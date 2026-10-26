@@ -1,0 +1,12 @@
+[package]
+name = "kronos-2t"
+version = "0.1.0"
+edition = "2021"
+description = "Sub-bit Kronecker-synthesized, multiplication-free sparse inference engine"
+default-run = "kronos-2t"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
