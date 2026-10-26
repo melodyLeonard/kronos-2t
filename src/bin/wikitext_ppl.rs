@@ -92,7 +92,7 @@ fn decode_speed(eng: &mut RealLlamaEngine, ids: &[usize], n_gen: usize, runs: us
 }
 
 /// Bump when the GPTQ compiler changes to invalidate `--cache-dir` entries.
-const COMPILE_REV: u32 = 2;
+const COMPILE_REV: u32 = 3;
 
 /// Compiles a Bipolar engine, or loads it from `cache_dir`.
 #[allow(clippy::too_many_arguments)]

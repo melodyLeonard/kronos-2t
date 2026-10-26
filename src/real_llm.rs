@@ -27,6 +27,9 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+/// Hessian off-diagonal shrinkage for the Bipolar GPTQ compile.
+const BIPOLAR_GPTQ_DAMP: f64 = 0.01;
+
 /// File magic for [`RealLlamaEngine::save_bipolar`] caches.
 const BIPOLAR_CACHE_MAGIC: &[u8] = b"K2TBIPOLAR1\n";
 
@@ -1295,7 +1298,7 @@ impl RealLlamaEngine {
                     hess_attn.observe_activation(&norm_buf);
                 }
             }
-            hess_attn.finalize(0.01);
+            hess_attn.finalize(BIPOLAR_GPTQ_DAMP);
             let qkv_mat = compile_hadamard_gptq_bipolar(
                 ref_layer.qkv_proj.as_fp32_slice(),
                 qkv_rows,
@@ -1349,7 +1352,7 @@ impl RealLlamaEngine {
             for row in all_attn_out.chunks_exact(h_dim) {
                 hess_o.observe_activation(row);
             }
-            hess_o.finalize(0.01);
+            hess_o.finalize(BIPOLAR_GPTQ_DAMP);
             let o_mat = compile_hadamard_gptq_bipolar(
                 ref_layer.o_proj.as_fp32_slice(),
                 h_dim,
@@ -1386,7 +1389,7 @@ impl RealLlamaEngine {
                     hess_mlp.observe_activation(&norm_buf);
                 }
             }
-            hess_mlp.finalize(0.01);
+            hess_mlp.finalize(BIPOLAR_GPTQ_DAMP);
             let gate_up_mat = compile_hadamard_gptq_bipolar(
                 ref_layer.gate_up_proj.as_fp32_slice(),
                 2 * inter_dim,
@@ -1414,7 +1417,7 @@ impl RealLlamaEngine {
             for row in all_swiglu.chunks_exact(inter_dim) {
                 hess_down.observe_activation(row);
             }
-            hess_down.finalize(0.01);
+            hess_down.finalize(BIPOLAR_GPTQ_DAMP);
             let down_mat = compile_hadamard_gptq_bipolar(
                 ref_layer.down_proj.as_fp32_slice(),
                 h_dim,
@@ -1458,7 +1461,7 @@ impl RealLlamaEngine {
                 hess_head.observe_activation(&norm_buf);
             }
         }
-        hess_head.finalize(0.01);
+        hess_head.finalize(BIPOLAR_GPTQ_DAMP);
         let head_mat = compile_hadamard_gptq_bipolar(
             self.lm_head.as_fp32_slice(),
             self.cfg.vocab_size,
