@@ -395,9 +395,7 @@ impl LinearBackend {
                 }
             }
             Self::Nibble4(mat) => {
-                let act = blut
-                    .and_then(|b| b.int8.as_ref())
-                    .expect("int8 activations required for Nibble4");
+                let act = blut.expect("BipolarActivationLut required for Nibble4");
                 let n_stripes = mat.num_stripes;
                 let out_addr = out.as_mut_ptr() as usize;
                 if let Some(p) = pool.filter(|p| p.num_threads() > 1 && n_stripes >= 16) {
@@ -1515,13 +1513,13 @@ impl RealLlamaEngine {
         }
     }
 
-    /// Repacks every 4-plane Bipolar projection into [`Nibble4SdotMatrix`] (bit-exact weights,
+    /// Repacks every `4..=6`-plane Bipolar projection into [`Nibble4SdotMatrix`] (bit-exact weights,
     /// `SDOT` kernel) and enables the `int8` activation path; the LUT build is skipped when no
     /// LUT-kernel projection remains. Call after compiling or loading, before inference.
     pub fn repack_sdot(&mut self) {
         let repack = |b: &mut LinearBackend| {
             if let LinearBackend::FusedBipolar(m) = b {
-                if m.num_planes == 4 {
+                if (4..=6).contains(&m.num_planes) {
                     *b = LinearBackend::Nibble4(Nibble4SdotMatrix::from_bipolar(m));
                 }
             }
@@ -1534,7 +1532,11 @@ impl RealLlamaEngine {
         }
         repack(&mut self.lm_head);
 
-        let is_lut = |b: &LinearBackend| matches!(b, LinearBackend::FusedBipolar(_));
+        let is_lut = |b: &LinearBackend| match b {
+            LinearBackend::FusedBipolar(_) => true,
+            LinearBackend::Nibble4(m) => m.hi_planes > 0,
+            _ => false,
+        };
         let hidden_lut = is_lut(&self.lm_head)
             || self.layers.iter().any(|l| is_lut(&l.qkv_proj) || is_lut(&l.o_proj) || is_lut(&l.gate_up_proj));
         let inter_lut = self.layers.iter().any(|l| is_lut(&l.down_proj));
