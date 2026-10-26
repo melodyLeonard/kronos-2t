@@ -1402,9 +1402,9 @@ pub struct BipolarActivationLut {
     pub num_chunks: usize,
     pub lut4: Vec<[i8; 16]>,
     pub chunk_scales: Vec<f32>,
-    /// Builds the 16-entry LUTs on `populate` (off when every consumer is a [`Nibble4SdotMatrix`]).
+    /// Build the 16-entry LUTs on `populate`.
     pub lut_enabled: bool,
-    /// Optional `int8` copy of the same activations for [`Nibble4SdotMatrix`] consumers.
+    /// `int8` activations for [`Nibble4SdotMatrix`].
     pub int8: Option<Int8ChunkActivation>,
 }
 
@@ -1511,9 +1511,7 @@ impl BipolarActivationLut {
         }
     }
 
-    /// Branch-free NEON `D4` populate: 4 quads per step (`vld4q` deinterleave puts one quad per
-    /// lane), vectorized parity fix-up (bit-exact with [`project_quad_d4`]) and a `tbl4` transpose
-    /// of the 16 bipolar sums into each quad's 16-byte table.
+    /// Branch-free NEON populate, 4 quads per step; bit-exact with the scalar path.
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "neon")]
     unsafe fn populate_neon_d4(&mut self, x: &[f32]) {
@@ -1803,7 +1801,7 @@ impl FusedBipolarLutMatrix {
         (self.physical_bytes() as f64 * 8.0) / ((self.rows * self.cols) as f64)
     }
 
-    /// Unpacks the unsigned plane codes `u` (`0 .. 2^num_planes`) of row `r` into `out`.
+    /// Unpacks row `r`'s plane codes `u` into `out`.
     pub fn unpack_row_codes(&self, r: usize, out: &mut [u8]) {
         assert!(r < self.rows);
         assert_eq!(out.len(), self.cols);
@@ -1822,8 +1820,7 @@ impl FusedBipolarLutMatrix {
         }
     }
 
-    /// Dequantizes row `r` into `out` (`cols` floats) in the Hadamard-rotated domain; apply
-    /// `ifwht64_signed_inplace` afterwards to recover the original-domain row.
+    /// Dequantizes row `r` (Hadamard-rotated domain).
     pub fn dequantize_row_rotated(&self, r: usize, out: &mut [f32]) {
         let mut codes = vec![0u8; self.cols];
         self.unpack_row_codes(r, &mut codes);
@@ -2919,8 +2916,7 @@ unsafe fn simd_lut_gemv_multiplane_neon(
     }
 }
 
-/// Per-64-column `int8` activation quantization for [`Nibble4SdotMatrix`]: `q = round(x / scale)`
-/// with `scale = max|x| / 127` per chunk, plus each chunk's integer sum (for the odd-grid offset).
+/// Per-64-column `int8` activations (`max|x| / 127` scale) with per-chunk sums.
 #[derive(Clone, Debug)]
 pub struct Int8ChunkActivation {
     pub cols: usize,
@@ -3013,16 +3009,9 @@ impl Int8ChunkActivation {
     }
 }
 
-/// **Bipolar weights repacked for `SDOT`** (`4..=6` planes): plane codes `u = u_lo + 16 * u_hi`
-/// give odd weights `q = 2u - (2^B - 1) = (2 u_lo - 15) + sum_{p>=4} 2^p s_p` (`s_p = 2 b_p - 1`),
-/// so the low 4 planes run as `2 * sum(u_lo * x) - 15 * sum(x)` on `int8` dot-product
-/// instructions over nibble-packed `u_lo`, and planes `4..B` stay bipolar `{-1,+1}` planes on the
-/// 16-entry LUT path inside the same fused loop (shared scales, identical bits/weight).
-///
-/// Nibble layout `[num_stripes, num_chunks, 4 col16-groups, 4 row-groups, 2 x 16 bytes]`: within a
-/// row group's 16-byte vector, byte `4 * row + t` holds column `t` (low nibble) and `t + 4` (high
-/// nibble) of an 8-column half, matching `SDOT`'s by-lane `4 rows x 4 bytes` shape. High planes keep
-/// the [`FusedBipolarLutMatrix`] layout `[num_stripes, octets_per_row, hi_planes, 16]`.
+/// Bipolar weights for `SDOT`: `q = (2 u_lo - 15) + sum_{p>=4} 2^p s_p`. The low 4 planes are
+/// nibble-packed for `sdot`; planes `4..B` stay on the LUT path.
+/// Nibble layout: `[stripe, chunk, col16, row4, 2 x 16 bytes]`, byte `4 * row + t` = cols `t`, `t + 4`.
 #[derive(Clone, Debug)]
 pub struct Nibble4SdotMatrix {
     pub rows: usize,
@@ -3030,15 +3019,15 @@ pub struct Nibble4SdotMatrix {
     pub num_stripes: usize,
     pub num_chunks: usize,
     pub data: Vec<u8>,
-    /// Bipolar planes `4..num_planes` (`0`, `1` or `2`).
+    /// Bipolar planes `4..num_planes`.
     pub hi_planes: usize,
     pub hi_data: Vec<u8>,
-    /// Shared `BF16` chunk scales `[num_stripes, num_chunks, SIMD_ROW_STRIPE]` (as in the LUT layout).
+    /// `BF16` chunk scales `[num_stripes, num_chunks, SIMD_ROW_STRIPE]`.
     pub bf16_chunk_scales: Vec<u16>,
 }
 
 impl Nibble4SdotMatrix {
-    /// Repacks a `4..=6`-plane [`FusedBipolarLutMatrix`] (bit-exact same weights).
+    /// Repacks a `4..=6`-plane [`FusedBipolarLutMatrix`].
     pub fn from_bipolar(m: &FusedBipolarLutMatrix) -> Self {
         assert!((4..=6).contains(&m.num_planes), "SDOT repack requires 4..=6 planes");
         let mut data = vec![0u8; m.num_stripes * m.num_chunks * 512];

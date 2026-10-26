@@ -10,6 +10,7 @@
 //! - [`k2t_format`]: 4KB page-aligned `.k2t` v2 multi-rank container & zero-copy views.
 //! - [`mmap_pager`]: Zero-copy POSIX `mmap` + `POSIX_MADV_WILLNEED` asynchronous Flash pager.
 //! - [`ssd`]: Constant-memory $O(1)$ State-Space Dual (SSD) block with induction shift.
+//! - [`accel`]: Parallel SYRK / Cholesky / triangular inverse for GPTQ.
 //! - [`compiler`]: BitNet $b1.58$ ternary quantizer & Multi-Rank Kronecker `.k2t` factorizer.
 //! - [`engine`]: Zero-allocation multi-layer sparse inference runtime.
 //! - [`demo_model`]: Trainable `.k2t`-compiled language & 1,200-token Needle-in-a-Haystack suite.
@@ -17,6 +18,7 @@
 //! - [`bpe_tokenizer`]: Pure-Rust `SmolLM2`/`GPT-2` byte-level BPE tokenizer (`vocab.json` + `merges.txt`).
 //! - [`real_llm`]: Real pretrained `LlamaForCausalLM` (`SmolLM2-135M`) `FP32` vs Multi-Plane NEON LUT verifier.
 
+pub mod accel;
 pub mod bpe_tokenizer;
 pub mod compiler;
 pub mod demo_model;

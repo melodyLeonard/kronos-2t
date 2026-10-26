@@ -1,16 +1,14 @@
-//! WikiText-2 perplexity / KL / top-1 evaluation, matched 1:1 to `llama-perplexity`, plus an
-//! optional `llama-bench`-style decode-speed test.
+//! WikiText-2 perplexity/KL/top-1 matched to `llama-perplexity`, plus `tg32` decode speed.
 //!
 //! Usage: `wikitext_ppl <model_dir> <token_ids_file> [flags]`
 //!   `--chunks N`        evaluation chunks (default 64)
 //!   `--ctx N`           chunk length (default 256)
 //!   `--modes LIST`      comma list of `q40,b4,mk,b5` (default all)
-//!   `--calib-ids FILE`  calibrate GPTQ on this token-id file (e.g. WikiText-2 *train*) instead of
-//!                       the 8 built-in passages
-//!   `--calib-tokens N`  tokens taken from `--calib-ids` (default 8192), split into `--ctx` sequences
-//!   `--cache-dir DIR`   reuse/save compiled Bipolar engines (keyed by mode + calibration)
-//!   `--sdot`            repack 4-plane Bipolar projections for the `SDOT` kernel
-//!   `--speed`           also measure decode tok/s (`tg32`, 1 and 8 threads, mean of 5 runs)
+//!   `--calib-ids FILE`  GPTQ calibration token ids (default: 8 built-in passages)
+//!   `--calib-tokens N`  tokens taken from `--calib-ids` (default 8192)
+//!   `--cache-dir DIR`   reuse/save compiled Bipolar engines
+//!   `--sdot`            use the `SDOT` kernel
+//!   `--speed`           also measure decode tok/s
 //!
 //! `token_ids_file` holds one token id per line, produced by
 //! `llama-tokenize -m <smollm2.gguf> -f wiki.test.raw --ids --no-bos` so both engines score the
@@ -75,8 +73,7 @@ impl Acc {
     }
 }
 
-/// `llama-bench tg32`-style decode speed: `n_gen` single-token forwards from an empty KV cache,
-/// `runs` timed repetitions after one warm-up, returning `(mean, stddev)` tok/s.
+/// `tg32`-style decode speed: `(mean, stddev)` tok/s over `runs` after one warm-up.
 fn decode_speed(eng: &mut RealLlamaEngine, ids: &[usize], n_gen: usize, runs: usize) -> (f64, f64) {
     let one_run = |eng: &mut RealLlamaEngine| {
         eng.reset_context();
@@ -93,10 +90,10 @@ fn decode_speed(eng: &mut RealLlamaEngine, ids: &[usize], n_gen: usize, runs: us
     (mean, var.sqrt())
 }
 
-/// Bumped whenever the GPTQ compiler changes, so stale `--cache-dir` entries are not reused.
+/// Bump when the GPTQ compiler changes to invalidate `--cache-dir` entries.
 const COMPILE_REV: u32 = 2;
 
-/// Compiles a Bipolar engine, or loads it from `cache_dir` when an identical compile was saved.
+/// Compiles a Bipolar engine, or loads it from `cache_dir`.
 #[allow(clippy::too_many_arguments)]
 fn compile_or_load(
     fp32: &RealLlamaEngine,

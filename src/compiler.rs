@@ -565,12 +565,12 @@ pub struct FullRowGptqHessian {
     raw_h: Vec<f64>,
     pub h_inv_chol_upper: Vec<f32>,
     sample_count: usize,
-    /// Rotated activations awaiting a batched `X^T X` flush (`pending_rows x cols`).
+    /// Rotated activations awaiting a batched `X^T X` flush.
     pending: Vec<f32>,
 }
 
-/// Activations buffered per batched Hessian flush (`f32` partial sums stay exact enough at this size).
-const HESSIAN_FLUSH_ROWS: usize = 256;
+/// Activations per batched Hessian flush.
+const HESSIAN_FLUSH_ROWS: usize = 1024;
 
 impl FullRowGptqHessian {
     pub fn new(cols: usize) -> Self {
@@ -602,42 +602,20 @@ impl FullRowGptqHessian {
         }
     }
 
-    /// Adds the upper triangle of `X^T X` for all buffered rows into `raw_h`, splitting rows `i`
-    /// round-robin across threads (balances the triangle) with contiguous `f32` SIMD inner loops.
+    /// Adds the upper triangle of `X^T X` for all buffered rows into `raw_h` (one `SYRK`).
     fn flush_pending(&mut self) {
         let c = self.cols;
         let n = self.pending.len() / c;
         if n == 0 {
             return;
         }
-        let xs = &self.pending;
-        let workers = std::thread::available_parallelism().map_or(1, |p| p.get()).clamp(1, 8);
-        let partials: Vec<Vec<(usize, Vec<f32>)>> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..workers)
-                .map(|w| {
-                    s.spawn(move || {
-                        let mut out = Vec::new();
-                        for i in (w..c).step_by(workers) {
-                            let mut acc = vec![0.0f32; c - i];
-                            for t in 0..n {
-                                let x = &xs[t * c..(t + 1) * c];
-                                let xi = x[i];
-                                if xi != 0.0 {
-                                    for (a, &xj) in acc.iter_mut().zip(x[i..].iter()) {
-                                        *a += xi * xj;
-                                    }
-                                }
-                            }
-                            out.push((i, acc));
-                        }
-                        out
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        for (i, acc) in partials.into_iter().flatten() {
-            for (slot, &v) in self.raw_h[i * c + i..(i + 1) * c].iter_mut().zip(acc.iter()) {
+        let mut partial = vec![0.0f32; c * c];
+        crate::accel::syrk_upper(&self.pending, n, c, &mut partial);
+        for i in 0..c {
+            for (slot, &v) in self.raw_h[i * c + i..(i + 1) * c]
+                .iter_mut()
+                .zip(&partial[i * c + i..(i + 1) * c])
+            {
                 *slot += v as f64;
             }
         }
@@ -666,60 +644,39 @@ impl FullRowGptqHessian {
         let off_diag_scale = 1.0 - lw_shrink;
         let iso_floor = (0.005 * mean_diag).max(1e-6);
 
-        // Build reversed SPD matrix `h_rev[i, j] = H_lw[c - 1 - i, c - 1 - j]` (lower triangle needed)
+        // Factor the reversed Hessian and invert; retry with more damping if not positive definite.
         let mut l_mat = vec![0.0f64; c * c];
-        for i in 0..c {
-            let orig_i = c - 1 - i;
-            for j in 0..=i {
-                let orig_j = c - 1 - j;
-                let (lo, hi) = if orig_i <= orig_j {
-                    (orig_i, orig_j)
-                } else {
-                    (orig_j, orig_i)
-                };
-                let raw_val = self.raw_h[lo * c + hi] / denom;
-                let val = if i == j {
-                    raw_val + iso_floor
-                } else {
-                    raw_val * off_diag_scale
-                };
-                let sum_prev: f64 = l_mat[i * c..i * c + j]
-                    .iter()
-                    .zip(&l_mat[j * c..j * c + j])
-                    .map(|(a, b)| a * b)
-                    .sum();
-                let rem = val - sum_prev;
-                if i == j {
-                    l_mat[i * c + i] = rem.max(1e-15).sqrt();
-                } else {
-                    l_mat[i * c + j] = rem / l_mat[j * c + j];
+        let mut floor = iso_floor;
+        loop {
+            for i in 0..c {
+                let orig_i = c - 1 - i;
+                for j in 0..=i {
+                    let orig_j = c - 1 - j;
+                    let (lo, hi) = if orig_i <= orig_j {
+                        (orig_i, orig_j)
+                    } else {
+                        (orig_j, orig_i)
+                    };
+                    let raw_val = self.raw_h[lo * c + hi] / denom;
+                    l_mat[i * c + j] = if i == j {
+                        raw_val + floor
+                    } else {
+                        raw_val * off_diag_scale
+                    };
                 }
             }
-        }
-
-        // Compute `mt[j * c + i] = (L^{-1})_{i, j}` (`j <= i`) via contiguous dot products!
-        let mut mt = vec![0.0f64; c * c];
-        for i in 0..c {
-            let inv_lii = 1.0 / l_mat[i * c + i];
-            mt[i * c + i] = inv_lii;
-            for j in 0..i {
-                let dot: f64 = l_mat[i * c + j..i * c + i]
-                    .iter()
-                    .zip(&mt[j * c + j..j * c + i])
-                    .map(|(a, b)| a * b)
-                    .sum();
-                mt[j * c + i] = -inv_lii * dot;
+            if crate::accel::cholesky_lower(&mut l_mat, c) && crate::accel::invert_lower(&mut l_mat, c) {
+                break;
             }
+            floor *= 10.0;
         }
 
-        // Map `U[r, col] = M[c - 1 - r, c - 1 - col] = mt[(c - 1 - col) * c + (c - 1 - r)]` for `r <= col`
+        // `U[r, col] = (L^{-1})[c - 1 - r, c - 1 - col]` for `r <= col`.
         let mut u_upper = vec![0.0f32; c * c];
         for r in 0..c {
-            let rev_r = c - 1 - r;
-            let dst_row = &mut u_upper[r * c..(r + 1) * c];
-            for (col, slot) in dst_row.iter_mut().enumerate().skip(r) {
-                let rev_col = c - 1 - col;
-                *slot = mt[rev_col * c + rev_r] as f32;
+            let src_row = &l_mat[(c - 1 - r) * c..(c - r) * c];
+            for (col, slot) in u_upper[r * c..(r + 1) * c].iter_mut().enumerate().skip(r) {
+                *slot = src_row[c - 1 - col] as f32;
             }
         }
         self.h_inv_chol_upper = u_upper;
@@ -1503,5 +1460,48 @@ mod tests {
         };
         assert!(cos(&out_neon2, &out_fp32) > 0.990);
         assert!(cos(&out_neon3, &out_fp32) > 0.999);
+    }
+
+    #[test]
+    fn test_full_row_hessian_inverse_cholesky() {
+        let c = 128;
+        let mut h = FullRowGptqHessian::new(c);
+        let xs: Vec<Vec<f32>> = (0..1500)
+            .map(|t| (0..c).map(|i| (((t * 131 + i * 71) % 97) as f32 / 97.0 - 0.5) * (1.0 + (i % 5) as f32)).collect())
+            .collect();
+        let mut raw = vec![0.0f64; c * c];
+        for x in &xs {
+            let mut xr = x.clone();
+            fwht64_signed_inplace(&mut xr);
+            for i in 0..c {
+                for j in 0..c {
+                    raw[i * c + j] += xr[i] as f64 * xr[j] as f64;
+                }
+            }
+            h.observe_activation(x);
+        }
+        h.finalize(0.01);
+        let u = &h.h_inv_chol_upper;
+        assert!(u.iter().all(|v| v.is_finite()), "non-finite U");
+        // (U^T U) * H_damped should be ~identity.
+        let n = xs.len() as f64;
+        let mean_diag = (0..c).map(|i| raw[i * c + i] / n).sum::<f64>() / c as f64;
+        let hd = |i: usize, j: usize| {
+            let v = raw[i * c + j] / n;
+            if i == j { v + 0.005 * mean_diag } else { v * 0.99 }
+        };
+        let mut max_err = 0.0f64;
+        for i in (0..c).step_by(7) {
+            for j in (0..c).step_by(5) {
+                let mut acc = 0.0f64;
+                for k in 0..c {
+                    let utu: f64 = (0..=i.min(k)).map(|r| u[r * c + i] as f64 * u[r * c + k] as f64).sum();
+                    acc += utu * hd(k, j);
+                }
+                let want = if i == j { 1.0 } else { 0.0 };
+                max_err = max_err.max((acc - want).abs());
+            }
+        }
+        assert!(max_err < 1e-2, "U^T U H != I (max err {max_err})");
     }
 }

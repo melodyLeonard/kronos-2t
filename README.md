@@ -2,7 +2,7 @@
 
 **Kronecker-Routed Non-multiplying On-device Sparse Engine**
 
-`kronos-2t` is a zero-dependency, zero-allocation-per-token Rust & ARM NEON inference engine proving the mathematical and systems primitives required to execute ultra-sparse Trillion-parameter ($2 \times 10^{12}$) architectures. On real pretrained LLMs (SmolLM2-135M / 360M) it beats `llama.cpp`'s entire quality-vs-size curve (12–23% smaller at equal KL), and on 4–8 CPU cores decodes faster than `llama.cpp` (CPU and Metal) and `Ollama` at matched quality — see [BENCHMARKS.md](BENCHMARKS.md) for the verified, reproducible numbers and their limits.
+`kronos-2t` is a zero-dependency, zero-allocation-per-token Rust & ARM NEON inference engine proving the mathematical and systems primitives required to execute ultra-sparse Trillion-parameter ($2 \times 10^{12}$) architectures. On SmolLM2-135M/360M it is smaller and faster than llama.cpp at matched quality ([BENCHMARKS.md](BENCHMARKS.md)).
 
 ---
 
@@ -20,13 +20,9 @@
 
 ---
 
-## Verified Real-Weight Benchmark (Apple M4 Pro, WikiText-2)
+## Benchmark (SmolLM2-135M, Apple M4 Pro)
 
-Same weights, same scored tokens and same 32k-token calibration set for both engines. KL is
-measured against full-precision logits; sizes include the embedding table. Full method, the
-360M results and the limitations are in [BENCHMARKS.md](BENCHMARKS.md).
-
-**SmolLM2-135M**: each Kronos tier is paired with the `llama.cpp` (imatrix) quant of matching quality.
+WikiText-2, same weights and calibration as llama.cpp (imatrix). Details and 360M: [BENCHMARKS.md](BENCHMARKS.md).
 
 | Kronos tier | Size | KL | 1-core tok/s | 8-core tok/s | `llama.cpp` match | Size | KL | 1-core | best CPU | Metal |
 | :--- | ---: | ---: | ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: |

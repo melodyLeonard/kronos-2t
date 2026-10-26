@@ -172,8 +172,7 @@ pub enum RealWeightMode {
     /// `4-Plane` (`4.25b`, `16` levels) on `qkv_proj`/`o_proj`/`gate_up_proj` + `5-Plane` (`5.25b`,
     /// `32` levels) on `down_proj` & `lm_head` (beats `GGUF Q4_K_M` at lower bit-width!).
     KronosBipolarGptqMixedK,
-    /// **`kronos-2t` Bipolar per-matrix plane allocation** (`3..=6` planes each for `qkv_proj`,
-    /// `o_proj`, `gate_up_proj`, `down_proj` and `lm_head`).
+    /// Bipolar with per-matrix plane counts.
     KronosBipolarGptqPlanes {
         qkv: usize,
         o: usize,
@@ -193,7 +192,7 @@ enum LinearBackend {
     GgufQ4_0(GgufQ4_0Matrix),
     FusedBase3(FusedBase3LutMatrix),
     FusedBipolar(FusedBipolarLutMatrix),
-    /// 4-plane Bipolar weights repacked for `SDOT` (see [`RealLlamaEngine::repack_sdot`]).
+    /// Bipolar weights repacked for `SDOT`.
     Nibble4(Nibble4SdotMatrix),
 }
 
@@ -1498,7 +1497,7 @@ impl RealLlamaEngine {
             cfg: self.cfg.clone(),
             mode,
             mean_weight_rel_error: 0.0,
-            // Tied embeddings are decoded on the fly from the quantized `lm_head` rows (no FP32 copy).
+            // Tied embeddings are decoded from the quantized `lm_head`.
             embed_f32_rows: if self.cfg.tie_word_embeddings {
                 Vec::new()
             } else {
@@ -1513,9 +1512,7 @@ impl RealLlamaEngine {
         }
     }
 
-    /// Repacks every `4..=6`-plane Bipolar projection into [`Nibble4SdotMatrix`] (bit-exact weights,
-    /// `SDOT` kernel) and enables the `int8` activation path; the LUT build is skipped when no
-    /// LUT-kernel projection remains. Call after compiling or loading, before inference.
+    /// Repacks `4..=6`-plane Bipolar projections for the `SDOT` kernel (same weights).
     pub fn repack_sdot(&mut self) {
         let repack = |b: &mut LinearBackend| {
             if let LinearBackend::FusedBipolar(m) = b {
@@ -1546,8 +1543,7 @@ impl RealLlamaEngine {
         self.ws.blut_inter.int8 = Some(Int8ChunkActivation::new_zeroed(self.cfg.intermediate_size));
     }
 
-    /// Saves a compiled Bipolar engine (every projection `FusedBipolar`) so later runs can skip the
-    /// sequential GPTQ compile via [`Self::load_bipolar`].
+    /// Saves a compiled Bipolar engine; see [`Self::load_bipolar`].
     pub fn save_bipolar(&self, path: &Path) -> io::Result<()> {
         use std::io::Write;
         fn w_u64(w: &mut impl Write, v: usize) -> io::Result<()> {
@@ -1695,7 +1691,7 @@ impl RealLlamaEngine {
         layer_bytes + self.lm_head.physical_bytes()
     }
 
-    /// Total resident weight RAM: linear projections plus any separate FP32 embedding table.
+    /// Linear weights plus any FP32 embedding table.
     pub fn resident_weight_bytes(&self) -> usize {
         self.linear_weight_bytes() + self.embed_f32_rows.len() * std::mem::size_of::<f32>()
     }
