@@ -2,7 +2,7 @@
 
 **Kronecker-Routed Non-multiplying On-device Sparse Engine**
 
-`kronos-2t` is a zero-dependency, zero-allocation-per-token Rust & ARM NEON inference engine proving the mathematical and systems primitives required to execute ultra-sparse Trillion-parameter ($2 \times 10^{12}$) architectures—and surpass cutting-edge engines (`Ollama` Metal GPU, `llama.cpp GGUF Q4_0` & `Q4_K_M`) in **both** decode speed and output quality-per-bit on real open-weight pretrained LLMs.
+`kronos-2t` is a zero-dependency, zero-allocation-per-token Rust & ARM NEON inference engine proving the mathematical and systems primitives required to execute ultra-sparse Trillion-parameter ($2 \times 10^{12}$) architectures. On real pretrained LLMs (SmolLM2-135M / 360M) it beats `llama.cpp`'s entire quality-vs-size curve (12–23% smaller at equal KL), and on 4–8 CPU cores decodes faster than `llama.cpp` (CPU and Metal) and `Ollama` at matched quality — see [BENCHMARKS.md](BENCHMARKS.md) for the verified, reproducible numbers and their limits.
 
 ---
 
@@ -20,18 +20,20 @@
 
 ---
 
-## Verified Real-Weight Benchmark (`HuggingFaceTB/SmolLM2-135M`, Apple M4 Pro)
+## Verified Real-Weight Benchmark (Apple M4 Pro, WikiText-2)
 
-| Engine / Quantization Mode | Bits/W | Weight RAM | Perplexity ($\downarrow$) | Logit Cos ($\uparrow$) | KL Div ($\downarrow$) | Top-1% ($\uparrow$) | 1-Core `tok/s` | 8-Core `tok/s` |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `Exact FP32 Reference` (NEON `vfmaq`) | `32.00b` | `513.0 MB` | `9.29` | `1.000000` | `0.0000` | `100.0%` | `128.1` | `339.6` |
-| `Ollama v0.35.0` Metal GPU (`F16 GGUF`) | `16.00b` | `256.5 MB` | `~9.29` | `~1.0000` | `~0.000` | `~100%` | — | `307.0` |
-| `Ollama v0.35.0` Metal GPU (`Q4_K_M`) | `4.85b` | `82.0 MB` | `~10.4` | — | — | — | — | `435.3` |
-| `llama.cpp GGUF Q4_0` (`G=32 Q4_0xQ8_0`) | `4.50b` | `72.1 MB` | `13.31` | `0.954563` | `0.3129` | `70.5%` | `209.5` | `925.7` |
-| `Kronos M4` Old Greedy 2-Plane (Before) | `4.50b` | `72.1 MB` | `116.53` | `0.699346` | `2.2341` | `30.8%` | `347.8` | `361.1` |
-| **`Kronos Bipolar-4 + D4 + GPTQ` (16-lvl)** | **`4.25b`** | **`68.1 MB`** | **`11.85`** | **`0.956945`** | **`0.1468`** | **`78.2%`** | **`363.0`** | **`1,178.7`** |
-| **`Kronos Bipolar Mixed-K + D4 + GPTQ`** | **`4.73b`** | **`75.9 MB`** | **`9.88`** | **`0.986751`** | **`0.0814`** | **`78.2%`** | **`321.2`** | **`1,030.1`** |
-| **`Kronos Bipolar-5 + D4 + GPTQ` (32-lvl)** | **`5.25b`** | **`84.2 MB`** | **`9.75`** | **`0.992964`** | **`0.0459`** | **`80.8%`** | **`296.6`** | **`977.1`** |
+Same weights, same scored tokens and same 32k-token calibration set for both engines. KL is
+measured against full-precision logits; sizes include the embedding table. Full method, the
+360M results and the limitations are in [BENCHMARKS.md](BENCHMARKS.md).
+
+**SmolLM2-135M**: each Kronos tier is paired with the `llama.cpp` (imatrix) quant of matching quality.
+
+| Kronos tier | Size | KL | 1-core tok/s | 8-core tok/s | `llama.cpp` match | Size | KL | 1-core | best CPU | Metal |
+| :--- | ---: | ---: | ---: | ---: | :--- | ---: | ---: | ---: | ---: | ---: |
+| **Bipolar-4** (4.25b) | **68.1 MiB** | **0.077** | **665** | **1,834** | IQ4_XS | 85.0 MiB | 0.079 | 417 | 820 | 483 |
+| **planes 55454** (4.64b) | **74.5 MiB** | **0.053** | **565** | **1,485** | Q4_1 | 92.1 MiB | 0.052 | 290 | 802 | 502 |
+| **Bipolar-5** (5.25b) | **84.2 MiB** | **0.021** | **467** | **1,392** | Q4_K_M | 98.9 MiB | 0.034 | 253 | 723 | 446 |
+| **Bipolar-6** (6.25b) | **100.2 MiB** | **0.006** | 357 | **1,166** | Q6_K | 130.3 MiB | 0.007 | **384** | 631 | 447 |
 
 ---
 
@@ -46,4 +48,8 @@ cargo run --release --bin kronos-2t
 
 # 2. Real pretrained LLM (`HuggingFaceTB/SmolLM2-135M`) quality & speed audit
 cargo run --release --bin verify_real_weights
+
+# 3. WikiText-2 quality (matched 1:1 to llama-perplexity) + decode speed; see BENCHMARKS.md
+cargo run --release --bin wikitext_ppl -- models/SmolLM2-135M wiki.ids \
+  --modes b4,p55454,b5,p66666 --calib-ids train.ids --calib-tokens 32768 --cache-dir k2tb --sdot --speed
 ```

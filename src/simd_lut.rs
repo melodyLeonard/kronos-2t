@@ -3309,8 +3309,8 @@ unsafe fn nibble4_sdot_stripe_range_neon(
         let mut tmp = [0.0f32; SIMD_ROW_STRIPE];
         // SAFETY: `tmp` holds 16 floats; writes stay within `row_start + valid <= rows`.
         unsafe {
-            for g in 0..4 {
-                vst1q_f32(tmp.as_mut_ptr().add(g * 4), f[g]);
+            for (g, fg) in f.iter().enumerate() {
+                vst1q_f32(tmp.as_mut_ptr().add(g * 4), *fg);
             }
             std::ptr::copy_nonoverlapping(tmp.as_ptr(), out_base.add(row_start), valid);
         }
@@ -3842,7 +3842,13 @@ mod tests {
                     let h = (z ^ (z >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
                     let v = (((h >> 40) as f32) / ((1u32 << 24) as f32)) - 0.5;
                     // Exercise exact zeros, integer-valued ties and an all-zero chunk.
-                    if c / 64 == 3 { 0.0 } else if c % 17 == 0 { 0.0 } else if c % 29 == 0 { 8.0 * v.signum() } else { v * (1.0 + (c % 7) as f32) }
+                    if c / 64 == 3 || c % 17 == 0 {
+                        0.0
+                    } else if c % 29 == 0 {
+                        8.0 * v.signum()
+                    } else {
+                        v * (1.0 + (c % 7) as f32)
+                    }
                 })
                 .collect();
             let mut neon = BipolarActivationLut::new_zeroed(cols);
