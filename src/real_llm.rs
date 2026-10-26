@@ -1283,16 +1283,6 @@ impl RealLlamaEngine {
         let mut all_swiglu = vec![0.0f32; total_tokens * inter_dim];
 
         let mut norm_buf = vec![0.0f32; h_dim];
-        let mut rot_h = vec![0.0f32; h_dim];
-        let mut rot_inter = vec![0.0f32; inter_dim];
-        let mut qkv_buf = vec![0.0f32; qkv_rows];
-        let mut gate_up_buf = vec![0.0f32; 2 * inter_dim];
-        let mut proj_out = vec![0.0f32; h_dim];
-        let mut scores = vec![0.0f32; self.cfg.max_seq_len];
-        let mut k_seq_cache = vec![0.0f32; self.cfg.max_seq_len * kv_dim];
-        let mut v_seq_cache = vec![0.0f32; self.cfg.max_seq_len * kv_dim];
-        let mut blut_h = BipolarActivationLut::new_zeroed(h_dim);
-        let mut blut_i = BipolarActivationLut::new_zeroed(inter_dim);
 
         let mut compiled_layers = Vec::with_capacity(self.cfg.num_hidden_layers);
 
@@ -1316,39 +1306,30 @@ impl RealLlamaEngine {
             );
 
             // 2. Execute quantized `qkv_proj` + causal GQA attention -> gather `o_proj` Hessian
-            let mut hess_o = FullRowGptqHessian::new(h_dim);
-            let mut flat_cursor = 0usize;
-            for seq_h in &seq_hiddens {
-                let seq_len = seq_h.len() / h_dim;
-                for pos in 0..seq_len {
-                    let hid = &seq_h[pos * h_dim..(pos + 1) * h_dim];
+            par_calib(&mut seq_hiddens, &mut all_attn_out, h_dim, h_dim, |seq_h, attn_seq| {
+                let mut norm_buf = vec![0.0f32; h_dim];
+                let mut qkv_buf = vec![0.0f32; qkv_rows];
+                let mut scores = vec![0.0f32; self.cfg.max_seq_len];
+                let mut k_seq_cache = vec![0.0f32; self.cfg.max_seq_len * kv_dim];
+                let mut v_seq_cache = vec![0.0f32; self.cfg.max_seq_len * kv_dim];
+                let mut blut_h = BipolarActivationLut::new_zeroed(h_dim);
+                for (pos, (hid, attn_dst)) in seq_h
+                    .chunks_exact(h_dim)
+                    .zip(attn_seq.chunks_exact_mut(h_dim))
+                    .enumerate()
+                {
                     rms_norm(hid, &ref_layer.input_norm, self.cfg.rms_norm_eps, &mut norm_buf);
-                    rot_h.copy_from_slice(&norm_buf);
-                    fwht64_signed_inplace(&mut rot_h);
-                    blut_h.populate(&rot_h);
+                    fwht64_signed_inplace(&mut norm_buf);
+                    blut_h.populate(&norm_buf);
                     simd_lut_bipolar_gemv(&qkv_mat, &blut_h, &mut qkv_buf);
 
                     let rope_row = &self.rope_cos_sin[pos * head_dim..(pos + 1) * head_dim];
                     let (q_slice, kv_rest) = qkv_buf.split_at_mut(h_dim);
                     let (k_slice, v_slice) = kv_rest.split_at_mut(kv_dim);
-                    apply_llama_rope_precomp(
-                        q_slice,
-                        self.cfg.num_attention_heads,
-                        head_dim,
-                        half_dim,
-                        rope_row,
-                    );
-                    apply_llama_rope_precomp(
-                        k_slice,
-                        self.cfg.num_key_value_heads,
-                        head_dim,
-                        half_dim,
-                        rope_row,
-                    );
+                    apply_llama_rope_precomp(q_slice, self.cfg.num_attention_heads, head_dim, half_dim, rope_row);
+                    apply_llama_rope_precomp(k_slice, self.cfg.num_key_value_heads, head_dim, half_dim, rope_row);
                     k_seq_cache[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(k_slice);
                     v_seq_cache[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(v_slice);
-
-                    let attn_dst = &mut all_attn_out[flat_cursor * h_dim..(flat_cursor + 1) * h_dim];
                     causal_gqa_attention(
                         q_slice,
                         &k_seq_cache,
@@ -1362,9 +1343,11 @@ impl RealLlamaEngine {
                         pos,
                         attn_scale,
                     );
-                    hess_o.observe_activation(attn_dst);
-                    flat_cursor += 1;
                 }
+            });
+            let mut hess_o = FullRowGptqHessian::new(h_dim);
+            for row in all_attn_out.chunks_exact(h_dim) {
+                hess_o.observe_activation(row);
             }
             hess_o.finalize(0.01);
             let o_mat = compile_hadamard_gptq_bipolar(
@@ -1377,19 +1360,18 @@ impl RealLlamaEngine {
             );
 
             // Propagate quantized `o_proj` into residual `seq_hiddens`
-            let mut flat_cursor = 0usize;
-            for seq_h in &mut seq_hiddens {
-                for hid in seq_h.chunks_exact_mut(h_dim) {
-                    rot_h.copy_from_slice(
-                        &all_attn_out[flat_cursor * h_dim..(flat_cursor + 1) * h_dim],
-                    );
+            par_calib(&mut seq_hiddens, &mut all_attn_out, h_dim, h_dim, |seq_h, attn_seq| {
+                let mut rot_h = vec![0.0f32; h_dim];
+                let mut proj_out = vec![0.0f32; h_dim];
+                let mut blut_h = BipolarActivationLut::new_zeroed(h_dim);
+                for (hid, attn) in seq_h.chunks_exact_mut(h_dim).zip(attn_seq.chunks_exact(h_dim)) {
+                    rot_h.copy_from_slice(attn);
                     fwht64_signed_inplace(&mut rot_h);
                     blut_h.populate(&rot_h);
                     simd_lut_bipolar_gemv(&o_mat, &blut_h, &mut proj_out);
                     add_inplace(hid, &proj_out);
-                    flat_cursor += 1;
                 }
-            }
+            });
 
             // 3. Post-attention normalized activations -> compile `gate_up_proj`
             let mut hess_mlp = FullRowGptqHessian::new(h_dim);
@@ -1415,28 +1397,22 @@ impl RealLlamaEngine {
             );
 
             // 4. Execute quantized `gate_up_proj` + `SwiGLU` -> gather `down_proj` Hessian
-            let mut hess_down = FullRowGptqHessian::new(inter_dim);
-            let mut flat_cursor = 0usize;
-            for seq_h in &seq_hiddens {
-                for hid in seq_h.chunks_exact(h_dim) {
-                    rms_norm(
-                        hid,
-                        &ref_layer.post_attn_norm,
-                        self.cfg.rms_norm_eps,
-                        &mut norm_buf,
-                    );
-                    rot_h.copy_from_slice(&norm_buf);
-                    fwht64_signed_inplace(&mut rot_h);
-                    blut_h.populate(&rot_h);
+            par_calib(&mut seq_hiddens, &mut all_swiglu, h_dim, inter_dim, |seq_h, sw_seq| {
+                let mut norm_buf = vec![0.0f32; h_dim];
+                let mut gate_up_buf = vec![0.0f32; 2 * inter_dim];
+                let mut blut_h = BipolarActivationLut::new_zeroed(h_dim);
+                for (hid, sw_dst) in seq_h.chunks_exact(h_dim).zip(sw_seq.chunks_exact_mut(inter_dim)) {
+                    rms_norm(hid, &ref_layer.post_attn_norm, self.cfg.rms_norm_eps, &mut norm_buf);
+                    fwht64_signed_inplace(&mut norm_buf);
+                    blut_h.populate(&norm_buf);
                     simd_lut_bipolar_gemv(&gate_up_mat, &blut_h, &mut gate_up_buf);
-
                     let (gate_s, up_s) = gate_up_buf.split_at(inter_dim);
-                    let sw_dst =
-                        &mut all_swiglu[flat_cursor * inter_dim..(flat_cursor + 1) * inter_dim];
                     swiglu_activate(gate_s, up_s, sw_dst);
-                    hess_down.observe_activation(sw_dst);
-                    flat_cursor += 1;
                 }
+            });
+            let mut hess_down = FullRowGptqHessian::new(inter_dim);
+            for row in all_swiglu.chunks_exact(inter_dim) {
+                hess_down.observe_activation(row);
             }
             hess_down.finalize(0.01);
             let down_mat = compile_hadamard_gptq_bipolar(
@@ -1449,19 +1425,18 @@ impl RealLlamaEngine {
             );
 
             // Propagate quantized `down_proj` into residual `seq_hiddens`
-            let mut flat_cursor = 0usize;
-            for seq_h in &mut seq_hiddens {
-                for hid in seq_h.chunks_exact_mut(h_dim) {
-                    rot_inter.copy_from_slice(
-                        &all_swiglu[flat_cursor * inter_dim..(flat_cursor + 1) * inter_dim],
-                    );
+            par_calib(&mut seq_hiddens, &mut all_swiglu, h_dim, inter_dim, |seq_h, sw_seq| {
+                let mut rot_inter = vec![0.0f32; inter_dim];
+                let mut proj_out = vec![0.0f32; h_dim];
+                let mut blut_i = BipolarActivationLut::new_zeroed(inter_dim);
+                for (hid, sw) in seq_h.chunks_exact_mut(h_dim).zip(sw_seq.chunks_exact(inter_dim)) {
+                    rot_inter.copy_from_slice(sw);
                     fwht64_signed_inplace(&mut rot_inter);
                     blut_i.populate(&rot_inter);
                     simd_lut_bipolar_gemv(&down_mat, &blut_i, &mut proj_out);
                     add_inplace(hid, &proj_out);
-                    flat_cursor += 1;
                 }
-            }
+            });
 
             compiled_layers.push(LlamaLayer {
                 input_norm: ref_layer.input_norm.clone(),
@@ -2043,6 +2018,32 @@ impl RealLlamaEngine {
         let tok_per_sec = (total_forward_calls as f64) / elapsed.max(1e-9);
         (generated, tok_per_sec)
     }
+}
+
+/// Runs `f(hidden_seq, buf_seq)` per calibration sequence in parallel; `buf_seq` is the sequence's
+/// slice of a per-token buffer with `buf_dim` floats per token.
+fn par_calib<F>(seq_hiddens: &mut [Vec<f32>], buf: &mut [f32], h_dim: usize, buf_dim: usize, f: F)
+where
+    F: Fn(&mut [f32], &mut [f32]) + Sync,
+{
+    let workers = std::thread::available_parallelism().map_or(1, |p| p.get()).clamp(1, 8);
+    let mut buckets: Vec<Vec<(&mut Vec<f32>, &mut [f32])>> = (0..workers).map(|_| Vec::new()).collect();
+    let mut rest = buf;
+    for (i, seq_h) in seq_hiddens.iter_mut().enumerate() {
+        let (head, tail) = rest.split_at_mut(seq_h.len() / h_dim * buf_dim);
+        rest = tail;
+        buckets[i % workers].push((seq_h, head));
+    }
+    let f = &f;
+    std::thread::scope(|s| {
+        for bucket in buckets {
+            s.spawn(move || {
+                for (seq_h, seq_buf) in bucket {
+                    f(seq_h, seq_buf);
+                }
+            });
+        }
+    });
 }
 
 fn build_rope_table(cfg: &LlamaConfig) -> Vec<f32> {

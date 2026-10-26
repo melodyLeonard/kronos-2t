@@ -1000,95 +1000,103 @@ fn quantize_stripe_batch_bipolar(
     let ratios = [0.62f32, 0.67, 0.72, 0.77, 0.82, 0.87, 0.92, 0.97, 1.02, 1.07, 1.12, 1.18];
     let max_u_f = max_odd as f32;
     let half_off = 0.5 * max_u_f;
+    // Tail columns per propagation tile (keeps the stripe's rows in L1).
+    const TAIL_TILE: usize = 512;
 
-    let mut row_work = vec![0.0f32; cols];
+    let mut work = vec![0.0f32; SIMD_ROW_STRIPE * cols];
+    let mut errs = vec![[0.0f32; HADAMARD_BLOCK]; SIMD_ROW_STRIPE];
     let mut blk_work = [0.0f32; HADAMARD_BLOCK];
     let mut best_u = [0u8; HADAMARD_BLOCK];
     let mut cand_u = [0u8; HADAMARD_BLOCK];
-    let mut best_err = [0.0f32; HADAMARD_BLOCK];
     let mut cand_err = [0.0f32; HADAMARD_BLOCK];
 
-    for local_r in 0..take_rows {
-        let local_stripe = local_r / SIMD_ROW_STRIPE;
-        let lane = local_r % SIMD_ROW_STRIPE;
-
-        row_work.copy_from_slice(&w_chunk[local_r * cols..(local_r + 1) * cols]);
-        fwht64_signed_inplace(&mut row_work);
+    for g0 in (0..take_rows).step_by(SIMD_ROW_STRIPE) {
+        let g_rows = (take_rows - g0).min(SIMD_ROW_STRIPE);
+        let local_stripe = g0 / SIMD_ROW_STRIPE;
+        for r in 0..g_rows {
+            let dst = &mut work[r * cols..(r + 1) * cols];
+            dst.copy_from_slice(&w_chunk[(g0 + r) * cols..(g0 + r + 1) * cols]);
+            fwht64_signed_inplace(dst);
+        }
 
         for c in 0..num_chunks {
             let col_s = c * HADAMARD_BLOCK;
             let col_e = col_s + HADAMARD_BLOCK;
-            let sub = &row_work[col_s..col_e];
 
-            let max_abs = sub.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-            if max_abs <= 1e-12 {
-                continue;
-            }
-
-            let mut best_loss = f32::INFINITY;
-            let mut best_bf16 = 0u16;
-
-            for &rat in &ratios {
-                let delta_raw = (max_abs * rat) / max_u_f;
-                let d_bf16 = f32_to_bf16(delta_raw);
-                let delta = bf16_to_f32(d_bf16);
-                if delta <= 0.0 {
+            for (r, err_out) in errs.iter_mut().enumerate().take(g_rows) {
+                let sub = &work[r * cols + col_s..r * cols + col_e];
+                err_out.fill(0.0);
+                let max_abs = sub.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+                if max_abs <= 1e-12 {
                     continue;
                 }
-                let inv_2delta = 0.5 / delta;
-                blk_work.copy_from_slice(sub);
-                let mut loss = 0.0f32;
 
-                if let Some(u_mat) = u_slice {
-                    for j in 0..HADAMARD_BLOCK {
-                        let g_col = col_s + j;
-                        let wj = blk_work[j];
-                        let u_idx = (wj * inv_2delta + half_off).round().clamp(0.0, max_u_f) as i32;
-                        cand_u[j] = u_idx as u8;
-                        let q_odd = 2 * u_idx - max_odd;
-                        let w_hat = (q_odd as f32) * delta;
-                        let u_jj = u_mat[g_col * cols + g_col].max(1e-12);
-                        let err = (wj - w_hat) / u_jj;
-                        cand_err[j] = err;
-                        loss += err * err;
-
-                        let u_sub = &u_mat[g_col * cols + g_col + 1..g_col * cols + col_e];
-                        for (k_slot, &u_jk) in blk_work[j + 1..].iter_mut().zip(u_sub.iter()) {
-                            *k_slot -= err * u_jk;
-                        }
-                    }
-                } else {
-                    for j in 0..HADAMARD_BLOCK {
-                        let wj = blk_work[j];
-                        let u_idx = (wj * inv_2delta + half_off).round().clamp(0.0, max_u_f) as i32;
-                        cand_u[j] = u_idx as u8;
-                        let q_odd = 2 * u_idx - max_odd;
-                        let diff = wj - (q_odd as f32) * delta;
-                        loss += diff * diff;
-                    }
-                }
-
-                if loss < best_loss {
-                    best_loss = loss;
-                    best_bf16 = d_bf16;
-                    best_u = cand_u;
-                    best_err = cand_err;
-                }
-            }
-
-            sc_chunk[(local_stripe * num_chunks + c) * SIMD_ROW_STRIPE + lane] = best_bf16;
-            u_chunk[local_r * cols + col_s..local_r * cols + col_e].copy_from_slice(&best_u);
-
-            if let (true, Some(u_mat)) = (col_e < cols, u_slice) {
-                let rem_work = &mut row_work[col_e..cols];
-                for (j, &err) in best_err.iter().enumerate() {
-                    if err == 0.0 {
+                let mut best_loss = f32::INFINITY;
+                let mut best_bf16 = 0u16;
+                for &rat in &ratios {
+                    let d_bf16 = f32_to_bf16((max_abs * rat) / max_u_f);
+                    let delta = bf16_to_f32(d_bf16);
+                    if delta <= 0.0 {
                         continue;
                     }
-                    let g_col = col_s + j;
-                    let u_tail = &u_mat[g_col * cols + col_e..(g_col + 1) * cols];
-                    for (dst, &u_val) in rem_work.iter_mut().zip(u_tail.iter()) {
-                        *dst -= err * u_val;
+                    let inv_2delta = 0.5 / delta;
+                    blk_work.copy_from_slice(sub);
+                    let mut loss = 0.0f32;
+
+                    if let Some(u_mat) = u_slice {
+                        for j in 0..HADAMARD_BLOCK {
+                            let g_col = col_s + j;
+                            let wj = blk_work[j];
+                            let u_idx = (wj * inv_2delta + half_off).round().clamp(0.0, max_u_f) as i32;
+                            cand_u[j] = u_idx as u8;
+                            let w_hat = ((2 * u_idx - max_odd) as f32) * delta;
+                            let err = (wj - w_hat) / u_mat[g_col * cols + g_col].max(1e-12);
+                            cand_err[j] = err;
+                            loss += err * err;
+                            let u_sub = &u_mat[g_col * cols + g_col + 1..g_col * cols + col_e];
+                            for (k_slot, &u_jk) in blk_work[j + 1..].iter_mut().zip(u_sub) {
+                                *k_slot -= err * u_jk;
+                            }
+                        }
+                    } else {
+                        for j in 0..HADAMARD_BLOCK {
+                            let wj = blk_work[j];
+                            let u_idx = (wj * inv_2delta + half_off).round().clamp(0.0, max_u_f) as i32;
+                            cand_u[j] = u_idx as u8;
+                            let diff = wj - ((2 * u_idx - max_odd) as f32) * delta;
+                            loss += diff * diff;
+                        }
+                    }
+
+                    if loss < best_loss {
+                        best_loss = loss;
+                        best_bf16 = d_bf16;
+                        best_u = cand_u;
+                        *err_out = cand_err;
+                    }
+                }
+
+                let lane = r;
+                sc_chunk[(local_stripe * num_chunks + c) * SIMD_ROW_STRIPE + lane] = best_bf16;
+                let row = g0 + r;
+                u_chunk[row * cols + col_s..row * cols + col_e].copy_from_slice(&best_u);
+            }
+
+            // Propagate this chunk's errors into all later columns for the whole stripe.
+            if let (true, Some(u_mat)) = (col_e < cols, u_slice) {
+                for t0 in (col_e..cols).step_by(TAIL_TILE) {
+                    let t1 = (t0 + TAIL_TILE).min(cols);
+                    for j in 0..HADAMARD_BLOCK {
+                        let g_col = col_s + j;
+                        let u_tail = &u_mat[g_col * cols + t0..g_col * cols + t1];
+                        for (r, err) in errs.iter().enumerate().take(g_rows) {
+                            let e = err[j];
+                            if e != 0.0 {
+                                for (dst, &u_val) in work[r * cols + t0..r * cols + t1].iter_mut().zip(u_tail) {
+                                    *dst -= e * u_val;
+                                }
+                            }
+                        }
                     }
                 }
             }
