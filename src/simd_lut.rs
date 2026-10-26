@@ -1511,77 +1511,149 @@ impl BipolarActivationLut {
         }
     }
 
+    /// Branch-free NEON `D4` populate: 4 quads per step (`vld4q` deinterleave puts one quad per
+    /// lane), vectorized parity fix-up (bit-exact with [`project_quad_d4`]) and a `tbl4` transpose
+    /// of the 16 bipolar sums into each quad's 16-byte table.
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "neon")]
     unsafe fn populate_neon_d4(&mut self, x: &[f32]) {
         use std::arch::aarch64::*;
+        // `idx[j][e] = 16 * (e / 4) + 4 * (e % 4) + j`: entry `e` of quad `j` inside 4 packed vectors.
+        const TIDX: [[u8; 16]; 4] = {
+            let mut t = [[0u8; 16]; 4];
+            let mut j = 0;
+            while j < 4 {
+                let mut e = 0;
+                while e < 16 {
+                    t[j][e] = (16 * (e / 4) + 4 * (e % 4) + j) as u8;
+                    e += 1;
+                }
+                j += 1;
+            }
+            t
+        };
+        // SAFETY: constant tables of exactly 16 bytes.
+        let tidx = unsafe {
+            [
+                vld1q_u8(TIDX[0].as_ptr()),
+                vld1q_u8(TIDX[1].as_ptr()),
+                vld1q_u8(TIDX[2].as_ptr()),
+                vld1q_u8(TIDX[3].as_ptr()),
+            ]
+        };
+        let one = vdupq_n_s32(1);
+        let zero_f = vdupq_n_f32(0.0);
+
         for (c_idx, (x_chunk, scale_slot)) in x
             .chunks_exact(64)
             .zip(self.chunk_scales.iter_mut())
             .enumerate()
         {
             let x_ptr = x_chunk.as_ptr();
-            let mut max_quad_l1 = 0.0f32;
-            for g in 0..16 {
-                // SAFETY: `g * 4 + 4 <= 64`.
-                let l1 = unsafe { vaddvq_f32(vabsq_f32(vld1q_f32(x_ptr.add(g * 4)))) };
-                if l1 > max_quad_l1 {
-                    max_quad_l1 = l1;
-                }
+            // SAFETY: 4 groups x 16 floats = 64 floats in `x_chunk`.
+            let groups = unsafe {
+                [
+                    vld4q_f32(x_ptr),
+                    vld4q_f32(x_ptr.add(16)),
+                    vld4q_f32(x_ptr.add(32)),
+                    vld4q_f32(x_ptr.add(48)),
+                ]
+            };
+            let mut vmax = zero_f;
+            for v in &groups {
+                // Same left-to-right summation order as the scalar reference.
+                let l1 = vaddq_f32(
+                    vaddq_f32(vaddq_f32(vabsq_f32(v.0), vabsq_f32(v.1)), vabsq_f32(v.2)),
+                    vabsq_f32(v.3),
+                );
+                vmax = vmaxq_f32(vmax, l1);
             }
+            let max_quad_l1 = vmaxvq_f32(vmax);
             let base_q = c_idx * 16;
             if max_quad_l1 <= f32::EPSILON {
                 *scale_slot = 0.0;
                 self.lut4[base_q..base_q + 16].fill([0i8; 16]);
                 continue;
             }
-
             *scale_slot = max_quad_l1 / 125.0;
             let v_inv = vdupq_n_f32(250.0 / max_quad_l1);
 
-            for g in 0..16 {
-                // SAFETY: `g * 4 + 4 <= 64` and `base_q + g < self.lut4.len()`.
-                unsafe {
-                    let vu = vmulq_f32(vld1q_f32(x_ptr.add(g * 4)), v_inv);
-                    let vqi = vcvtnq_s32_f32(vu);
-                    let mut q0 = vgetq_lane_s32::<0>(vqi);
-                    let mut q1 = vgetq_lane_s32::<1>(vqi);
-                    let mut q2 = vgetq_lane_s32::<2>(vqi);
-                    let mut q3 = vgetq_lane_s32::<3>(vqi);
-
-                    if ((q0 + q1 + q2 + q3) & 1) != 0 {
-                        let u_arr = [
-                            vgetq_lane_f32::<0>(vu),
-                            vgetq_lane_f32::<1>(vu),
-                            vgetq_lane_f32::<2>(vu),
-                            vgetq_lane_f32::<3>(vu),
-                        ];
-                        [q0, q1, q2, q3] = project_quad_d4(u_arr, [q0, q1, q2, q3]);
+            for (g, v) in groups.iter().enumerate() {
+                let u = [
+                    vmulq_f32(v.0, v_inv),
+                    vmulq_f32(v.1, v_inv),
+                    vmulq_f32(v.2, v_inv),
+                    vmulq_f32(v.3, v_inv),
+                ];
+                let mut q = [
+                    vcvtnq_s32_f32(u[0]),
+                    vcvtnq_s32_f32(u[1]),
+                    vcvtnq_s32_f32(u[2]),
+                    vcvtnq_s32_f32(u[3]),
+                ];
+                let odd = vtstq_s32(vaddq_s32(vaddq_s32(q[0], q[1]), vaddq_s32(q[2], q[3])), one);
+                // Odd-parity quads: move the coordinate with the largest rounding error (first max
+                // wins) one step toward `u`, matching `project_quad_d4`'s tie rules exactly.
+                let e = [
+                    vsubq_f32(u[0], vcvtq_f32_s32(q[0])),
+                    vsubq_f32(u[1], vcvtq_f32_s32(q[1])),
+                    vsubq_f32(u[2], vcvtq_f32_s32(q[2])),
+                    vsubq_f32(u[3], vcvtq_f32_s32(q[3])),
+                ];
+                let mut best = vabsq_f32(e[0]);
+                let mut sel = [vdupq_n_u32(u32::MAX), vdupq_n_u32(0), vdupq_n_u32(0), vdupq_n_u32(0)];
+                for k in 1..4 {
+                    let a = vabsq_f32(e[k]);
+                    let gt = vcgtq_f32(a, best);
+                    best = vbslq_f32(gt, a, best);
+                    for prev in sel.iter_mut().take(k) {
+                        *prev = vbicq_u32(*prev, gt);
                     }
-
-                    let p0 = ((-q0 - q1) as i16 as u16) as u64;
-                    let p1 = ((q0 - q1) as i16 as u16) as u64;
-                    let p2 = ((-q0 + q1) as i16 as u16) as u64;
-                    let p3 = ((q0 + q1) as i16 as u16) as u64;
-                    let v_p01 = vcreate_s16(p0 | (p1 << 16) | (p2 << 32) | (p3 << 48));
-
-                    let r0 = vadd_s16(v_p01, vdup_n_s16((-q2 - q3) as i16));
-                    let r1 = vadd_s16(v_p01, vdup_n_s16((q2 - q3) as i16));
-                    let r2 = vadd_s16(v_p01, vdup_n_s16((-q2 + q3) as i16));
-                    let r3 = vadd_s16(v_p01, vdup_n_s16((q2 + q3) as i16));
-
-                    let lo8 = vshrq_n_s16::<1>(vcombine_s16(r0, r1));
-                    let hi8 = vshrq_n_s16::<1>(vcombine_s16(r2, r3));
-                    vst1q_s8(
-                        self.lut4.as_mut_ptr().add(base_q + g).cast::<i8>(),
-                        vcombine_s8(vmovn_s16(lo8), vmovn_s16(hi8)),
+                    sel[k] = gt;
+                }
+                for k in 0..4 {
+                    let up = vorrq_u32(
+                        vcgtq_f32(e[k], zero_f),
+                        vandq_u32(vceqq_f32(e[k], zero_f), vcleq_s32(q[k], vdupq_n_s32(0))),
                     );
+                    let step = vbslq_s32(up, one, vdupq_n_s32(-1));
+                    let apply = vandq_u32(sel[k], odd);
+                    q[k] = vaddq_s32(q[k], vandq_s32(step, vreinterpretq_s32_u32(apply)));
+                }
+
+                let a01 = vaddq_s32(q[0], q[1]);
+                let b01 = vsubq_s32(q[0], q[1]);
+                let a23 = vaddq_s32(q[2], q[3]);
+                let b23 = vsubq_s32(q[2], q[3]);
+                let p01 = [vnegq_s32(a01), b01, vnegq_s32(b01), a01];
+                let p23 = [vnegq_s32(a23), b23, vnegq_s32(b23), a23];
+                // `packed[m]` = entries `4m..4m+3` (`= (p01[l] + p23[m]) >> 1`) for the 4 quads.
+                let mut packed = [vdupq_n_s8(0); 4];
+                for (m, slot) in packed.iter_mut().enumerate() {
+                    let e0 = vshrq_n_s32::<1>(vaddq_s32(p01[0], p23[m]));
+                    let e1 = vshrq_n_s32::<1>(vaddq_s32(p01[1], p23[m]));
+                    let e2 = vshrq_n_s32::<1>(vaddq_s32(p01[2], p23[m]));
+                    let e3 = vshrq_n_s32::<1>(vaddq_s32(p01[3], p23[m]));
+                    let h01 = vcombine_s16(vmovn_s32(e0), vmovn_s32(e1));
+                    let h23 = vcombine_s16(vmovn_s32(e2), vmovn_s32(e3));
+                    *slot = vcombine_s8(vmovn_s16(h01), vmovn_s16(h23));
+                }
+                let tbl = int8x16x4_t(packed[0], packed[1], packed[2], packed[3]);
+                for (j, idx) in tidx.iter().enumerate() {
+                    // SAFETY: `base_q + g * 4 + j < num_quads`.
+                    unsafe {
+                        vst1q_s8(
+                            self.lut4.as_mut_ptr().add(base_q + g * 4 + j).cast::<i8>(),
+                            vqtbl4q_s8(tbl, *idx),
+                        );
+                    }
                 }
             }
         }
     }
 }
 
+#[cfg(any(not(target_arch = "aarch64"), test))]
 #[inline]
 fn project_quad_d4(u: [f32; 4], mut q: [i32; 4]) -> [i32; 4] {
     if ((q[0] + q[1] + q[2] + q[3]) & 1) != 0 {
@@ -2870,6 +2942,56 @@ impl Int8ChunkActivation {
 
     pub fn populate(&mut self, x: &[f32]) {
         assert_eq!(x.len(), self.cols);
+        #[cfg(target_arch = "aarch64")]
+        {
+            // SAFETY: NEON is baseline on `aarch64` and `x.len() == self.cols`.
+            unsafe { self.populate_neon(x) };
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            self.populate_scalar(x);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn populate_neon(&mut self, x: &[f32]) {
+        use std::arch::aarch64::*;
+        for (c, (xc, qc)) in x.chunks_exact(64).zip(self.q.chunks_exact_mut(64)).enumerate() {
+            let xp = xc.as_ptr();
+            // SAFETY: 16 x 4 floats = 64 floats in `xc`; 4 x 16 bytes = 64 bytes in `qc`.
+            unsafe {
+                let mut vmax = vdupq_n_f32(0.0);
+                for i in 0..16 {
+                    vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(xp.add(i * 4))));
+                }
+                let max_abs = vmaxvq_f32(vmax);
+                if max_abs <= f32::EPSILON {
+                    qc.fill(0);
+                    self.scales[c] = 0.0;
+                    self.sums[c] = 0;
+                    continue;
+                }
+                let inv = vdupq_n_f32(127.0 / max_abs);
+                let mut vsum = vdupq_n_s32(0);
+                for b in 0..4 {
+                    let mut q32 = [vdupq_n_s32(0); 4];
+                    for (k, slot) in q32.iter_mut().enumerate() {
+                        *slot = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(xp.add(b * 16 + k * 4)), inv));
+                        vsum = vaddq_s32(vsum, *slot);
+                    }
+                    let h0 = vcombine_s16(vmovn_s32(q32[0]), vmovn_s32(q32[1]));
+                    let h1 = vcombine_s16(vmovn_s32(q32[2]), vmovn_s32(q32[3]));
+                    vst1q_s8(qc.as_mut_ptr().add(b * 16), vcombine_s8(vmovn_s16(h0), vmovn_s16(h1)));
+                }
+                self.scales[c] = max_abs / 127.0;
+                self.sums[c] = vaddvq_s32(vsum);
+            }
+        }
+    }
+
+    #[cfg(any(not(target_arch = "aarch64"), test))]
+    fn populate_scalar(&mut self, x: &[f32]) {
         for (c, (xc, qc)) in x.chunks_exact(64).zip(self.q.chunks_exact_mut(64)).enumerate() {
             let max_abs = xc.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
             if max_abs <= f32::EPSILON {
@@ -3708,5 +3830,42 @@ mod tests {
             let i8_ns = t.elapsed().as_nanos() as f64 / iters as f64;
             println!("cols {cols}: D4 LUT populate {lut_ns:.0} ns | int8 populate {i8_ns:.0} ns");
         }
+    }
+
+    #[test]
+    fn test_d4_populate_neon_matches_scalar() {
+        let cols = 512;
+        for seed in 0..40u64 {
+            let x: Vec<f32> = (0..cols)
+                .map(|c| {
+                    let z = (seed * 1_000_003 + c as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    let h = (z ^ (z >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    let v = (((h >> 40) as f32) / ((1u32 << 24) as f32)) - 0.5;
+                    // Exercise exact zeros, integer-valued ties and an all-zero chunk.
+                    if c / 64 == 3 { 0.0 } else if c % 17 == 0 { 0.0 } else if c % 29 == 0 { 8.0 * v.signum() } else { v * (1.0 + (c % 7) as f32) }
+                })
+                .collect();
+            let mut neon = BipolarActivationLut::new_zeroed(cols);
+            let mut scalar = BipolarActivationLut::new_zeroed(cols);
+            neon.populate(&x);
+            scalar.populate_scalar_d4(&x);
+            assert_eq!(neon.chunk_scales, scalar.chunk_scales, "seed {seed}");
+            assert_eq!(neon.lut4, scalar.lut4, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn test_int8_populate_neon_matches_scalar() {
+        let cols = 256;
+        let x: Vec<f32> = (0..cols)
+            .map(|c| if c / 64 == 2 { 0.0 } else { ((c as f32) * 0.71).sin() * (1.0 + (c % 5) as f32) })
+            .collect();
+        let mut a = Int8ChunkActivation::new_zeroed(cols);
+        let mut b = Int8ChunkActivation::new_zeroed(cols);
+        a.populate(&x);
+        b.populate_scalar(&x);
+        assert_eq!(a.q, b.q);
+        assert_eq!(a.scales, b.scales);
+        assert_eq!(a.sums, b.sums);
     }
 }
