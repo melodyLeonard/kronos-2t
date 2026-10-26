@@ -3204,10 +3204,8 @@ unsafe fn nibble4_sdot_stripe_range_neon(
     let act = blut.int8.as_ref().expect("int8 activations required for Nibble4");
     let nc = matrix.num_chunks;
     let hp = matrix.hi_planes;
-    let opr = matrix.cols / 8;
     let mask = vdupq_n_u8(0x0F);
     let data = matrix.data.as_ptr();
-    let hi_data = matrix.hi_data.as_ptr();
     let scales = matrix.bf16_chunk_scales.as_ptr();
     let xq = act.q.as_ptr();
 
@@ -3244,42 +3242,11 @@ unsafe fn nibble4_sdot_stripe_range_neon(
                 lo[g] = vmulq_f32(vcvtq_f32_s32(dot), vsx);
             }
 
-            // High bipolar planes `p = 4..B`: `16 * sum_p 2^(p-4) * sum(s_p * x)` on the LUT path.
             if hp > 0 {
-                let lut_scale = blut.chunk_scales[c];
-                let mut h_lo = vdupq_n_s16(0);
-                let mut h_hi = vdupq_n_s16(0);
-                for o in c * BIPOLAR_OCTETS_PER_CHUNK..(c + 1) * BIPOLAR_OCTETS_PER_CHUNK {
-                    // SAFETY: `2 * o + 1 < num_quads`; plane offsets stay inside `hi_data`.
-                    unsafe {
-                        let tbl_lo = vld1q_s8(blut.lut4.as_ptr().add(2 * o).cast::<i8>());
-                        let tbl_hi = vld1q_s8(blut.lut4.as_ptr().add(2 * o + 1).cast::<i8>());
-                        for p in 0..hp {
-                            let codes =
-                                vld1q_u8(hi_data.add(((s * opr + o) * hp + p) * SIMD_ROW_STRIPE));
-                            let v_lo = vqtbl1q_s8(tbl_lo, vandq_u8(codes, mask));
-                            let v_hi = vqtbl1q_s8(tbl_hi, vshrq_n_u8::<4>(codes));
-                            let sum_lo = vaddl_s8(vget_low_s8(v_lo), vget_low_s8(v_hi));
-                            let sum_hi = vaddl_high_s8(v_lo, v_hi);
-                            if p == 0 {
-                                h_lo = vaddq_s16(h_lo, sum_lo);
-                                h_hi = vaddq_s16(h_hi, sum_hi);
-                            } else {
-                                h_lo = vaddq_s16(h_lo, vshlq_n_s16::<1>(sum_lo));
-                                h_hi = vaddq_s16(h_hi, vshlq_n_s16::<1>(sum_hi));
-                            }
-                        }
-                    }
-                }
-                let vls = vdupq_n_f32(16.0 * lut_scale);
-                let hsum = [
-                    vmovl_s16(vget_low_s16(h_lo)),
-                    vmovl_high_s16(h_lo),
-                    vmovl_s16(vget_low_s16(h_hi)),
-                    vmovl_high_s16(h_hi),
-                ];
+                // SAFETY: `s < num_stripes`, `c < num_chunks`; LUTs populated by the caller.
+                let hi = unsafe { nibble4_hi_planes_chunk(matrix, blut, s, c) };
                 for g in 0..4 {
-                    lo[g] = vfmaq_f32(lo[g], vcvtq_f32_s32(hsum[g]), vls);
+                    lo[g] = vaddq_f32(lo[g], hi[g]);
                 }
             }
 
@@ -3302,6 +3269,181 @@ unsafe fn nibble4_sdot_stripe_range_neon(
                 vst1q_f32(tmp.as_mut_ptr().add(g * 4), *fg);
             }
             std::ptr::copy_nonoverlapping(tmp.as_ptr(), out_base.add(row_start), valid);
+        }
+    }
+}
+
+/// High bipolar planes `4..B` of stripe `s`, chunk `c`: `16 * sum_p 2^(p-4) * sum(s_p * x)` per row.
+///
+/// # Safety
+/// `s < matrix.num_stripes`, `c < matrix.num_chunks`, `matrix.hi_planes > 0`, `blut` LUTs populated.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn nibble4_hi_planes_chunk(
+    matrix: &Nibble4SdotMatrix,
+    blut: &BipolarActivationLut,
+    s: usize,
+    c: usize,
+) -> [std::arch::aarch64::float32x4_t; 4] {
+    use std::arch::aarch64::*;
+    let hp = matrix.hi_planes;
+    let opr = matrix.cols / 8;
+    let mask = vdupq_n_u8(0x0F);
+    let hi_data = matrix.hi_data.as_ptr();
+    let mut h_lo = vdupq_n_s16(0);
+    let mut h_hi = vdupq_n_s16(0);
+    for o in c * BIPOLAR_OCTETS_PER_CHUNK..(c + 1) * BIPOLAR_OCTETS_PER_CHUNK {
+        // SAFETY: `2 * o + 1 < num_quads`; plane offsets stay inside `hi_data`.
+        unsafe {
+            let tbl_lo = vld1q_s8(blut.lut4.as_ptr().add(2 * o).cast::<i8>());
+            let tbl_hi = vld1q_s8(blut.lut4.as_ptr().add(2 * o + 1).cast::<i8>());
+            for p in 0..hp {
+                let codes = vld1q_u8(hi_data.add(((s * opr + o) * hp + p) * SIMD_ROW_STRIPE));
+                let v_lo = vqtbl1q_s8(tbl_lo, vandq_u8(codes, mask));
+                let v_hi = vqtbl1q_s8(tbl_hi, vshrq_n_u8::<4>(codes));
+                let sum_lo = vaddl_s8(vget_low_s8(v_lo), vget_low_s8(v_hi));
+                let sum_hi = vaddl_high_s8(v_lo, v_hi);
+                if p == 0 {
+                    h_lo = vaddq_s16(h_lo, sum_lo);
+                    h_hi = vaddq_s16(h_hi, sum_hi);
+                } else {
+                    h_lo = vaddq_s16(h_lo, vshlq_n_s16::<1>(sum_lo));
+                    h_hi = vaddq_s16(h_hi, vshlq_n_s16::<1>(sum_hi));
+                }
+            }
+        }
+    }
+    let vls = vdupq_n_f32(16.0 * blut.chunk_scales[c]);
+    [
+        vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(h_lo))), vls),
+        vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(h_lo)), vls),
+        vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(h_hi))), vls),
+        vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(h_hi)), vls),
+    ]
+}
+
+/// Executes stripes `[stripe_start, stripe_end)` for several tokens: row `r` of token `t` (with
+/// activations `acts[t]`) goes to `out_base[t * out_stride + r]`.
+///
+/// # Safety
+/// As [`nibble4_sdot_stripe_range`], with `out_base` valid for `acts.len() * out_stride` floats.
+pub unsafe fn nibble4_sdot_batch_stripe_range(
+    matrix: &Nibble4SdotMatrix,
+    acts: &[BipolarActivationLut],
+    stripe_start: usize,
+    stripe_end: usize,
+    out_base: *mut f32,
+    out_stride: usize,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut t = 0;
+        while t < acts.len() {
+            let n = (acts.len() - t).min(4);
+            // SAFETY: caller upholds bounds; each group writes its own tokens' rows.
+            unsafe {
+                let out = out_base.add(t * out_stride);
+                let a = &acts[t..t + n];
+                match n {
+                    4 => nibble4_batch_neon::<4>(matrix, a, stripe_start, stripe_end, out, out_stride),
+                    3 => nibble4_batch_neon::<3>(matrix, a, stripe_start, stripe_end, out, out_stride),
+                    2 => nibble4_batch_neon::<2>(matrix, a, stripe_start, stripe_end, out, out_stride),
+                    _ => nibble4_batch_neon::<1>(matrix, a, stripe_start, stripe_end, out, out_stride),
+                }
+            }
+            t += n;
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for (t, blut) in acts.iter().enumerate() {
+            // SAFETY: caller upholds bounds.
+            unsafe {
+                nibble4_sdot_stripe_range(matrix, blut, stripe_start, stripe_end, out_base.add(t * out_stride))
+            };
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn nibble4_batch_neon<const NT: usize>(
+    matrix: &Nibble4SdotMatrix,
+    acts: &[BipolarActivationLut],
+    stripe_start: usize,
+    stripe_end: usize,
+    out_base: *mut f32,
+    out_stride: usize,
+) {
+    use std::arch::aarch64::*;
+    let i8a: [&Int8ChunkActivation; NT] =
+        std::array::from_fn(|t| acts[t].int8.as_ref().expect("int8 activations required for Nibble4"));
+    let nc = matrix.num_chunks;
+    let mask = vdupq_n_u8(0x0F);
+    let data = matrix.data.as_ptr();
+    let scales = matrix.bf16_chunk_scales.as_ptr();
+
+    for s in stripe_start..stripe_end {
+        let mut f = [[0.0f32; SIMD_ROW_STRIPE]; NT];
+        for c in 0..nc {
+            let hi: [Option<[float32x4_t; 4]>; NT] = std::array::from_fn(|t| {
+                (matrix.hi_planes > 0 && i8a[t].scales[c] != 0.0)
+                    // SAFETY: `s`, `c` in range; caller populated LUTs.
+                    .then(|| unsafe { nibble4_hi_planes_chunk(matrix, &acts[t], s, c) })
+            });
+            for g in 0..4 {
+                // One 4-row group at a time keeps the per-token accumulators in registers.
+                let mut acc = [vdupq_n_s32(0); NT];
+                for k in 0..4 {
+                    // SAFETY: `c * 64 + k * 16 + 16 <= cols`; the block offset stays inside `data`.
+                    unsafe {
+                        let blk = data.add(((s * nc + c) * 4 + k) * 128 + g * 32);
+                        let va = vld1q_u8(blk);
+                        let vb = vld1q_u8(blk.add(16));
+                        let (la, ha) = (vandq_u8(va, mask), vshrq_n_u8::<4>(va));
+                        let (lb, hb) = (vandq_u8(vb, mask), vshrq_n_u8::<4>(vb));
+                        for t in 0..NT {
+                            let x16 = vld1q_s8(i8a[t].q.as_ptr().add(c * 64 + k * 16));
+                            let mut a = acc[t];
+                            a = sdot_lane::<0>(a, la, x16);
+                            a = sdot_lane::<1>(a, ha, x16);
+                            a = sdot_lane::<2>(a, lb, x16);
+                            a = sdot_lane::<3>(a, hb, x16);
+                            acc[t] = a;
+                        }
+                    }
+                }
+                // SAFETY: scale index `(s * nc + c) * 16 + g * 4 + 4 <= len`.
+                let ws = unsafe {
+                    vreinterpretq_f32_u32(vshll_n_u16::<16>(vld1_u16(
+                        scales.add((s * nc + c) * SIMD_ROW_STRIPE + g * 4),
+                    )))
+                };
+                for t in 0..NT {
+                    let sx = i8a[t].scales[c];
+                    if sx == 0.0 {
+                        continue;
+                    }
+                    let dot = vsubq_s32(vshlq_n_s32::<1>(acc[t]), vdupq_n_s32(15 * i8a[t].sums[c]));
+                    let mut v = vmulq_f32(vcvtq_f32_s32(dot), vdupq_n_f32(sx));
+                    if let Some(h) = hi[t] {
+                        v = vaddq_f32(v, h[g]);
+                    }
+                    // SAFETY: `f[t]` holds 16 floats.
+                    unsafe {
+                        let fp = f[t].as_mut_ptr().add(g * 4);
+                        vst1q_f32(fp, vfmaq_f32(vld1q_f32(fp), v, ws));
+                    }
+                }
+            }
+        }
+        let row_start = s * SIMD_ROW_STRIPE;
+        let valid = (matrix.rows - row_start).min(SIMD_ROW_STRIPE);
+        for (t, ft) in f.iter().enumerate() {
+            // SAFETY: rows `row_start..row_start + valid` of token `t` are inside the caller's output.
+            unsafe {
+                std::ptr::copy_nonoverlapping(ft.as_ptr(), out_base.add(t * out_stride + row_start), valid);
+            }
         }
     }
 }
@@ -3862,5 +4004,37 @@ mod tests {
         assert_eq!(a.q, b.q);
         assert_eq!(a.scales, b.scales);
         assert_eq!(a.sums, b.sums);
+    }
+
+    #[test]
+    fn test_nibble4_batch_matches_single() {
+        use crate::compiler::compile_hadamard_gptq_bipolar;
+        let (rows, cols) = (40, 192);
+        let weights: Vec<f32> = (0..rows * cols)
+            .map(|idx| (((idx * 7919 + 13) % 1009) as f32 / 1009.0 - 0.5) * 0.3)
+            .collect();
+        for np in [4, 5, 6] {
+            let n = Nibble4SdotMatrix::from_bipolar(&compile_hadamard_gptq_bipolar(&weights, rows, cols, np, None, 2));
+            let acts: Vec<BipolarActivationLut> = (0..7)
+                .map(|t| {
+                    let x: Vec<f32> = (0..cols).map(|c| ((c * (t + 3)) as f32 * 0.11).sin()).collect();
+                    let mut b = BipolarActivationLut::new_zeroed(cols);
+                    b.int8 = Some(Int8ChunkActivation::new_zeroed(cols));
+                    b.populate(&x);
+                    b
+                })
+                .collect();
+            let mut batch = vec![0.0f32; acts.len() * rows];
+            // SAFETY: `batch` holds `acts.len() * rows` floats.
+            unsafe { nibble4_sdot_batch_stripe_range(&n, &acts, 0, n.num_stripes, batch.as_mut_ptr(), rows) };
+            for (t, a) in acts.iter().enumerate() {
+                let mut one = vec![0.0f32; rows];
+                // SAFETY: `one` holds `rows` floats.
+                unsafe { nibble4_sdot_stripe_range(&n, a, 0, n.num_stripes, one.as_mut_ptr()) };
+                for (x, y) in batch[t * rows..(t + 1) * rows].iter().zip(&one) {
+                    assert!((x - y).abs() <= 1e-4 * (1.0 + y.abs()), "planes {np} token {t}: {x} vs {y}");
+                }
+            }
+        }
     }
 }

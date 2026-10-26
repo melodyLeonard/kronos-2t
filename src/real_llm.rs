@@ -18,7 +18,7 @@ use crate::safetensors::{JsonCursor, SafeTensorsFile};
 use crate::simd_lut::{
     simd_lut_base3_gemv, simd_lut_base3_stripe_range, simd_lut_bipolar_gemv,
     simd_lut_bipolar_stripe_range, simd_lut_gemv_multiplane, BipolarActivationLut,
-    nibble4_sdot_stripe_range, FusedBase3LutMatrix, FusedBipolarLutMatrix, GgufQ4_0Matrix,
+    nibble4_sdot_batch_stripe_range, nibble4_sdot_stripe_range, FusedBase3LutMatrix, FusedBipolarLutMatrix, GgufQ4_0Matrix,
     Int8ChunkActivation, MultiPlaneTernaryMatrix, Nibble4SdotMatrix, QuantizedActivationLut,
     SIMD_ROW_STRIPE,
 };
@@ -546,7 +546,7 @@ impl LlamaWorkspace {
             proj_out: vec![0.0f32; cfg.hidden_size],
             gate_up_buf: vec![0.0f32; 2 * cfg.intermediate_size],
             swiglu_buf: vec![0.0f32; cfg.intermediate_size],
-            scores: vec![0.0f32; cfg.max_seq_len],
+            scores: vec![0.0f32; cfg.max_seq_len * cfg.num_attention_heads],
             logits: vec![0.0f32; cfg.vocab_size],
             qlut_hidden: QuantizedActivationLut::new_zeroed(cfg.hidden_size),
             qlut_inter: QuantizedActivationLut::new_zeroed(cfg.intermediate_size),
@@ -1011,7 +1011,7 @@ impl RealLlamaEngine {
         let mut qkv_buf = vec![0.0f32; qkv_rows];
         let mut gate_up_buf = vec![0.0f32; 2 * inter_dim];
         let mut proj_out = vec![0.0f32; h_dim];
-        let mut scores = vec![0.0f32; self.cfg.max_seq_len];
+        let mut scores = vec![0.0f32; self.cfg.max_seq_len * self.cfg.num_attention_heads];
         let mut k_seq_cache = vec![0.0f32; self.cfg.max_seq_len * kv_dim];
         let mut v_seq_cache = vec![0.0f32; self.cfg.max_seq_len * kv_dim];
         let mut qlut_h = QuantizedActivationLut::new_zeroed(h_dim);
@@ -1309,7 +1309,7 @@ impl RealLlamaEngine {
             par_calib(&mut seq_hiddens, &mut all_attn_out, h_dim, h_dim, |seq_h, attn_seq| {
                 let mut norm_buf = vec![0.0f32; h_dim];
                 let mut qkv_buf = vec![0.0f32; qkv_rows];
-                let mut scores = vec![0.0f32; self.cfg.max_seq_len];
+                let mut scores = vec![0.0f32; self.cfg.max_seq_len * self.cfg.num_attention_heads];
                 let mut k_seq_cache = vec![0.0f32; self.cfg.max_seq_len * kv_dim];
                 let mut v_seq_cache = vec![0.0f32; self.cfg.max_seq_len * kv_dim];
                 let mut blut_h = BipolarActivationLut::new_zeroed(h_dim);
@@ -1983,6 +1983,152 @@ impl RealLlamaEngine {
         &self.ws.logits
     }
 
+    /// Runs a prompt as one batch (SDOT engines, see [`Self::repack_sdot`]) and returns the logits
+    /// after its last token. Other engines fall back to token-by-token decoding.
+    pub fn forward_prompt(&mut self, tokens: &[usize]) -> &[f32] {
+        assert!(!tokens.is_empty());
+        let is_sdot = |b: &LinearBackend| matches!(b, LinearBackend::Nibble4(_));
+        let all_sdot = is_sdot(&self.lm_head)
+            && self.layers.iter().all(|l| {
+                is_sdot(&l.qkv_proj) && is_sdot(&l.o_proj) && is_sdot(&l.gate_up_proj) && is_sdot(&l.down_proj)
+            });
+        if !all_sdot || tokens.len() == 1 {
+            for &t in &tokens[..tokens.len() - 1] {
+                self.forward_token(t);
+            }
+            return self.forward_token(tokens[tokens.len() - 1]);
+        }
+
+        let n = tokens.len();
+        let pos0 = self.ws.pos;
+        assert!(pos0 + n <= self.cfg.max_seq_len, "prompt exceeds max_seq_len");
+        let h = self.cfg.hidden_size;
+        let inter = self.cfg.intermediate_size;
+        let kv_dim = self.cfg.kv_dim();
+        let qkv_rows = h + 2 * kv_dim;
+        let head_dim = self.cfg.head_dim();
+        let half_dim = head_dim / 2;
+        let kv_group = self.cfg.num_attention_heads / self.cfg.num_key_value_heads;
+        let attn_scale = 1.0 / (head_dim as f32).sqrt();
+        let layer_kv_stride = self.cfg.max_seq_len * kv_dim;
+        let eps = self.cfg.rms_norm_eps;
+        let pool = self.pool.as_ref();
+
+        let mut hidden = vec![0.0f32; n * h];
+        for (t, &tok) in tokens.iter().enumerate() {
+            let row = &mut hidden[t * h..(t + 1) * h];
+            if self.embed_f32_rows.is_empty() {
+                if let LinearBackend::Nibble4(m) = &self.lm_head {
+                    m.dequantize_row_rotated(tok, row);
+                    ifwht64_signed_inplace(row);
+                }
+            } else {
+                row.copy_from_slice(&self.embed_f32_rows[tok * h..(tok + 1) * h]);
+            }
+        }
+        let new_acts = |cols: usize, lut: bool| -> Vec<BipolarActivationLut> {
+            (0..n)
+                .map(|_| {
+                    let mut b = BipolarActivationLut::new_zeroed(cols);
+                    b.lut_enabled = lut;
+                    b.int8 = Some(Int8ChunkActivation::new_zeroed(cols));
+                    b
+                })
+                .collect()
+        };
+        let mut acts_h = new_acts(h, self.ws.blut_hidden.lut_enabled);
+        let mut acts_i = new_acts(inter, self.ws.blut_inter.lut_enabled);
+        let mut qkv = vec![0.0f32; n * qkv_rows];
+        let mut attn = vec![0.0f32; n * h];
+        let mut proj = vec![0.0f32; n * h];
+        let mut gate_up = vec![0.0f32; n * 2 * inter];
+        let mut sw = vec![0.0f32; n * inter];
+
+        for (l_idx, layer) in self.layers.iter().enumerate() {
+            let kv_base = l_idx * layer_kv_stride;
+            prompt_populate(pool, &hidden, h, Some((&layer.input_norm, eps)), &mut acts_h);
+            prompt_gemm(pool, &layer.qkv_proj, &acts_h, &mut qkv);
+
+            let k_ptr = self.ws.k_cache.as_mut_ptr() as usize;
+            let v_ptr = self.ws.v_cache.as_mut_ptr() as usize;
+            let qkv_ptr = qkv.as_mut_ptr() as usize;
+            let rope = &self.rope_cos_sin;
+            let cfg = &self.cfg;
+            par_range(pool, n, |a, b| {
+                for t in a..b {
+                    let pos = pos0 + t;
+                    // SAFETY: token `t` owns row `t` of `qkv` and cache slot `pos`.
+                    let row = unsafe { std::slice::from_raw_parts_mut((qkv_ptr as *mut f32).add(t * qkv_rows), qkv_rows) };
+                    let rope_row = &rope[pos * head_dim..(pos + 1) * head_dim];
+                    let (q, kv) = row.split_at_mut(h);
+                    let (k, v) = kv.split_at_mut(kv_dim);
+                    apply_llama_rope_precomp(q, cfg.num_attention_heads, head_dim, half_dim, rope_row);
+                    apply_llama_rope_precomp(k, cfg.num_key_value_heads, head_dim, half_dim, rope_row);
+                    let off = kv_base + pos * kv_dim;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(k.as_ptr(), (k_ptr as *mut f32).add(off), kv_dim);
+                        std::ptr::copy_nonoverlapping(v.as_ptr(), (v_ptr as *mut f32).add(off), kv_dim);
+                    }
+                }
+            });
+
+            let k_cache = &self.ws.k_cache[kv_base..];
+            let v_cache = &self.ws.v_cache[kv_base..];
+            let attn_ptr = attn.as_mut_ptr() as usize;
+            let qkv_ref = &qkv;
+            par_range(pool, n, |a, b| {
+                let mut scores = vec![0.0f32; cfg.max_seq_len * cfg.num_attention_heads];
+                for t in a..b {
+                    // SAFETY: token `t` owns row `t` of `attn`.
+                    let dst = unsafe { std::slice::from_raw_parts_mut((attn_ptr as *mut f32).add(t * h), h) };
+                    causal_gqa_attention(
+                        &qkv_ref[t * qkv_rows..t * qkv_rows + h],
+                        k_cache,
+                        v_cache,
+                        &mut scores,
+                        dst,
+                        cfg.num_attention_heads,
+                        kv_group,
+                        head_dim,
+                        kv_dim,
+                        pos0 + t,
+                        attn_scale,
+                    );
+                }
+            });
+
+            prompt_populate(pool, &attn, h, None, &mut acts_h);
+            prompt_gemm(pool, &layer.o_proj, &acts_h, &mut proj);
+            add_inplace(&mut hidden, &proj);
+
+            prompt_populate(pool, &hidden, h, Some((&layer.post_attn_norm, eps)), &mut acts_h);
+            prompt_gemm(pool, &layer.gate_up_proj, &acts_h, &mut gate_up);
+            for (gu, out) in gate_up.chunks_exact(2 * inter).zip(sw.chunks_exact_mut(inter)) {
+                let (g, u) = gu.split_at(inter);
+                swiglu_activate(g, u, out);
+            }
+            prompt_populate(pool, &sw, inter, None, &mut acts_i);
+            prompt_gemm(pool, &layer.down_proj, &acts_i, &mut proj);
+            add_inplace(&mut hidden, &proj);
+        }
+
+        // LM head for the last token only.
+        rms_norm(&hidden[(n - 1) * h..], &self.final_norm, eps, &mut self.ws.norm_buf);
+        fwht64_signed_inplace(&mut self.ws.norm_buf);
+        self.ws.blut_hidden.populate(&self.ws.norm_buf);
+        self.lm_head.forward_exec(
+            &self.ws.norm_buf,
+            None,
+            Some(&self.ws.blut_hidden),
+            &self.ws.q8_hidden_vals,
+            &self.ws.q8_hidden_scales,
+            pool,
+            &mut self.ws.logits,
+        );
+        self.ws.pos += n;
+        &self.ws.logits
+    }
+
     /// Greedy autoregressive generation (`temperature = 0`) returning `(generated_token_ids, tokens_per_sec)`.
     pub fn generate_greedy(
         &mut self,
@@ -2043,6 +2189,51 @@ where
                 }
             });
         }
+    });
+}
+
+/// `f(a, b)` over `0..n`, split across `pool` when present.
+fn par_range(pool: Option<&SpinThreadPool>, n: usize, f: impl Fn(usize, usize) + Sync) {
+    match pool {
+        Some(p) if n > 1 => p.parallel_for(n, 1, f),
+        _ => f(0, n),
+    }
+}
+
+/// Per token: optional RMSNorm, Hadamard rotation, then activation quantization into `acts[t]`.
+fn prompt_populate(
+    pool: Option<&SpinThreadPool>,
+    x: &[f32],
+    dim: usize,
+    norm: Option<(&[f32], f32)>,
+    acts: &mut [BipolarActivationLut],
+) {
+    let acts_ptr = acts.as_mut_ptr() as usize;
+    par_range(pool, acts.len(), |a, b| {
+        let mut buf = vec![0.0f32; dim];
+        for t in a..b {
+            let row = &x[t * dim..(t + 1) * dim];
+            match norm {
+                Some((w, eps)) => rms_norm(row, w, eps, &mut buf),
+                None => buf.copy_from_slice(row),
+            }
+            fwht64_signed_inplace(&mut buf);
+            // SAFETY: token `t` is owned by exactly one range.
+            unsafe { (*(acts_ptr as *mut BipolarActivationLut).add(t)).populate(&buf) };
+        }
+    });
+}
+
+/// Batched projection of all prompt tokens: `out[t * rows + r]`.
+fn prompt_gemm(pool: Option<&SpinThreadPool>, mat: &LinearBackend, acts: &[BipolarActivationLut], out: &mut [f32]) {
+    let LinearBackend::Nibble4(m) = mat else {
+        unreachable!("prompt_gemm requires SDOT projections");
+    };
+    debug_assert_eq!(out.len(), acts.len() * m.rows);
+    let out_ptr = out.as_mut_ptr() as usize;
+    par_range(pool, m.num_stripes, |s0, s1| {
+        // SAFETY: disjoint stripe ranges write disjoint rows of every token.
+        unsafe { nibble4_sdot_batch_stripe_range(m, acts, s0, s1, out_ptr as *mut f32, m.rows) };
     });
 }
 
@@ -2138,31 +2329,34 @@ fn causal_gqa_attention(
     attn_scale: f32,
 ) {
     let seq_len = pos + 1;
-    for qh in 0..num_q_heads {
-        let kvh = qh / kv_group;
-        let q_head = &q_buf[qh * head_dim..(qh + 1) * head_dim];
-
-        let mut max_score = f32::NEG_INFINITY;
-        for (t, sc_slot) in scores[..seq_len].iter_mut().enumerate() {
+    // Query heads sharing a KV head are processed together so each K/V row is read once.
+    for kvh in 0..num_q_heads / kv_group {
+        let q0 = kvh * kv_group;
+        let sc = &mut scores[..kv_group * seq_len];
+        for t in 0..seq_len {
             let k_off = t * kv_dim + kvh * head_dim;
             let k_head = &k_layer_cache[k_off..k_off + head_dim];
-            let s = dot_f32_fast(q_head, k_head) * attn_scale;
-            *sc_slot = s;
-            if s > max_score {
-                max_score = s;
+            for g in 0..kv_group {
+                let q_head = &q_buf[(q0 + g) * head_dim..(q0 + g + 1) * head_dim];
+                sc[g * seq_len + t] = dot_f32_fast(q_head, k_head) * attn_scale;
             }
         }
-
-        let sum_exp = softmax_unnorm_inplace(&mut scores[..seq_len], max_score);
-        let inv_sum = 1.0 / sum_exp;
-
-        let out_head = &mut attn_out[qh * head_dim..(qh + 1) * head_dim];
-        out_head.fill(0.0);
-        for (t, &unnorm_p) in scores[..seq_len].iter().enumerate() {
-            let p = unnorm_p * inv_sum;
+        for g in 0..kv_group {
+            let row = &mut sc[g * seq_len..(g + 1) * seq_len];
+            let max_score = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let inv_sum = 1.0 / softmax_unnorm_inplace(row, max_score);
+            for p in row.iter_mut() {
+                *p *= inv_sum;
+            }
+        }
+        attn_out[q0 * head_dim..(q0 + kv_group) * head_dim].fill(0.0);
+        for t in 0..seq_len {
             let v_off = t * kv_dim + kvh * head_dim;
             let v_head = &v_layer_cache[v_off..v_off + head_dim];
-            axpy_f32_fast(out_head, v_head, p);
+            for g in 0..kv_group {
+                let out_head = &mut attn_out[(q0 + g) * head_dim..(q0 + g + 1) * head_dim];
+                axpy_f32_fast(out_head, v_head, sc[g * seq_len + t]);
+            }
         }
     }
 }

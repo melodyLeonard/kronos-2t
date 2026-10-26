@@ -9,6 +9,7 @@
 //!   `--cache-dir DIR`   reuse/save compiled Bipolar engines
 //!   `--sdot`            use the `SDOT` kernel
 //!   `--speed`           also measure decode tok/s
+//!   `--prefill`         also measure batched prompt processing (pp = ctx) tok/s
 //!
 //! `token_ids_file` holds one token id per line, produced by
 //! `llama-tokenize -m <smollm2.gguf> -f wiki.test.raw --ids --no-bos` so both engines score the
@@ -299,6 +300,39 @@ fn main() {
             kl,
             top1
         );
+    }
+
+    if args.iter().any(|a| a == "--prefill") {
+        println!("\n  Prefill (pp{n_ctx}, mean ± sd of 5 runs, tok/s; max |logit diff| vs token-by-token)");
+        let prompt = &ids[..n_ctx];
+        for (label, eng) in candidates.iter_mut() {
+            eng.set_num_threads(p_cores);
+            eng.reset_context();
+            let batched = eng.forward_prompt(prompt).to_vec();
+            eng.reset_context();
+            let mut seq = Vec::new();
+            for &t in prompt {
+                seq = eng.forward_token(t).to_vec();
+            }
+            let diff = batched.iter().zip(&seq).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+            let mut line = format!("  {label:<32} | diff {diff:.2e}");
+            for threads in [1, 4, p_cores] {
+                eng.set_num_threads(threads);
+                let tps: Vec<f64> = (0..6)
+                    .map(|_| {
+                        eng.reset_context();
+                        let t = Instant::now();
+                        std::hint::black_box(eng.forward_prompt(prompt));
+                        n_ctx as f64 / t.elapsed().as_secs_f64()
+                    })
+                    .skip(1)
+                    .collect();
+                let mean = tps.iter().sum::<f64>() / tps.len() as f64;
+                let sd = (tps.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (tps.len() as f64 - 1.0)).sqrt();
+                line += &format!(" | {threads}T {mean:>7.1} ± {sd:<5.1}");
+            }
+            println!("{line}");
+        }
     }
 
     if speed {
