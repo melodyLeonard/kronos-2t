@@ -309,11 +309,13 @@ fn main() {
         for (label, eng) in std::iter::once(("Exact FP32 Reference", &mut fp32))
             .chain(candidates.iter_mut().map(|(l, e)| (*l, e)))
         {
-            eng.set_num_threads(1);
-            let (t1, s1) = decode_speed(eng, &ids, 32, 5);
-            eng.set_num_threads(p_cores);
-            let (t8, s8) = decode_speed(eng, &ids, 32, 5);
-            println!("  {:<32} | 1T {:>7.1} ± {:<5.1} | 8T {:>7.1} ± {:<5.1}", label, t1, s1, t8, s8);
+            let mut line = format!("  {label:<32}");
+            for threads in [1, 4, p_cores] {
+                eng.set_num_threads(threads);
+                let (t, sd) = decode_speed(eng, &ids, 32, 5);
+                line += &format!(" | {threads}T {t:>7.1} ± {sd:<5.1}");
+            }
+            println!("{line}");
         }
     }
 }
