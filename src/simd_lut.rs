@@ -4037,4 +4037,39 @@ mod tests {
             }
         }
     }
+
+    fn test_acts(cols: usize, n_tok: usize) -> Vec<BipolarActivationLut> {
+        (0..n_tok)
+            .map(|t| {
+                let x: Vec<f32> = (0..cols).map(|c| ((c * (t + 3)) as f32 * 0.11).sin()).collect();
+                let mut b = BipolarActivationLut::new_zeroed(cols);
+                b.int8 = Some(Int8ChunkActivation::new_zeroed(cols));
+                b.populate(&x);
+                b
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "micro-benchmark: cargo test --release -- --ignored bench_batch_gemm --nocapture"]
+    fn bench_batch_gemm() {
+        use crate::compiler::compile_hadamard_gptq_bipolar;
+        let (rows, cols, n_tok) = (3072, 576, 64);
+        let weights: Vec<f32> = (0..rows * cols).map(|i| ((i * 7919 % 1009) as f32 / 1009.0 - 0.5) * 0.3).collect();
+        let n = Nibble4SdotMatrix::from_bipolar(&compile_hadamard_gptq_bipolar(&weights, rows, cols, 4, None, 8));
+        let acts = test_acts(cols, n_tok);
+        let mut out = vec![0.0f32; n_tok * rows];
+        let macs = (rows * cols * n_tok) as f64;
+        let time = |f: &mut dyn FnMut()| {
+            f();
+            let t = std::time::Instant::now();
+            for _ in 0..20 {
+                f();
+            }
+            macs * 20.0 / t.elapsed().as_secs_f64() / 1e9
+        };
+        // SAFETY: `out` holds `n_tok * rows` floats.
+        let sdot = time(&mut || unsafe { nibble4_sdot_batch_stripe_range(&n, &acts, 0, n.num_stripes, out.as_mut_ptr(), rows) });
+        println!("batch GEMM 1T: {sdot:.1} GMAC/s");
+    }
 }

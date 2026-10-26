@@ -75,18 +75,20 @@ beat it at 15–23% less size.
 
 | Model | Pair | Kronos 1T | llama.cpp 1T | Kronos best CPU | llama.cpp best CPU | llama.cpp Metal |
 |---|---|---:|---:|---:|---:|---:|
-| 135M | B4 / IQ4_XS | **849** | 660 | **4204** | 2611 | 18918 |
-| 135M | p55454 / Q4_1 | 629 | **1038** | **3212** | 2340 | 19105 |
-| 135M | B5 / Q4_K_M | 517 | **681** | **2767** | 2114 | 17961 |
-| 135M | B6 / Q6_K | 417 | **562** | 2346 | **2533** | 18891 |
-| 360M | B4 / IQ4_XS | **333** | 288 | **1780** | 1414 | 7995 |
-| 360M | B6 / Q6_K | 153 | **240** | 821 | **1075** | 7946 |
-| 1.7B | B4 / IQ4_XS | 74 | **183** | **457** | 437 | 1930 |
-| 1.7B | p55454 / Q4_K_M | **52** | 33 | **298** | 215 | 1882 |
-| 1.7B | B6 / Q6_K | 32 | **46** | 197 | **315** | 1838 |
+| 135M | B4 / IQ4_XS | **935** | 660 | **4576** | 2611 | 18918 |
+| 135M | p55454 / Q4_1 | 678 | **1038** | **3211** | 2340 | 19105 |
+| 135M | B5 / Q4_K_M | 549 | **681** | **2873** | 2114 | 17961 |
+| 135M | B6 / Q6_K | 434 | **562** | 2459 | **2533** | 18891 |
+| 360M | B4 / IQ4_XS | **355** | 288 | **1936** | 1414 | 7995 |
+| 360M | B6 / Q6_K | 158 | **240** | 963 | **1075** | 7946 |
+| 1.7B | B4 / IQ4_XS | 76 | **183** | 434 | 437 | 1930 |
+| 1.7B | p55454 / Q4_K_M | **53** | 33 | **309** | 215 | 1882 |
+| 1.7B | B6 / Q6_K | 32 | **46** | 190 | **315** | 1838 |
 
-Prefill is batched (4 tokens per weight load, `sdot`). llama.cpp's faster CPU cases use `i8mm`
-matrix instructions. The Metal GPU is 4–10x faster than any CPU result for prefill.
+Prefill is batched (4 tokens per weight load, `sdot`) with NEON attention. The batched GEMM
+runs at about 133 GMAC/s per core, 85% of `sdot` peak; an `i8mm` (`SMMLA`) version measured the
+same, since `SMMLA` peaks only 1.2x higher on the M4. The Metal GPU is 4–10x faster than any CPU
+result for prefill.
 
 ## Remaining limitations
 

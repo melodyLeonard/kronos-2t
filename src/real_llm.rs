@@ -2332,6 +2332,22 @@ fn causal_gqa_attention(
     attn_scale: f32,
 ) {
     let seq_len = pos + 1;
+    #[cfg(target_arch = "aarch64")]
+    if head_dim == 64 {
+        for qh in 0..num_q_heads {
+            let off = (qh / kv_group) * head_dim;
+            let q_head = &q_buf[qh * head_dim..(qh + 1) * head_dim];
+            let sc = &mut scores[..seq_len];
+            // SAFETY: rows `0..seq_len` of the caches hold `kv_dim >= off + 64` floats each.
+            unsafe { attn_scores_head64_neon(q_head, k_layer_cache, kv_dim, off, attn_scale, sc) };
+            let max_score = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let inv_sum = 1.0 / softmax_unnorm_inplace(sc, max_score);
+            let out_head = &mut attn_out[qh * head_dim..(qh + 1) * head_dim];
+            // SAFETY: as above.
+            unsafe { attn_values_head64_neon(sc, v_layer_cache, kv_dim, off, inv_sum, out_head) };
+        }
+        return;
+    }
     // Query heads sharing a KV head are processed together so each K/V row is read once.
     for kvh in 0..num_q_heads / kv_group {
         let q0 = kvh * kv_group;
@@ -2361,6 +2377,70 @@ fn causal_gqa_attention(
                 axpy_f32_fast(out_head, v_head, sc[g * seq_len + t]);
             }
         }
+    }
+}
+
+/// `out[t] = scale * q . k_t` for a 64-wide head, 8 positions per pass with one reduction tree.
+///
+/// # Safety
+/// `k_cache` holds `out.len()` rows of `kv_dim` floats with `off + 64 <= kv_dim`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn attn_scores_head64_neon(q: &[f32], k_cache: &[f32], kv_dim: usize, off: usize, scale: f32, out: &mut [f32]) {
+    use std::arch::aarch64::*;
+    debug_assert!(q.len() == 64 && off + 64 <= kv_dim && k_cache.len() >= out.len() * kv_dim);
+    // SAFETY: `q` holds 64 floats.
+    let qv: [float32x4_t; 16] = std::array::from_fn(|i| unsafe { vld1q_f32(q.as_ptr().add(4 * i)) });
+    let kp = k_cache.as_ptr();
+    let n = out.len();
+    let mut t = 0;
+    while t + 8 <= n {
+        let mut acc = [vdupq_n_f32(0.0); 8];
+        for (i, qi) in qv.iter().enumerate() {
+            for (j, a) in acc.iter_mut().enumerate() {
+                // SAFETY: row `t + j < n`, column `off + 4i + 4 <= kv_dim`.
+                *a = vfmaq_f32(*a, *qi, unsafe { vld1q_f32(kp.add((t + j) * kv_dim + off + 4 * i)) });
+            }
+        }
+        let lo = vpaddq_f32(vpaddq_f32(acc[0], acc[1]), vpaddq_f32(acc[2], acc[3]));
+        let hi = vpaddq_f32(vpaddq_f32(acc[4], acc[5]), vpaddq_f32(acc[6], acc[7]));
+        // SAFETY: `t + 8 <= n`.
+        unsafe {
+            vst1q_f32(out.as_mut_ptr().add(t), vmulq_n_f32(lo, scale));
+            vst1q_f32(out.as_mut_ptr().add(t + 4), vmulq_n_f32(hi, scale));
+        }
+        t += 8;
+    }
+    for (j, o) in out.iter_mut().enumerate().skip(t) {
+        let mut a = vdupq_n_f32(0.0);
+        for (i, qi) in qv.iter().enumerate() {
+            // SAFETY: row `j < n`.
+            a = vfmaq_f32(a, *qi, unsafe { vld1q_f32(kp.add(j * kv_dim + off + 4 * i)) });
+        }
+        *o = vaddvq_f32(a) * scale;
+    }
+}
+
+/// `out = inv_sum * sum_t p[t] * v_t` for a 64-wide head, accumulating in registers.
+///
+/// # Safety
+/// As [`attn_scores_head64_neon`], with `out.len() == 64`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn attn_values_head64_neon(p: &[f32], v_cache: &[f32], kv_dim: usize, off: usize, inv_sum: f32, out: &mut [f32]) {
+    use std::arch::aarch64::*;
+    debug_assert!(out.len() == 64 && off + 64 <= kv_dim && v_cache.len() >= p.len() * kv_dim);
+    let vp = v_cache.as_ptr();
+    let mut acc = [vdupq_n_f32(0.0); 16];
+    for (t, &pt) in p.iter().enumerate() {
+        for (i, a) in acc.iter_mut().enumerate() {
+            // SAFETY: row `t < p.len()`, column `off + 4i + 4 <= kv_dim`.
+            *a = vfmaq_n_f32(*a, unsafe { vld1q_f32(vp.add(t * kv_dim + off + 4 * i)) }, pt);
+        }
+    }
+    for (i, a) in acc.iter().enumerate() {
+        // SAFETY: `out` holds 64 floats.
+        unsafe { vst1q_f32(out.as_mut_ptr().add(4 * i), vmulq_n_f32(*a, inv_sum)) };
     }
 }
 
@@ -2839,6 +2919,36 @@ mod tests {
         assert!((sum_neon - sum_ref).abs() < 1e-4);
         for (a, b) in scores_neon.iter().zip(scores_ref.iter()) {
             assert!((a - b).abs() < 1e-6, "Softmax mismatch: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn test_attention_matches_naive() {
+        let (heads, kv_heads, hd) = (6, 2, 64);
+        let kv_dim = kv_heads * hd;
+        for pos in [0usize, 5, 7, 8, 30] {
+            let n = pos + 1;
+            let f = |i: usize, m: usize| ((i * m % 97) as f32 / 97.0 - 0.5) * 2.0;
+            let q: Vec<f32> = (0..heads * hd).map(|i| f(i, 31)).collect();
+            let k: Vec<f32> = (0..n * kv_dim).map(|i| f(i, 17)).collect();
+            let v: Vec<f32> = (0..n * kv_dim).map(|i| f(i, 13)).collect();
+            let mut scores = vec![0.0f32; n * heads];
+            let mut out = vec![0.0f32; heads * hd];
+            causal_gqa_attention(&q, &k, &v, &mut scores, &mut out, heads, heads / kv_heads, hd, kv_dim, pos, 0.125);
+            for h in 0..heads {
+                let off = (h / (heads / kv_heads)) * hd;
+                let sc: Vec<f64> = (0..n)
+                    .map(|t| (0..hd).map(|d| (q[h * hd + d] * k[t * kv_dim + off + d]) as f64).sum::<f64>() * 0.125)
+                    .collect();
+                let m = sc.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let e: Vec<f64> = sc.iter().map(|x| (x - m).exp()).collect();
+                let z: f64 = e.iter().sum();
+                for d in 0..hd {
+                    let want: f64 = (0..n).map(|t| e[t] / z * v[t * kv_dim + off + d] as f64).sum();
+                    let got = out[h * hd + d] as f64;
+                    assert!((got - want).abs() < 1e-4, "pos {pos} head {h} dim {d}: {got} vs {want}");
+                }
+            }
         }
     }
 }
