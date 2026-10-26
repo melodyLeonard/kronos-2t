@@ -18,8 +18,9 @@ use crate::safetensors::{JsonCursor, SafeTensorsFile};
 use crate::simd_lut::{
     simd_lut_base3_gemv, simd_lut_base3_stripe_range, simd_lut_bipolar_gemv,
     simd_lut_bipolar_stripe_range, simd_lut_gemv_multiplane, BipolarActivationLut,
-    FusedBase3LutMatrix, FusedBipolarLutMatrix, GgufQ4_0Matrix, MultiPlaneTernaryMatrix,
-    QuantizedActivationLut, SIMD_ROW_STRIPE,
+    nibble4_sdot_stripe_range, FusedBase3LutMatrix, FusedBipolarLutMatrix, GgufQ4_0Matrix,
+    Int8ChunkActivation, MultiPlaneTernaryMatrix, Nibble4SdotMatrix, QuantizedActivationLut,
+    SIMD_ROW_STRIPE,
 };
 use crate::thread_pool::SpinThreadPool;
 use std::fs;
@@ -192,6 +193,8 @@ enum LinearBackend {
     GgufQ4_0(GgufQ4_0Matrix),
     FusedBase3(FusedBase3LutMatrix),
     FusedBipolar(FusedBipolarLutMatrix),
+    /// 4-plane Bipolar weights repacked for `SDOT` (see [`RealLlamaEngine::repack_sdot`]).
+    Nibble4(Nibble4SdotMatrix),
 }
 
 impl LinearBackend {
@@ -273,6 +276,7 @@ impl LinearBackend {
             Self::GgufQ4_0(m) => m.physical_bytes(),
             Self::FusedBase3(m) => m.physical_bytes(),
             Self::FusedBipolar(m) => m.physical_bytes(),
+            Self::Nibble4(m) => m.physical_bytes(),
         }
     }
 
@@ -388,6 +392,25 @@ impl LinearBackend {
                     });
                 } else {
                     simd_lut_bipolar_gemv(mat, lut, out);
+                }
+            }
+            Self::Nibble4(mat) => {
+                let act = blut
+                    .and_then(|b| b.int8.as_ref())
+                    .expect("int8 activations required for Nibble4");
+                let n_stripes = mat.num_stripes;
+                let out_addr = out.as_mut_ptr() as usize;
+                if let Some(p) = pool.filter(|p| p.num_threads() > 1 && n_stripes >= 16) {
+                    let grain = (n_stripes / (p.num_threads() * 2)).clamp(4, 128);
+                    p.parallel_for(n_stripes, grain, |s_start, s_end| {
+                        // SAFETY: Disjoint 16-row stripes write disjoint `out` slices.
+                        unsafe {
+                            nibble4_sdot_stripe_range(mat, act, s_start, s_end, out_addr as *mut f32);
+                        }
+                    });
+                } else {
+                    // SAFETY: Single-threaded full stripe range.
+                    unsafe { nibble4_sdot_stripe_range(mat, act, 0, n_stripes, out_addr as *mut f32) };
                 }
             }
         }
@@ -1492,6 +1515,35 @@ impl RealLlamaEngine {
         }
     }
 
+    /// Repacks every 4-plane Bipolar projection into [`Nibble4SdotMatrix`] (bit-exact weights,
+    /// `SDOT` kernel) and enables the `int8` activation path; the LUT build is skipped when no
+    /// LUT-kernel projection remains. Call after compiling or loading, before inference.
+    pub fn repack_sdot(&mut self) {
+        let repack = |b: &mut LinearBackend| {
+            if let LinearBackend::FusedBipolar(m) = b {
+                if m.num_planes == 4 {
+                    *b = LinearBackend::Nibble4(Nibble4SdotMatrix::from_bipolar(m));
+                }
+            }
+        };
+        for l in &mut self.layers {
+            repack(&mut l.qkv_proj);
+            repack(&mut l.o_proj);
+            repack(&mut l.gate_up_proj);
+            repack(&mut l.down_proj);
+        }
+        repack(&mut self.lm_head);
+
+        let is_lut = |b: &LinearBackend| matches!(b, LinearBackend::FusedBipolar(_));
+        let hidden_lut = is_lut(&self.lm_head)
+            || self.layers.iter().any(|l| is_lut(&l.qkv_proj) || is_lut(&l.o_proj) || is_lut(&l.gate_up_proj));
+        let inter_lut = self.layers.iter().any(|l| is_lut(&l.down_proj));
+        self.ws.blut_hidden.lut_enabled = hidden_lut;
+        self.ws.blut_inter.lut_enabled = inter_lut;
+        self.ws.blut_hidden.int8 = Some(Int8ChunkActivation::new_zeroed(self.cfg.hidden_size));
+        self.ws.blut_inter.int8 = Some(Int8ChunkActivation::new_zeroed(self.cfg.intermediate_size));
+    }
+
     /// Saves a compiled Bipolar engine (every projection `FusedBipolar`) so later runs can skip the
     /// sequential GPTQ compile via [`Self::load_bipolar`].
     pub fn save_bipolar(&self, path: &Path) -> io::Result<()> {
@@ -1703,6 +1755,10 @@ impl RealLlamaEngine {
         if self.embed_f32_rows.is_empty() {
             match &self.lm_head {
                 LinearBackend::FusedBipolar(m) => {
+                    m.dequantize_row_rotated(token_id, &mut self.ws.hidden);
+                    ifwht64_signed_inplace(&mut self.ws.hidden);
+                }
+                LinearBackend::Nibble4(m) => {
                     m.dequantize_row_rotated(token_id, &mut self.ws.hidden);
                     ifwht64_signed_inplace(&mut self.ws.hidden);
                 }

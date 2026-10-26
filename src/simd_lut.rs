@@ -1402,6 +1402,10 @@ pub struct BipolarActivationLut {
     pub num_chunks: usize,
     pub lut4: Vec<[i8; 16]>,
     pub chunk_scales: Vec<f32>,
+    /// Builds the 16-entry LUTs on `populate` (off when every consumer is a [`Nibble4SdotMatrix`]).
+    pub lut_enabled: bool,
+    /// Optional `int8` copy of the same activations for [`Nibble4SdotMatrix`] consumers.
+    pub int8: Option<Int8ChunkActivation>,
 }
 
 impl BipolarActivationLut {
@@ -1415,6 +1419,8 @@ impl BipolarActivationLut {
             num_chunks,
             lut4: vec![[0i8; 16]; num_quads],
             chunk_scales: vec![0.0f32; num_chunks],
+            lut_enabled: true,
+            int8: None,
         }
     }
 
@@ -1436,6 +1442,12 @@ impl BipolarActivationLut {
     #[inline]
     pub fn populate(&mut self, x: &[f32]) {
         assert_eq!(x.len(), self.cols);
+        if let Some(a) = self.int8.as_mut() {
+            a.populate(x);
+        }
+        if !self.lut_enabled {
+            return;
+        }
         #[cfg(target_arch = "aarch64")]
         {
             // SAFETY: NEON is baseline on `aarch64` and `x.len() == self.cols`.
@@ -1719,30 +1731,36 @@ impl FusedBipolarLutMatrix {
         (self.physical_bytes() as f64 * 8.0) / ((self.rows * self.cols) as f64)
     }
 
-    /// Dequantizes row `r` into `out` (`cols` floats) in the Hadamard-rotated domain; apply
-    /// `ifwht64_signed_inplace` afterwards to recover the original-domain row.
-    pub fn dequantize_row_rotated(&self, r: usize, out: &mut [f32]) {
+    /// Unpacks the unsigned plane codes `u` (`0 .. 2^num_planes`) of row `r` into `out`.
+    pub fn unpack_row_codes(&self, r: usize, out: &mut [u8]) {
         assert!(r < self.rows);
         assert_eq!(out.len(), self.cols);
         let np = self.num_planes;
         let stripe = r / SIMD_ROW_STRIPE;
         let lane = r % SIMD_ROW_STRIPE;
-        let max_odd = (1i32 << np) - 1;
-        let sc_base = stripe * self.num_chunks * SIMD_ROW_STRIPE;
         for (o, oct_out) in out.chunks_exact_mut(8).enumerate() {
             let base = (stripe * self.octets_per_row + o) * np * SIMD_ROW_STRIPE + lane;
-            let delta = bf16_to_f32(
-                self.bf16_chunk_scales[sc_base + (o / BIPOLAR_OCTETS_PER_CHUNK) * SIMD_ROW_STRIPE + lane],
-            );
-            let mut u = [0i32; 8];
+            oct_out.fill(0);
             for p in 0..np {
                 let byte = self.interleaved_data[base + p * SIMD_ROW_STRIPE];
-                for (k, uk) in u.iter_mut().enumerate() {
-                    *uk |= (((byte >> k) & 1) as i32) << p;
+                for (k, uk) in oct_out.iter_mut().enumerate() {
+                    *uk |= ((byte >> k) & 1) << p;
                 }
             }
-            for (dst, &uk) in oct_out.iter_mut().zip(u.iter()) {
-                *dst = ((2 * uk - max_odd) as f32) * delta;
+        }
+    }
+
+    /// Dequantizes row `r` into `out` (`cols` floats) in the Hadamard-rotated domain; apply
+    /// `ifwht64_signed_inplace` afterwards to recover the original-domain row.
+    pub fn dequantize_row_rotated(&self, r: usize, out: &mut [f32]) {
+        let mut codes = vec![0u8; self.cols];
+        self.unpack_row_codes(r, &mut codes);
+        let max_odd = (1i32 << self.num_planes) - 1;
+        let sc_base = (r / SIMD_ROW_STRIPE) * self.num_chunks * SIMD_ROW_STRIPE + r % SIMD_ROW_STRIPE;
+        for (c, (dst, src)) in out.chunks_exact_mut(64).zip(codes.chunks_exact(64)).enumerate() {
+            let delta = bf16_to_f32(self.bf16_chunk_scales[sc_base + c * SIMD_ROW_STRIPE]);
+            for (d, &u) in dst.iter_mut().zip(src.iter()) {
+                *d = ((2 * u as i32 - max_odd) as f32) * delta;
             }
         }
     }
@@ -2829,6 +2847,267 @@ unsafe fn simd_lut_gemv_multiplane_neon(
     }
 }
 
+/// Per-64-column `int8` activation quantization for [`Nibble4SdotMatrix`]: `q = round(x / scale)`
+/// with `scale = max|x| / 127` per chunk, plus each chunk's integer sum (for the odd-grid offset).
+#[derive(Clone, Debug)]
+pub struct Int8ChunkActivation {
+    pub cols: usize,
+    pub q: Vec<i8>,
+    pub scales: Vec<f32>,
+    pub sums: Vec<i32>,
+}
+
+impl Int8ChunkActivation {
+    pub fn new_zeroed(cols: usize) -> Self {
+        assert!(cols > 0 && cols.is_multiple_of(64));
+        Self {
+            cols,
+            q: vec![0i8; cols],
+            scales: vec![0.0f32; cols / 64],
+            sums: vec![0i32; cols / 64],
+        }
+    }
+
+    pub fn populate(&mut self, x: &[f32]) {
+        assert_eq!(x.len(), self.cols);
+        for (c, (xc, qc)) in x.chunks_exact(64).zip(self.q.chunks_exact_mut(64)).enumerate() {
+            let max_abs = xc.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            if max_abs <= f32::EPSILON {
+                qc.fill(0);
+                self.scales[c] = 0.0;
+                self.sums[c] = 0;
+                continue;
+            }
+            let inv = 127.0 / max_abs;
+            let mut sum = 0i32;
+            for (dst, &v) in qc.iter_mut().zip(xc.iter()) {
+                let qv = (v * inv).round_ties_even() as i32;
+                sum += qv;
+                *dst = qv as i8;
+            }
+            self.scales[c] = max_abs / 127.0;
+            self.sums[c] = sum;
+        }
+    }
+}
+
+/// **4-plane Bipolar weights repacked for `SDOT`**: the 4 bit-planes of each weight combine into
+/// the odd integer `q = 2u - 15` (`u` = 4-bit plane code), so
+/// `sum_k q_k x_k = 2 * sum_k u_k x_k - 15 * sum_k x_k` runs on `int8` dot-product instructions
+/// over nibble-packed `u` (identical `4.25` bits/weight, ~1.8x fewer instructions than the LUT path).
+///
+/// Layout `[num_stripes, num_chunks, 4 col16-groups, 4 row-groups, 2 x 16 bytes]`: within a row
+/// group's 16-byte vector, byte `4 * row + t` holds column `t` (low nibble) and `t + 4` (high
+/// nibble) of an 8-column half, matching `SDOT`'s by-lane `4 rows x 4 bytes` shape.
+#[derive(Clone, Debug)]
+pub struct Nibble4SdotMatrix {
+    pub rows: usize,
+    pub cols: usize,
+    pub num_stripes: usize,
+    pub num_chunks: usize,
+    pub data: Vec<u8>,
+    /// Shared `BF16` chunk scales `[num_stripes, num_chunks, SIMD_ROW_STRIPE]` (as in the LUT layout).
+    pub bf16_chunk_scales: Vec<u16>,
+}
+
+impl Nibble4SdotMatrix {
+    /// Repacks a 4-plane [`FusedBipolarLutMatrix`] (bit-exact same weights).
+    pub fn from_bipolar(m: &FusedBipolarLutMatrix) -> Self {
+        assert_eq!(m.num_planes, 4, "SDOT repack requires exactly 4 planes");
+        let mut data = vec![0u8; m.num_stripes * m.num_chunks * 512];
+        let mut codes = vec![0u8; m.cols];
+        for r in 0..m.rows {
+            m.unpack_row_codes(r, &mut codes);
+            let (stripe, lane) = (r / SIMD_ROW_STRIPE, r % SIMD_ROW_STRIPE);
+            let (g, j) = (lane / 4, lane % 4);
+            for (col, &u) in codes.iter().enumerate() {
+                let (c, k, w) = (col / 64, (col % 64) / 16, col % 16);
+                let half = w / 8;
+                let t = w % 4;
+                let byte = ((stripe * m.num_chunks + c) * 4 + k) * 128 + g * 32 + half * 16 + j * 4 + t;
+                data[byte] |= if (w % 8) < 4 { u } else { u << 4 };
+            }
+        }
+        Self {
+            rows: m.rows,
+            cols: m.cols,
+            num_stripes: m.num_stripes,
+            num_chunks: m.num_chunks,
+            data,
+            bf16_chunk_scales: m.bf16_chunk_scales.clone(),
+        }
+    }
+
+    pub fn physical_bytes(&self) -> usize {
+        self.data.len() + self.bf16_chunk_scales.len() * std::mem::size_of::<u16>()
+    }
+
+    /// Dequantizes row `r` into `out` in the Hadamard-rotated domain.
+    pub fn dequantize_row_rotated(&self, r: usize, out: &mut [f32]) {
+        assert!(r < self.rows);
+        assert_eq!(out.len(), self.cols);
+        let (stripe, lane) = (r / SIMD_ROW_STRIPE, r % SIMD_ROW_STRIPE);
+        let (g, j) = (lane / 4, lane % 4);
+        for (col, dst) in out.iter_mut().enumerate() {
+            let (c, k, w) = (col / 64, (col % 64) / 16, col % 16);
+            let byte = self.data[((stripe * self.num_chunks + c) * 4 + k) * 128
+                + g * 32
+                + (w / 8) * 16
+                + j * 4
+                + w % 4];
+            let u = if (w % 8) < 4 { byte & 0x0F } else { byte >> 4 };
+            let delta = bf16_to_f32(
+                self.bf16_chunk_scales[(stripe * self.num_chunks + c) * SIMD_ROW_STRIPE + lane],
+            );
+            *dst = ((2 * u as i32 - 15) as f32) * delta;
+        }
+    }
+}
+
+/// Executes stripes `[stripe_start, stripe_end)` of a [`Nibble4SdotMatrix`].
+///
+/// # Safety
+/// `stripe_end <= matrix.num_stripes`, `out_base` valid for `matrix.rows` floats on disjoint ranges.
+pub unsafe fn nibble4_sdot_stripe_range(
+    matrix: &Nibble4SdotMatrix,
+    act: &Int8ChunkActivation,
+    stripe_start: usize,
+    stripe_end: usize,
+    out_base: *mut f32,
+) {
+    debug_assert_eq!(matrix.cols, act.cols);
+    debug_assert!(stripe_end <= matrix.num_stripes);
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: Apple/ARMv8.4 targets have `dotprod`; caller upholds bounds.
+        unsafe { nibble4_sdot_stripe_range_neon(matrix, act, stripe_start, stripe_end, out_base) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // SAFETY: Caller upholds bounds.
+        unsafe { nibble4_sdot_stripe_range_scalar(matrix, act, stripe_start, stripe_end, out_base) }
+    }
+}
+
+/// Portable scalar reference for [`nibble4_sdot_stripe_range`].
+///
+/// # Safety
+/// Same preconditions as [`nibble4_sdot_stripe_range`].
+pub unsafe fn nibble4_sdot_stripe_range_scalar(
+    matrix: &Nibble4SdotMatrix,
+    act: &Int8ChunkActivation,
+    stripe_start: usize,
+    stripe_end: usize,
+    out_base: *mut f32,
+) {
+    let mut row = vec![0.0f32; matrix.cols];
+    for s in stripe_start..stripe_end {
+        for lane in 0..SIMD_ROW_STRIPE {
+            let r = s * SIMD_ROW_STRIPE + lane;
+            if r >= matrix.rows {
+                break;
+            }
+            matrix.dequantize_row_rotated(r, &mut row);
+            let mut acc = 0.0f32;
+            for (c, (wc, qc)) in row.chunks_exact(64).zip(act.q.chunks_exact(64)).enumerate() {
+                let dot: f32 = wc.iter().zip(qc.iter()).map(|(&w, &q)| w * q as f32).sum();
+                acc += dot * act.scales[c];
+            }
+            // SAFETY: `r < matrix.rows` inside the caller's disjoint stripe range.
+            unsafe { *out_base.add(r) = acc };
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sdot_lane<const L: i32>(
+    mut acc: std::arch::aarch64::int32x4_t,
+    a: std::arch::aarch64::uint8x16_t,
+    b: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    // SAFETY: `sdot` (FEAT_DotProd) is baseline on every Apple-silicon / ARMv8.4+ target; `a` holds
+    // nibbles `0..=15` so reading it as signed bytes is exact.
+    unsafe {
+        core::arch::asm!(
+            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.4b[{l}]",
+            acc = inout(vreg) acc,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            l = const L,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+    }
+    acc
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn nibble4_sdot_stripe_range_neon(
+    matrix: &Nibble4SdotMatrix,
+    act: &Int8ChunkActivation,
+    stripe_start: usize,
+    stripe_end: usize,
+    out_base: *mut f32,
+) {
+    use std::arch::aarch64::*;
+    let nc = matrix.num_chunks;
+    let mask = vdupq_n_u8(0x0F);
+    let data = matrix.data.as_ptr();
+    let scales = matrix.bf16_chunk_scales.as_ptr();
+    let xq = act.q.as_ptr();
+
+    for s in stripe_start..stripe_end {
+        let mut f = [vdupq_n_f32(0.0); 4];
+        for c in 0..nc {
+            let sx = act.scales[c];
+            if sx == 0.0 {
+                continue;
+            }
+            // Two accumulators per 4-row group break the `sdot` dependency chain.
+            let mut a = [vdupq_n_s32(0); 4];
+            let mut b = [vdupq_n_s32(0); 4];
+            for k in 0..4 {
+                // SAFETY: `c * 64 + k * 16 + 16 <= cols`; the block offset stays inside `data`.
+                unsafe {
+                    let x16 = vld1q_s8(xq.add(c * 64 + k * 16));
+                    let blk = data.add(((s * nc + c) * 4 + k) * 128);
+                    for g in 0..4 {
+                        let va = vld1q_u8(blk.add(g * 32));
+                        let vb = vld1q_u8(blk.add(g * 32 + 16));
+                        a[g] = sdot_lane::<0>(a[g], vandq_u8(va, mask), x16);
+                        b[g] = sdot_lane::<1>(b[g], vshrq_n_u8::<4>(va), x16);
+                        a[g] = sdot_lane::<2>(a[g], vandq_u8(vb, mask), x16);
+                        b[g] = sdot_lane::<3>(b[g], vshrq_n_u8::<4>(vb), x16);
+                    }
+                }
+            }
+            let offset = vdupq_n_s32(15 * act.sums[c]);
+            let vsx = vdupq_n_f32(sx);
+            for g in 0..4 {
+                // SAFETY: scale index `(s * nc + c) * 16 + g * 4 + 4 <= len`.
+                unsafe {
+                    let dot = vsubq_s32(vshlq_n_s32::<1>(vaddq_s32(a[g], b[g])), offset);
+                    let ws = vreinterpretq_f32_u32(vshll_n_u16::<16>(vld1_u16(
+                        scales.add((s * nc + c) * SIMD_ROW_STRIPE + g * 4),
+                    )));
+                    f[g] = vfmaq_f32(f[g], vmulq_f32(vcvtq_f32_s32(dot), vsx), ws);
+                }
+            }
+        }
+        let row_start = s * SIMD_ROW_STRIPE;
+        let valid = (matrix.rows - row_start).min(SIMD_ROW_STRIPE);
+        let mut tmp = [0.0f32; SIMD_ROW_STRIPE];
+        // SAFETY: `tmp` holds 16 floats; writes stay within `row_start + valid <= rows`.
+        unsafe {
+            for g in 0..4 {
+                vst1q_f32(tmp.as_mut_ptr().add(g * 4), f[g]);
+            }
+            std::ptr::copy_nonoverlapping(tmp.as_ptr(), out_base.add(row_start), valid);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3272,5 +3551,44 @@ mod tests {
             assert!(cos_kernel > 0.999, "planes {np}: kernel vs dequant cos {cos_kernel}");
             assert!(cos_weights > 0.99, "planes {np}: reconstruction cos {cos_weights}");
         }
+    }
+
+    #[test]
+    fn test_nibble4_sdot_matches_bipolar_lut() {
+        use crate::compiler::compile_hadamard_gptq_bipolar;
+        use crate::hadamard::fwht64_signed_inplace;
+
+        let rows = 50;
+        let cols = 256;
+        let weights: Vec<f32> = (0..rows * cols)
+            .map(|idx| (((idx * 7919 + 13) % 1009) as f32 / 1009.0 - 0.5) * 0.3)
+            .collect();
+        let mut x_rot: Vec<f32> = (0..cols).map(|c| ((c as f32) * 0.37).sin()).collect();
+        fwht64_signed_inplace(&mut x_rot);
+
+        let m = compile_hadamard_gptq_bipolar(&weights, rows, cols, 4, None, 2);
+        let n = Nibble4SdotMatrix::from_bipolar(&m);
+        let (mut row_b, mut row_n) = (vec![0.0f32; cols], vec![0.0f32; cols]);
+        for r in 0..rows {
+            m.dequantize_row_rotated(r, &mut row_b);
+            n.dequantize_row_rotated(r, &mut row_n);
+            assert_eq!(row_b, row_n, "repack changed row {r}");
+        }
+
+        let mut act = Int8ChunkActivation::new_zeroed(cols);
+        act.populate(&x_rot);
+        let mut lut_out = vec![0.0f32; rows];
+        simd_lut_bipolar_gemv(&m, &BipolarActivationLut::build(&x_rot), &mut lut_out);
+        let (mut neon_out, mut scalar_out) = (vec![0.0f32; rows], vec![0.0f32; rows]);
+        // SAFETY: full stripe range with `rows`-sized outputs.
+        unsafe {
+            nibble4_sdot_stripe_range(&n, &act, 0, n.num_stripes, neon_out.as_mut_ptr());
+            nibble4_sdot_stripe_range_scalar(&n, &act, 0, n.num_stripes, scalar_out.as_mut_ptr());
+        }
+        for (a, b) in neon_out.iter().zip(scalar_out.iter()) {
+            assert!((a - b).abs() <= 1e-4 * (1.0 + b.abs()), "neon {a} vs scalar {b}");
+        }
+        let cos = cosine_similarity(&neon_out, &lut_out);
+        assert!(cos > 0.9995, "sdot vs LUT cos {cos}");
     }
 }

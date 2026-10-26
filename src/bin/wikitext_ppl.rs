@@ -9,6 +9,7 @@
 //!                       the 8 built-in passages
 //!   `--calib-tokens N`  tokens taken from `--calib-ids` (default 8192), split into `--ctx` sequences
 //!   `--cache-dir DIR`   reuse/save compiled Bipolar engines (keyed by mode + calibration)
+//!   `--sdot`            repack 4-plane Bipolar projections for the `SDOT` kernel
 //!   `--speed`           also measure decode tok/s (`tg32`, 1 and 8 threads, mean of 5 runs)
 //!
 //! `token_ids_file` holds one token id per line, produced by
@@ -216,6 +217,13 @@ fn main() {
         };
         eprintln!("  compiled {label} in {:.1}s", t.elapsed().as_secs_f64());
         candidates.push((label, eng));
+    }
+    if args.iter().any(|a| a == "--sdot") {
+        for (_, eng) in candidates.iter_mut() {
+            if eng.mode != RealWeightMode::GgufQ4_0 {
+                eng.repack_sdot();
+            }
+        }
     }
     fp32.set_num_threads(p_cores);
     for (_, eng) in candidates.iter_mut() {
