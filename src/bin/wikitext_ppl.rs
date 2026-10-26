@@ -1,6 +1,14 @@
-//! WikiText-2 perplexity / KL / top-1 evaluation, matched 1:1 to `llama-perplexity`.
+//! WikiText-2 perplexity / KL / top-1 evaluation, matched 1:1 to `llama-perplexity`, plus an
+//! optional `llama-bench`-style decode-speed test.
 //!
-//! Usage: `wikitext_ppl <model_dir> <token_ids_file> [n_chunks=64] [n_ctx=256]`
+//! Usage: `wikitext_ppl <model_dir> <token_ids_file> [flags]`
+//!   `--chunks N`        evaluation chunks (default 64)
+//!   `--ctx N`           chunk length (default 256)
+//!   `--modes LIST`      comma list of `q40,b4,mk,b5` (default all)
+//!   `--calib-ids FILE`  calibrate GPTQ on this token-id file (e.g. WikiText-2 *train*) instead of
+//!                       the 8 built-in passages
+//!   `--calib-tokens N`  tokens taken from `--calib-ids` (default 8192), split into `--ctx` sequences
+//!   `--speed`           also measure decode tok/s (`tg32`, 1 and 8 threads, mean of 5 runs)
 //!
 //! `token_ids_file` holds one token id per line, produced by
 //! `llama-tokenize -m <smollm2.gguf> -f wiki.test.raw --ids --no-bos` so both engines score the
@@ -19,6 +27,22 @@ fn log_softmax(logits: &[f32]) -> Vec<f64> {
     let max_v = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
     let lse = max_v + logits.iter().map(|&v| ((v as f64) - max_v).exp()).sum::<f64>().ln();
     logits.iter().map(|&v| (v as f64) - lse).collect()
+}
+
+fn argmax_f64(v: &[f64]) -> usize {
+    v.iter()
+        .enumerate()
+        .fold((0, f64::NEG_INFINITY), |(bi, bv), (i, &x)| if x > bv { (i, x) } else { (bi, bv) })
+        .0
+}
+
+fn read_ids(path: &str) -> Vec<usize> {
+    std::fs::read_to_string(path)
+        .expect("failed to read token ids")
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.trim().parse().expect("bad token id"))
+        .collect()
 }
 
 #[derive(Default)]
@@ -49,22 +73,37 @@ impl Acc {
     }
 }
 
+/// `llama-bench tg32`-style decode speed: `n_gen` single-token forwards from an empty KV cache,
+/// `runs` timed repetitions after one warm-up, returning `(mean, stddev)` tok/s.
+fn decode_speed(eng: &mut RealLlamaEngine, ids: &[usize], n_gen: usize, runs: usize) -> (f64, f64) {
+    let one_run = |eng: &mut RealLlamaEngine| {
+        eng.reset_context();
+        let t = Instant::now();
+        for &tok in &ids[..n_gen] {
+            std::hint::black_box(argmax(eng.forward_token(tok)));
+        }
+        n_gen as f64 / t.elapsed().as_secs_f64()
+    };
+    one_run(eng);
+    let tps: Vec<f64> = (0..runs).map(|_| one_run(eng)).collect();
+    let mean = tps.iter().sum::<f64>() / runs as f64;
+    let var = tps.iter().map(|t| (t - mean) * (t - mean)).sum::<f64>() / (runs as f64 - 1.0);
+    (mean, var.sqrt())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: {} <model_dir> <token_ids_file> [n_chunks=64] [n_ctx=256]", args[0]);
+        eprintln!("usage: {} <model_dir> <token_ids_file> [--chunks N] [--ctx N] [--modes q40,b4,mk,b5] [--calib-ids FILE] [--calib-tokens N] [--speed]", args[0]);
         std::process::exit(1);
     }
+    let flag = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].clone());
     let model_dir = Path::new(&args[1]);
-    let ids: Vec<usize> = std::fs::read_to_string(&args[2])
-        .expect("failed to read token ids")
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.trim().parse().expect("bad token id"))
-        .collect();
-    let n_chunks: usize = args.get(3).map_or(64, |s| s.parse().unwrap());
-    let n_ctx: usize = args.get(4).map_or(256, |s| s.parse().unwrap());
-    let n_chunks = n_chunks.min(ids.len() / n_ctx);
+    let ids = read_ids(&args[2]);
+    let n_ctx: usize = flag("--ctx").map_or(256, |s| s.parse().unwrap());
+    let n_chunks = flag("--chunks").map_or(64, |s| s.parse().unwrap()).min(ids.len() / n_ctx);
+    let modes = flag("--modes").unwrap_or_else(|| "q40,b4,mk,b5".to_string());
+    let speed = args.iter().any(|a| a == "--speed");
     let first = n_ctx / 2;
     let p_cores = 8usize;
 
@@ -76,38 +115,58 @@ fn main() {
         n_chunks * (n_ctx - 1 - first)
     );
 
-    // Same 8 calibration passages as `verify_real_weights` (disjoint from WikiText-2 test).
     let tokenizer = BpeTokenizer::from_model_dir(model_dir).expect("failed to load BPE tokenizer");
-    let raw_calib_texts = [
-        "Photosynthesis converts sunlight, water, and carbon dioxide into chemical energy inside plant chloroplasts while releasing oxygen into the atmosphere.",
-        "Ocean tides rise and fall twice each lunar day because gravitational attraction varies across opposite sides of a rotating coastal basin.",
-        "String instruments produce harmonic overtones when a vibrating bow excites standing waves along a wooden soundboard in a concert hall.",
-        "Suspension bridges distribute heavy roadway loads through vertical suspender cables anchored into bedrock towers on either river bank.",
-        "Artisan sourdough fermentation relies on wild yeast and lactic acid bacteria metabolizing flour starches into aromatic organic acids.",
-        "Spoken human languages organize vowel and consonant phonemes into syllables, morphemes, and recursive grammatical clauses.",
-        "Migratory songbirds navigate across continents at night using geomagnetic inclination cues combined with starlight polarization patterns.",
-        "Metamorphic marble recrystallizes deep within mountain belts when limestone strata experience sustained tectonic pressure and geothermal heat.",
-    ];
-    let calib_sequences: Vec<Vec<usize>> = raw_calib_texts
+    let calib_sequences: Vec<Vec<usize>> = if let Some(path) = flag("--calib-ids") {
+        let calib_tokens: usize = flag("--calib-tokens").map_or(8192, |s| s.parse().unwrap());
+        let calib = read_ids(&path);
+        calib[..calib_tokens.min(calib.len())].chunks(n_ctx).map(|c| c.to_vec()).collect()
+    } else {
+        // Same 8 calibration passages as `verify_real_weights` (disjoint from WikiText-2 test).
+        [
+            "Photosynthesis converts sunlight, water, and carbon dioxide into chemical energy inside plant chloroplasts while releasing oxygen into the atmosphere.",
+            "Ocean tides rise and fall twice each lunar day because gravitational attraction varies across opposite sides of a rotating coastal basin.",
+            "String instruments produce harmonic overtones when a vibrating bow excites standing waves along a wooden soundboard in a concert hall.",
+            "Suspension bridges distribute heavy roadway loads through vertical suspender cables anchored into bedrock towers on either river bank.",
+            "Artisan sourdough fermentation relies on wild yeast and lactic acid bacteria metabolizing flour starches into aromatic organic acids.",
+            "Spoken human languages organize vowel and consonant phonemes into syllables, morphemes, and recursive grammatical clauses.",
+            "Migratory songbirds navigate across continents at night using geomagnetic inclination cues combined with starlight polarization patterns.",
+            "Metamorphic marble recrystallizes deep within mountain belts when limestone strata experience sustained tectonic pressure and geothermal heat.",
+        ]
         .iter()
         .map(|txt| {
             let mut v = vec![tokenizer.eos_token_id];
             v.extend(tokenizer.encode(txt));
             v
         })
-        .collect();
+        .collect()
+    };
+    println!(
+        "Calibration: {} sequences, {} tokens",
+        calib_sequences.len(),
+        calib_sequences.iter().map(|s| s.len()).sum::<usize>()
+    );
 
     let mut fp32 = RealLlamaEngine::load_fp32_reference(model_dir, n_ctx).expect("load fp32");
-    let mut candidates: Vec<(&str, RealLlamaEngine)> = vec![(
-        "In-house GGUF Q4_0 reimpl",
-        fp32.compile_from_reference(RealWeightMode::GgufQ4_0, None),
-    )];
-    for (label, mode) in [
-        ("Kronos Bipolar-4 + GPTQ", RealWeightMode::KronosBipolarGptq { num_planes: 4 }),
-        ("Kronos Bipolar Mixed-K + GPTQ", RealWeightMode::KronosBipolarGptqMixedK),
-        ("Kronos Bipolar-5 + GPTQ", RealWeightMode::KronosBipolarGptq { num_planes: 5 }),
-    ] {
-        candidates.push((label, fp32.compile_sequential_bipolar_gptq(mode, &calib_sequences, p_cores)));
+    let mut candidates: Vec<(&str, RealLlamaEngine)> = Vec::new();
+    for m in modes.split(',') {
+        let t = Instant::now();
+        let (label, eng) = match m {
+            "q40" => (
+                "In-house GGUF Q4_0 reimpl",
+                fp32.compile_from_reference(RealWeightMode::GgufQ4_0, None),
+            ),
+            "b4" | "mk" | "b5" => {
+                let (label, mode) = match m {
+                    "b4" => ("Kronos Bipolar-4 + GPTQ", RealWeightMode::KronosBipolarGptq { num_planes: 4 }),
+                    "mk" => ("Kronos Bipolar Mixed-K + GPTQ", RealWeightMode::KronosBipolarGptqMixedK),
+                    _ => ("Kronos Bipolar-5 + GPTQ", RealWeightMode::KronosBipolarGptq { num_planes: 5 }),
+                };
+                (label, fp32.compile_sequential_bipolar_gptq(mode, &calib_sequences, p_cores))
+            }
+            other => panic!("unknown mode {other}"),
+        };
+        eprintln!("  compiled {label} in {:.1}s", t.elapsed().as_secs_f64());
+        candidates.push((label, eng));
     }
     fp32.set_num_threads(p_cores);
     for (_, eng) in candidates.iter_mut() {
@@ -146,12 +205,11 @@ fn main() {
                         .filter(|(&p, _)| p > -40.0)
                         .map(|(&p, &q)| p.exp() * (p - q))
                         .sum();
-                    let ref_top1 = argmax_f64(lp);
-                    acc.add(-lq[chunk[i + 1]], kl.max(0.0), argmax(logits) == ref_top1);
+                    acc.add(-lq[chunk[i + 1]], kl.max(0.0), argmax(logits) == argmax_f64(lp));
                 }
             }
         }
-        if (c + 1) % 8 == 0 {
+        if (c + 1) % 16 == 0 {
             eprintln!("  chunk {}/{} ({:.0}s)", c + 1, n_chunks, t0.elapsed().as_secs_f64());
         }
     }
@@ -185,11 +243,17 @@ fn main() {
             top1
         );
     }
-}
 
-fn argmax_f64(v: &[f64]) -> usize {
-    v.iter()
-        .enumerate()
-        .fold((0, f64::NEG_INFINITY), |(bi, bv), (i, &x)| if x > bv { (i, x) } else { (bi, bv) })
-        .0
+    if speed {
+        println!("\n  Decode speed (tg32, mean ± sd of 5 runs, tok/s)");
+        for (label, eng) in std::iter::once(("Exact FP32 Reference", &mut fp32))
+            .chain(candidates.iter_mut().map(|(l, e)| (*l, e)))
+        {
+            eng.set_num_threads(1);
+            let (t1, s1) = decode_speed(eng, &ids, 32, 5);
+            eng.set_num_threads(p_cores);
+            let (t8, s8) = decode_speed(eng, &ids, 32, 5);
+            println!("  {:<32} | 1T {:>7.1} ± {:<5.1} | 8T {:>7.1} ± {:<5.1}", label, t1, s1, t8, s8);
+        }
+    }
 }
