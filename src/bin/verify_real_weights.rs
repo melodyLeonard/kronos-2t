@@ -206,7 +206,7 @@ fn main() {
     );
     println!(
         "  {:<46} | {:>9.2}b | {:>16.6}",
-        "llama.cpp GGUF Q4_0 x Q8_0 (G=32)",
+        "In-house Q4_0 x Q8_0 reimpl (G=32)",
         q4_mat.physical_bits_per_weight(),
         cosine_sim(&y_exact, &y_q4)
     );
@@ -319,31 +319,6 @@ proving that a universal machine reading symbols from memory could execute any c
         fp32_gen_1t.max(fp32_eval_1t),
         fp32_gen_8t
     );
-    println!(
-        "  {:<36} | {:>4.2}b | {:>5.1}M | {:>7} | {:>8} | {:>7} | {:>6} | {:>8} | {:>8.1}",
-        "Ollama v0.35 Metal GPU (F16 GGUF)*",
-        16.00,
-        256.5,
-        "~9.29",
-        "~1.0000",
-        "~0.000",
-        "~100%",
-        "-",
-        307.0
-    );
-    println!(
-        "  {:<36} | {:>4.2}b | {:>5.1}M | {:>7} | {:>8} | {:>7} | {:>6} | {:>8} | {:>8.1}",
-        "Ollama v0.35 Metal GPU (Q4_K_M)*",
-        4.85,
-        82.0,
-        "~10.4",
-        "-",
-        "-",
-        "-",
-        "-",
-        435.3
-    );
-
     let mut gen_showcase: Vec<(String, Vec<String>, f64, f64)> = vec![(
         "Exact FP32 Reference (32.00b)".to_string(),
         fp32_outs,
@@ -351,7 +326,7 @@ proving that a universal machine reading symbols from memory could execute any c
         fp32_gen_8t,
     )];
 
-    // 1. Naive Global 1-Plane (1.58b PTQ) & Milestone-4 AWQ 2-Plane (4.50b) & llama.cpp GGUF Q4_0 (4.50b)
+    // 1. Naive Global 1-Plane (1.58b PTQ) & Milestone-4 AWQ 2-Plane (4.50b) & in-house Q4_0 reimpl (4.50b)
     let direct_modes = [
         (
             "Naive Global 1-Plane PTQ (M4 Base)",
@@ -364,7 +339,7 @@ proving that a universal machine reading symbols from memory could execute any c
             false,
         ),
         (
-            "llama.cpp GGUF Q4_0 (G=32 Q4xQ8)",
+            "In-house Q4_0 reimpl (G=32 Q4xQ8)",
             RealWeightMode::GgufQ4_0,
             true,
         ),
@@ -479,7 +454,8 @@ proving that a universal machine reading symbols from memory could execute any c
         );
         gen_showcase.push((label.to_string(), outs_8t, tps_1t, tps_8t));
     }
-    println!("  (*Ollama v0.35.0 llama.cpp Metal GPU measured live on this exact Apple M4 Pro, greedy temp=0.0)");
+    println!("  (In-house Q4_0 is a reimplementation inside this engine, not llama.cpp. For verified comparisons");
+    println!("   against real llama.cpp / Ollama on WikiText-2, see `wikitext_ppl` and BENCHMARKS.md.)");
 
     // --------------------------------------------------------------------------------------------------
     // PART 3: Side-by-Side Live Autoregressive English Text Generation
