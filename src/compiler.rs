@@ -565,7 +565,12 @@ pub struct FullRowGptqHessian {
     raw_h: Vec<f64>,
     pub h_inv_chol_upper: Vec<f32>,
     sample_count: usize,
+    /// Rotated activations awaiting a batched `X^T X` flush (`pending_rows x cols`).
+    pending: Vec<f32>,
 }
+
+/// Activations buffered per batched Hessian flush (`f32` partial sums stay exact enough at this size).
+const HESSIAN_FLUSH_ROWS: usize = 256;
 
 impl FullRowGptqHessian {
     pub fn new(cols: usize) -> Self {
@@ -575,6 +580,7 @@ impl FullRowGptqHessian {
             raw_h: vec![0.0f64; cols * cols],
             h_inv_chol_upper: Vec::new(),
             sample_count: 0,
+            pending: Vec::with_capacity(HESSIAN_FLUSH_ROWS * cols),
         }
     }
 
@@ -588,23 +594,60 @@ impl FullRowGptqHessian {
 
     /// Accumulates an already-Hadamard-rotated activation vector `x_rot`.
     pub fn observe_prerotated(&mut self, x_rot: &[f32]) {
+        assert_eq!(x_rot.len(), self.cols);
+        self.pending.extend_from_slice(x_rot);
+        self.sample_count += 1;
+        if self.pending.len() >= HESSIAN_FLUSH_ROWS * self.cols {
+            self.flush_pending();
+        }
+    }
+
+    /// Adds the upper triangle of `X^T X` for all buffered rows into `raw_h`, splitting rows `i`
+    /// round-robin across threads (balances the triangle) with contiguous `f32` SIMD inner loops.
+    fn flush_pending(&mut self) {
         let c = self.cols;
-        assert_eq!(x_rot.len(), c);
-        for i in 0..c {
-            let xi = x_rot[i] as f64;
-            if xi == 0.0 {
-                continue;
-            }
-            let row = &mut self.raw_h[i * c + i..(i + 1) * c];
-            for (slot, &xj) in row.iter_mut().zip(x_rot[i..].iter()) {
-                *slot += xi * (xj as f64);
+        let n = self.pending.len() / c;
+        if n == 0 {
+            return;
+        }
+        let xs = &self.pending;
+        let workers = std::thread::available_parallelism().map_or(1, |p| p.get()).clamp(1, 8);
+        let partials: Vec<Vec<(usize, Vec<f32>)>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..workers)
+                .map(|w| {
+                    s.spawn(move || {
+                        let mut out = Vec::new();
+                        for i in (w..c).step_by(workers) {
+                            let mut acc = vec![0.0f32; c - i];
+                            for t in 0..n {
+                                let x = &xs[t * c..(t + 1) * c];
+                                let xi = x[i];
+                                if xi != 0.0 {
+                                    for (a, &xj) in acc.iter_mut().zip(x[i..].iter()) {
+                                        *a += xi * xj;
+                                    }
+                                }
+                            }
+                            out.push((i, acc));
+                        }
+                        out
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (i, acc) in partials.into_iter().flatten() {
+            for (slot, &v) in self.raw_h[i * c + i..(i + 1) * c].iter_mut().zip(acc.iter()) {
+                *slot += v as f64;
             }
         }
-        self.sample_count += 1;
+        self.pending.clear();
     }
 
     /// Computes $U = P L^{-1} P$ (`U^T U = (H + damp * I)^{-1}`) in $O(C^3 / 3)$ `f64` flops.
     pub fn finalize(&mut self, damp_ratio: f64) {
+        self.flush_pending();
+        self.pending = Vec::new();
         let c = self.cols;
         let denom = (self.sample_count.max(1)) as f64;
 

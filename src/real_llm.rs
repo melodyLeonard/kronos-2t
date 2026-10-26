@@ -13,7 +13,7 @@ use crate::compiler::{
     compile_global_ternary_as_multiplane, compile_hadamard_gptq_bipolar,
     compile_hadamard_gptq_full_row, compile_multiplane_ternary, FullRowGptqHessian,
 };
-use crate::hadamard::fwht64_signed_inplace;
+use crate::hadamard::{fwht64_signed_inplace, ifwht64_signed_inplace};
 use crate::safetensors::{JsonCursor, SafeTensorsFile};
 use crate::simd_lut::{
     simd_lut_base3_gemv, simd_lut_base3_stripe_range, simd_lut_bipolar_gemv,
@@ -25,6 +25,34 @@ use crate::thread_pool::SpinThreadPool;
 use std::fs;
 use std::io;
 use std::path::Path;
+
+/// File magic for [`RealLlamaEngine::save_bipolar`] caches.
+const BIPOLAR_CACHE_MAGIC: &[u8] = b"K2TBIPOLAR1\n";
+
+/// Little-endian cursor over a [`RealLlamaEngine::save_bipolar`] cache.
+struct CacheReader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> CacheReader<'a> {
+    fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
+        let out = self.bytes.get(self.pos..self.pos + n).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "truncated bipolar cache")
+        })?;
+        self.pos += n;
+        Ok(out)
+    }
+
+    fn u64(&mut self) -> io::Result<usize> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()) as usize)
+    }
+
+    fn f32s(&mut self) -> io::Result<Vec<f32>> {
+        let n = self.u64()?;
+        Ok(self.take(n * 4)?.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+    }
+}
 
 /// Model hyperparameters parsed from HuggingFace `config.json`.
 #[derive(Clone, Debug)]
@@ -143,6 +171,15 @@ pub enum RealWeightMode {
     /// `4-Plane` (`4.25b`, `16` levels) on `qkv_proj`/`o_proj`/`gate_up_proj` + `5-Plane` (`5.25b`,
     /// `32` levels) on `down_proj` & `lm_head` (beats `GGUF Q4_K_M` at lower bit-width!).
     KronosBipolarGptqMixedK,
+    /// **`kronos-2t` Bipolar per-matrix plane allocation** (`3..=6` planes each for `qkv_proj`,
+    /// `o_proj`, `gate_up_proj`, `down_proj` and `lm_head`).
+    KronosBipolarGptqPlanes {
+        qkv: usize,
+        o: usize,
+        gate_up: usize,
+        down: usize,
+        head: usize,
+    },
 }
 
 enum LinearBackend {
@@ -214,7 +251,8 @@ impl LinearBackend {
                 )),
                 0.0,
             ),
-            RealWeightMode::KronosBipolarGptqMixedK => (
+            RealWeightMode::KronosBipolarGptqMixedK
+            | RealWeightMode::KronosBipolarGptqPlanes { .. } => (
                 Self::FusedBipolar(compile_hadamard_gptq_bipolar(w_ref, rows, cols, 4, None, 4)),
                 0.0,
             ),
@@ -1187,11 +1225,14 @@ impl RealLlamaEngine {
         compile_threads: usize,
     ) -> Self {
         assert_eq!(self.mode, RealWeightMode::ExactFp32);
-        let (base_planes, o_planes, down_planes, head_planes) = match mode {
+        let (qkv_planes, o_planes, gate_up_planes, down_planes, head_planes) = match mode {
             RealWeightMode::KronosBipolarGptq { num_planes } => {
-                (num_planes, num_planes, num_planes, num_planes)
+                (num_planes, num_planes, num_planes, num_planes, num_planes)
             }
-            RealWeightMode::KronosBipolarGptqMixedK => (4, 5, 5, 5),
+            RealWeightMode::KronosBipolarGptqMixedK => (4, 5, 4, 5, 5),
+            RealWeightMode::KronosBipolarGptqPlanes { qkv, o, gate_up, down, head } => {
+                (qkv, o, gate_up, down, head)
+            }
             _ => panic!("compile_sequential_bipolar_gptq expects KronosBipolarGptq* mode"),
         };
 
@@ -1249,7 +1290,7 @@ impl RealLlamaEngine {
                 ref_layer.qkv_proj.as_fp32_slice(),
                 qkv_rows,
                 h_dim,
-                base_planes,
+                qkv_planes,
                 Some(&hess_attn),
                 compile_threads,
             );
@@ -1348,7 +1389,7 @@ impl RealLlamaEngine {
                 ref_layer.gate_up_proj.as_fp32_slice(),
                 2 * inter_dim,
                 h_dim,
-                base_planes,
+                gate_up_planes,
                 Some(&hess_mlp),
                 compile_threads,
             );
@@ -1436,7 +1477,12 @@ impl RealLlamaEngine {
             cfg: self.cfg.clone(),
             mode,
             mean_weight_rel_error: 0.0,
-            embed_f32_rows: self.embed_f32_rows.clone(),
+            // Tied embeddings are decoded on the fly from the quantized `lm_head` rows (no FP32 copy).
+            embed_f32_rows: if self.cfg.tie_word_embeddings {
+                Vec::new()
+            } else {
+                self.embed_f32_rows.clone()
+            },
             layers: compiled_layers,
             final_norm: self.final_norm.clone(),
             lm_head: LinearBackend::FusedBipolar(head_mat),
@@ -1444,6 +1490,140 @@ impl RealLlamaEngine {
             pool: None,
             ws: LlamaWorkspace::new(&self.cfg),
         }
+    }
+
+    /// Saves a compiled Bipolar engine (every projection `FusedBipolar`) so later runs can skip the
+    /// sequential GPTQ compile via [`Self::load_bipolar`].
+    pub fn save_bipolar(&self, path: &Path) -> io::Result<()> {
+        use std::io::Write;
+        fn w_u64(w: &mut impl Write, v: usize) -> io::Result<()> {
+            w.write_all(&(v as u64).to_le_bytes())
+        }
+        fn w_f32s(w: &mut impl Write, v: &[f32]) -> io::Result<()> {
+            w_u64(w, v.len())?;
+            v.iter().try_for_each(|x| w.write_all(&x.to_le_bytes()))
+        }
+        fn w_mat(w: &mut impl Write, b: &LinearBackend) -> io::Result<()> {
+            let LinearBackend::FusedBipolar(m) = b else {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "non-bipolar projection"));
+            };
+            w_u64(w, m.rows)?;
+            w_u64(w, m.cols)?;
+            w_u64(w, m.num_planes)?;
+            w_u64(w, m.interleaved_data.len())?;
+            w.write_all(&m.interleaved_data)?;
+            w_u64(w, m.bf16_chunk_scales.len())?;
+            m.bf16_chunk_scales.iter().try_for_each(|x| w.write_all(&x.to_le_bytes()))
+        }
+
+        let mut w = io::BufWriter::new(fs::File::create(path)?);
+        w.write_all(BIPOLAR_CACHE_MAGIC)?;
+        let mode_words = match self.mode {
+            RealWeightMode::KronosBipolarGptq { num_planes } => [0, num_planes, 0, 0, 0, 0],
+            RealWeightMode::KronosBipolarGptqMixedK => [1, 0, 0, 0, 0, 0],
+            RealWeightMode::KronosBipolarGptqPlanes { qkv, o, gate_up, down, head } => {
+                [2, qkv, o, gate_up, down, head]
+            }
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a bipolar engine")),
+        };
+        mode_words.iter().try_for_each(|&v| w_u64(&mut w, v))?;
+        w_u64(&mut w, self.layers.len())?;
+        for l in &self.layers {
+            w_f32s(&mut w, &l.input_norm)?;
+            w_f32s(&mut w, &l.post_attn_norm)?;
+            for b in [&l.qkv_proj, &l.o_proj, &l.gate_up_proj, &l.down_proj] {
+                w_mat(&mut w, b)?;
+            }
+        }
+        w_f32s(&mut w, &self.final_norm)?;
+        w_mat(&mut w, &self.lm_head)?;
+        w_f32s(&mut w, &self.embed_f32_rows)?;
+        w.flush()
+    }
+
+    /// Loads an engine written by [`Self::save_bipolar`]; `model_dir` supplies `config.json`.
+    pub fn load_bipolar(model_dir: &Path, path: &Path, max_seq_len: usize) -> io::Result<Self> {
+        let cfg = LlamaConfig::from_config_json(&model_dir.join("config.json"), max_seq_len)?;
+        let bytes = fs::read(path)?;
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+        if !bytes.starts_with(BIPOLAR_CACHE_MAGIC) {
+            return Err(bad("bad bipolar cache magic"));
+        }
+        let mut rd = CacheReader {
+            bytes: &bytes,
+            pos: BIPOLAR_CACHE_MAGIC.len(),
+        };
+        let r_mat = |rd: &mut CacheReader| -> io::Result<LinearBackend> {
+            let rows = rd.u64()?;
+            let cols = rd.u64()?;
+            let num_planes = rd.u64()?;
+            let n = rd.u64()?;
+            let interleaved_data = rd.take(n)?.to_vec();
+            let n = rd.u64()?;
+            let bf16_chunk_scales =
+                rd.take(n * 2)?.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            Ok(LinearBackend::FusedBipolar(FusedBipolarLutMatrix {
+                rows,
+                cols,
+                num_planes,
+                octets_per_row: cols / 8,
+                num_stripes: rows.div_ceil(SIMD_ROW_STRIPE),
+                num_chunks: cols / 64,
+                interleaved_data,
+                bf16_chunk_scales,
+            }))
+        };
+
+        let mut mw = [0usize; 6];
+        for v in mw.iter_mut() {
+            *v = rd.u64()?;
+        }
+        let mode = match mw[0] {
+            0 => RealWeightMode::KronosBipolarGptq { num_planes: mw[1] },
+            1 => RealWeightMode::KronosBipolarGptqMixedK,
+            _ => RealWeightMode::KronosBipolarGptqPlanes {
+                qkv: mw[1],
+                o: mw[2],
+                gate_up: mw[3],
+                down: mw[4],
+                head: mw[5],
+            },
+        };
+        let num_layers = rd.u64()?;
+        if num_layers != cfg.num_hidden_layers {
+            return Err(bad("layer count does not match config.json"));
+        }
+        let mut layers = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            let input_norm = rd.f32s()?;
+            let post_attn_norm = rd.f32s()?;
+            layers.push(LlamaLayer {
+                input_norm,
+                post_attn_norm,
+                o_inv_scale: None,
+                down_inv_scale: None,
+                qkv_proj: r_mat(&mut rd)?,
+                o_proj: r_mat(&mut rd)?,
+                gate_up_proj: r_mat(&mut rd)?,
+                down_proj: r_mat(&mut rd)?,
+            });
+        }
+        let final_norm = rd.f32s()?;
+        let lm_head = r_mat(&mut rd)?;
+        let embed_f32_rows = rd.f32s()?;
+
+        Ok(Self {
+            rope_cos_sin: build_rope_table(&cfg),
+            ws: LlamaWorkspace::new(&cfg),
+            cfg,
+            mode,
+            mean_weight_rel_error: 0.0,
+            embed_f32_rows,
+            layers,
+            final_norm,
+            lm_head,
+            pool: None,
+        })
     }
 
     /// Total physical RAM occupied by all compiled linear projections (`layers` + `lm_head`).
@@ -1459,6 +1639,11 @@ impl RealLlamaEngine {
             })
             .sum();
         layer_bytes + self.lm_head.physical_bytes()
+    }
+
+    /// Total resident weight RAM: linear projections plus any separate FP32 embedding table.
+    pub fn resident_weight_bytes(&self) -> usize {
+        self.linear_weight_bytes() + self.embed_f32_rows.len() * std::mem::size_of::<f32>()
     }
 
     /// Physical bits per weight across all 30 transformer layers + `lm_head`.
@@ -1498,7 +1683,9 @@ impl RealLlamaEngine {
 
         let is_bipolar = matches!(
             self.mode,
-            RealWeightMode::KronosBipolarGptq { .. } | RealWeightMode::KronosBipolarGptqMixedK
+            RealWeightMode::KronosBipolarGptq { .. }
+                | RealWeightMode::KronosBipolarGptqMixedK
+                | RealWeightMode::KronosBipolarGptqPlanes { .. }
         );
         let is_hadamard = matches!(
             self.mode,
@@ -1513,9 +1700,19 @@ impl RealLlamaEngine {
         );
         let is_q4_0 = matches!(self.mode, RealWeightMode::GgufQ4_0);
 
-        self.ws
-            .hidden
-            .copy_from_slice(&self.embed_f32_rows[token_id * h_dim..(token_id + 1) * h_dim]);
+        if self.embed_f32_rows.is_empty() {
+            match &self.lm_head {
+                LinearBackend::FusedBipolar(m) => {
+                    m.dequantize_row_rotated(token_id, &mut self.ws.hidden);
+                    ifwht64_signed_inplace(&mut self.ws.hidden);
+                }
+                _ => unreachable!("embedding table dropped only for bipolar tied lm_head"),
+            }
+        } else {
+            self.ws
+                .hidden
+                .copy_from_slice(&self.embed_f32_rows[token_id * h_dim..(token_id + 1) * h_dim]);
+        }
         let rope_row = &self.rope_cos_sin[pos * head_dim..(pos + 1) * head_dim];
         let pool_ref = self.pool.as_ref();
 

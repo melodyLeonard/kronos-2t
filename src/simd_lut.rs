@@ -1718,6 +1718,34 @@ impl FusedBipolarLutMatrix {
     pub fn physical_bits_per_weight(&self) -> f64 {
         (self.physical_bytes() as f64 * 8.0) / ((self.rows * self.cols) as f64)
     }
+
+    /// Dequantizes row `r` into `out` (`cols` floats) in the Hadamard-rotated domain; apply
+    /// `ifwht64_signed_inplace` afterwards to recover the original-domain row.
+    pub fn dequantize_row_rotated(&self, r: usize, out: &mut [f32]) {
+        assert!(r < self.rows);
+        assert_eq!(out.len(), self.cols);
+        let np = self.num_planes;
+        let stripe = r / SIMD_ROW_STRIPE;
+        let lane = r % SIMD_ROW_STRIPE;
+        let max_odd = (1i32 << np) - 1;
+        let sc_base = stripe * self.num_chunks * SIMD_ROW_STRIPE;
+        for (o, oct_out) in out.chunks_exact_mut(8).enumerate() {
+            let base = (stripe * self.octets_per_row + o) * np * SIMD_ROW_STRIPE + lane;
+            let delta = bf16_to_f32(
+                self.bf16_chunk_scales[sc_base + (o / BIPOLAR_OCTETS_PER_CHUNK) * SIMD_ROW_STRIPE + lane],
+            );
+            let mut u = [0i32; 8];
+            for p in 0..np {
+                let byte = self.interleaved_data[base + p * SIMD_ROW_STRIPE];
+                for (k, uk) in u.iter_mut().enumerate() {
+                    *uk |= (((byte >> k) & 1) as i32) << p;
+                }
+            }
+            for (dst, &uk) in oct_out.iter_mut().zip(u.iter()) {
+                *dst = ((2 * uk - max_odd) as f32) * delta;
+            }
+        }
+    }
 }
 
 /// Executes [`FusedBipolarLutMatrix`] across all stripes on a single thread.
@@ -3209,5 +3237,40 @@ mod tests {
             "16-level Bipolar-4 ({cos_b4}) must beat Base3-2P ({cos_m2}) and GGUF Q4_0 ({cos_q4})!"
         );
         assert!(cos_b5 > cos_b4 && cos_b5 > 0.999);
+    }
+
+    #[test]
+    fn test_bipolar_dequantize_row_matches_kernel_and_weights() {
+        use crate::compiler::compile_hadamard_gptq_bipolar;
+        use crate::hadamard::{fwht64_signed_inplace, ifwht64_signed_inplace};
+
+        let rows = 40;
+        let cols = 192;
+        let weights: Vec<f32> = (0..rows * cols)
+            .map(|idx| (((idx * 7919 + 13) % 1009) as f32 / 1009.0 - 0.5) * 0.3)
+            .collect();
+        let x: Vec<f32> = (0..cols).map(|c| ((c as f32) * 0.37).sin()).collect();
+        let mut x_rot = x.clone();
+        fwht64_signed_inplace(&mut x_rot);
+
+        for np in [4, 5] {
+            let m = compile_hadamard_gptq_bipolar(&weights, rows, cols, np, None, 2);
+            let mut kernel_out = vec![0.0f32; rows];
+            simd_lut_bipolar_gemv(&m, &BipolarActivationLut::build(&x_rot), &mut kernel_out);
+
+            let mut row = vec![0.0f32; cols];
+            let mut dequant_out = vec![0.0f32; rows];
+            let mut recon = vec![0.0f32; rows * cols];
+            for r in 0..rows {
+                m.dequantize_row_rotated(r, &mut row);
+                dequant_out[r] = row.iter().zip(x_rot.iter()).map(|(a, b)| a * b).sum();
+                ifwht64_signed_inplace(&mut row);
+                recon[r * cols..(r + 1) * cols].copy_from_slice(&row);
+            }
+            let cos_kernel = cosine_similarity(&kernel_out, &dequant_out);
+            let cos_weights = cosine_similarity(&weights, &recon);
+            assert!(cos_kernel > 0.999, "planes {np}: kernel vs dequant cos {cos_kernel}");
+            assert!(cos_weights > 0.99, "planes {np}: reconstruction cos {cos_weights}");
+        }
     }
 }

@@ -8,6 +8,7 @@
 //!   `--calib-ids FILE`  calibrate GPTQ on this token-id file (e.g. WikiText-2 *train*) instead of
 //!                       the 8 built-in passages
 //!   `--calib-tokens N`  tokens taken from `--calib-ids` (default 8192), split into `--ctx` sequences
+//!   `--cache-dir DIR`   reuse/save compiled Bipolar engines (keyed by mode + calibration)
 //!   `--speed`           also measure decode tok/s (`tg32`, 1 and 8 threads, mean of 5 runs)
 //!
 //! `token_ids_file` holds one token id per line, produced by
@@ -91,6 +92,32 @@ fn decode_speed(eng: &mut RealLlamaEngine, ids: &[usize], n_gen: usize, runs: us
     (mean, var.sqrt())
 }
 
+/// Compiles a Bipolar engine, or loads it from `cache_dir` when an identical compile was saved.
+#[allow(clippy::too_many_arguments)]
+fn compile_or_load(
+    fp32: &RealLlamaEngine,
+    model_dir: &Path,
+    mode: RealWeightMode,
+    mode_key: &str,
+    calib_tag: &str,
+    calib_sequences: &[Vec<usize>],
+    cache_dir: Option<&str>,
+    n_ctx: usize,
+) -> RealLlamaEngine {
+    let Some(dir) = cache_dir else {
+        return fp32.compile_sequential_bipolar_gptq(mode, calib_sequences, 8);
+    };
+    let path = Path::new(dir).join(format!("{mode_key}-{calib_tag}.k2tb"));
+    if let Ok(eng) = RealLlamaEngine::load_bipolar(model_dir, &path, n_ctx) {
+        eprintln!("  loaded cached {}", path.display());
+        return eng;
+    }
+    let eng = fp32.compile_sequential_bipolar_gptq(mode, calib_sequences, 8);
+    std::fs::create_dir_all(dir).expect("create cache dir");
+    eng.save_bipolar(&path).expect("save bipolar cache");
+    eng
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
@@ -104,6 +131,15 @@ fn main() {
     let n_chunks = flag("--chunks").map_or(64, |s| s.parse().unwrap()).min(ids.len() / n_ctx);
     let modes = flag("--modes").unwrap_or_else(|| "q40,b4,mk,b5".to_string());
     let speed = args.iter().any(|a| a == "--speed");
+    let cache_dir = flag("--cache-dir");
+    let calib_tag = match flag("--calib-ids") {
+        Some(p) => format!(
+            "{}-{}",
+            Path::new(&p).file_stem().unwrap().to_string_lossy(),
+            flag("--calib-tokens").unwrap_or_else(|| "8192".to_string())
+        ),
+        None => "builtin".to_string(),
+    };
     let first = n_ctx / 2;
     let p_cores = 8usize;
 
@@ -161,7 +197,20 @@ fn main() {
                     "mk" => ("Kronos Bipolar Mixed-K + GPTQ", RealWeightMode::KronosBipolarGptqMixedK),
                     _ => ("Kronos Bipolar-5 + GPTQ", RealWeightMode::KronosBipolarGptq { num_planes: 5 }),
                 };
-                (label, fp32.compile_sequential_bipolar_gptq(mode, &calib_sequences, p_cores))
+                (label, compile_or_load(&fp32, model_dir, mode, m, &calib_tag, &calib_sequences, cache_dir.as_deref(), n_ctx))
+            }
+            // `pQOGDH`: planes for qkv, o, gate_up, down, lm_head (e.g. `p44455`).
+            p if p.len() == 6 && p.starts_with('p') => {
+                let d: Vec<usize> = p[1..].bytes().map(|b| (b - b'0') as usize).collect();
+                let mode = RealWeightMode::KronosBipolarGptqPlanes {
+                    qkv: d[0],
+                    o: d[1],
+                    gate_up: d[2],
+                    down: d[3],
+                    head: d[4],
+                };
+                let label: &'static str = Box::leak(format!("Kronos Bipolar planes {}", &p[1..]).into_boxed_str());
+                (label, compile_or_load(&fp32, model_dir, mode, m, &calib_tag, &calib_sequences, cache_dir.as_deref(), n_ctx))
             }
             other => panic!("unknown mode {other}"),
         };
@@ -224,7 +273,7 @@ fn main() {
         "  {:<32} | {:>5.2}b | {:>6.1}M | {:>9.4} ± {:<6.4} | {:>8} | {:>7}",
         "Exact FP32 Reference",
         fp32.physical_bits_per_weight(),
-        fp32.linear_weight_bytes() as f64 / (1024.0 * 1024.0),
+        fp32.resident_weight_bytes() as f64 / (1024.0 * 1024.0),
         ppl,
         se,
         "-",
@@ -236,7 +285,7 @@ fn main() {
             "  {:<32} | {:>5.2}b | {:>6.1}M | {:>9.4} ± {:<6.4} | {:>8.5} | {:>6.2}%",
             label,
             eng.physical_bits_per_weight(),
-            eng.linear_weight_bytes() as f64 / (1024.0 * 1024.0),
+            eng.resident_weight_bytes() as f64 / (1024.0 * 1024.0),
             ppl,
             se,
             kl,
