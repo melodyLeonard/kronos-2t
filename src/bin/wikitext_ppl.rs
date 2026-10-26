@@ -93,6 +93,9 @@ fn decode_speed(eng: &mut RealLlamaEngine, ids: &[usize], n_gen: usize, runs: us
     (mean, var.sqrt())
 }
 
+/// Bumped whenever the GPTQ compiler changes, so stale `--cache-dir` entries are not reused.
+const COMPILE_REV: u32 = 2;
+
 /// Compiles a Bipolar engine, or loads it from `cache_dir` when an identical compile was saved.
 #[allow(clippy::too_many_arguments)]
 fn compile_or_load(
@@ -108,7 +111,7 @@ fn compile_or_load(
     let Some(dir) = cache_dir else {
         return fp32.compile_sequential_bipolar_gptq(mode, calib_sequences, 8);
     };
-    let path = Path::new(dir).join(format!("{mode_key}-{calib_tag}.k2tb"));
+    let path = Path::new(dir).join(format!("{mode_key}-{calib_tag}-r{COMPILE_REV}.k2tb"));
     if let Ok(eng) = RealLlamaEngine::load_bipolar(model_dir, &path, n_ctx) {
         eprintln!("  loaded cached {}", path.display());
         return eng;

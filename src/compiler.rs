@@ -1040,7 +1040,7 @@ fn quantize_stripe_batch_bipolar(
     max_odd: i32,
     u_slice: Option<&[f32]>,
 ) {
-    let ratios = [0.72f32, 0.80, 0.88, 0.95, 1.02, 1.10];
+    let ratios = [0.62f32, 0.67, 0.72, 0.77, 0.82, 0.87, 0.92, 0.97, 1.02, 1.07, 1.12, 1.18];
     let max_u_f = max_odd as f32;
     let half_off = 0.5 * max_u_f;
 

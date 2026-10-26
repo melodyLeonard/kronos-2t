@@ -1306,7 +1306,7 @@ impl RealLlamaEngine {
                     hess_attn.observe_activation(&norm_buf);
                 }
             }
-            hess_attn.finalize(0.025);
+            hess_attn.finalize(0.01);
             let qkv_mat = compile_hadamard_gptq_bipolar(
                 ref_layer.qkv_proj.as_fp32_slice(),
                 qkv_rows,
@@ -1367,7 +1367,7 @@ impl RealLlamaEngine {
                     flat_cursor += 1;
                 }
             }
-            hess_o.finalize(0.025);
+            hess_o.finalize(0.01);
             let o_mat = compile_hadamard_gptq_bipolar(
                 ref_layer.o_proj.as_fp32_slice(),
                 h_dim,
@@ -1405,7 +1405,7 @@ impl RealLlamaEngine {
                     hess_mlp.observe_activation(&norm_buf);
                 }
             }
-            hess_mlp.finalize(0.025);
+            hess_mlp.finalize(0.01);
             let gate_up_mat = compile_hadamard_gptq_bipolar(
                 ref_layer.gate_up_proj.as_fp32_slice(),
                 2 * inter_dim,
@@ -1439,7 +1439,7 @@ impl RealLlamaEngine {
                     flat_cursor += 1;
                 }
             }
-            hess_down.finalize(0.03);
+            hess_down.finalize(0.01);
             let down_mat = compile_hadamard_gptq_bipolar(
                 ref_layer.down_proj.as_fp32_slice(),
                 h_dim,
@@ -1484,7 +1484,7 @@ impl RealLlamaEngine {
                 hess_head.observe_activation(&norm_buf);
             }
         }
-        hess_head.finalize(0.02);
+        hess_head.finalize(0.01);
         let head_mat = compile_hadamard_gptq_bipolar(
             self.lm_head.as_fp32_slice(),
             self.cfg.vocab_size,
