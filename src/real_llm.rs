@@ -1686,6 +1686,16 @@ impl RealLlamaEngine {
         (self.linear_weight_bytes() as f64 * 8.0) / (total_params as f64)
     }
 
+    /// Drops KV-cache entries after the first `n` tokens.
+    pub fn truncate_context(&mut self, n: usize) {
+        self.ws.pos = self.ws.pos.min(n);
+    }
+
+    /// Tokens currently in the KV cache.
+    pub fn position(&self) -> usize {
+        self.ws.pos
+    }
+
     /// Resets KV cache position to 0.
     pub fn reset_context(&mut self) {
         self.ws.reset();

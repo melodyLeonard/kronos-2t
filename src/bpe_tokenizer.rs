@@ -289,8 +289,8 @@ fn gpt2_regex_split(text: &str) -> Vec<&str> {
         while j < n && chars[j].1.is_whitespace() {
             j += 1;
         }
-        if j < n && (j - i) > 1 && chars[j - 1].1 == ' ' {
-            // Leave the final space attached to the upcoming non-whitespace token!
+        if j < n && (j - i) > 1 {
+            // `\s+(?!\S)`: the last whitespace char starts the next token (`"\n\nx"` -> `"\n"`, `"\n"`, `"x"`).
             out.push(slice_chars(i, j - 1));
             i = j - 1;
         } else {
@@ -313,6 +313,7 @@ mod tests {
             parts,
             vec!["Hello", ",", " ", " world", "!", " don", "'t", " stop", "\n", "now"]
         );
+        assert_eq!(gpt2_regex_split("a\n\nuser\n \tb  "), vec!["a", "\n", "\n", "user", "\n ", "\t", "b", "  "]);
 
         let model_dir = Path::new("/Users/melodyleonard/Documents/project/kronos-2t/models/SmolLM2-135M");
         if model_dir.join("vocab.json").exists() {

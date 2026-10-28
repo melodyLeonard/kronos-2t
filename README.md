@@ -41,8 +41,8 @@ Numbers, method and limitations: [BENCHMARKS.md](BENCHMARKS.md).
 - The Metal GPU processes prompts 4–10x faster than any CPU path, including this one.
 - With generic calibration data, the 4-bit tiers lose their quality edge over llama.cpp.
 - Compiling a model takes minutes (GPTQ), not seconds.
-- Only Llama-architecture models with tied embeddings, on Apple Silicon.
-- No server, sampling options or chat templates; it is a research engine.
+- Only Llama-architecture models with tied embeddings, on ARM64 with `dotprod` (Apple Silicon).
+- One request at a time; it serves a single model on one machine, not a fleet.
 
 ### Building
 
@@ -51,7 +51,45 @@ cargo build --release
 cargo test --release
 ```
 
-### Running
+### Chat and API server
+
+Download an Instruct model from Hugging Face (`config.json`, `model.safetensors`, `vocab.json`,
+`merges.txt`, `tokenizer.json`) into `models/<name>`, then chat in the terminal:
+
+```bash
+cargo run --release --bin kronos_chat -- models/SmolLM2-1.7B-Instruct --calib calib.txt
+```
+
+The first run compiles the model with GPTQ on `calib.txt` (any few hundred KB of plain text;
+a mix of encyclopedic and web text works well) and caches it as
+`models/<name>/kronos-<mode>.k2tb`. Later runs load the cache in seconds and no longer need
+`--calib`. `--mode` picks the precision (`b4`, `p55454` (default), `b5`, `b6`); see
+[BENCHMARKS.md](BENCHMARKS.md) for the size, quality and speed of each.
+
+`kronos_server` serves the same model over an OpenAI-compatible HTTP API, so any OpenAI client
+library works by changing its base URL:
+
+```bash
+cargo run --release --bin kronos_server -- models/SmolLM2-1.7B-Instruct --port 8080 --api-key secret
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="secret")
+reply = client.chat.completions.create(
+    model="kronos", messages=[{"role": "user", "content": "Summarize GPTQ in one line."}])
+print(reply.choices[0].message.content)
+```
+
+Endpoints: `POST /v1/chat/completions` (`stream: true` sends server-sent events), `GET /v1/models`,
+`GET /health`. Supported request fields: `messages`, `temperature`, `top_p`, `top_k`,
+`max_tokens`, `repetition_penalty`, `seed`, `stream`. The server binds to `127.0.0.1` by
+default; use `--host 0.0.0.0` and `--api-key` to expose it on a network. It runs one
+generation at a time and reuses the KV cache when a request extends the previous conversation.
+
+To embed Kronos in another Rust program, use `kronos_2t::chat::ChatModel` directly.
+
+### Benchmarking
 
 `wikitext_ppl` compiles a model, measures quality the same way as `llama-perplexity`, and
 optionally measures decode and prefill speed:

@@ -11,6 +11,8 @@
 //! - [`mmap_pager`]: Zero-copy POSIX `mmap` + `POSIX_MADV_WILLNEED` asynchronous Flash pager.
 //! - [`ssd`]: Constant-memory $O(1)$ State-Space Dual (SSD) block with induction shift.
 //! - [`accel`]: Parallel SYRK / Cholesky / triangular inverse for GPTQ.
+//! - [`chat`]: Chat template, sampling and streaming on a compiled model.
+//! - [`json`]: Minimal JSON values for the HTTP API.
 //! - [`compiler`]: BitNet $b1.58$ ternary quantizer & Multi-Rank Kronecker `.k2t` factorizer.
 //! - [`engine`]: Zero-allocation multi-layer sparse inference runtime.
 //! - [`demo_model`]: Trainable `.k2t`-compiled language & 1,200-token Needle-in-a-Haystack suite.
@@ -20,10 +22,12 @@
 
 pub mod accel;
 pub mod bpe_tokenizer;
+pub mod chat;
 pub mod compiler;
 pub mod demo_model;
 pub mod engine;
 pub mod hadamard;
+pub mod json;
 pub mod k2t_format;
 pub mod lut_gemv;
 pub mod mmap_pager;
