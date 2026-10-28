@@ -1691,6 +1691,53 @@ impl RealLlamaEngine {
         self.ws.pos = self.ws.pos.min(n);
     }
 
+    /// Embedding row of `token` (decoded from the quantized LM head when embeddings are tied).
+    pub fn embed(&self, token: usize, out: &mut [f32]) {
+        let h = self.cfg.hidden_size;
+        if !self.embed_f32_rows.is_empty() {
+            out.copy_from_slice(&self.embed_f32_rows[token * h..(token + 1) * h]);
+            return;
+        }
+        match &self.lm_head {
+            LinearBackend::FusedBipolar(m) => m.dequantize_row_rotated(token, out),
+            LinearBackend::Nibble4(m) => m.dequantize_row_rotated(token, out),
+            _ => unreachable!("embedding table dropped only for bipolar tied lm_head"),
+        }
+        ifwht64_signed_inplace(out);
+    }
+
+    /// Replaces the KV cache with positions `0..n` from `keys`/`values` laid out
+    /// `[layers, rows, kv_dim]` (`rows >= n`), e.g. from an external prefill.
+    pub fn load_prefix_kv(&mut self, keys: &[f32], values: &[f32], rows: usize, n: usize) {
+        let kvd = self.cfg.kv_dim();
+        let stride = self.cfg.max_seq_len * kvd;
+        assert!(n <= rows && n <= self.cfg.max_seq_len);
+        assert_eq!(keys.len(), self.layers.len() * rows * kvd);
+        for l in 0..self.layers.len() {
+            let src = l * rows * kvd;
+            self.ws.k_cache[l * stride..l * stride + n * kvd].copy_from_slice(&keys[src..src + n * kvd]);
+            self.ws.v_cache[l * stride..l * stride + n * kvd].copy_from_slice(&values[src..src + n * kvd]);
+        }
+        self.ws.pos = n;
+    }
+
+    /// Logits from a last-layer hidden state (final RMSNorm + LM head). SDOT engines only.
+    pub fn logits_from_hidden(&mut self, hidden: &[f32]) -> &[f32] {
+        rms_norm(hidden, &self.final_norm, self.cfg.rms_norm_eps, &mut self.ws.norm_buf);
+        fwht64_signed_inplace(&mut self.ws.norm_buf);
+        self.ws.blut_hidden.populate(&self.ws.norm_buf);
+        self.lm_head.forward_exec(
+            &self.ws.norm_buf,
+            None,
+            Some(&self.ws.blut_hidden),
+            &self.ws.q8_hidden_vals,
+            &self.ws.q8_hidden_scales,
+            self.pool.as_ref(),
+            &mut self.ws.logits,
+        );
+        &self.ws.logits
+    }
+
     /// Tokens currently in the KV cache.
     pub fn position(&self) -> usize {
         self.ws.pos

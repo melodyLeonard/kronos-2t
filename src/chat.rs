@@ -62,6 +62,8 @@ pub struct Completion {
     pub finish: FinishReason,
     pub prefill_secs: f64,
     pub decode_secs: f64,
+    /// `"ane"` when the Neural Engine ran the prefill, else `"cpu"`.
+    pub prefill_unit: &'static str,
 }
 
 /// `b4`, `b5`, `b6` or `pQOGDH` (plane counts 4–6 for qkv, o, gate_up, down, lm_head).
@@ -101,6 +103,8 @@ pub struct ChatModel {
     cached: Vec<usize>,
     ctx: usize,
     pub name: String,
+    #[cfg(all(feature = "ane", target_os = "macos"))]
+    ane: Vec<(usize, crate::coreml::CoreMlModel)>,
 }
 
 impl ChatModel {
@@ -139,11 +143,63 @@ impl ChatModel {
             "{}-kronos-{mode_key}",
             model_dir.file_name().map_or("model".into(), |n| n.to_string_lossy().to_lowercase())
         );
-        Ok(Self { engine, tok, im_start, im_end, newline, cached: Vec::new(), ctx, name })
+        Ok(Self {
+            engine,
+            tok,
+            im_start,
+            im_end,
+            newline,
+            cached: Vec::new(),
+            ctx,
+            name,
+            #[cfg(all(feature = "ane", target_os = "macos"))]
+            ane: Vec::new(),
+        })
     }
 
     pub fn context_size(&self) -> usize {
         self.ctx
+    }
+
+    /// Loads Neural Engine prefill models `prefill_s<N>.mlmodelc` from `dir` (see
+    /// `ane/export_prefill.py`); returns the prompt-length buckets found.
+    #[cfg(all(feature = "ane", target_os = "macos"))]
+    pub fn enable_ane(&mut self, dir: &Path) -> Result<Vec<usize>, String> {
+        use crate::coreml::{ComputeUnits, CoreMlModel};
+        let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(n) = name.strip_prefix("prefill_s").and_then(|r| r.strip_suffix(".mlmodelc")) else {
+                continue;
+            };
+            let seq: usize = n.parse().map_err(|_| format!("bad bucket name {name}"))?;
+            if seq <= self.ctx {
+                let mut m = CoreMlModel::load(&e.path(), ComputeUnits::CpuAndNeuralEngine)?;
+                // The first prediction pays a one-time Neural Engine setup cost.
+                let h = self.engine.cfg.hidden_size;
+                m.predict("x", &[1, seq, h], &vec![0.0; seq * h], &["hidden"])?;
+                self.ane.push((seq, m));
+            }
+        }
+        self.ane.sort_by_key(|(s, _)| *s);
+        Ok(self.ane.iter().map(|(s, _)| *s).collect())
+    }
+
+    /// Prefills `prompt` from an empty cache on the Neural Engine, if a bucket fits.
+    #[cfg(all(feature = "ane", target_os = "macos"))]
+    fn ane_prefill(&mut self, prompt: &[usize]) -> Option<Result<Vec<f32>, String>> {
+        let n = prompt.len();
+        let (seq, model) = self.ane.iter_mut().find(|(s, _)| *s >= n)?;
+        let seq = *seq;
+        let h = self.engine.cfg.hidden_size;
+        let mut x = vec![0.0f32; seq * h];
+        for (t, &tok) in prompt.iter().enumerate() {
+            self.engine.embed(tok, &mut x[t * h..(t + 1) * h]);
+        }
+        Some(model.predict("x", &[1, seq, h], &x, &["hidden", "keys", "values"]).map(|out| {
+            self.engine.load_prefix_kv(&out[1], &out[2], seq, n);
+            self.engine.logits_from_hidden(&out[0][(n - 1) * h..n * h]).to_vec()
+        }))
     }
 
     /// ChatML prompt ending with an open assistant turn; adds the default system prompt if none.
@@ -194,7 +250,18 @@ impl ChatModel {
         self.engine.truncate_context(common);
         self.cached.truncate(common);
         let t0 = Instant::now();
-        let mut logits = self.engine.forward_prompt(&prompt[common..]).to_vec();
+        let mut prefill_unit = "cpu";
+        #[cfg(all(feature = "ane", target_os = "macos"))]
+        let ane_logits = if common == 0 { self.ane_prefill(&prompt).transpose()? } else { None };
+        #[cfg(not(all(feature = "ane", target_os = "macos")))]
+        let ane_logits: Option<Vec<f32>> = None;
+        let mut logits = match ane_logits {
+            Some(l) => {
+                prefill_unit = "ane";
+                l
+            }
+            None => self.engine.forward_prompt(&prompt[common..]).to_vec(),
+        };
         self.cached.extend_from_slice(&prompt[common..]);
         let prefill_secs = t0.elapsed().as_secs_f64();
 
@@ -233,6 +300,7 @@ impl ChatModel {
             finish,
             prefill_secs,
             decode_secs: t1.elapsed().as_secs_f64(),
+            prefill_unit,
         })
     }
 }
