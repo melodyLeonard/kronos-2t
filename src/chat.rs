@@ -6,6 +6,10 @@ use crate::real_llm::{argmax, RealLlamaEngine, RealWeightMode};
 use std::path::Path;
 use std::time::Instant;
 
+/// Minimum new prompt tokens before Neural Engine prefill beats extending the CPU cache.
+#[cfg(all(feature = "ane", target_os = "macos"))]
+const ANE_MIN_NEW_TOKENS: usize = 32;
+
 pub const DEFAULT_SYSTEM: &str = "You are a helpful AI assistant named SmolLM, trained by Hugging Face";
 
 #[derive(Clone, Debug)]
@@ -252,12 +256,20 @@ impl ChatModel {
         let t0 = Instant::now();
         let mut prefill_unit = "cpu";
         #[cfg(all(feature = "ane", target_os = "macos"))]
-        let ane_logits = if common == 0 { self.ane_prefill(&prompt).transpose()? } else { None };
+        // The Neural Engine recomputes the whole prompt from position 0; worth it once there is
+        // a meaningful amount of new text, even when a shared prefix (system prompt) is cached.
+        let ane_logits = if prompt.len() - common >= ANE_MIN_NEW_TOKENS {
+            self.ane_prefill(&prompt).transpose()?
+        } else {
+            None
+        };
         #[cfg(not(all(feature = "ane", target_os = "macos")))]
         let ane_logits: Option<Vec<f32>> = None;
         let mut logits = match ane_logits {
             Some(l) => {
                 prefill_unit = "ane";
+                common = 0;
+                self.cached.clear();
                 l
             }
             None => self.engine.forward_prompt(&prompt[common..]).to_vec(),

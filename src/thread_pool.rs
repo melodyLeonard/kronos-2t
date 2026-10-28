@@ -29,7 +29,6 @@ struct CachePadded<T>(T);
 struct DispatchHeader {
     epoch: AtomicUsize,
     total_items: AtomicUsize,
-    num_participants: AtomicUsize,
     task_fn: AtomicUsize,
     task_ctx: AtomicUsize,
     shutdown: AtomicBool,
@@ -40,6 +39,10 @@ struct SharedPoolState {
     header: CachePadded<DispatchHeader>,
     /// Decremented once per worker upon finishing a wave (isolated 128B cache line!).
     active_remaining: CachePadded<AtomicUsize>,
+    /// Next unclaimed item of the current wave; threads claim `chunk`-sized ranges from it so a
+    /// core slowed by other processes takes fewer ranges instead of stalling the wave.
+    next_item: CachePadded<AtomicUsize>,
+    chunk: CachePadded<AtomicUsize>,
     /// Idle sleep management (isolated 128B cache line!).
     sleeping_workers: CachePadded<AtomicUsize>,
     idle_lock: Mutex<()>,
@@ -63,19 +66,20 @@ impl SpinThreadPool {
             header: CachePadded(DispatchHeader {
                 epoch: AtomicUsize::new(0),
                 total_items: AtomicUsize::new(0),
-                num_participants: AtomicUsize::new(n),
                 task_fn: AtomicUsize::new(0),
                 task_ctx: AtomicUsize::new(0),
                 shutdown: AtomicBool::new(false),
             }),
             active_remaining: CachePadded(AtomicUsize::new(0)),
+            next_item: CachePadded(AtomicUsize::new(0)),
+            chunk: CachePadded(AtomicUsize::new(1)),
             sleeping_workers: CachePadded(AtomicUsize::new(0)),
             idle_lock: Mutex::new(()),
             idle_cvar: Condvar::new(),
         });
 
         let mut workers = Vec::with_capacity(n.saturating_sub(1));
-        for w_id in 1..n {
+        for _ in 1..n {
             let st = Arc::clone(&shared);
             workers.push(thread::spawn(move || {
                 pin_macos_p_core_qos();
@@ -114,7 +118,7 @@ impl SpinThreadPool {
                         return;
                     }
 
-                    execute_static_partition(&st, w_id);
+                    execute_wave(&st);
                     st.active_remaining.0.fetch_sub(1, Ordering::Release);
                 }
             }));
@@ -147,9 +151,8 @@ impl SpinThreadPool {
         self.num_threads
     }
 
-    /// Executes `f(item_start, item_end)` over `0..total_items` across all pool threads using
-    /// zero-contention deterministic static core-to-stripe partitioning (preserving L1/L2 weight
-    /// cache affinity across successive tokens with zero mid-wave atomic RMWs!).
+    /// Executes `f(item_start, item_end)` over `0..total_items` across all pool threads, which
+    /// claim ranges of about `total_items / (4 * threads)` items from a shared counter.
     #[inline]
     pub fn parallel_for<F>(&self, total_items: usize, _grain: usize, f: F)
     where
@@ -182,6 +185,10 @@ impl SpinThreadPool {
         st.active_remaining
             .0
             .store(self.num_threads - 1, Ordering::Relaxed);
+        st.next_item.0.store(0, Ordering::Relaxed);
+        st.chunk
+            .0
+            .store(total_items.div_ceil(self.num_threads * 4).max(1), Ordering::Relaxed);
 
         let next_epoch = st.header.0.epoch.load(Ordering::Relaxed).wrapping_add(1);
         st.header.0.epoch.store(next_epoch, Ordering::SeqCst);
@@ -191,8 +198,8 @@ impl SpinThreadPool {
             st.idle_cvar.notify_all();
         }
 
-        // Caller executes deterministic Partition 0 directly!
-        execute_static_partition(st, 0);
+        // The caller claims ranges too.
+        execute_wave(st);
 
         while st.active_remaining.0.load(Ordering::Acquire) != 0 {
             std::hint::spin_loop();
@@ -201,19 +208,20 @@ impl SpinThreadPool {
 }
 
 #[inline]
-fn execute_static_partition(st: &SharedPoolState, worker_id: usize) {
+fn execute_wave(st: &SharedPoolState) {
     let total = st.header.0.total_items.load(Ordering::Relaxed);
-    let n_part = st.header.0.num_participants.load(Ordering::Relaxed);
     let fn_addr = st.header.0.task_fn.load(Ordering::Relaxed);
     let ctx = st.header.0.task_ctx.load(Ordering::Relaxed);
-
-    let start = (total * worker_id) / n_part;
-    let end = (total * (worker_id + 1)) / n_part;
-    if start < end {
-        // SAFETY: `fn_addr` was written from `trampoline::<F>` before `epoch` store,
-        // and `[start, end)` partitions `0..total` into strictly disjoint ranges per `worker_id`.
-        let runner: unsafe fn(usize, usize, usize) = unsafe { std::mem::transmute(fn_addr) };
-        unsafe { runner(ctx, start, end) };
+    let chunk = st.chunk.0.load(Ordering::Relaxed);
+    // SAFETY: `fn_addr` was written from `trampoline::<F>` before the `epoch` store.
+    let runner: unsafe fn(usize, usize, usize) = unsafe { std::mem::transmute(fn_addr) };
+    loop {
+        let start = st.next_item.0.fetch_add(chunk, Ordering::Relaxed);
+        if start >= total {
+            break;
+        }
+        // SAFETY: `fetch_add` hands out each `[start, start + chunk)` range exactly once.
+        unsafe { runner(ctx, start, (start + chunk).min(total)) };
     }
 }
 
