@@ -63,8 +63,12 @@ cargo run --release --bin kronos_chat -- models/SmolLM2-1.7B-Instruct --calib ca
 The first run compiles the model with GPTQ on `calib.txt` (any few hundred KB of plain text;
 a mix of encyclopedic and web text works well) and caches it as
 `models/<name>/kronos-<mode>.k2tb`. Later runs load the cache in seconds and no longer need
-`--calib`. `--mode` picks the precision (`b4`, `p55454` (default), `b5`, `b6`); see
+`--calib`. `--mode` picks the precision (`b4`, `nf4g128`, `p55454` (default), `b5`, `b6`); see
 [BENCHMARKS.md](BENCHMARKS.md) for the size, quality and speed of each.
+
+The KV cache is stored as int8 after a Hadamard rotation, about 4x smaller than FP32;
+`--fp32-kv` turns this off. Built with `--features ane`, `--ane` runs prompt prefill on the
+Neural Engine (see [ane/README.md](ane/README.md)).
 
 `kronos_server` serves the same model over an OpenAI-compatible HTTP API, so any OpenAI client
 library works by changing its base URL:
@@ -110,3 +114,6 @@ Models are read from Hugging Face safetensors (`config.json`, `model.safetensors
 `src/router.rs`, `src/synthesis.rs`, `src/ssd.rs`, `src/k2t_format.rs` and `src/mmap_pager.rs`
 are experimental sparse-expert and storage components, run by
 `cargo run --release --bin kronos-2t`. The LLM path above does not use them.
+
+`src/moe_800b.rs` and `bench_800b` are an experiment in streaming mixture-of-experts weights
+from the SSD. They use synthetic weights; no real MoE model runs yet.

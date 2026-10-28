@@ -11,28 +11,34 @@
 
 use crate::compiler::{
     compile_global_ternary_as_multiplane, compile_hadamard_gptq_bipolar,
-    compile_hadamard_gptq_full_row, compile_multiplane_ternary, FullRowGptqHessian,
+    compile_hadamard_gptq_full_row, compile_hadamard_gptq_nf, compile_hadamard_gptq_vq2,
+    compile_multiplane_ternary, FullRowGptqHessian,
 };
 use crate::hadamard::{fwht64_signed_inplace, ifwht64_signed_inplace};
 use crate::safetensors::{JsonCursor, SafeTensorsFile};
 use crate::simd_lut::{
-    nibble4_sdot_batch_stripe_range, nibble4_sdot_stripe_range, nibble4_sdot_stripe_range_int8,
-    nibble4_sdot_stripe_range_raw, simd_lut_base3_gemv, simd_lut_base3_stripe_range,
-    simd_lut_bipolar_gemv, simd_lut_bipolar_stripe_range, simd_lut_gemv_multiplane,
-    BipolarActivationLut, FusedBase3LutMatrix, FusedBipolarLutMatrix, GgufQ4_0Matrix,
-    Int8ChunkActivation, MultiPlaneTernaryMatrix, Nibble4SdotMatrix, QuantizedActivationLut,
-    SIMD_ROW_STRIPE,
+    nf_sdot_batch_stripe_range, nf_sdot_stripe_range, nf_sdot_stripe_range_int8,
+    nf_sdot_stripe_range_raw, nibble4_sdot_batch_stripe_range, nibble4_sdot_stripe_range,
+    nibble4_sdot_stripe_range_int8, nibble4_sdot_stripe_range_raw, simd_lut_base3_gemv,
+    simd_lut_base3_stripe_range, simd_lut_bipolar_gemv, simd_lut_bipolar_stripe_range,
+    simd_lut_gemv_multiplane, vq2_lut_gemv, vq2_lut_stripe_range, vq2_lut_stripe_range_raw,
+    vq2_sdot_batch_stripe_range, BipolarActivationLut, FusedBase3LutMatrix, FusedBipolarLutMatrix,
+    GgufQ4_0Matrix, Int8ChunkActivation, MultiPlaneTernaryMatrix, NfSdotMatrix, Nibble4SdotMatrix,
+    QuantizedActivationLut, Vq2ActivationLut, Vq2LutMatrix, SIMD_ROW_STRIPE,
 };
 use crate::thread_pool::{physical_p_cores, SpinBarrier, SpinThreadPool};
 use std::fs;
 use std::io;
 use std::path::Path;
 
-/// Hessian off-diagonal shrinkage for the Bipolar GPTQ compile.
+/// Hessian off-diagonal shrinkage for the Bipolar / VQ2 GPTQ compile.
 const BIPOLAR_GPTQ_DAMP: f64 = 0.01;
 
-/// File magic for [`RealLlamaEngine::save_bipolar`] caches.
+/// Cache magic for Bipolar-only engines.
 const BIPOLAR_CACHE_MAGIC: &[u8] = b"K2TBIPOLAR1\n";
+
+/// Cache magic for VQ2 and mixed VQ2/Bipolar engines.
+const KRONOS2_CACHE_MAGIC: &[u8] = b"K2TKRONOS2\n";
 
 /// Little-endian cursor over a [`RealLlamaEngine::save_bipolar`] cache.
 struct CacheReader<'a> {
@@ -184,6 +190,26 @@ pub enum RealWeightMode {
         down: usize,
         head: usize,
     },
+    /// 2D vector-quantized GPTQ ([`Vq2LutMatrix`]). `scale_group_chunks` 1, 2, 4 give 2.25, 2.125,
+    /// 2.0625 bits/weight.
+    KronosVq2Gptq { scale_group_chunks: usize },
+    /// VQ2 FFN with `attn_head_planes`-plane Bipolar attention and LM head.
+    KronosVq2MixedGptq {
+        attn_head_planes: usize,
+        scale_group_chunks: usize,
+    },
+    /// Lloyd-Max NF4/NF3 with GPTQ. `scale_group_chunks` 1 or 2 (`g128`); 4.25/4.125 bpw at 4 bits,
+    /// 3.25/3.125 at 3 bits.
+    KronosNfGptq {
+        bits: usize,
+        scale_group_chunks: usize,
+    },
+    /// `ffn_bits` NF FFN with `attn_head_bits` NF attention and LM head.
+    KronosNfMixedGptq {
+        attn_head_bits: usize,
+        ffn_bits: usize,
+        scale_group_chunks: usize,
+    },
 }
 
 enum LinearBackend {
@@ -198,6 +224,10 @@ enum LinearBackend {
     FusedBipolar(FusedBipolarLutMatrix),
     /// Bipolar weights repacked for `SDOT`.
     Nibble4(Nibble4SdotMatrix),
+    /// Lloyd-Max NF4/NF3 weights for `SDOT`.
+    NfSdot(NfSdotMatrix),
+    /// 2-bit vector-quantized weights.
+    Vq2(Vq2LutMatrix),
 }
 
 impl LinearBackend {
@@ -262,6 +292,49 @@ impl LinearBackend {
                 Self::FusedBipolar(compile_hadamard_gptq_bipolar(w_ref, rows, cols, 4, None, 4)),
                 0.0,
             ),
+            RealWeightMode::KronosVq2Gptq { scale_group_chunks }
+            | RealWeightMode::KronosVq2MixedGptq { scale_group_chunks, .. } => (
+                Self::Vq2(compile_hadamard_gptq_vq2(
+                    w_ref,
+                    rows,
+                    cols,
+                    scale_group_chunks,
+                    None,
+                    4,
+                )),
+                0.0,
+            ),
+            RealWeightMode::KronosNfGptq {
+                bits,
+                scale_group_chunks,
+            } => (
+                Self::NfSdot(compile_hadamard_gptq_nf(
+                    w_ref,
+                    rows,
+                    cols,
+                    bits,
+                    scale_group_chunks,
+                    None,
+                    4,
+                )),
+                0.0,
+            ),
+            RealWeightMode::KronosNfMixedGptq {
+                attn_head_bits,
+                scale_group_chunks,
+                ..
+            } => (
+                Self::NfSdot(compile_hadamard_gptq_nf(
+                    w_ref,
+                    rows,
+                    cols,
+                    attn_head_bits,
+                    scale_group_chunks,
+                    None,
+                    4,
+                )),
+                0.0,
+            ),
         }
     }
 
@@ -280,6 +353,8 @@ impl LinearBackend {
             Self::FusedBase3(m) => m.physical_bytes(),
             Self::FusedBipolar(m) => m.physical_bytes(),
             Self::Nibble4(m) => m.physical_bytes(),
+            Self::NfSdot(m) => m.physical_bytes(),
+            Self::Vq2(m) => m.physical_bytes(),
         }
     }
 
@@ -290,6 +365,7 @@ impl LinearBackend {
         x: &[f32],
         qlut: Option<&QuantizedActivationLut>,
         blut: Option<&BipolarActivationLut>,
+        vlut: Option<&Vq2ActivationLut>,
         q8_vals: &[i8],
         q8_scales: &[f32],
         pool: Option<&SpinThreadPool>,
@@ -402,7 +478,7 @@ impl LinearBackend {
                 let n_stripes = mat.num_stripes;
                 let out_addr = out.as_mut_ptr() as usize;
                 if let Some(p) = pool.filter(|p| p.num_threads() > 1 && n_stripes >= 16) {
-                    let grain = (n_stripes / (p.num_threads() * 2)).clamp(4, 128);
+                    let grain = ((n_stripes / (p.num_threads() * 2)) & !1).clamp(2, 128);
                     p.parallel_for(n_stripes, grain, |s_start, s_end| {
                         // SAFETY: Disjoint 16-row stripes write disjoint `out` slices.
                         unsafe {
@@ -412,6 +488,39 @@ impl LinearBackend {
                 } else {
                     // SAFETY: Single-threaded full stripe range.
                     unsafe { nibble4_sdot_stripe_range(mat, act, 0, n_stripes, out_addr as *mut f32) };
+                }
+            }
+            Self::NfSdot(mat) => {
+                let act = blut.expect("BipolarActivationLut required for NfSdot");
+                let n_stripes = mat.num_stripes;
+                let out_addr = out.as_mut_ptr() as usize;
+                if let Some(p) = pool.filter(|p| p.num_threads() > 1 && n_stripes >= 16) {
+                    let grain = ((n_stripes / (p.num_threads() * 2)) & !1).clamp(2, 128);
+                    p.parallel_for(n_stripes, grain, |s_start, s_end| {
+                        // SAFETY: Disjoint 16-row stripes write disjoint `out` slices.
+                        unsafe {
+                            nf_sdot_stripe_range(mat, act, s_start, s_end, out_addr as *mut f32);
+                        }
+                    });
+                } else {
+                    // SAFETY: Single-threaded full stripe range.
+                    unsafe { nf_sdot_stripe_range(mat, act, 0, n_stripes, out_addr as *mut f32) };
+                }
+            }
+            Self::Vq2(mat) => {
+                let lut = vlut.expect("Vq2ActivationLut required for Vq2");
+                let n_stripes = mat.num_stripes;
+                let out_addr = out.as_mut_ptr() as usize;
+                if let Some(p) = pool.filter(|p| p.num_threads() > 1 && n_stripes >= 16) {
+                    let grain = ((n_stripes / (p.num_threads() * 2)) & !3).clamp(4, 128);
+                    p.parallel_for(n_stripes, grain, |s_start, s_end| {
+                        // SAFETY: Disjoint 16-row stripes write disjoint `out` slices.
+                        unsafe {
+                            vq2_lut_stripe_range(mat, lut, s_start, s_end, out_addr as *mut f32);
+                        }
+                    });
+                } else {
+                    vq2_lut_gemv(mat, lut, out);
                 }
             }
         }
@@ -499,6 +608,8 @@ struct LlamaLayer {
     o_proj: LinearBackend,
     /// Fused `[gate_proj; up_proj]` (`[2 * intermediate_size, hidden_size]`).
     gate_up_proj: LinearBackend,
+    /// `gate_up_proj` rows interleaved in 64-row blocks `[gate_64(ic), up_64(ic)]`.
+    gate_up_interleaved: bool,
     down_proj: LinearBackend,
 }
 
@@ -584,11 +695,93 @@ impl PromptScratch {
     }
 }
 
+/// INT8 KV cache, KV-head-major. Post-RoPE heads are rotated by a signed FWHT-64 to spread RoPE
+/// outliers, then quantized with one FP32 scale per head and token.
+struct QuantizedKvCache {
+    num_layers: usize,
+    num_kv_heads: usize,
+    max_seq_len: usize,
+    k_q8: Vec<i8>,
+    v_q8: Vec<i8>,
+    k_scales: Vec<f32>,
+    v_scales: Vec<f32>,
+}
+
+impl QuantizedKvCache {
+    fn new(cfg: &LlamaConfig) -> Self {
+        assert_eq!(
+            cfg.head_dim(),
+            64,
+            "Hadamard Q8 KV-cache requires head_dim == 64"
+        );
+        let slots = cfg.num_hidden_layers * cfg.num_key_value_heads * cfg.max_seq_len;
+        Self {
+            num_layers: cfg.num_hidden_layers,
+            num_kv_heads: cfg.num_key_value_heads,
+            max_seq_len: cfg.max_seq_len,
+            k_q8: vec![0i8; slots * 64],
+            v_q8: vec![0i8; slots * 64],
+            k_scales: vec![0.0f32; slots],
+            v_scales: vec![0.0f32; slots],
+        }
+    }
+
+    #[inline]
+    fn physical_bytes(&self) -> usize {
+        (self.k_q8.len() + self.v_q8.len()) * std::mem::size_of::<i8>()
+            + (self.k_scales.len() + self.v_scales.len()) * std::mem::size_of::<f32>()
+    }
+
+    #[inline]
+    fn head_slot_base(&self, layer_idx: usize, kvh: usize) -> usize {
+        debug_assert!(layer_idx < self.num_layers && kvh < self.num_kv_heads);
+        (layer_idx * self.num_kv_heads + kvh) * self.max_seq_len
+    }
+
+    #[inline]
+    fn store_k_head64(&mut self, layer_idx: usize, kvh: usize, pos: usize, k_head: &[f32]) {
+        let slot = self.head_slot_base(layer_idx, kvh) + pos;
+        // SAFETY: `slot < k_scales.len()` and `slot * 64 + 64 <= k_q8.len()`.
+        unsafe {
+            store_hadamard_q8_head64_raw(
+                k_head,
+                self.k_q8.as_mut_ptr().add(slot * 64),
+                self.k_scales.as_mut_ptr().add(slot),
+            );
+        }
+    }
+
+    #[inline]
+    fn store_v_head64(&mut self, layer_idx: usize, kvh: usize, pos: usize, v_head: &[f32]) {
+        let slot = self.head_slot_base(layer_idx, kvh) + pos;
+        // SAFETY: `slot < v_scales.len()` and `slot * 64 + 64 <= v_q8.len()`.
+        unsafe {
+            store_hadamard_q8_head64_raw(
+                v_head,
+                self.v_q8.as_mut_ptr().add(slot * 64),
+                self.v_scales.as_mut_ptr().add(slot),
+            );
+        }
+    }
+
+    #[inline]
+    fn head_views(&self, layer_idx: usize, kvh: usize, seq_len: usize) -> (&[i8], &[f32], &[i8], &[f32]) {
+        let base = self.head_slot_base(layer_idx, kvh);
+        (
+            &self.k_q8[base * 64..(base + seq_len) * 64],
+            &self.k_scales[base..base + seq_len],
+            &self.v_q8[base * 64..(base + seq_len) * 64],
+            &self.v_scales[base..base + seq_len],
+        )
+    }
+}
+
 /// Pre-allocated zero-allocation execution workspace and KV cache for [`RealLlamaEngine`].
 struct LlamaWorkspace {
     pos: usize,
     k_cache: Vec<f32>,
     v_cache: Vec<f32>,
+    q8_kv: Option<QuantizedKvCache>,
     hidden: Vec<f32>,
     norm_buf: Vec<f32>,
     qkv_buf: Vec<f32>,
@@ -602,6 +795,8 @@ struct LlamaWorkspace {
     qlut_inter: QuantizedActivationLut,
     blut_hidden: BipolarActivationLut,
     blut_inter: BipolarActivationLut,
+    vqlut_hidden: Vq2ActivationLut,
+    vqlut_inter: Vq2ActivationLut,
     q8_hidden_vals: Vec<i8>,
     q8_hidden_scales: Vec<f32>,
     q8_inter_vals: Vec<i8>,
@@ -617,6 +812,7 @@ impl LlamaWorkspace {
             pos: 0,
             k_cache: vec![0.0f32; kv_total],
             v_cache: vec![0.0f32; kv_total],
+            q8_kv: None,
             hidden: vec![0.0f32; cfg.hidden_size],
             norm_buf: vec![0.0f32; cfg.hidden_size],
             qkv_buf: vec![0.0f32; qkv_rows],
@@ -630,6 +826,8 @@ impl LlamaWorkspace {
             qlut_inter: QuantizedActivationLut::new_zeroed(cfg.intermediate_size),
             blut_hidden: BipolarActivationLut::new_zeroed(cfg.hidden_size),
             blut_inter: BipolarActivationLut::new_zeroed(cfg.intermediate_size),
+            vqlut_hidden: Vq2ActivationLut::new_zeroed(cfg.hidden_size),
+            vqlut_inter: Vq2ActivationLut::new_zeroed(cfg.intermediate_size),
             q8_hidden_vals: vec![0i8; cfg.hidden_size],
             q8_hidden_scales: vec![0.0f32; cfg.hidden_size / 32],
             q8_inter_vals: vec![0i8; cfg.intermediate_size],
@@ -679,6 +877,45 @@ impl RealLlamaEngine {
         self.pool.as_ref().map(|p| p.num_threads()).unwrap_or(1)
     }
 
+    /// Toggles the Hadamard INT8 KV cache (`head_dim == 64`). Frees the FP32 cache and resets `pos`.
+    pub fn enable_q8_kv_cache(&mut self, enable: bool) {
+        self.ws.pos = 0;
+        if enable {
+            assert_eq!(
+                self.cfg.head_dim(),
+                64,
+                "Hadamard Q8 KV-cache requires head_dim == 64"
+            );
+            self.ws.k_cache = Vec::new();
+            self.ws.v_cache = Vec::new();
+            if self.ws.q8_kv.is_none() {
+                self.ws.q8_kv = Some(QuantizedKvCache::new(&self.cfg));
+            }
+        } else {
+            self.ws.q8_kv = None;
+            let kv_total = self.cfg.num_hidden_layers * self.cfg.max_seq_len * self.cfg.kv_dim();
+            if self.ws.k_cache.len() != kv_total {
+                self.ws.k_cache = vec![0.0f32; kv_total];
+                self.ws.v_cache = vec![0.0f32; kv_total];
+            }
+        }
+    }
+
+    /// Whether the INT8 KV cache is active.
+    #[inline]
+    pub fn is_q8_kv_enabled(&self) -> bool {
+        self.ws.q8_kv.is_some()
+    }
+
+    /// Bytes allocated for the active KV cache.
+    pub fn kv_cache_bytes(&self) -> usize {
+        if let Some(q8) = &self.ws.q8_kv {
+            q8.physical_bytes()
+        } else {
+            (self.ws.k_cache.len() + self.ws.v_cache.len()) * std::mem::size_of::<f32>()
+        }
+    }
+
     /// Loads the exact `FP32` reference model from `model_dir` (fusing `[q;k;v]` and `[gate;up]`).
     pub fn load_fp32_reference(model_dir: &Path, max_seq_len: usize) -> io::Result<Self> {
         let cfg = LlamaConfig::from_config_json(&model_dir.join("config.json"), max_seq_len)?;
@@ -726,6 +963,7 @@ impl RealLlamaEngine {
                     cols: cfg.hidden_size,
                     weights: gate_up_w,
                 },
+                gate_up_interleaved: false,
                 down_proj: LinearBackend::Fp32 {
                     rows: cfg.hidden_size,
                     cols: cfg.intermediate_size,
@@ -802,6 +1040,7 @@ impl RealLlamaEngine {
                     &self.ws.norm_buf,
                     None,
                     None,
+                    None,
                     &[],
                     &[],
                     None,
@@ -849,6 +1088,7 @@ impl RealLlamaEngine {
                     &self.ws.attn_out,
                     None,
                     None,
+                    None,
                     &[],
                     &[],
                     None,
@@ -868,6 +1108,7 @@ impl RealLlamaEngine {
                     &self.ws.norm_buf,
                     None,
                     None,
+                    None,
                     &[],
                     &[],
                     None,
@@ -879,6 +1120,7 @@ impl RealLlamaEngine {
                 accum_sq(&self.ws.swiglu_buf, &mut down_sq[l_idx]);
                 layer.down_proj.forward_exec(
                     &self.ws.swiglu_buf,
+                    None,
                     None,
                     None,
                     &[],
@@ -1006,6 +1248,7 @@ impl RealLlamaEngine {
                 qkv_proj,
                 o_proj,
                 gate_up_proj,
+                gate_up_interleaved: false,
                 down_proj,
             });
         }
@@ -1031,7 +1274,7 @@ impl RealLlamaEngine {
         err_sum += el as f64;
         mat_count += 1;
 
-        Self {
+        let mut eng = Self {
             cfg: self.cfg.clone(),
             mode,
             mean_weight_rel_error: (err_sum / (mat_count as f64)) as f32,
@@ -1042,7 +1285,9 @@ impl RealLlamaEngine {
             rope_cos_sin: self.rope_cos_sin.clone(),
             pool: None,
             ws: LlamaWorkspace::new(&self.cfg),
-        }
+        };
+        eng.init_activation_scratch();
+        eng
     }
 
     /// Compiles **`kronos-2t` Sequential Layer-by-Layer Hadamard + Full-Row Cholesky `GPTQ`**
@@ -1279,6 +1524,7 @@ impl RealLlamaEngine {
                 qkv_proj: LinearBackend::FusedBase3(qkv_mat),
                 o_proj: LinearBackend::FusedBase3(o_mat),
                 gate_up_proj: LinearBackend::FusedBase3(gate_up_mat),
+                gate_up_interleaved: false,
                 down_proj: LinearBackend::FusedBase3(down_mat),
             });
         }
@@ -1315,30 +1561,149 @@ impl RealLlamaEngine {
         }
     }
 
-    /// Compiles **`kronos-2t` Full-16-Entry Bipolar Radix-2 LUT + Sequential Hadamard-GPTQ**
-    /// across `calib_sequences`.
-    ///
-    /// Packing `4` bipolar weights $s \in \{-1, +1\}^4$ per 4-bit nibble utilizes **all 16 slots**
-    /// (`100%` register density) of ARM NEON `vqtbl1q_s8` (`1.00` bit/weight/plane).
-    /// - `4` planes = **`4.25` bits/weight** (`16` uniform symmetric levels `{-15..+15}`)
-    /// - `Mixed-K` = **`4.66` bits/weight** (`4` planes on `qkv/o/gate_up` + `5` planes on `down_proj/lm_head`)
-    /// - `5` planes = **`5.25` bits/weight** (`32` uniform symmetric levels `{-31..+31}`)
+    /// Sequential layer-by-layer Hadamard GPTQ compile for the Bipolar, NF and VQ2 modes.
     pub fn compile_sequential_bipolar_gptq(
         &self,
         mode: RealWeightMode,
         calib_sequences: &[Vec<usize>],
         compile_threads: usize,
     ) -> Self {
+        #[derive(Clone, Copy)]
+        enum ProjSpec {
+            Bipolar(usize),
+            Nf { bits: usize, sgc: usize },
+            Vq2(usize),
+        }
+
+        fn compile_proj_spec(
+            weights: &[f32],
+            rows: usize,
+            cols: usize,
+            spec: ProjSpec,
+            hess: Option<&FullRowGptqHessian>,
+            compile_threads: usize,
+        ) -> LinearBackend {
+            match spec {
+                ProjSpec::Bipolar(num_planes) => LinearBackend::FusedBipolar(
+                    compile_hadamard_gptq_bipolar(
+                        weights,
+                        rows,
+                        cols,
+                        num_planes,
+                        hess,
+                        compile_threads,
+                    ),
+                ),
+                ProjSpec::Nf { bits, sgc } => LinearBackend::NfSdot(compile_hadamard_gptq_nf(
+                    weights,
+                    rows,
+                    cols,
+                    bits,
+                    sgc,
+                    hess,
+                    compile_threads,
+                )),
+                ProjSpec::Vq2(scale_group_chunks) => LinearBackend::Vq2(compile_hadamard_gptq_vq2(
+                    weights,
+                    rows,
+                    cols,
+                    scale_group_chunks,
+                    hess,
+                    compile_threads,
+                )),
+            }
+        }
+
+        fn eval_proj_rot(
+            proj: &LinearBackend,
+            rot_x: &[f32],
+            blut: &mut BipolarActivationLut,
+            vlut: &mut Vq2ActivationLut,
+            out: &mut [f32],
+        ) {
+            match proj {
+                LinearBackend::FusedBipolar(m) => {
+                    blut.populate(rot_x);
+                    simd_lut_bipolar_gemv(m, blut, out);
+                }
+                LinearBackend::NfSdot(m) => {
+                    let i8a = blut
+                        .int8
+                        .get_or_insert_with(|| Int8ChunkActivation::new_zeroed(m.cols));
+                    i8a.populate(rot_x);
+                    // SAFETY: `0..m.num_stripes` is in bounds and `out.len() == m.rows`.
+                    unsafe {
+                        nf_sdot_stripe_range_int8(m, i8a, 0, m.num_stripes, out.as_mut_ptr());
+                    }
+                }
+                LinearBackend::Vq2(m) => {
+                    vlut.populate(rot_x);
+                    vq2_lut_gemv(m, vlut, out);
+                }
+                _ => unreachable!("expected FusedBipolar, NfSdot, or Vq2 during sequential GPTQ"),
+            }
+        }
+
         assert_eq!(self.mode, RealWeightMode::ExactFp32);
-        let (qkv_planes, o_planes, gate_up_planes, down_planes, head_planes) = match mode {
+        let (qkv_spec, o_spec, gate_up_spec, down_spec, head_spec) = match mode {
             RealWeightMode::KronosBipolarGptq { num_planes } => {
-                (num_planes, num_planes, num_planes, num_planes, num_planes)
+                let s = ProjSpec::Bipolar(num_planes);
+                (s, s, s, s, s)
             }
-            RealWeightMode::KronosBipolarGptqMixedK => (4, 5, 4, 5, 5),
-            RealWeightMode::KronosBipolarGptqPlanes { qkv, o, gate_up, down, head } => {
-                (qkv, o, gate_up, down, head)
+            RealWeightMode::KronosBipolarGptqMixedK => (
+                ProjSpec::Bipolar(4),
+                ProjSpec::Bipolar(5),
+                ProjSpec::Bipolar(4),
+                ProjSpec::Bipolar(5),
+                ProjSpec::Bipolar(5),
+            ),
+            RealWeightMode::KronosBipolarGptqPlanes { qkv, o, gate_up, down, head } => (
+                ProjSpec::Bipolar(qkv),
+                ProjSpec::Bipolar(o),
+                ProjSpec::Bipolar(gate_up),
+                ProjSpec::Bipolar(down),
+                ProjSpec::Bipolar(head),
+            ),
+            RealWeightMode::KronosVq2Gptq { scale_group_chunks } => {
+                let s = ProjSpec::Vq2(scale_group_chunks);
+                (s, s, s, s, s)
             }
-            _ => panic!("compile_sequential_bipolar_gptq expects KronosBipolarGptq* mode"),
+            RealWeightMode::KronosVq2MixedGptq {
+                attn_head_planes,
+                scale_group_chunks,
+            } => (
+                ProjSpec::Bipolar(attn_head_planes),
+                ProjSpec::Bipolar(attn_head_planes),
+                ProjSpec::Vq2(scale_group_chunks),
+                ProjSpec::Vq2(scale_group_chunks),
+                ProjSpec::Bipolar(attn_head_planes),
+            ),
+            RealWeightMode::KronosNfGptq {
+                bits,
+                scale_group_chunks,
+            } => {
+                let s = ProjSpec::Nf {
+                    bits,
+                    sgc: scale_group_chunks,
+                };
+                (s, s, s, s, s)
+            }
+            RealWeightMode::KronosNfMixedGptq {
+                attn_head_bits,
+                ffn_bits,
+                scale_group_chunks,
+            } => {
+                let attn = ProjSpec::Nf {
+                    bits: attn_head_bits,
+                    sgc: scale_group_chunks,
+                };
+                let ffn = ProjSpec::Nf {
+                    bits: ffn_bits,
+                    sgc: scale_group_chunks,
+                };
+                (attn, attn, ffn, ffn, attn)
+            }
+            _ => panic!("compile_sequential_bipolar_gptq expects KronosBipolarGptq*, KronosNf*, or KronosVq2* mode"),
         };
 
         let h_dim = self.cfg.hidden_size;
@@ -1381,11 +1746,11 @@ impl RealLlamaEngine {
                 }
             }
             hess_attn.finalize(BIPOLAR_GPTQ_DAMP);
-            let qkv_mat = compile_hadamard_gptq_bipolar(
+            let qkv_proj = compile_proj_spec(
                 ref_layer.qkv_proj.as_fp32_slice(),
                 qkv_rows,
                 h_dim,
-                qkv_planes,
+                qkv_spec,
                 Some(&hess_attn),
                 compile_threads,
             );
@@ -1398,6 +1763,7 @@ impl RealLlamaEngine {
                 let mut k_seq_cache = vec![0.0f32; self.cfg.max_seq_len * kv_dim];
                 let mut v_seq_cache = vec![0.0f32; self.cfg.max_seq_len * kv_dim];
                 let mut blut_h = BipolarActivationLut::new_zeroed(h_dim);
+                let mut vlut_h = Vq2ActivationLut::new_zeroed(h_dim);
                 for (pos, (hid, attn_dst)) in seq_h
                     .chunks_exact(h_dim)
                     .zip(attn_seq.chunks_exact_mut(h_dim))
@@ -1405,8 +1771,7 @@ impl RealLlamaEngine {
                 {
                     rms_norm(hid, &ref_layer.input_norm, self.cfg.rms_norm_eps, &mut norm_buf);
                     fwht64_signed_inplace(&mut norm_buf);
-                    blut_h.populate(&norm_buf);
-                    simd_lut_bipolar_gemv(&qkv_mat, &blut_h, &mut qkv_buf);
+                    eval_proj_rot(&qkv_proj, &norm_buf, &mut blut_h, &mut vlut_h, &mut qkv_buf);
 
                     let rope_row = &self.rope_cos_sin[pos * head_dim..(pos + 1) * head_dim];
                     let (q_slice, kv_rest) = qkv_buf.split_at_mut(h_dim);
@@ -1435,11 +1800,11 @@ impl RealLlamaEngine {
                 hess_o.observe_activation(row);
             }
             hess_o.finalize(BIPOLAR_GPTQ_DAMP);
-            let o_mat = compile_hadamard_gptq_bipolar(
+            let o_proj = compile_proj_spec(
                 ref_layer.o_proj.as_fp32_slice(),
                 h_dim,
                 h_dim,
-                o_planes,
+                o_spec,
                 Some(&hess_o),
                 compile_threads,
             );
@@ -1449,11 +1814,11 @@ impl RealLlamaEngine {
                 let mut rot_h = vec![0.0f32; h_dim];
                 let mut proj_out = vec![0.0f32; h_dim];
                 let mut blut_h = BipolarActivationLut::new_zeroed(h_dim);
+                let mut vlut_h = Vq2ActivationLut::new_zeroed(h_dim);
                 for (hid, attn) in seq_h.chunks_exact_mut(h_dim).zip(attn_seq.chunks_exact(h_dim)) {
                     rot_h.copy_from_slice(attn);
                     fwht64_signed_inplace(&mut rot_h);
-                    blut_h.populate(&rot_h);
-                    simd_lut_bipolar_gemv(&o_mat, &blut_h, &mut proj_out);
+                    eval_proj_rot(&o_proj, &rot_h, &mut blut_h, &mut vlut_h, &mut proj_out);
                     add_inplace(hid, &proj_out);
                 }
             });
@@ -1472,11 +1837,11 @@ impl RealLlamaEngine {
                 }
             }
             hess_mlp.finalize(BIPOLAR_GPTQ_DAMP);
-            let gate_up_mat = compile_hadamard_gptq_bipolar(
+            let gate_up_proj = compile_proj_spec(
                 ref_layer.gate_up_proj.as_fp32_slice(),
                 2 * inter_dim,
                 h_dim,
-                gate_up_planes,
+                gate_up_spec,
                 Some(&hess_mlp),
                 compile_threads,
             );
@@ -1486,11 +1851,11 @@ impl RealLlamaEngine {
                 let mut norm_buf = vec![0.0f32; h_dim];
                 let mut gate_up_buf = vec![0.0f32; 2 * inter_dim];
                 let mut blut_h = BipolarActivationLut::new_zeroed(h_dim);
+                let mut vlut_h = Vq2ActivationLut::new_zeroed(h_dim);
                 for (hid, sw_dst) in seq_h.chunks_exact(h_dim).zip(sw_seq.chunks_exact_mut(inter_dim)) {
                     rms_norm(hid, &ref_layer.post_attn_norm, self.cfg.rms_norm_eps, &mut norm_buf);
                     fwht64_signed_inplace(&mut norm_buf);
-                    blut_h.populate(&norm_buf);
-                    simd_lut_bipolar_gemv(&gate_up_mat, &blut_h, &mut gate_up_buf);
+                    eval_proj_rot(&gate_up_proj, &norm_buf, &mut blut_h, &mut vlut_h, &mut gate_up_buf);
                     let (gate_s, up_s) = gate_up_buf.split_at(inter_dim);
                     swiglu_activate(gate_s, up_s, sw_dst);
                 }
@@ -1500,11 +1865,11 @@ impl RealLlamaEngine {
                 hess_down.observe_activation(row);
             }
             hess_down.finalize(BIPOLAR_GPTQ_DAMP);
-            let down_mat = compile_hadamard_gptq_bipolar(
+            let down_proj = compile_proj_spec(
                 ref_layer.down_proj.as_fp32_slice(),
                 h_dim,
                 inter_dim,
-                down_planes,
+                down_spec,
                 Some(&hess_down),
                 compile_threads,
             );
@@ -1514,11 +1879,11 @@ impl RealLlamaEngine {
                 let mut rot_inter = vec![0.0f32; inter_dim];
                 let mut proj_out = vec![0.0f32; h_dim];
                 let mut blut_i = BipolarActivationLut::new_zeroed(inter_dim);
+                let mut vlut_i = Vq2ActivationLut::new_zeroed(inter_dim);
                 for (hid, sw) in seq_h.chunks_exact_mut(h_dim).zip(sw_seq.chunks_exact(inter_dim)) {
                     rot_inter.copy_from_slice(sw);
                     fwht64_signed_inplace(&mut rot_inter);
-                    blut_i.populate(&rot_inter);
-                    simd_lut_bipolar_gemv(&down_mat, &blut_i, &mut proj_out);
+                    eval_proj_rot(&down_proj, &rot_inter, &mut blut_i, &mut vlut_i, &mut proj_out);
                     add_inplace(hid, &proj_out);
                 }
             });
@@ -1528,10 +1893,11 @@ impl RealLlamaEngine {
                 post_attn_norm: ref_layer.post_attn_norm.clone(),
                 o_inv_scale: None,
                 down_inv_scale: None,
-                qkv_proj: LinearBackend::FusedBipolar(qkv_mat),
-                o_proj: LinearBackend::FusedBipolar(o_mat),
-                gate_up_proj: LinearBackend::FusedBipolar(gate_up_mat),
-                down_proj: LinearBackend::FusedBipolar(down_mat),
+                qkv_proj,
+                o_proj,
+                gate_up_proj,
+                gate_up_interleaved: false,
+                down_proj,
             });
         }
 
@@ -1544,16 +1910,16 @@ impl RealLlamaEngine {
             }
         }
         hess_head.finalize(BIPOLAR_GPTQ_DAMP);
-        let head_mat = compile_hadamard_gptq_bipolar(
+        let lm_head = compile_proj_spec(
             self.lm_head.as_fp32_slice(),
             self.cfg.vocab_size,
             h_dim,
-            head_planes,
+            head_spec,
             Some(&hess_head),
             compile_threads,
         );
 
-        Self {
+        let mut eng = Self {
             cfg: self.cfg.clone(),
             mode,
             mean_weight_rel_error: 0.0,
@@ -1565,14 +1931,51 @@ impl RealLlamaEngine {
             },
             layers: compiled_layers,
             final_norm: self.final_norm.clone(),
-            lm_head: LinearBackend::FusedBipolar(head_mat),
+            lm_head,
             rope_cos_sin: self.rope_cos_sin.clone(),
             pool: None,
             ws: LlamaWorkspace::new(&self.cfg),
+        };
+        eng.init_activation_scratch();
+        eng
+    }
+
+    fn init_activation_scratch(&mut self) {
+        let is_lut = |b: &LinearBackend| matches!(b, LinearBackend::FusedBipolar(_));
+        let is_int8 = |b: &LinearBackend| {
+            matches!(
+                b,
+                LinearBackend::Nibble4(_) | LinearBackend::NfSdot(_) | LinearBackend::Vq2(_)
+            )
+        };
+        let hidden_lut = is_lut(&self.lm_head)
+            || self
+                .layers
+                .iter()
+                .any(|l| is_lut(&l.qkv_proj) || is_lut(&l.o_proj) || is_lut(&l.gate_up_proj));
+        let inter_lut = self.layers.iter().any(|l| is_lut(&l.down_proj));
+        let any_int8 = is_int8(&self.lm_head)
+            || self.layers.iter().any(|l| {
+                is_int8(&l.qkv_proj)
+                    || is_int8(&l.o_proj)
+                    || is_int8(&l.gate_up_proj)
+                    || is_int8(&l.down_proj)
+            });
+        self.ws.blut_hidden.lut_enabled = hidden_lut;
+        self.ws.blut_inter.lut_enabled = inter_lut;
+        if any_int8 {
+            if self.ws.blut_hidden.int8.is_none() {
+                self.ws.blut_hidden.int8 = Some(Int8ChunkActivation::new_zeroed(self.cfg.hidden_size));
+            }
+            if self.ws.blut_inter.int8.is_none() {
+                self.ws.blut_inter.int8 =
+                    Some(Int8ChunkActivation::new_zeroed(self.cfg.intermediate_size));
+            }
         }
     }
 
-    /// Repacks `4..=6`-plane Bipolar projections for the `SDOT` kernel (same weights).
+    /// Repacks projections for `SDOT`, interleaves `gate_up_proj` in 64-row blocks and enables INT8
+    /// chunk activations.
     pub fn repack_sdot(&mut self) {
         let repack = |b: &mut LinearBackend| {
             if let LinearBackend::FusedBipolar(m) = b {
@@ -1581,28 +1984,45 @@ impl RealLlamaEngine {
                 }
             }
         };
+        let can_interleave_gu = self.cfg.intermediate_size.is_multiple_of(64);
         for l in &mut self.layers {
             repack(&mut l.qkv_proj);
             repack(&mut l.o_proj);
-            repack(&mut l.gate_up_proj);
+            if !l.gate_up_interleaved && can_interleave_gu {
+                match &mut l.gate_up_proj {
+                    LinearBackend::FusedBipolar(m) if (4..=6).contains(&m.num_planes) => {
+                        l.gate_up_proj =
+                            LinearBackend::Nibble4(Nibble4SdotMatrix::from_bipolar_with_perm(m, true));
+                        l.gate_up_interleaved = true;
+                    }
+                    LinearBackend::NfSdot(m) => {
+                        l.gate_up_proj = LinearBackend::NfSdot(m.to_gate_up_interleaved());
+                        l.gate_up_interleaved = true;
+                    }
+                    LinearBackend::Vq2(m) => {
+                        l.gate_up_proj = LinearBackend::Vq2(m.to_gate_up_interleaved());
+                        l.gate_up_interleaved = true;
+                    }
+                    _ => repack(&mut l.gate_up_proj),
+                }
+            } else {
+                repack(&mut l.gate_up_proj);
+            }
             repack(&mut l.down_proj);
         }
         repack(&mut self.lm_head);
-
-        // Pure-`SDOT` executes all `4..=6` planes directly from `Int8ChunkActivation` with zero D4 LUTs!
-        let is_lut = |b: &LinearBackend| matches!(b, LinearBackend::FusedBipolar(_));
-        let hidden_lut = is_lut(&self.lm_head)
-            || self.layers.iter().any(|l| is_lut(&l.qkv_proj) || is_lut(&l.o_proj) || is_lut(&l.gate_up_proj));
-        let inter_lut = self.layers.iter().any(|l| is_lut(&l.down_proj));
-        self.ws.blut_hidden.lut_enabled = hidden_lut;
-        self.ws.blut_inter.lut_enabled = inter_lut;
-        self.ws.blut_hidden.int8 = Some(Int8ChunkActivation::new_zeroed(self.cfg.hidden_size));
-        self.ws.blut_inter.int8 = Some(Int8ChunkActivation::new_zeroed(self.cfg.intermediate_size));
+        self.init_activation_scratch();
     }
 
-    /// Saves a compiled Bipolar engine; see [`Self::load_bipolar`].
+    /// Saves a compiled Bipolar, NF, VQ2 or mixed engine; see [`Self::load_bipolar`].
     pub fn save_bipolar(&self, path: &Path) -> io::Result<()> {
         use std::io::Write;
+        if self.layers.iter().any(|l| l.gate_up_interleaved) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "save_bipolar must be called before repack_sdot()",
+            ));
+        }
         fn w_u64(w: &mut impl Write, v: usize) -> io::Result<()> {
             w.write_all(&(v as u64).to_le_bytes())
         }
@@ -1610,10 +2030,7 @@ impl RealLlamaEngine {
             w_u64(w, v.len())?;
             v.iter().try_for_each(|x| w.write_all(&x.to_le_bytes()))
         }
-        fn w_mat(w: &mut impl Write, b: &LinearBackend) -> io::Result<()> {
-            let LinearBackend::FusedBipolar(m) = b else {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "non-bipolar projection"));
-            };
+        fn w_bipolar_body(w: &mut impl Write, m: &FusedBipolarLutMatrix) -> io::Result<()> {
             w_u64(w, m.rows)?;
             w_u64(w, m.cols)?;
             w_u64(w, m.num_planes)?;
@@ -1622,28 +2039,99 @@ impl RealLlamaEngine {
             w_u64(w, m.bf16_chunk_scales.len())?;
             m.bf16_chunk_scales.iter().try_for_each(|x| w.write_all(&x.to_le_bytes()))
         }
+        fn w_mat_v1(w: &mut impl Write, b: &LinearBackend) -> io::Result<()> {
+            let LinearBackend::FusedBipolar(m) = b else {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "non-bipolar projection"));
+            };
+            w_bipolar_body(w, m)
+        }
+        fn w_mat_v2(w: &mut impl Write, b: &LinearBackend) -> io::Result<()> {
+            match b {
+                LinearBackend::FusedBipolar(m) => {
+                    w_u64(w, 0)?;
+                    w_bipolar_body(w, m)
+                }
+                LinearBackend::Vq2(m) => {
+                    w_u64(w, 1)?;
+                    w_u64(w, m.rows)?;
+                    w_u64(w, m.cols)?;
+                    w_u64(w, m.scale_group_chunks)?;
+                    w_u64(w, m.packed_data.len())?;
+                    w.write_all(&m.packed_data)?;
+                    w_u64(w, m.bf16_chunk_scales.len())?;
+                    m.bf16_chunk_scales.iter().try_for_each(|x| w.write_all(&x.to_le_bytes()))
+                }
+                LinearBackend::NfSdot(m) => {
+                    w_u64(w, 2)?;
+                    w_u64(w, m.rows)?;
+                    w_u64(w, m.cols)?;
+                    w_u64(w, m.bits)?;
+                    w_u64(w, m.scale_group_chunks)?;
+                    let cb_bytes: [u8; 16] = std::array::from_fn(|i| m.codebook[i] as u8);
+                    w.write_all(&cb_bytes)?;
+                    w_u64(w, m.pair_stream.len())?;
+                    w.write_all(&m.pair_stream)?;
+                    w_u64(w, m.tail_stream.len())?;
+                    w.write_all(&m.tail_stream)
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "save_bipolar expects un-repacked FusedBipolar, NfSdot, or Vq2 projections",
+                )),
+            }
+        }
+
+        let (is_v2, mode_words) = match self.mode {
+            RealWeightMode::KronosBipolarGptq { num_planes } => (false, [0, num_planes, 0, 0, 0, 0]),
+            RealWeightMode::KronosBipolarGptqMixedK => (false, [1, 0, 0, 0, 0, 0]),
+            RealWeightMode::KronosBipolarGptqPlanes { qkv, o, gate_up, down, head } => {
+                (false, [2, qkv, o, gate_up, down, head])
+            }
+            RealWeightMode::KronosVq2Gptq { scale_group_chunks } => {
+                (true, [3, scale_group_chunks, 0, 0, 0, 0])
+            }
+            RealWeightMode::KronosVq2MixedGptq {
+                attn_head_planes,
+                scale_group_chunks,
+            } => (true, [4, attn_head_planes, scale_group_chunks, 0, 0, 0]),
+            RealWeightMode::KronosNfGptq {
+                bits,
+                scale_group_chunks,
+            } => (true, [5, bits, scale_group_chunks, 0, 0, 0]),
+            RealWeightMode::KronosNfMixedGptq {
+                attn_head_bits,
+                ffn_bits,
+                scale_group_chunks,
+            } => (true, [6, attn_head_bits, ffn_bits, scale_group_chunks, 0, 0]),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a bipolar/nf/vq2 engine",
+                ));
+            }
+        };
 
         let mut w = io::BufWriter::new(fs::File::create(path)?);
-        w.write_all(BIPOLAR_CACHE_MAGIC)?;
-        let mode_words = match self.mode {
-            RealWeightMode::KronosBipolarGptq { num_planes } => [0, num_planes, 0, 0, 0, 0],
-            RealWeightMode::KronosBipolarGptqMixedK => [1, 0, 0, 0, 0, 0],
-            RealWeightMode::KronosBipolarGptqPlanes { qkv, o, gate_up, down, head } => {
-                [2, qkv, o, gate_up, down, head]
-            }
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a bipolar engine")),
-        };
+        w.write_all(if is_v2 { KRONOS2_CACHE_MAGIC } else { BIPOLAR_CACHE_MAGIC })?;
         mode_words.iter().try_for_each(|&v| w_u64(&mut w, v))?;
         w_u64(&mut w, self.layers.len())?;
         for l in &self.layers {
             w_f32s(&mut w, &l.input_norm)?;
             w_f32s(&mut w, &l.post_attn_norm)?;
             for b in [&l.qkv_proj, &l.o_proj, &l.gate_up_proj, &l.down_proj] {
-                w_mat(&mut w, b)?;
+                if is_v2 {
+                    w_mat_v2(&mut w, b)?;
+                } else {
+                    w_mat_v1(&mut w, b)?;
+                }
             }
         }
         w_f32s(&mut w, &self.final_norm)?;
-        w_mat(&mut w, &self.lm_head)?;
+        if is_v2 {
+            w_mat_v2(&mut w, &self.lm_head)?;
+        } else {
+            w_mat_v1(&mut w, &self.lm_head)?;
+        }
         w_f32s(&mut w, &self.embed_f32_rows)?;
         w.flush()
     }
@@ -1653,14 +2141,22 @@ impl RealLlamaEngine {
         let cfg = LlamaConfig::from_config_json(&model_dir.join("config.json"), max_seq_len)?;
         let bytes = fs::read(path)?;
         let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
-        if !bytes.starts_with(BIPOLAR_CACHE_MAGIC) {
-            return Err(bad("bad bipolar cache magic"));
-        }
+        let is_v2 = if bytes.starts_with(BIPOLAR_CACHE_MAGIC) {
+            false
+        } else if bytes.starts_with(KRONOS2_CACHE_MAGIC) {
+            true
+        } else {
+            return Err(bad("bad bipolar/kronos2 cache magic"));
+        };
         let mut rd = CacheReader {
             bytes: &bytes,
-            pos: BIPOLAR_CACHE_MAGIC.len(),
+            pos: if is_v2 {
+                KRONOS2_CACHE_MAGIC.len()
+            } else {
+                BIPOLAR_CACHE_MAGIC.len()
+            },
         };
-        let r_mat = |rd: &mut CacheReader| -> io::Result<LinearBackend> {
+        let r_bipolar_body = |rd: &mut CacheReader| -> io::Result<LinearBackend> {
             let rows = rd.u64()?;
             let cols = rd.u64()?;
             let num_planes = rd.u64()?;
@@ -1680,6 +2176,69 @@ impl RealLlamaEngine {
                 bf16_chunk_scales,
             }))
         };
+        let r_mat = |rd: &mut CacheReader| -> io::Result<LinearBackend> {
+            if !is_v2 {
+                return r_bipolar_body(rd);
+            }
+            match rd.u64()? {
+                0 => r_bipolar_body(rd),
+                1 => {
+                    let rows = rd.u64()?;
+                    let cols = rd.u64()?;
+                    let scale_group_chunks = rd.u64()?.max(1);
+                    let n = rd.u64()?;
+                    let packed_data = rd.take(n)?.to_vec();
+                    let n = rd.u64()?;
+                    let bf16_chunk_scales = rd
+                        .take(n * 2)?
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    let num_chunks = cols / 64;
+                    Ok(LinearBackend::Vq2(Vq2LutMatrix {
+                        rows,
+                        cols,
+                        scale_group_chunks,
+                        num_stripes: rows.div_ceil(SIMD_ROW_STRIPE),
+                        num_chunks,
+                        num_scale_groups: num_chunks.div_ceil(scale_group_chunks),
+                        packed_data,
+                        bf16_chunk_scales,
+                    }))
+                }
+                2 => {
+                    let rows = rd.u64()?;
+                    let cols = rd.u64()?;
+                    let bits = rd.u64()?;
+                    let scale_group_chunks = rd.u64()?.max(1);
+                    let cb_raw = rd.take(16)?;
+                    let codebook: [i8; 16] = std::array::from_fn(|i| cb_raw[i] as i8);
+                    let pair_len = rd.u64()?;
+                    let pair_stream = rd.take(pair_len)?.to_vec();
+                    let tail_len = rd.u64()?;
+                    let tail_stream = rd.take(tail_len)?.to_vec();
+                    let num_stripes = rows.div_ceil(SIMD_ROW_STRIPE);
+                    let num_chunks = cols / 64;
+                    Ok(LinearBackend::NfSdot(NfSdotMatrix {
+                        rows,
+                        cols,
+                        bits,
+                        scale_group_chunks,
+                        num_stripes,
+                        num_pairs: num_stripes / 2,
+                        num_chunks,
+                        num_scale_groups: num_chunks.div_ceil(scale_group_chunks),
+                        codebook,
+                        pair_stream,
+                        tail_stream,
+                    }))
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unknown matrix tag in K2TKRONOS2 cache",
+                )),
+            }
+        };
 
         let mut mw = [0usize; 6];
         for v in mw.iter_mut() {
@@ -1688,13 +2247,30 @@ impl RealLlamaEngine {
         let mode = match mw[0] {
             0 => RealWeightMode::KronosBipolarGptq { num_planes: mw[1] },
             1 => RealWeightMode::KronosBipolarGptqMixedK,
-            _ => RealWeightMode::KronosBipolarGptqPlanes {
+            2 => RealWeightMode::KronosBipolarGptqPlanes {
                 qkv: mw[1],
                 o: mw[2],
                 gate_up: mw[3],
                 down: mw[4],
                 head: mw[5],
             },
+            3 => RealWeightMode::KronosVq2Gptq {
+                scale_group_chunks: mw[1].max(1),
+            },
+            4 => RealWeightMode::KronosVq2MixedGptq {
+                attn_head_planes: mw[1],
+                scale_group_chunks: mw[2].max(1),
+            },
+            5 => RealWeightMode::KronosNfGptq {
+                bits: mw[1],
+                scale_group_chunks: mw[2].max(1),
+            },
+            6 => RealWeightMode::KronosNfMixedGptq {
+                attn_head_bits: mw[1],
+                ffn_bits: mw[2],
+                scale_group_chunks: mw[3].max(1),
+            },
+            _ => return Err(bad("unknown mode tag in cache")),
         };
         let num_layers = rd.u64()?;
         if num_layers != cfg.num_hidden_layers {
@@ -1712,6 +2288,7 @@ impl RealLlamaEngine {
                 qkv_proj: r_mat(&mut rd)?,
                 o_proj: r_mat(&mut rd)?,
                 gate_up_proj: r_mat(&mut rd)?,
+                gate_up_interleaved: false,
                 down_proj: r_mat(&mut rd)?,
             });
         }
@@ -1719,7 +2296,7 @@ impl RealLlamaEngine {
         let lm_head = r_mat(&mut rd)?;
         let embed_f32_rows = rd.f32s()?;
 
-        Ok(Self {
+        let mut eng = Self {
             rope_cos_sin: build_rope_table(&cfg),
             ws: LlamaWorkspace::new(&cfg),
             cfg,
@@ -1730,7 +2307,9 @@ impl RealLlamaEngine {
             final_norm,
             lm_head,
             pool: None,
-        })
+        };
+        eng.init_activation_scratch();
+        Ok(eng)
     }
 
     /// Total physical RAM occupied by all compiled linear projections (`layers` + `lm_head`).
@@ -1780,7 +2359,9 @@ impl RealLlamaEngine {
         match &self.lm_head {
             LinearBackend::FusedBipolar(m) => m.dequantize_row_rotated(token, out),
             LinearBackend::Nibble4(m) => m.dequantize_row_rotated(token, out),
-            _ => unreachable!("embedding table dropped only for bipolar tied lm_head"),
+            LinearBackend::NfSdot(m) => m.dequantize_row_rotated(token, out),
+            LinearBackend::Vq2(m) => m.dequantize_row_rotated(token, out),
+            _ => unreachable!("embedding table dropped only for quantized tied lm_head"),
         }
         ifwht64_signed_inplace(out);
     }
@@ -1789,26 +2370,45 @@ impl RealLlamaEngine {
     /// `[layers, rows, kv_dim]` (`rows >= n`), e.g. from an external prefill.
     pub fn load_prefix_kv(&mut self, keys: &[f32], values: &[f32], rows: usize, n: usize) {
         let kvd = self.cfg.kv_dim();
-        let stride = self.cfg.max_seq_len * kvd;
         assert!(n <= rows && n <= self.cfg.max_seq_len);
         assert_eq!(keys.len(), self.layers.len() * rows * kvd);
-        for l in 0..self.layers.len() {
-            let src = l * rows * kvd;
-            self.ws.k_cache[l * stride..l * stride + n * kvd].copy_from_slice(&keys[src..src + n * kvd]);
-            self.ws.v_cache[l * stride..l * stride + n * kvd].copy_from_slice(&values[src..src + n * kvd]);
+        if let Some(q8) = self.ws.q8_kv.as_mut() {
+            let nkvh = self.cfg.num_key_value_heads;
+            for l in 0..self.layers.len() {
+                let src = l * rows * kvd;
+                for pos in 0..n {
+                    for kvh in 0..nkvh {
+                        let off = src + pos * kvd + kvh * 64;
+                        q8.store_k_head64(l, kvh, pos, &keys[off..off + 64]);
+                        q8.store_v_head64(l, kvh, pos, &values[off..off + 64]);
+                    }
+                }
+            }
+        } else {
+            let stride = self.cfg.max_seq_len * kvd;
+            for l in 0..self.layers.len() {
+                let src = l * rows * kvd;
+                self.ws.k_cache[l * stride..l * stride + n * kvd].copy_from_slice(&keys[src..src + n * kvd]);
+                self.ws.v_cache[l * stride..l * stride + n * kvd].copy_from_slice(&values[src..src + n * kvd]);
+            }
         }
         self.ws.pos = n;
     }
 
-    /// Logits from a last-layer hidden state (final RMSNorm + LM head). SDOT engines only.
+    /// Logits from a last-layer hidden state (final RMSNorm + LM head).
     pub fn logits_from_hidden(&mut self, hidden: &[f32]) -> &[f32] {
         rms_norm(hidden, &self.final_norm, self.cfg.rms_norm_eps, &mut self.ws.norm_buf);
         fwht64_signed_inplace(&mut self.ws.norm_buf);
-        self.ws.blut_hidden.populate(&self.ws.norm_buf);
+        if matches!(self.lm_head, LinearBackend::Vq2(_)) {
+            self.ws.vqlut_hidden.populate(&self.ws.norm_buf);
+        } else {
+            self.ws.blut_hidden.populate(&self.ws.norm_buf);
+        }
         self.lm_head.forward_exec(
             &self.ws.norm_buf,
             None,
             Some(&self.ws.blut_hidden),
+            Some(&self.ws.vqlut_hidden),
             &self.ws.q8_hidden_vals,
             &self.ws.q8_hidden_scales,
             self.pool.as_ref(),
@@ -1827,11 +2427,18 @@ impl RealLlamaEngine {
         self.ws.reset();
     }
 
-    /// Returns `true` when every projection uses Pure-`SDOT` [`Nibble4SdotMatrix`].
+    /// Whether every projection supports batched `SDOT` and the INT8 activation scratch is set up.
     #[inline]
     pub fn is_all_sdot(&self) -> bool {
-        let is_sdot = |b: &LinearBackend| matches!(b, LinearBackend::Nibble4(_));
-        is_sdot(&self.lm_head)
+        let is_sdot = |b: &LinearBackend| {
+            matches!(
+                b,
+                LinearBackend::Nibble4(_) | LinearBackend::NfSdot(_) | LinearBackend::Vq2(_)
+            )
+        };
+        self.ws.blut_hidden.int8.is_some()
+            && self.ws.blut_inter.int8.is_some()
+            && is_sdot(&self.lm_head)
             && self.layers.iter().all(|l| {
                 is_sdot(&l.qkv_proj)
                     && is_sdot(&l.o_proj)
@@ -1844,13 +2451,35 @@ impl RealLlamaEngine {
 
     #[inline]
     fn can_run_sdot_megakernel(&self) -> bool {
+        let is_fast = |b: &LinearBackend| {
+            matches!(
+                b,
+                LinearBackend::Nibble4(_) | LinearBackend::NfSdot(_) | LinearBackend::Vq2(_)
+            )
+        };
+        let needs_int8 =
+            |b: &LinearBackend| matches!(b, LinearBackend::Nibble4(_) | LinearBackend::NfSdot(_));
+        let any_int8 = needs_int8(&self.lm_head)
+            || self.layers.iter().any(|l| {
+                needs_int8(&l.qkv_proj)
+                    || needs_int8(&l.o_proj)
+                    || needs_int8(&l.gate_up_proj)
+                    || needs_int8(&l.down_proj)
+            });
         self.cfg.head_dim() == 64
             && self.cfg.hidden_size <= 4096
             && self.cfg.hidden_size.is_multiple_of(64)
             && self.cfg.intermediate_size.is_multiple_of(64)
-            && self.ws.blut_hidden.int8.is_some()
-            && self.ws.blut_inter.int8.is_some()
-            && self.is_all_sdot()
+            && (!any_int8 || (self.ws.blut_hidden.int8.is_some() && self.ws.blut_inter.int8.is_some()))
+            && is_fast(&self.lm_head)
+            && self.layers.iter().all(|l| {
+                is_fast(&l.qkv_proj)
+                    && is_fast(&l.o_proj)
+                    && is_fast(&l.gate_up_proj)
+                    && is_fast(&l.down_proj)
+                    && l.o_inv_scale.is_none()
+                    && l.down_inv_scale.is_none()
+            })
     }
 
     /// Executes one full causal step for `token_id` and returns a slice of `[vocab_size]` logits.
@@ -1870,28 +2499,10 @@ impl RealLlamaEngine {
         let head_dim = self.cfg.head_dim();
         let half_dim = head_dim / 2;
         let kv_dim = self.cfg.kv_dim();
-        let kv_group = self.cfg.num_attention_heads / self.cfg.num_key_value_heads;
+        let num_kv_heads = self.cfg.num_key_value_heads;
+        let kv_group = self.cfg.num_attention_heads / num_kv_heads;
         let attn_scale = 1.0 / (head_dim as f32).sqrt();
         let layer_kv_stride = self.cfg.max_seq_len * kv_dim;
-
-        let is_bipolar = matches!(
-            self.mode,
-            RealWeightMode::KronosBipolarGptq { .. }
-                | RealWeightMode::KronosBipolarGptqMixedK
-                | RealWeightMode::KronosBipolarGptqPlanes { .. }
-        );
-        let is_hadamard = matches!(
-            self.mode,
-            RealWeightMode::KronosHadamardGptqBase3 { .. }
-                | RealWeightMode::KronosHadamardGptqMixedK
-        );
-        let is_legacy_lut = matches!(
-            self.mode,
-            RealWeightMode::GlobalTernary1Plane
-                | RealWeightMode::Group64Ternary { .. }
-                | RealWeightMode::AwqGroup64Ternary { .. }
-        );
-        let is_q4_0 = matches!(self.mode, RealWeightMode::GgufQ4_0);
 
         if self.embed_f32_rows.is_empty() {
             match &self.lm_head {
@@ -1903,7 +2514,15 @@ impl RealLlamaEngine {
                     m.dequantize_row_rotated(token_id, &mut self.ws.hidden);
                     ifwht64_signed_inplace(&mut self.ws.hidden);
                 }
-                _ => unreachable!("embedding table dropped only for bipolar tied lm_head"),
+                LinearBackend::NfSdot(m) => {
+                    m.dequantize_row_rotated(token_id, &mut self.ws.hidden);
+                    ifwht64_signed_inplace(&mut self.ws.hidden);
+                }
+                LinearBackend::Vq2(m) => {
+                    m.dequantize_row_rotated(token_id, &mut self.ws.hidden);
+                    ifwht64_signed_inplace(&mut self.ws.hidden);
+                }
+                _ => unreachable!("embedding table dropped only for quantized tied lm_head"),
             }
         } else {
             self.ws
@@ -1913,6 +2532,48 @@ impl RealLlamaEngine {
         let rope_row = &self.rope_cos_sin[pos * head_dim..(pos + 1) * head_dim];
         let pool_ref = self.pool.as_ref();
 
+        macro_rules! exec_hidden_proj {
+            ($proj:expr, $buf:expr, $out:expr) => {{
+                match &$proj {
+                    LinearBackend::Vq2(_) => {
+                        fwht64_signed_inplace($buf);
+                        self.ws.vqlut_hidden.populate($buf);
+                    }
+                    LinearBackend::FusedBipolar(_)
+                    | LinearBackend::Nibble4(_)
+                    | LinearBackend::NfSdot(_) => {
+                        fwht64_signed_inplace($buf);
+                        self.ws.blut_hidden.populate($buf);
+                    }
+                    LinearBackend::FusedBase3(_) => {
+                        fwht64_signed_inplace($buf);
+                        self.ws.qlut_hidden.populate($buf);
+                    }
+                    LinearBackend::LutMultiPlane(_) => {
+                        self.ws.qlut_hidden.populate($buf);
+                    }
+                    LinearBackend::GgufQ4_0(_) => {
+                        GgufQ4_0Matrix::quantize_q8_0_activation(
+                            $buf,
+                            &mut self.ws.q8_hidden_vals,
+                            &mut self.ws.q8_hidden_scales,
+                        );
+                    }
+                    LinearBackend::Fp32 { .. } => {}
+                }
+                $proj.forward_exec(
+                    $buf,
+                    Some(&self.ws.qlut_hidden),
+                    Some(&self.ws.blut_hidden),
+                    Some(&self.ws.vqlut_hidden),
+                    &self.ws.q8_hidden_vals,
+                    &self.ws.q8_hidden_scales,
+                    pool_ref,
+                    $out,
+                );
+            }};
+        }
+
         for (l_idx, layer) in self.layers.iter().enumerate() {
             // 1. Pre-Attention RMSNorm + Fused QKV Projection
             rms_norm(
@@ -1921,38 +2582,7 @@ impl RealLlamaEngine {
                 self.cfg.rms_norm_eps,
                 &mut self.ws.norm_buf,
             );
-
-            let (qlut_qkv, blut_qkv) = if is_bipolar {
-                fwht64_signed_inplace(&mut self.ws.norm_buf);
-                self.ws.blut_hidden.populate(&self.ws.norm_buf);
-                (None, Some(&self.ws.blut_hidden))
-            } else if is_hadamard {
-                fwht64_signed_inplace(&mut self.ws.norm_buf);
-                self.ws.qlut_hidden.populate(&self.ws.norm_buf);
-                (Some(&self.ws.qlut_hidden), None)
-            } else if is_legacy_lut {
-                self.ws.qlut_hidden.populate(&self.ws.norm_buf);
-                (Some(&self.ws.qlut_hidden), None)
-            } else {
-                if is_q4_0 {
-                    GgufQ4_0Matrix::quantize_q8_0_activation(
-                        &self.ws.norm_buf,
-                        &mut self.ws.q8_hidden_vals,
-                        &mut self.ws.q8_hidden_scales,
-                    );
-                }
-                (None, None)
-            };
-
-            layer.qkv_proj.forward_exec(
-                &self.ws.norm_buf,
-                qlut_qkv,
-                blut_qkv,
-                &self.ws.q8_hidden_vals,
-                &self.ws.q8_hidden_scales,
-                pool_ref,
-                &mut self.ws.qkv_buf,
-            );
+            exec_hidden_proj!(layer.qkv_proj, &mut self.ws.norm_buf, &mut self.ws.qkv_buf);
 
             // 2. Precomputed RoPE + KV Cache Store + Causal GQA Attention
             let (q_slice, kv_rest) = self.ws.qkv_buf.split_at_mut(h_dim);
@@ -1966,30 +2596,48 @@ impl RealLlamaEngine {
             );
             apply_llama_rope_precomp(
                 k_slice,
-                self.cfg.num_key_value_heads,
+                num_kv_heads,
                 head_dim,
                 half_dim,
                 rope_row,
             );
 
-            let kv_base = l_idx * layer_kv_stride;
-            let step_off = kv_base + pos * kv_dim;
-            self.ws.k_cache[step_off..step_off + kv_dim].copy_from_slice(k_slice);
-            self.ws.v_cache[step_off..step_off + kv_dim].copy_from_slice(v_slice);
+            if let Some(q8) = self.ws.q8_kv.as_mut() {
+                for kvh in 0..num_kv_heads {
+                    q8.store_k_head64(l_idx, kvh, pos, &k_slice[kvh * 64..(kvh + 1) * 64]);
+                    q8.store_v_head64(l_idx, kvh, pos, &v_slice[kvh * 64..(kvh + 1) * 64]);
+                }
+                causal_gqa_attention_q8(
+                    q_slice,
+                    q8,
+                    l_idx,
+                    &mut self.ws.scores,
+                    &mut self.ws.attn_out,
+                    self.cfg.num_attention_heads,
+                    kv_group,
+                    pos,
+                    attn_scale,
+                );
+            } else {
+                let kv_base = l_idx * layer_kv_stride;
+                let step_off = kv_base + pos * kv_dim;
+                self.ws.k_cache[step_off..step_off + kv_dim].copy_from_slice(k_slice);
+                self.ws.v_cache[step_off..step_off + kv_dim].copy_from_slice(v_slice);
 
-            causal_gqa_attention(
-                q_slice,
-                &self.ws.k_cache[kv_base..],
-                &self.ws.v_cache[kv_base..],
-                &mut self.ws.scores,
-                &mut self.ws.attn_out,
-                self.cfg.num_attention_heads,
-                kv_group,
-                head_dim,
-                kv_dim,
-                pos,
-                attn_scale,
-            );
+                causal_gqa_attention(
+                    q_slice,
+                    &self.ws.k_cache[kv_base..],
+                    &self.ws.v_cache[kv_base..],
+                    &mut self.ws.scores,
+                    &mut self.ws.attn_out,
+                    self.cfg.num_attention_heads,
+                    kv_group,
+                    head_dim,
+                    kv_dim,
+                    pos,
+                    attn_scale,
+                );
+            }
 
             // 3. Output Projection + Residual
             if let Some(inv_s) = &layer.o_inv_scale {
@@ -1997,36 +2645,7 @@ impl RealLlamaEngine {
                     *a *= is;
                 }
             }
-            let (qlut_o, blut_o) = if is_bipolar {
-                fwht64_signed_inplace(&mut self.ws.attn_out);
-                self.ws.blut_hidden.populate(&self.ws.attn_out);
-                (None, Some(&self.ws.blut_hidden))
-            } else if is_hadamard {
-                fwht64_signed_inplace(&mut self.ws.attn_out);
-                self.ws.qlut_hidden.populate(&self.ws.attn_out);
-                (Some(&self.ws.qlut_hidden), None)
-            } else if is_legacy_lut {
-                self.ws.qlut_hidden.populate(&self.ws.attn_out);
-                (Some(&self.ws.qlut_hidden), None)
-            } else {
-                if is_q4_0 {
-                    GgufQ4_0Matrix::quantize_q8_0_activation(
-                        &self.ws.attn_out,
-                        &mut self.ws.q8_hidden_vals,
-                        &mut self.ws.q8_hidden_scales,
-                    );
-                }
-                (None, None)
-            };
-            layer.o_proj.forward_exec(
-                &self.ws.attn_out,
-                qlut_o,
-                blut_o,
-                &self.ws.q8_hidden_vals,
-                &self.ws.q8_hidden_scales,
-                pool_ref,
-                &mut self.ws.proj_out,
-            );
+            exec_hidden_proj!(layer.o_proj, &mut self.ws.attn_out, &mut self.ws.proj_out);
             add_inplace(&mut self.ws.hidden, &self.ws.proj_out);
 
             // 4. Post-Attention RMSNorm + Fused Gate+Up SwiGLU Projection
@@ -2036,70 +2655,62 @@ impl RealLlamaEngine {
                 self.cfg.rms_norm_eps,
                 &mut self.ws.norm_buf,
             );
-            let (qlut_gu, blut_gu) = if is_bipolar {
-                fwht64_signed_inplace(&mut self.ws.norm_buf);
-                self.ws.blut_hidden.populate(&self.ws.norm_buf);
-                (None, Some(&self.ws.blut_hidden))
-            } else if is_hadamard {
-                fwht64_signed_inplace(&mut self.ws.norm_buf);
-                self.ws.qlut_hidden.populate(&self.ws.norm_buf);
-                (Some(&self.ws.qlut_hidden), None)
-            } else if is_legacy_lut {
-                self.ws.qlut_hidden.populate(&self.ws.norm_buf);
-                (Some(&self.ws.qlut_hidden), None)
-            } else {
-                if is_q4_0 {
-                    GgufQ4_0Matrix::quantize_q8_0_activation(
-                        &self.ws.norm_buf,
-                        &mut self.ws.q8_hidden_vals,
-                        &mut self.ws.q8_hidden_scales,
-                    );
-                }
-                (None, None)
-            };
-            layer.gate_up_proj.forward_exec(
-                &self.ws.norm_buf,
-                qlut_gu,
-                blut_gu,
-                &self.ws.q8_hidden_vals,
-                &self.ws.q8_hidden_scales,
-                pool_ref,
-                &mut self.ws.gate_up_buf,
+            exec_hidden_proj!(
+                layer.gate_up_proj,
+                &mut self.ws.norm_buf,
+                &mut self.ws.gate_up_buf
             );
 
-            let (gate_s, up_s) = self.ws.gate_up_buf.split_at(inter_dim);
-            swiglu_activate(gate_s, up_s, &mut self.ws.swiglu_buf);
+            if layer.gate_up_interleaved {
+                for ic in 0..(inter_dim / 64) {
+                    swiglu_activate(
+                        &self.ws.gate_up_buf[ic * 128..ic * 128 + 64],
+                        &self.ws.gate_up_buf[ic * 128 + 64..ic * 128 + 128],
+                        &mut self.ws.swiglu_buf[ic * 64..(ic + 1) * 64],
+                    );
+                }
+            } else {
+                let (gate_s, up_s) = self.ws.gate_up_buf.split_at(inter_dim);
+                swiglu_activate(gate_s, up_s, &mut self.ws.swiglu_buf);
+            }
 
             if let Some(inv_s) = &layer.down_inv_scale {
                 for (g, &is) in self.ws.swiglu_buf.iter_mut().zip(inv_s.iter()) {
                     *g *= is;
                 }
             }
-            let (qlut_down, blut_down) = if is_bipolar {
-                fwht64_signed_inplace(&mut self.ws.swiglu_buf);
-                self.ws.blut_inter.populate(&self.ws.swiglu_buf);
-                (None, Some(&self.ws.blut_inter))
-            } else if is_hadamard {
-                fwht64_signed_inplace(&mut self.ws.swiglu_buf);
-                self.ws.qlut_inter.populate(&self.ws.swiglu_buf);
-                (Some(&self.ws.qlut_inter), None)
-            } else if is_legacy_lut {
-                self.ws.qlut_inter.populate(&self.ws.swiglu_buf);
-                (Some(&self.ws.qlut_inter), None)
-            } else {
-                if is_q4_0 {
+            match &layer.down_proj {
+                LinearBackend::Vq2(_) => {
+                    fwht64_signed_inplace(&mut self.ws.swiglu_buf);
+                    self.ws.vqlut_inter.populate(&self.ws.swiglu_buf);
+                }
+                LinearBackend::FusedBipolar(_)
+                | LinearBackend::Nibble4(_)
+                | LinearBackend::NfSdot(_) => {
+                    fwht64_signed_inplace(&mut self.ws.swiglu_buf);
+                    self.ws.blut_inter.populate(&self.ws.swiglu_buf);
+                }
+                LinearBackend::FusedBase3(_) => {
+                    fwht64_signed_inplace(&mut self.ws.swiglu_buf);
+                    self.ws.qlut_inter.populate(&self.ws.swiglu_buf);
+                }
+                LinearBackend::LutMultiPlane(_) => {
+                    self.ws.qlut_inter.populate(&self.ws.swiglu_buf);
+                }
+                LinearBackend::GgufQ4_0(_) => {
                     GgufQ4_0Matrix::quantize_q8_0_activation(
                         &self.ws.swiglu_buf,
                         &mut self.ws.q8_inter_vals,
                         &mut self.ws.q8_inter_scales,
                     );
                 }
-                (None, None)
-            };
+                LinearBackend::Fp32 { .. } => {}
+            }
             layer.down_proj.forward_exec(
                 &self.ws.swiglu_buf,
-                qlut_down,
-                blut_down,
+                Some(&self.ws.qlut_inter),
+                Some(&self.ws.blut_inter),
+                Some(&self.ws.vqlut_inter),
                 &self.ws.q8_inter_vals,
                 &self.ws.q8_inter_scales,
                 pool_ref,
@@ -2115,51 +2726,20 @@ impl RealLlamaEngine {
             self.cfg.rms_norm_eps,
             &mut self.ws.norm_buf,
         );
-        let (qlut_final, blut_final) = if is_bipolar {
-            fwht64_signed_inplace(&mut self.ws.norm_buf);
-            self.ws.blut_hidden.populate(&self.ws.norm_buf);
-            (None, Some(&self.ws.blut_hidden))
-        } else if is_hadamard {
-            fwht64_signed_inplace(&mut self.ws.norm_buf);
-            self.ws.qlut_hidden.populate(&self.ws.norm_buf);
-            (Some(&self.ws.qlut_hidden), None)
-        } else if is_legacy_lut {
-            self.ws.qlut_hidden.populate(&self.ws.norm_buf);
-            (Some(&self.ws.qlut_hidden), None)
-        } else {
-            if is_q4_0 {
-                GgufQ4_0Matrix::quantize_q8_0_activation(
-                    &self.ws.norm_buf,
-                    &mut self.ws.q8_hidden_vals,
-                    &mut self.ws.q8_hidden_scales,
-                );
-            }
-            (None, None)
-        };
-        self.lm_head.forward_exec(
-            &self.ws.norm_buf,
-            qlut_final,
-            blut_final,
-            &self.ws.q8_hidden_vals,
-            &self.ws.q8_hidden_scales,
-            pool_ref,
-            &mut self.ws.logits,
-        );
+        exec_hidden_proj!(self.lm_head, &mut self.ws.norm_buf, &mut self.ws.logits);
 
         let _ = SIMD_ROW_STRIPE;
         self.ws.pos += 1;
         &self.ws.logits
     }
 
-    /// Single-dispatch persistent P-core megakernel for Pure-`SDOT` (`4/5/6`-bit) decode.
+    /// Decodes one token for `SDOT`/VQ2 engines with all layers and the LM head in a single pool
+    /// dispatch.
     ///
     /// Executes all Transformer layers + `lm_head` inside **one** thread-pool dispatch with:
-    /// - In-register fused `RMSNorm + FWHT-64 + Int8ChunkActivation` quantization (`0` `norm_buf` writes),
-    /// - 64-row head-aligned `qkv_proj` fused directly with NEON `RoPE` and `KV` cache writes,
-    /// - Multi-head parallel `GQA Attention` fused directly into in-register `FWHT-64 + Int8Quant` (`0` `attn_out` writes),
-    /// - Worker-local 64-row L1-fused `[gate; up] -> SwiGLU -> FWHT-64 -> Int8Quant` (`0` extra barrier),
-    /// - Even-stripe (`32`-row) worker partitions so 100% of stripes hit the 2-stripe `16`-accumulator NEON fast path.
     fn forward_token_sdot_megakernel(&mut self, token_id: usize) -> &[f32] {
+        use std::mem::MaybeUninit;
+
         let pos = self.ws.pos;
         let seq_len = pos + 1;
         let h_dim = self.cfg.hidden_size;
@@ -2175,11 +2755,13 @@ impl RealLlamaEngine {
         let layer_kv_stride = max_seq_len * kv_dim;
         let eps = self.cfg.rms_norm_eps;
 
-        let LinearBackend::Nibble4(head_mat) = &self.lm_head else {
-            unreachable!("megakernel requires Nibble4 lm_head");
-        };
         if self.embed_f32_rows.is_empty() {
-            head_mat.dequantize_row_rotated(token_id, &mut self.ws.hidden);
+            match &self.lm_head {
+                LinearBackend::Nibble4(m) => m.dequantize_row_rotated(token_id, &mut self.ws.hidden),
+                LinearBackend::NfSdot(m) => m.dequantize_row_rotated(token_id, &mut self.ws.hidden),
+                LinearBackend::Vq2(m) => m.dequantize_row_rotated(token_id, &mut self.ws.hidden),
+                _ => unreachable!("megakernel requires Nibble4, NfSdot, or Vq2 lm_head"),
+            }
             ifwht64_signed_inplace(&mut self.ws.hidden);
         } else {
             self.ws
@@ -2190,6 +2772,7 @@ impl RealLlamaEngine {
         let rope_row = &self.rope_cos_sin[pos * 64..(pos + 1) * 64];
         let layers = &self.layers;
         let final_norm = &self.final_norm;
+        let lm_head = &self.lm_head;
 
         let hidden_addr = self.ws.hidden.as_mut_ptr() as usize;
         let qkv_addr = self.ws.qkv_buf.as_mut_ptr() as usize;
@@ -2200,33 +2783,48 @@ impl RealLlamaEngine {
         let v_cache_addr = self.ws.v_cache.as_mut_ptr() as usize;
         let logits_addr = self.ws.logits.as_mut_ptr() as usize;
 
-        let (act_h_addr, act_hq_addr, act_hs_addr, act_hsum_addr) = {
-            let a = self.ws.blut_hidden.int8.as_mut().unwrap();
-            (
-                (a as *const Int8ChunkActivation) as usize,
-                a.q.as_mut_ptr() as usize,
-                a.scales.as_mut_ptr() as usize,
-                a.sums.as_mut_ptr() as usize,
-            )
-        };
-        let (act_i_addr, act_iq_addr, act_is_addr, act_isum_addr) = {
-            let a = self.ws.blut_inter.int8.as_mut().unwrap();
-            (
-                (a as *const Int8ChunkActivation) as usize,
-                a.q.as_mut_ptr() as usize,
-                a.scales.as_mut_ptr() as usize,
-                a.sums.as_mut_ptr() as usize,
-            )
-        };
+        let (use_q8_kv, q8_k_addr, q8_ks_addr, q8_v_addr, q8_vs_addr) =
+            if let Some(q8) = self.ws.q8_kv.as_mut() {
+                (
+                    true,
+                    q8.k_q8.as_mut_ptr() as usize,
+                    q8.k_scales.as_mut_ptr() as usize,
+                    q8.v_q8.as_mut_ptr() as usize,
+                    q8.v_scales.as_mut_ptr() as usize,
+                )
+            } else {
+                (false, 0, 0, 0, 0)
+            };
 
-        let even_stripes = |num_stripes: usize, tid: usize, nt: usize| -> (usize, usize) {
-            let pairs = num_stripes.div_ceil(2);
-            let s0 = (((pairs * tid) / nt) * 2).min(num_stripes);
-            let s1 = (((pairs * (tid + 1)) / nt) * 2).min(num_stripes);
-            (s0, s1)
-        };
+        let (act_h_addr, act_hq_addr, act_hs_addr, act_hsum_addr) =
+            if let Some(a) = self.ws.blut_hidden.int8.as_mut() {
+                (
+                    (a as *const Int8ChunkActivation) as usize,
+                    a.q.as_mut_ptr() as usize,
+                    a.scales.as_mut_ptr() as usize,
+                    a.sums.as_mut_ptr() as usize,
+                )
+            } else {
+                (0, 0, 0, 0)
+            };
+        let (act_i_addr, act_iq_addr, act_is_addr, act_isum_addr) =
+            if let Some(a) = self.ws.blut_inter.int8.as_mut() {
+                (
+                    (a as *const Int8ChunkActivation) as usize,
+                    a.q.as_mut_ptr() as usize,
+                    a.scales.as_mut_ptr() as usize,
+                    a.sums.as_mut_ptr() as usize,
+                )
+            } else {
+                (0, 0, 0, 0)
+            };
 
-        let kernel = |tid: usize, nt: usize, barrier: &SpinBarrier| {
+        let vlut_h_addr = self.ws.vqlut_hidden.lut.as_mut_ptr() as usize;
+        let vscales_h_addr = self.ws.vqlut_hidden.chunk_scales.as_mut_ptr() as usize;
+        let vlut_i_addr = self.ws.vqlut_inter.lut.as_mut_ptr() as usize;
+        let vscales_i_addr = self.ws.vqlut_inter.chunk_scales.as_mut_ptr() as usize;
+
+        let kernel = |_tid: usize, nt: usize, barrier: &SpinBarrier| {
             let hidden_ptr = hidden_addr as *mut f32;
             let qkv_ptr = qkv_addr as *mut f32;
             let proj_ptr = proj_addr as *mut f32;
@@ -2235,64 +2833,115 @@ impl RealLlamaEngine {
             let k_cache_ptr = k_cache_addr as *mut f32;
             let v_cache_ptr = v_cache_addr as *mut f32;
             let logits_ptr = logits_addr as *mut f32;
+            let q8_k_ptr = q8_k_addr as *mut i8;
+            let q8_ks_ptr = q8_ks_addr as *mut f32;
+            let q8_v_ptr = q8_v_addr as *mut i8;
+            let q8_vs_ptr = q8_vs_addr as *mut f32;
             let act_hq = act_hq_addr as *mut i8;
             let act_hs = act_hs_addr as *mut f32;
             let act_hsum = act_hsum_addr as *mut i32;
             let act_iq = act_iq_addr as *mut i8;
             let act_is = act_is_addr as *mut f32;
             let act_isum = act_isum_addr as *mut i32;
+            let vlut_h_ptr = vlut_h_addr as *mut [i8; 16];
+            let vscales_h_ptr = vscales_h_addr as *mut f32;
+            let vlut_i_ptr = vlut_i_addr as *mut [i8; 16];
+            let vscales_i_ptr = vscales_i_addr as *mut f32;
 
-            // Worker-private L1D stack buffers (`4.6 KB`): eliminates 3 cross-core barriers per layer!
-            let mut lq = [0i8; 4096];
-            let mut ls = [0.0f32; 64];
-            let mut lsum = [0i32; 64];
+            // Worker-private stack scratch, left uninitialized.
+            let mut lq = MaybeUninit::<[i8; 4096]>::uninit();
+            let mut ls = MaybeUninit::<[f32; 64]>::uninit();
+            let mut lsum = MaybeUninit::<[i32; 64]>::uninit();
+            let mut vlq = MaybeUninit::<[[i8; 16]; 2048]>::uninit();
+            let mut vls = MaybeUninit::<[f32; 64]>::uninit();
+            let mut lis = MaybeUninit::<[f32; 256]>::uninit();
+            let mut lisum = MaybeUninit::<[i32; 256]>::uninit();
+            let lq_ptr = lq.as_mut_ptr().cast::<i8>();
+            let ls_ptr = ls.as_mut_ptr().cast::<f32>();
+            let lsum_ptr = lsum.as_mut_ptr().cast::<i32>();
+            let vlq_ptr = vlq.as_mut_ptr().cast::<[i8; 16]>();
+            let vls_ptr = vls.as_mut_ptr().cast::<f32>();
 
-            let qh0 = (num_q_heads * tid) / nt;
-            let qh1 = (num_q_heads * (tid + 1)) / nt;
-            let ic0 = (nc_i * tid) / nt;
-            let ic1 = (nc_i * (tid + 1)) / nt;
+            let qh_grain = (num_q_heads / (nt * 2)).clamp(1, 4);
+            let ic_grain = (nc_i / (nt * 2)).clamp(1, 8);
 
             for (l_idx, layer) in layers.iter().enumerate() {
-                let (
-                    LinearBackend::Nibble4(qkv_mat),
-                    LinearBackend::Nibble4(o_mat),
-                    LinearBackend::Nibble4(gu_mat),
-                    LinearBackend::Nibble4(down_mat),
-                ) = (&layer.qkv_proj, &layer.o_proj, &layer.gate_up_proj, &layer.down_proj)
-                else {
-                    unreachable!();
-                };
                 let kv_base = l_idx * layer_kv_stride;
+                let qkv_rows = match &layer.qkv_proj {
+                    LinearBackend::Nibble4(m) => m.rows,
+                    LinearBackend::NfSdot(m) => m.rows,
+                    LinearBackend::Vq2(m) => m.rows,
+                    _ => unreachable!(),
+                };
 
-                // 1. Zero-Barrier Worker-Local `input_norm + FWHT-64 + INT8` -> 64-Row `qkv_proj + RoPE + KV Store`
-                let qkv_heads = qkv_mat.rows / 64;
-                let b0 = (qkv_heads * tid) / nt;
-                let b1 = (qkv_heads * (tid + 1)) / nt;
-                if b0 < b1 {
-                    // SAFETY: `hidden` is globally synchronized and read-only here; `(lq, ls, lsum)` are worker-private
-                    // stack arrays (`h_dim <= 4096`), and `[b0*4, b1*4)` writes disjoint 64-row head blocks.
+                // 1. Input norm + FWHT, then `qkv_proj` + RoPE + KV store per head.
+                let qkv_heads = qkv_rows / 64;
+                let qkv_grain = (qkv_heads / (nt * 3)).clamp(1, 4);
+                let mut populated = false;
+                while let Some((b0, b1)) = barrier.claim_work(qkv_grain, qkv_heads) {
+                    // SAFETY: `hidden` is read-only here; `[b0*4, b1*4)` rows are disjoint per worker.
                     unsafe {
-                        let hidden_ro = std::slice::from_raw_parts(hidden_ptr, h_dim);
-                        let inv_rms = 1.0 / (dot_f32_fast(hidden_ro, hidden_ro) / (h_dim as f32) + eps).sqrt();
-                        for c in 0..nc_h {
-                            Int8ChunkActivation::populate_chunk_fwht_raw(
-                                lq.as_mut_ptr(),
-                                ls.as_mut_ptr(),
-                                lsum.as_mut_ptr(),
-                                c,
-                                &hidden_ro[c * 64..(c + 1) * 64],
-                                Some((&layer.input_norm[c * 64..(c + 1) * 64], inv_rms)),
-                            );
+                        if !populated {
+                            let hidden_ro = std::slice::from_raw_parts(hidden_ptr, h_dim);
+                            let inv_rms = 1.0 / (dot_f32_fast(hidden_ro, hidden_ro) / (h_dim as f32) + eps).sqrt();
+                            if matches!(layer.qkv_proj, LinearBackend::Vq2(_)) {
+                                for c in 0..nc_h {
+                                    Vq2ActivationLut::populate_chunk_fwht_raw(
+                                        vlq_ptr,
+                                        vls_ptr,
+                                        c,
+                                        &hidden_ro[c * 64..(c + 1) * 64],
+                                        Some((&layer.input_norm[c * 64..(c + 1) * 64], inv_rms)),
+                                    );
+                                }
+                            } else {
+                                for c in 0..nc_h {
+                                    Int8ChunkActivation::populate_chunk_fwht_raw(
+                                        lq_ptr,
+                                        ls_ptr,
+                                        lsum_ptr,
+                                        c,
+                                        &hidden_ro[c * 64..(c + 1) * 64],
+                                        Some((&layer.input_norm[c * 64..(c + 1) * 64], inv_rms)),
+                                    );
+                                }
+                            }
+                            populated = true;
                         }
-                        nibble4_sdot_stripe_range_raw(
-                            qkv_mat,
-                            lq.as_ptr(),
-                            ls.as_ptr(),
-                            lsum.as_ptr(),
-                            b0 * 4,
-                            b1 * 4,
-                            qkv_ptr,
-                        );
+                        match &layer.qkv_proj {
+                            LinearBackend::Nibble4(qkv_mat) => {
+                                nibble4_sdot_stripe_range_raw(
+                                    qkv_mat,
+                                    lq_ptr,
+                                    ls_ptr,
+                                    lsum_ptr,
+                                    b0 * 4,
+                                    b1 * 4,
+                                    qkv_ptr,
+                                );
+                            }
+                            LinearBackend::NfSdot(qkv_mat) => {
+                                nf_sdot_stripe_range_raw(
+                                    qkv_mat,
+                                    lq_ptr,
+                                    ls_ptr,
+                                    b0 * 4,
+                                    b1 * 4,
+                                    qkv_ptr,
+                                );
+                            }
+                            LinearBackend::Vq2(qkv_mat) => {
+                                vq2_lut_stripe_range_raw(
+                                    qkv_mat,
+                                    vlq_ptr,
+                                    vls_ptr,
+                                    b0 * 4,
+                                    b1 * 4,
+                                    qkv_ptr,
+                                );
+                            }
+                            _ => unreachable!(),
+                        }
                         for b in b0..b1 {
                             let head_s = std::slice::from_raw_parts_mut(qkv_ptr.add(b * 64), 64);
                             if b < num_q_heads {
@@ -2300,57 +2949,140 @@ impl RealLlamaEngine {
                             } else if b < num_q_heads + num_kv_heads {
                                 let kvh = b - num_q_heads;
                                 apply_llama_rope_head64(head_s, rope_row);
-                                std::ptr::copy_nonoverlapping(
-                                    head_s.as_ptr(),
-                                    k_cache_ptr.add(kv_base + pos * kv_dim + kvh * 64),
-                                    64,
-                                );
+                                if use_q8_kv {
+                                    let slot = (l_idx * num_kv_heads + kvh) * max_seq_len + pos;
+                                    store_hadamard_q8_head64_raw(
+                                        head_s,
+                                        q8_k_ptr.add(slot * 64),
+                                        q8_ks_ptr.add(slot),
+                                    );
+                                } else {
+                                    std::ptr::copy_nonoverlapping(
+                                        head_s.as_ptr(),
+                                        k_cache_ptr.add(kv_base + pos * kv_dim + kvh * 64),
+                                        64,
+                                    );
+                                }
                             } else {
                                 let kvh = b - num_q_heads - num_kv_heads;
-                                std::ptr::copy_nonoverlapping(
-                                    head_s.as_ptr(),
-                                    v_cache_ptr.add(kv_base + pos * kv_dim + kvh * 64),
-                                    64,
-                                );
+                                if use_q8_kv {
+                                    let slot = (l_idx * num_kv_heads + kvh) * max_seq_len + pos;
+                                    store_hadamard_q8_head64_raw(
+                                        head_s,
+                                        q8_v_ptr.add(slot * 64),
+                                        q8_vs_ptr.add(slot),
+                                    );
+                                } else {
+                                    std::ptr::copy_nonoverlapping(
+                                        head_s.as_ptr(),
+                                        v_cache_ptr.add(kv_base + pos * kv_dim + kvh * 64),
+                                        64,
+                                    );
+                                }
                             }
                         }
                     }
                 }
                 barrier.wait();
 
-                // 2. Parallel Per-Head `GQA Attention` + Fused In-Register `FWHT-64 + INT8 Quantization`
-                if qh0 < qh1 {
-                    // SAFETY: `qkv_buf[..h_dim]`, `k_cache`, `v_cache` are immutable; each `qh` owns `scores[qh*max_seq_len..]`
-                    // and writes exclusively to Hadamard chunk `c = qh` of `act_h`.
+                // 2. Per-head attention, quantized in-register for `o_proj`.
+                let o_is_vq2 = matches!(layer.o_proj, LinearBackend::Vq2(_));
+                while let Some((qh0, qh1)) = barrier.claim_work(qh_grain, num_q_heads) {
+                    // SAFETY: inputs are read-only; head `qh` owns its `scores` row and Hadamard chunk `qh`.
                     unsafe {
-                        let k_layer = std::slice::from_raw_parts(k_cache_ptr.add(kv_base), seq_len * kv_dim);
-                        let v_layer = std::slice::from_raw_parts(v_cache_ptr.add(kv_base), seq_len * kv_dim);
                         let mut out_head = [0.0f32; 64];
                         for qh in qh0..qh1 {
                             let q_head = std::slice::from_raw_parts(qkv_ptr.add(qh * 64), 64);
                             let sc = std::slice::from_raw_parts_mut(scores_ptr.add(qh * max_seq_len), seq_len);
-                            let off = (qh / kv_group) * 64;
-                            causal_gqa_head64(q_head, k_layer, v_layer, sc, &mut out_head, kv_dim, off, attn_scale);
-                            Int8ChunkActivation::populate_chunk_fwht_raw(
-                                act_hq,
-                                act_hs,
-                                act_hsum,
-                                qh,
-                                &out_head,
-                                None,
-                            );
+                            let kvh = qh / kv_group;
+                            if use_q8_kv {
+                                let base = (l_idx * num_kv_heads + kvh) * max_seq_len;
+                                let k_q8_h = std::slice::from_raw_parts(q8_k_ptr.add(base * 64), seq_len * 64);
+                                let ks_h = std::slice::from_raw_parts(q8_ks_ptr.add(base), seq_len);
+                                let v_q8_h = std::slice::from_raw_parts(q8_v_ptr.add(base * 64), seq_len * 64);
+                                let vs_h = std::slice::from_raw_parts(q8_vs_ptr.add(base), seq_len);
+                                causal_gqa_head64_q8(
+                                    q_head,
+                                    k_q8_h,
+                                    ks_h,
+                                    v_q8_h,
+                                    vs_h,
+                                    sc,
+                                    &mut out_head,
+                                    attn_scale,
+                                );
+                            } else {
+                                let k_layer = std::slice::from_raw_parts(k_cache_ptr.add(kv_base), seq_len * kv_dim);
+                                let v_layer = std::slice::from_raw_parts(v_cache_ptr.add(kv_base), seq_len * kv_dim);
+                                causal_gqa_head64(
+                                    q_head,
+                                    k_layer,
+                                    v_layer,
+                                    sc,
+                                    &mut out_head,
+                                    kv_dim,
+                                    kvh * 64,
+                                    attn_scale,
+                                );
+                            }
+                            if o_is_vq2 {
+                                Vq2ActivationLut::populate_chunk_fwht_raw(
+                                    vlut_h_ptr,
+                                    vls_ptr,
+                                    qh,
+                                    &out_head,
+                                    None,
+                                );
+                            } else {
+                                Int8ChunkActivation::populate_chunk_fwht_raw(
+                                    act_hq,
+                                    ls_ptr,
+                                    lsum_ptr,
+                                    qh,
+                                    &out_head,
+                                    None,
+                                );
+                            }
+                        }
+                        let n_qh = qh1 - qh0;
+                        if o_is_vq2 {
+                            std::ptr::copy_nonoverlapping(vls_ptr.add(qh0), vscales_h_ptr.add(qh0), n_qh);
+                        } else {
+                            std::ptr::copy_nonoverlapping(ls_ptr.add(qh0), act_hs.add(qh0), n_qh);
+                            std::ptr::copy_nonoverlapping(lsum_ptr.add(qh0), act_hsum.add(qh0), n_qh);
                         }
                     }
                 }
                 barrier.wait();
 
-                // 3. Parallel `o_proj` + Fused Disjoint Residual `hidden += proj_out`
-                let (os0, os1) = even_stripes(o_mat.num_stripes, tid, nt);
-                if os0 < os1 {
-                    // SAFETY: `act_h` immutable; `[os0*16, os1*16)` partitions `proj_out` and `hidden` disjointly.
+                // 3. `o_proj` plus residual.
+                let o_stripes = match &layer.o_proj {
+                    LinearBackend::Nibble4(m) => m.num_stripes,
+                    LinearBackend::NfSdot(m) => m.num_stripes,
+                    LinearBackend::Vq2(m) => m.num_stripes,
+                    _ => unreachable!(),
+                };
+                let o_pairs = o_stripes.div_ceil(2);
+                let o_grain = (o_pairs / (nt * 2)).clamp(1, 4);
+                while let Some((op0, op1)) = barrier.claim_work(o_grain, o_pairs) {
+                    let os0 = (op0 * 2).min(o_stripes);
+                    let os1 = (op1 * 2).min(o_stripes);
+                    // SAFETY: `[os0*16, os1*16)` rows are disjoint per worker.
                     unsafe {
-                        let act_h_ref = &*(act_h_addr as *const Int8ChunkActivation);
-                        nibble4_sdot_stripe_range_int8(o_mat, act_h_ref, os0, os1, proj_ptr);
+                        match &layer.o_proj {
+                            LinearBackend::Nibble4(o_mat) => {
+                                let act_h_ref = &*(act_h_addr as *const Int8ChunkActivation);
+                                nibble4_sdot_stripe_range_int8(o_mat, act_h_ref, os0, os1, proj_ptr);
+                            }
+                            LinearBackend::NfSdot(o_mat) => {
+                                let act_h_ref = &*(act_h_addr as *const Int8ChunkActivation);
+                                nf_sdot_stripe_range_int8(o_mat, act_h_ref, os0, os1, proj_ptr);
+                            }
+                            LinearBackend::Vq2(o_mat) => {
+                                vq2_lut_stripe_range_raw(o_mat, vlut_h_ptr, vscales_h_ptr, os0, os1, proj_ptr);
+                            }
+                            _ => unreachable!(),
+                        }
                         let r0 = os0 * SIMD_ROW_STRIPE;
                         let r1 = (os1 * SIMD_ROW_STRIPE).min(h_dim);
                         add_inplace(
@@ -2361,65 +3093,140 @@ impl RealLlamaEngine {
                 }
                 barrier.wait();
 
-                // 4. Zero-Barrier Worker-Local `post_attn_norm + FWHT-64 + INT8` -> L1-Fused 64-Row `[gate; up] -> SwiGLU -> FWHT-64 -> INT8`
-                if ic0 < ic1 {
-                    // SAFETY: `hidden` is read-only after barrier 3; `(lq, ls, lsum)` are worker-private stack buffers;
-                    // each `ic` writes disjoint 64-float slices of `gate_up_buf` and `act_i[ic]`.
+                // 4. Post-attention norm + FWHT, then fused `[gate; up]` -> SwiGLU -> quantize.
+                let down_is_vq2 = matches!(layer.down_proj, LinearBackend::Vq2(_));
+                let lis_ptr = if nc_i <= 256 {
+                    lis.as_mut_ptr().cast::<f32>()
+                } else if down_is_vq2 {
+                    vscales_i_ptr
+                } else {
+                    act_is
+                };
+                let lisum_ptr = if nc_i <= 256 {
+                    lisum.as_mut_ptr().cast::<i32>()
+                } else {
+                    act_isum
+                };
+                let mut gu_populated = false;
+                while let Some((ic0, ic1)) = barrier.claim_work(ic_grain, nc_i) {
+                    // SAFETY: `hidden` is read-only after barrier 3; `[ic0, ic1)` chunks are disjoint per worker.
                     unsafe {
-                        let hidden_ro = std::slice::from_raw_parts(hidden_ptr, h_dim);
-                        let inv_rms = 1.0 / (dot_f32_fast(hidden_ro, hidden_ro) / (h_dim as f32) + eps).sqrt();
-                        for c in 0..nc_h {
-                            Int8ChunkActivation::populate_chunk_fwht_raw(
-                                lq.as_mut_ptr(),
-                                ls.as_mut_ptr(),
-                                lsum.as_mut_ptr(),
-                                c,
-                                &hidden_ro[c * 64..(c + 1) * 64],
-                                Some((&layer.post_attn_norm[c * 64..(c + 1) * 64], inv_rms)),
-                            );
+                        if !gu_populated {
+                            let hidden_ro = std::slice::from_raw_parts(hidden_ptr, h_dim);
+                            let inv_rms = 1.0 / (dot_f32_fast(hidden_ro, hidden_ro) / (h_dim as f32) + eps).sqrt();
+                            if matches!(layer.gate_up_proj, LinearBackend::Vq2(_)) {
+                                for c in 0..nc_h {
+                                    Vq2ActivationLut::populate_chunk_fwht_raw(
+                                        vlq_ptr,
+                                        vls_ptr,
+                                        c,
+                                        &hidden_ro[c * 64..(c + 1) * 64],
+                                        Some((&layer.post_attn_norm[c * 64..(c + 1) * 64], inv_rms)),
+                                    );
+                                }
+                            } else {
+                                for c in 0..nc_h {
+                                    Int8ChunkActivation::populate_chunk_fwht_raw(
+                                        lq_ptr,
+                                        ls_ptr,
+                                        lsum_ptr,
+                                        c,
+                                        &hidden_ro[c * 64..(c + 1) * 64],
+                                        Some((&layer.post_attn_norm[c * 64..(c + 1) * 64], inv_rms)),
+                                    );
+                                }
+                            }
+                            gu_populated = true;
+                        }
+                        if layer.gate_up_interleaved {
+                            match &layer.gate_up_proj {
+                                LinearBackend::Nibble4(gu_mat) => {
+                                    nibble4_sdot_stripe_range_raw(gu_mat, lq_ptr, ls_ptr, lsum_ptr, ic0 * 8, ic1 * 8, gu_ptr);
+                                }
+                                LinearBackend::NfSdot(gu_mat) => {
+                                    nf_sdot_stripe_range_raw(gu_mat, lq_ptr, ls_ptr, ic0 * 8, ic1 * 8, gu_ptr);
+                                }
+                                LinearBackend::Vq2(gu_mat) => {
+                                    vq2_lut_stripe_range_raw(gu_mat, vlq_ptr, vls_ptr, ic0 * 8, ic1 * 8, gu_ptr);
+                                }
+                                _ => unreachable!(),
+                            }
                         }
                         let mut sw64 = [0.0f32; 64];
                         for ic in ic0..ic1 {
-                            nibble4_sdot_stripe_range_raw(
-                                gu_mat,
-                                lq.as_ptr(),
-                                ls.as_ptr(),
-                                lsum.as_ptr(),
-                                ic * 4,
-                                ic * 4 + 4,
-                                gu_ptr,
-                            );
-                            nibble4_sdot_stripe_range_raw(
-                                gu_mat,
-                                lq.as_ptr(),
-                                ls.as_ptr(),
-                                lsum.as_ptr(),
-                                (nc_i + ic) * 4,
-                                (nc_i + ic) * 4 + 4,
-                                gu_ptr,
-                            );
-                            let g64 = std::slice::from_raw_parts(gu_ptr.add(ic * 64), 64);
-                            let u64 = std::slice::from_raw_parts(gu_ptr.add(inter_dim + ic * 64), 64);
+                            let (g64, u64) = if layer.gate_up_interleaved {
+                                (
+                                    std::slice::from_raw_parts(gu_ptr.add(ic * 128), 64),
+                                    std::slice::from_raw_parts(gu_ptr.add(ic * 128 + 64), 64),
+                                )
+                            } else {
+                                match &layer.gate_up_proj {
+                                    LinearBackend::Nibble4(gu_mat) => {
+                                        nibble4_sdot_stripe_range_raw(gu_mat, lq_ptr, ls_ptr, lsum_ptr, ic * 4, ic * 4 + 4, gu_ptr);
+                                        nibble4_sdot_stripe_range_raw(gu_mat, lq_ptr, ls_ptr, lsum_ptr, (nc_i + ic) * 4, (nc_i + ic) * 4 + 4, gu_ptr);
+                                    }
+                                    LinearBackend::NfSdot(gu_mat) => {
+                                        nf_sdot_stripe_range_raw(gu_mat, lq_ptr, ls_ptr, ic * 4, ic * 4 + 4, gu_ptr);
+                                        nf_sdot_stripe_range_raw(gu_mat, lq_ptr, ls_ptr, (nc_i + ic) * 4, (nc_i + ic) * 4 + 4, gu_ptr);
+                                    }
+                                    LinearBackend::Vq2(gu_mat) => {
+                                        vq2_lut_stripe_range_raw(gu_mat, vlq_ptr, vls_ptr, ic * 4, ic * 4 + 4, gu_ptr);
+                                        vq2_lut_stripe_range_raw(gu_mat, vlq_ptr, vls_ptr, (nc_i + ic) * 4, (nc_i + ic) * 4 + 4, gu_ptr);
+                                    }
+                                    _ => unreachable!(),
+                                }
+                                (
+                                    std::slice::from_raw_parts(gu_ptr.add(ic * 64), 64),
+                                    std::slice::from_raw_parts(gu_ptr.add(inter_dim + ic * 64), 64),
+                                )
+                            };
                             swiglu_activate(g64, u64, &mut sw64);
-                            Int8ChunkActivation::populate_chunk_fwht_raw(
-                                act_iq,
-                                act_is,
-                                act_isum,
-                                ic,
-                                &sw64,
-                                None,
-                            );
+                            if down_is_vq2 {
+                                Vq2ActivationLut::populate_chunk_fwht_raw(vlut_i_ptr, lis_ptr, ic, &sw64, None);
+                            } else {
+                                Int8ChunkActivation::populate_chunk_fwht_raw(act_iq, lis_ptr, lisum_ptr, ic, &sw64, None);
+                            }
+                        }
+                        if nc_i <= 256 {
+                            let n_ic = ic1 - ic0;
+                            if down_is_vq2 {
+                                std::ptr::copy_nonoverlapping(lis_ptr.add(ic0), vscales_i_ptr.add(ic0), n_ic);
+                            } else {
+                                std::ptr::copy_nonoverlapping(lis_ptr.add(ic0), act_is.add(ic0), n_ic);
+                                std::ptr::copy_nonoverlapping(lisum_ptr.add(ic0), act_isum.add(ic0), n_ic);
+                            }
                         }
                     }
                 }
                 barrier.wait();
 
-                // 5. Parallel `down_proj` + Fused Disjoint Residual `hidden += proj_out`
-                let (ds0, ds1) = even_stripes(down_mat.num_stripes, tid, nt);
-                if ds0 < ds1 {
+                // 5. `down_proj` plus residual.
+                let down_stripes = match &layer.down_proj {
+                    LinearBackend::Nibble4(m) => m.num_stripes,
+                    LinearBackend::NfSdot(m) => m.num_stripes,
+                    LinearBackend::Vq2(m) => m.num_stripes,
+                    _ => unreachable!(),
+                };
+                let down_pairs = down_stripes.div_ceil(2);
+                let down_grain = (down_pairs / (nt * 2)).clamp(1, 4);
+                while let Some((dp0, dp1)) = barrier.claim_work(down_grain, down_pairs) {
+                    let ds0 = (dp0 * 2).min(down_stripes);
+                    let ds1 = (dp1 * 2).min(down_stripes);
                     unsafe {
-                        let act_i_ref = &*(act_i_addr as *const Int8ChunkActivation);
-                        nibble4_sdot_stripe_range_int8(down_mat, act_i_ref, ds0, ds1, proj_ptr);
+                        match &layer.down_proj {
+                            LinearBackend::Nibble4(down_mat) => {
+                                let act_i_ref = &*(act_i_addr as *const Int8ChunkActivation);
+                                nibble4_sdot_stripe_range_int8(down_mat, act_i_ref, ds0, ds1, proj_ptr);
+                            }
+                            LinearBackend::NfSdot(down_mat) => {
+                                let act_i_ref = &*(act_i_addr as *const Int8ChunkActivation);
+                                nf_sdot_stripe_range_int8(down_mat, act_i_ref, ds0, ds1, proj_ptr);
+                            }
+                            LinearBackend::Vq2(down_mat) => {
+                                vq2_lut_stripe_range_raw(down_mat, vlut_i_ptr, vscales_i_ptr, ds0, ds1, proj_ptr);
+                            }
+                            _ => unreachable!(),
+                        }
                         let r0 = ds0 * SIMD_ROW_STRIPE;
                         let r1 = (ds1 * SIMD_ROW_STRIPE).min(h_dim);
                         add_inplace(
@@ -2431,40 +3238,65 @@ impl RealLlamaEngine {
                 barrier.wait();
             }
 
-            // 6. Zero-Barrier Worker-Local `final_norm + FWHT-64 + INT8` -> Parallel `lm_head`
-            let (hs0, hs1) = even_stripes(head_mat.num_stripes, tid, nt);
-            if hs0 < hs1 {
+            // 6. Final norm + FWHT, then `lm_head`.
+            let head_stripes = match lm_head {
+                LinearBackend::Nibble4(m) => m.num_stripes,
+                LinearBackend::NfSdot(m) => m.num_stripes,
+                LinearBackend::Vq2(m) => m.num_stripes,
+                _ => unreachable!(),
+            };
+            let head_pairs = head_stripes.div_ceil(2);
+            let head_grain = (head_pairs / (nt * 6)).clamp(2, 32);
+            let mut head_populated = false;
+            while let Some((hp0, hp1)) = barrier.claim_work(head_grain, head_pairs) {
+                let hs0 = (hp0 * 2).min(head_stripes);
+                let hs1 = (hp1 * 2).min(head_stripes);
                 unsafe {
-                    let hidden_ro = std::slice::from_raw_parts(hidden_ptr, h_dim);
-                    let inv_rms = 1.0 / (dot_f32_fast(hidden_ro, hidden_ro) / (h_dim as f32) + eps).sqrt();
-                    for c in 0..nc_h {
-                        Int8ChunkActivation::populate_chunk_fwht_raw(
-                            lq.as_mut_ptr(),
-                            ls.as_mut_ptr(),
-                            lsum.as_mut_ptr(),
-                            c,
-                            &hidden_ro[c * 64..(c + 1) * 64],
-                            Some((&final_norm[c * 64..(c + 1) * 64], inv_rms)),
-                        );
+                    if !head_populated {
+                        let hidden_ro = std::slice::from_raw_parts(hidden_ptr, h_dim);
+                        let inv_rms = 1.0 / (dot_f32_fast(hidden_ro, hidden_ro) / (h_dim as f32) + eps).sqrt();
+                        if matches!(lm_head, LinearBackend::Vq2(_)) {
+                            for c in 0..nc_h {
+                                Vq2ActivationLut::populate_chunk_fwht_raw(
+                                    vlq_ptr,
+                                    vls_ptr,
+                                    c,
+                                    &hidden_ro[c * 64..(c + 1) * 64],
+                                    Some((&final_norm[c * 64..(c + 1) * 64], inv_rms)),
+                                );
+                            }
+                        } else {
+                            for c in 0..nc_h {
+                                Int8ChunkActivation::populate_chunk_fwht_raw(
+                                    lq_ptr,
+                                    ls_ptr,
+                                    lsum_ptr,
+                                    c,
+                                    &hidden_ro[c * 64..(c + 1) * 64],
+                                    Some((&final_norm[c * 64..(c + 1) * 64], inv_rms)),
+                                );
+                            }
+                        }
+                        head_populated = true;
                     }
-                    nibble4_sdot_stripe_range_raw(
-                        head_mat,
-                        lq.as_ptr(),
-                        ls.as_ptr(),
-                        lsum.as_ptr(),
-                        hs0,
-                        hs1,
-                        logits_ptr,
-                    );
+                    match lm_head {
+                        LinearBackend::Nibble4(head_mat) => {
+                            nibble4_sdot_stripe_range_raw(head_mat, lq_ptr, ls_ptr, lsum_ptr, hs0, hs1, logits_ptr);
+                        }
+                        LinearBackend::NfSdot(head_mat) => {
+                            nf_sdot_stripe_range_raw(head_mat, lq_ptr, ls_ptr, hs0, hs1, logits_ptr);
+                        }
+                        LinearBackend::Vq2(head_mat) => {
+                            vq2_lut_stripe_range_raw(head_mat, vlq_ptr, vls_ptr, hs0, hs1, logits_ptr);
+                        }
+                        _ => unreachable!(),
+                    }
                 }
             }
         };
 
         if let Some(pool) = self.pool.as_ref() {
-            // For sub-1B L2/SLC-resident models (`h_dim <= 1024`), 8 P-cores divide `nc_i` (`24` / `40`)
-            // and `lm_head` (`1536` pairs) evenly while leaving 2 P-cores free for OS/desktop interrupts.
-            let max_decode_nt = if h_dim <= 1024 { 8 } else { usize::MAX };
-            pool.execute_up_to(max_decode_nt, kernel);
+            pool.execute_all(kernel);
         } else {
             let b1 = SpinBarrier::new(1);
             kernel(0, 1, &b1);
@@ -2514,9 +3346,11 @@ impl RealLlamaEngine {
         let qkv_rows = h + 2 * kv_dim;
         let head_dim = self.cfg.head_dim();
         let half_dim = head_dim / 2;
-        let kv_group = self.cfg.num_attention_heads / self.cfg.num_key_value_heads;
+        let num_kv_heads = self.cfg.num_key_value_heads;
+        let kv_group = self.cfg.num_attention_heads / num_kv_heads;
         let attn_scale = 1.0 / (head_dim as f32).sqrt();
-        let layer_kv_stride = self.cfg.max_seq_len * kv_dim;
+        let max_seq_len = self.cfg.max_seq_len;
+        let layer_kv_stride = max_seq_len * kv_dim;
         let eps = self.cfg.rms_norm_eps;
         let lut_h = self.ws.blut_hidden.lut_enabled;
         let lut_i = self.ws.blut_inter.lut_enabled;
@@ -2531,10 +3365,14 @@ impl RealLlamaEngine {
         for (t, &tok) in tokens.iter().enumerate() {
             let row = &mut hidden[t * h..(t + 1) * h];
             if self.embed_f32_rows.is_empty() {
-                if let LinearBackend::Nibble4(m) = &self.lm_head {
-                    m.dequantize_row_rotated(tok, row);
-                    ifwht64_signed_inplace(row);
+                match &self.lm_head {
+                    LinearBackend::Nibble4(m) => m.dequantize_row_rotated(tok, row),
+                    LinearBackend::NfSdot(m) => m.dequantize_row_rotated(tok, row),
+                    LinearBackend::Vq2(m) => m.dequantize_row_rotated(tok, row),
+                    LinearBackend::FusedBipolar(m) => m.dequantize_row_rotated(tok, row),
+                    _ => unreachable!("embedding table dropped only for quantized tied lm_head"),
                 }
+                ifwht64_signed_inplace(row);
             } else {
                 row.copy_from_slice(&self.embed_f32_rows[tok * h..(tok + 1) * h]);
             }
@@ -2547,9 +3385,9 @@ impl RealLlamaEngine {
         let gate_up = &mut ps.gate_up[..n * 2 * inter];
         let sw = &mut ps.sw[..n * inter];
         let score_stride = if head_dim == 64 {
-            self.cfg.max_seq_len
+            max_seq_len
         } else {
-            kv_group.max(1) * self.cfg.max_seq_len
+            kv_group.max(1) * max_seq_len
         };
         let scores_all = &mut ps.scores[..n * score_stride];
 
@@ -2558,58 +3396,120 @@ impl RealLlamaEngine {
             prompt_populate(pool, hidden, h, Some((&layer.input_norm, eps)), acts_h);
             prompt_gemm(pool, &layer.qkv_proj, acts_h, qkv);
 
-            let k_ptr = self.ws.k_cache.as_mut_ptr() as usize;
-            let v_ptr = self.ws.v_cache.as_mut_ptr() as usize;
             let qkv_ptr = qkv.as_mut_ptr() as usize;
             let rope = &self.rope_cos_sin;
             let cfg = &self.cfg;
-            par_range(pool, n, |a, b| {
-                for t in a..b {
-                    let pos = pos0 + t;
-                    // SAFETY: token `t` owns row `t` of `qkv` and cache slot `pos`.
-                    let row = unsafe {
-                        std::slice::from_raw_parts_mut((qkv_ptr as *mut f32).add(t * qkv_rows), qkv_rows)
-                    };
-                    let rope_row = &rope[pos * head_dim..(pos + 1) * head_dim];
-                    let (q, kv) = row.split_at_mut(h);
-                    let (k, v) = kv.split_at_mut(kv_dim);
-                    apply_llama_rope_precomp(q, cfg.num_attention_heads, head_dim, half_dim, rope_row);
-                    apply_llama_rope_precomp(k, cfg.num_key_value_heads, head_dim, half_dim, rope_row);
-                    let off = kv_base + pos * kv_dim;
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(k.as_ptr(), (k_ptr as *mut f32).add(off), kv_dim);
-                        std::ptr::copy_nonoverlapping(v.as_ptr(), (v_ptr as *mut f32).add(off), kv_dim);
+            if let Some(q8) = self.ws.q8_kv.as_mut() {
+                let q8_k_addr = q8.k_q8.as_mut_ptr() as usize;
+                let q8_ks_addr = q8.k_scales.as_mut_ptr() as usize;
+                let q8_v_addr = q8.v_q8.as_mut_ptr() as usize;
+                let q8_vs_addr = q8.v_scales.as_mut_ptr() as usize;
+                par_range(pool, n, |a, b| {
+                    for t in a..b {
+                        let pos = pos0 + t;
+                        // SAFETY: token `t` owns row `t` of `qkv` and cache slot `pos` across all KV heads.
+                        unsafe {
+                            let row = std::slice::from_raw_parts_mut(
+                                (qkv_ptr as *mut f32).add(t * qkv_rows),
+                                qkv_rows,
+                            );
+                            let rope_row = &rope[pos * head_dim..(pos + 1) * head_dim];
+                            let (q, kv) = row.split_at_mut(h);
+                            let (k, v) = kv.split_at_mut(kv_dim);
+                            apply_llama_rope_precomp(q, cfg.num_attention_heads, head_dim, half_dim, rope_row);
+                            apply_llama_rope_precomp(k, num_kv_heads, head_dim, half_dim, rope_row);
+                            for kvh in 0..num_kv_heads {
+                                let slot = (l_idx * num_kv_heads + kvh) * max_seq_len + pos;
+                                store_hadamard_q8_head64_raw(
+                                    &k[kvh * 64..(kvh + 1) * 64],
+                                    (q8_k_addr as *mut i8).add(slot * 64),
+                                    (q8_ks_addr as *mut f32).add(slot),
+                                );
+                                store_hadamard_q8_head64_raw(
+                                    &v[kvh * 64..(kvh + 1) * 64],
+                                    (q8_v_addr as *mut i8).add(slot * 64),
+                                    (q8_vs_addr as *mut f32).add(slot),
+                                );
+                            }
+                        }
                     }
-                }
-            });
+                });
 
-            let k_cache = &self.ws.k_cache[kv_base..];
-            let v_cache = &self.ws.v_cache[kv_base..];
-            let attn_ptr = attn.as_mut_ptr() as usize;
-            let scores_ptr = scores_all.as_mut_ptr() as usize;
-            let qkv_ref = &*qkv;
-            par_range(pool, n, |a, b| {
-                for t in a..b {
-                    // SAFETY: token `t` owns row `t` of `attn` and `scores_all`.
-                    let dst = unsafe { std::slice::from_raw_parts_mut((attn_ptr as *mut f32).add(t * h), h) };
-                    let sc = unsafe {
-                        std::slice::from_raw_parts_mut((scores_ptr as *mut f32).add(t * score_stride), score_stride)
-                    };
-                    causal_gqa_attention(
-                        &qkv_ref[t * qkv_rows..t * qkv_rows + h],
-                        k_cache,
-                        v_cache,
-                        sc,
-                        dst,
-                        cfg.num_attention_heads,
-                        kv_group,
-                        head_dim,
-                        kv_dim,
-                        pos0 + t,
-                        attn_scale,
-                    );
-                }
-            });
+                let q8_ro = &*q8;
+                let attn_ptr = attn.as_mut_ptr() as usize;
+                let scores_ptr = scores_all.as_mut_ptr() as usize;
+                let qkv_ref = &*qkv;
+                par_range(pool, n, |a, b| {
+                    for t in a..b {
+                        // SAFETY: token `t` owns row `t` of `attn` and `scores_all`.
+                        let dst = unsafe { std::slice::from_raw_parts_mut((attn_ptr as *mut f32).add(t * h), h) };
+                        let sc = unsafe {
+                            std::slice::from_raw_parts_mut((scores_ptr as *mut f32).add(t * score_stride), score_stride)
+                        };
+                        causal_gqa_attention_q8(
+                            &qkv_ref[t * qkv_rows..t * qkv_rows + h],
+                            q8_ro,
+                            l_idx,
+                            sc,
+                            dst,
+                            cfg.num_attention_heads,
+                            kv_group,
+                            pos0 + t,
+                            attn_scale,
+                        );
+                    }
+                });
+            } else {
+                let k_ptr = self.ws.k_cache.as_mut_ptr() as usize;
+                let v_ptr = self.ws.v_cache.as_mut_ptr() as usize;
+                par_range(pool, n, |a, b| {
+                    for t in a..b {
+                        let pos = pos0 + t;
+                        // SAFETY: token `t` owns row `t` of `qkv` and cache slot `pos`.
+                        let row = unsafe {
+                            std::slice::from_raw_parts_mut((qkv_ptr as *mut f32).add(t * qkv_rows), qkv_rows)
+                        };
+                        let rope_row = &rope[pos * head_dim..(pos + 1) * head_dim];
+                        let (q, kv) = row.split_at_mut(h);
+                        let (k, v) = kv.split_at_mut(kv_dim);
+                        apply_llama_rope_precomp(q, cfg.num_attention_heads, head_dim, half_dim, rope_row);
+                        apply_llama_rope_precomp(k, num_kv_heads, head_dim, half_dim, rope_row);
+                        let off = kv_base + pos * kv_dim;
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(k.as_ptr(), (k_ptr as *mut f32).add(off), kv_dim);
+                            std::ptr::copy_nonoverlapping(v.as_ptr(), (v_ptr as *mut f32).add(off), kv_dim);
+                        }
+                    }
+                });
+
+                let k_cache = &self.ws.k_cache[kv_base..];
+                let v_cache = &self.ws.v_cache[kv_base..];
+                let attn_ptr = attn.as_mut_ptr() as usize;
+                let scores_ptr = scores_all.as_mut_ptr() as usize;
+                let qkv_ref = &*qkv;
+                par_range(pool, n, |a, b| {
+                    for t in a..b {
+                        // SAFETY: token `t` owns row `t` of `attn` and `scores_all`.
+                        let dst = unsafe { std::slice::from_raw_parts_mut((attn_ptr as *mut f32).add(t * h), h) };
+                        let sc = unsafe {
+                            std::slice::from_raw_parts_mut((scores_ptr as *mut f32).add(t * score_stride), score_stride)
+                        };
+                        causal_gqa_attention(
+                            &qkv_ref[t * qkv_rows..t * qkv_rows + h],
+                            k_cache,
+                            v_cache,
+                            sc,
+                            dst,
+                            cfg.num_attention_heads,
+                            kv_group,
+                            head_dim,
+                            kv_dim,
+                            pos0 + t,
+                            attn_scale,
+                        );
+                    }
+                });
+            }
 
             prompt_populate(pool, attn, h, None, acts_h);
             prompt_gemm(pool, &layer.o_proj, acts_h, proj);
@@ -2619,13 +3519,24 @@ impl RealLlamaEngine {
             prompt_gemm(pool, &layer.gate_up_proj, acts_h, gate_up);
             let gu_ref = &*gate_up;
             let sw_ptr = sw.as_mut_ptr() as usize;
+            let gu_interleaved = layer.gate_up_interleaved;
             par_range(pool, n, |a, b| {
                 for t in a..b {
                     let gu = &gu_ref[t * 2 * inter..(t + 1) * 2 * inter];
-                    let (g, u) = gu.split_at(inter);
                     // SAFETY: token `t` owns row `t` of `sw`.
                     let out = unsafe { std::slice::from_raw_parts_mut((sw_ptr as *mut f32).add(t * inter), inter) };
-                    swiglu_activate(g, u, out);
+                    if gu_interleaved {
+                        for ic in 0..(inter / 64) {
+                            swiglu_activate(
+                                &gu[ic * 128..ic * 128 + 64],
+                                &gu[ic * 128 + 64..ic * 128 + 128],
+                                &mut out[ic * 64..(ic + 1) * 64],
+                            );
+                        }
+                    } else {
+                        let (g, u) = gu.split_at(inter);
+                        swiglu_activate(g, u, out);
+                    }
                 }
             });
             prompt_populate(pool, sw, inter, None, acts_i);
@@ -2640,7 +3551,12 @@ impl RealLlamaEngine {
             self.ws.logits.copy_from_slice(&out_all[(n - 1) * vocab..n * vocab]);
         } else {
             let last_h = &hidden[(n - 1) * h..];
-            if !self.ws.blut_hidden.lut_enabled {
+            if matches!(self.lm_head, LinearBackend::Vq2(_)) {
+                let inv_rms = 1.0 / (dot_f32_fast(last_h, last_h) / (h as f32) + eps).sqrt();
+                self.ws
+                    .vqlut_hidden
+                    .populate_rmsnorm_fwht(last_h, &self.final_norm, inv_rms);
+            } else if !self.ws.blut_hidden.lut_enabled {
                 let inv_rms = 1.0 / (dot_f32_fast(last_h, last_h) / (h as f32) + eps).sqrt();
                 self.ws
                     .blut_hidden
@@ -2657,6 +3573,7 @@ impl RealLlamaEngine {
                 &self.ws.norm_buf,
                 None,
                 Some(&self.ws.blut_hidden),
+                Some(&self.ws.vqlut_hidden),
                 &self.ws.q8_hidden_vals,
                 &self.ws.q8_hidden_scales,
                 pool,
@@ -2776,15 +3693,325 @@ fn prompt_populate(
 
 /// Batched projection of all prompt tokens: `out[t * rows + r]`.
 fn prompt_gemm(pool: Option<&SpinThreadPool>, mat: &LinearBackend, acts: &[BipolarActivationLut], out: &mut [f32]) {
-    let LinearBackend::Nibble4(m) = mat else {
-        unreachable!("prompt_gemm requires SDOT projections");
-    };
-    debug_assert_eq!(out.len(), acts.len() * m.rows);
     let out_ptr = out.as_mut_ptr() as usize;
-    par_range(pool, m.num_stripes, |s0, s1| {
-        // SAFETY: disjoint stripe ranges write disjoint rows of every token.
-        unsafe { nibble4_sdot_batch_stripe_range(m, acts, s0, s1, out_ptr as *mut f32, m.rows) };
-    });
+    let par_stripes = |n_stripes: usize, grain: usize, f: &(dyn Fn(usize, usize) + Sync)| match pool {
+        Some(p) if n_stripes > grain => p.parallel_for(n_stripes, grain, f),
+        _ => f(0, n_stripes),
+    };
+    match mat {
+        LinearBackend::Nibble4(m) => {
+            debug_assert_eq!(out.len(), acts.len() * m.rows);
+            par_stripes(m.num_stripes, 2, &|s0, s1| {
+                // SAFETY: disjoint stripe ranges write disjoint rows of every token.
+                unsafe { nibble4_sdot_batch_stripe_range(m, acts, s0, s1, out_ptr as *mut f32, m.rows) };
+            });
+        }
+        LinearBackend::NfSdot(m) => {
+            debug_assert_eq!(out.len(), acts.len() * m.rows);
+            par_stripes(m.num_stripes, 2, &|s0, s1| {
+                // SAFETY: disjoint stripe ranges write disjoint rows of every token.
+                unsafe { nf_sdot_batch_stripe_range(m, acts, s0, s1, out_ptr as *mut f32, m.rows) };
+            });
+        }
+        LinearBackend::Vq2(m) => {
+            debug_assert_eq!(out.len(), acts.len() * m.rows);
+            par_stripes(m.num_stripes, 4, &|s0, s1| {
+                // SAFETY: disjoint stripe ranges write disjoint rows of every token.
+                unsafe { vq2_sdot_batch_stripe_range(m, acts, s0, s1, out_ptr as *mut f32, m.rows) };
+            });
+        }
+        _ => unreachable!("prompt_gemm requires Nibble4, NfSdot, or Vq2 SDOT projections"),
+    }
+}
+
+/// Rotates `src` (64 floats) by the signed FWHT-64 and quantizes to 64 INT8 values plus one FP32 scale.
+///
+/// # Safety
+/// `src.len() == 64`, `dst_q8` valid for `64` `i8` writes, `dst_scale` valid for `1` `f32` write.
+#[inline]
+unsafe fn store_hadamard_q8_head64_raw(src: &[f32], dst_q8: *mut i8, dst_scale: *mut f32) {
+    debug_assert_eq!(src.len(), 64);
+    let mut rot = [0.0f32; 64];
+    rot.copy_from_slice(src);
+    fwht64_signed_inplace(&mut rot);
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on `aarch64`; caller upholds pointer bounds.
+        let s = unsafe { quantize_rot64_to_i8_neon(&rot, dst_q8) };
+        unsafe { *dst_scale = s };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let max_abs = rot.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        if max_abs <= f32::EPSILON {
+            unsafe {
+                std::ptr::write_bytes(dst_q8, 0, 64);
+                *dst_scale = 0.0;
+            }
+            return;
+        }
+        let inv = 127.0 / max_abs;
+        for (i, &v) in rot.iter().enumerate() {
+            unsafe { *dst_q8.add(i) = (v * inv).round_ties_even() as i32 as i8 };
+        }
+        unsafe { *dst_scale = max_abs / 127.0 };
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn quantize_rot64_to_i8_neon(rot: &[f32; 64], dst_q8: *mut i8) -> f32 {
+    use std::arch::aarch64::*;
+    let p = rot.as_ptr();
+    let mut vmax = vdupq_n_f32(0.0);
+    for i in 0..16 {
+        // SAFETY: `i * 4 + 4 <= 64`.
+        let v = unsafe { vld1q_f32(p.add(i * 4)) };
+        vmax = vmaxq_f32(vmax, vabsq_f32(v));
+    }
+    let max_abs = vmaxvq_f32(vmax);
+    if max_abs <= f32::EPSILON {
+        // SAFETY: caller guarantees `dst_q8` valid for `64` bytes.
+        unsafe { std::ptr::write_bytes(dst_q8, 0, 64) };
+        return 0.0;
+    }
+    let scale = max_abs / 127.0;
+    let vinv = vdupq_n_f32(127.0 / max_abs);
+    for g in 0..4 {
+        let b = g * 16;
+        // SAFETY: `b + 16 <= 64` for both `rot` and `dst_q8`.
+        unsafe {
+            let q0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(p.add(b)), vinv));
+            let q1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(p.add(b + 4)), vinv));
+            let q2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(p.add(b + 8)), vinv));
+            let q3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(p.add(b + 12)), vinv));
+            let s16_lo = vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
+            let s16_hi = vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
+            let s8 = vcombine_s8(vqmovn_s16(s16_lo), vqmovn_s16(s16_hi));
+            vst1q_s8(dst_q8.add(b), s8);
+        }
+    }
+    scale
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sdot_v16_i8(
+    mut acc: std::arch::aarch64::int32x4_t,
+    a: std::arch::aarch64::int8x16_t,
+    b: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    // SAFETY: `FEAT_DotProd` (`sdot`) is baseline on every Apple Silicon / ARMv8.4+ CPU.
+    unsafe {
+        core::arch::asm!(
+            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+            acc = inout(vreg) acc,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+    }
+    acc
+}
+
+/// Single-head GQA attention (`head_dim == 64`) over the INT8 Hadamard KV cache using `SDOT`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn causal_gqa_head64_q8(
+    q_head: &[f32],
+    k_q8_head: &[i8],
+    k_scales_head: &[f32],
+    v_q8_head: &[i8],
+    v_scales_head: &[f32],
+    sc: &mut [f32],
+    out_head: &mut [f32; 64],
+    attn_scale: f32,
+) {
+    debug_assert_eq!(q_head.len(), 64);
+    let seq_len = sc.len();
+    debug_assert_eq!(k_q8_head.len(), seq_len * 64);
+    debug_assert_eq!(k_scales_head.len(), seq_len);
+    debug_assert_eq!(v_q8_head.len(), seq_len * 64);
+    debug_assert_eq!(v_scales_head.len(), seq_len);
+
+    let mut q_i8 = [0i8; 64];
+    let mut q_scale = 0.0f32;
+    // SAFETY: `q_head.len() == 64`, `q_i8` holds 64 `i8`s, `q_scale` is valid.
+    unsafe {
+        store_hadamard_q8_head64_raw(q_head, q_i8.as_mut_ptr(), &mut q_scale);
+    }
+    let q_attn_scale = q_scale * attn_scale;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: slice lengths verified above; NEON + `sdot` available on Apple Silicon.
+        unsafe {
+            attn_scores_head64_q8_sdot_neon(&q_i8, k_q8_head, k_scales_head, q_attn_scale, sc);
+        }
+        let max_score = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let inv_sum = 1.0 / softmax_unnorm_inplace(sc, max_score);
+        // SAFETY: slice lengths verified above.
+        unsafe {
+            attn_values_head64_q8_neon(sc, v_q8_head, v_scales_head, inv_sum, out_head);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for t in 0..seq_len {
+            let kt = &k_q8_head[t * 64..(t + 1) * 64];
+            let dot: i32 = q_i8.iter().zip(kt.iter()).map(|(&a, &b)| (a as i32) * (b as i32)).sum();
+            sc[t] = (dot as f32) * k_scales_head[t] * q_attn_scale;
+        }
+        let max_score = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let inv_sum = 1.0 / softmax_unnorm_inplace(sc, max_score);
+        out_head.fill(0.0);
+        for t in 0..seq_len {
+            let w = sc[t] * inv_sum * v_scales_head[t];
+            let vt = &v_q8_head[t * 64..(t + 1) * 64];
+            for (dst, &vq) in out_head.iter_mut().zip(vt.iter()) {
+                *dst += w * (vq as f32);
+            }
+        }
+    }
+    ifwht64_signed_inplace(out_head);
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn causal_gqa_attention_q8(
+    q_buf: &[f32],
+    q8_kv: &QuantizedKvCache,
+    layer_idx: usize,
+    scores: &mut [f32],
+    attn_out: &mut [f32],
+    num_q_heads: usize,
+    kv_group: usize,
+    pos: usize,
+    attn_scale: f32,
+) {
+    let seq_len = pos + 1;
+    let mut out_head = [0.0f32; 64];
+    for qh in 0..num_q_heads {
+        let kvh = qh / kv_group;
+        let (k_q8_h, ks_h, v_q8_h, vs_h) = q8_kv.head_views(layer_idx, kvh, seq_len);
+        let q_head = &q_buf[qh * 64..(qh + 1) * 64];
+        let sc = &mut scores[..seq_len];
+        causal_gqa_head64_q8(q_head, k_q8_h, ks_h, v_q8_h, vs_h, sc, &mut out_head, attn_scale);
+        attn_out[qh * 64..(qh + 1) * 64].copy_from_slice(&out_head);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn attn_scores_head64_q8_sdot_neon(
+    q_i8: &[i8; 64],
+    k_q8: &[i8],
+    k_scales: &[f32],
+    q_attn_scale: f32,
+    out: &mut [f32],
+) {
+    use std::arch::aarch64::*;
+    let n = out.len();
+    debug_assert!(k_q8.len() >= n * 64 && k_scales.len() >= n);
+    let qp = q_i8.as_ptr();
+    // SAFETY: `q_i8` holds 64 `i8` bytes.
+    let (qv0, qv1, qv2, qv3) = unsafe {
+        (
+            vld1q_s8(qp),
+            vld1q_s8(qp.add(16)),
+            vld1q_s8(qp.add(32)),
+            vld1q_s8(qp.add(48)),
+        )
+    };
+    let kp = k_q8.as_ptr();
+    let ksp = k_scales.as_ptr();
+    let op = out.as_mut_ptr();
+    let vqs = vdupq_n_f32(q_attn_scale);
+    let mut t = 0usize;
+
+    while t + 8 <= n {
+        let mut acc = [vdupq_n_s32(0); 8];
+        for (j, a) in acc.iter_mut().enumerate() {
+            // SAFETY: `(t + j) * 64 + 64 <= n * 64`.
+            unsafe {
+                let kj = kp.add((t + j) * 64);
+                let mut s = *a;
+                s = sdot_v16_i8(s, vld1q_s8(kj), qv0);
+                s = sdot_v16_i8(s, vld1q_s8(kj.add(16)), qv1);
+                s = sdot_v16_i8(s, vld1q_s8(kj.add(32)), qv2);
+                s = sdot_v16_i8(s, vld1q_s8(kj.add(48)), qv3);
+                *a = s;
+            }
+        }
+        let lo_i32 = vpaddq_s32(vpaddq_s32(acc[0], acc[1]), vpaddq_s32(acc[2], acc[3]));
+        let hi_i32 = vpaddq_s32(vpaddq_s32(acc[4], acc[5]), vpaddq_s32(acc[6], acc[7]));
+        // SAFETY: `t + 8 <= n`.
+        unsafe {
+            let s_lo = vmulq_f32(vld1q_f32(ksp.add(t)), vqs);
+            let s_hi = vmulq_f32(vld1q_f32(ksp.add(t + 4)), vqs);
+            vst1q_f32(op.add(t), vmulq_f32(vcvtq_f32_s32(lo_i32), s_lo));
+            vst1q_f32(op.add(t + 4), vmulq_f32(vcvtq_f32_s32(hi_i32), s_hi));
+        }
+        t += 8;
+    }
+
+    while t < n {
+        // SAFETY: `t < n`.
+        unsafe {
+            let kj = kp.add(t * 64);
+            let mut a = vdupq_n_s32(0);
+            a = sdot_v16_i8(a, vld1q_s8(kj), qv0);
+            a = sdot_v16_i8(a, vld1q_s8(kj.add(16)), qv1);
+            a = sdot_v16_i8(a, vld1q_s8(kj.add(32)), qv2);
+            a = sdot_v16_i8(a, vld1q_s8(kj.add(48)), qv3);
+            *op.add(t) = (vaddvq_s32(a) as f32) * (*ksp.add(t)) * q_attn_scale;
+        }
+        t += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn attn_values_head64_q8_neon(
+    p: &[f32],
+    v_q8: &[i8],
+    v_scales: &[f32],
+    inv_sum: f32,
+    out: &mut [f32; 64],
+) {
+    use std::arch::aarch64::*;
+    let n = p.len();
+    debug_assert!(v_q8.len() >= n * 64 && v_scales.len() >= n);
+    let vp = v_q8.as_ptr();
+    let mut acc = [vdupq_n_f32(0.0); 16];
+
+    for t in 0..n {
+        let w = (p[t] * inv_sum) * v_scales[t];
+        if w == 0.0 {
+            continue;
+        }
+        let vw = vdupq_n_f32(w);
+        // SAFETY: `t * 64 + 64 <= n * 64`.
+        unsafe {
+            let vt = vp.add(t * 64);
+            for g in 0..4 {
+                let vb = vld1q_s8(vt.add(g * 16));
+                let lo16 = vmovl_s8(vget_low_s8(vb));
+                let hi16 = vmovl_high_s8(vb);
+                let b = g * 4;
+                acc[b] = vfmaq_f32(acc[b], vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16))), vw);
+                acc[b + 1] = vfmaq_f32(acc[b + 1], vcvtq_f32_s32(vmovl_high_s16(lo16)), vw);
+                acc[b + 2] = vfmaq_f32(acc[b + 2], vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16))), vw);
+                acc[b + 3] = vfmaq_f32(acc[b + 3], vcvtq_f32_s32(vmovl_high_s16(hi16)), vw);
+            }
+        }
+    }
+
+    let op = out.as_mut_ptr();
+    for (i, a) in acc.iter().enumerate() {
+        // SAFETY: `i * 4 + 4 <= 64`.
+        unsafe { vst1q_f32(op.add(i * 4), *a) };
+    }
 }
 
 fn build_rope_table(cfg: &LlamaConfig) -> Vec<f32> {
@@ -3575,6 +4802,85 @@ mod tests {
                     assert!((got - want).abs() < 1e-4, "pos {pos} head {h} dim {d}: {got} vs {want}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_hadamard_q8_kv_cache_attention_accuracy() {
+        let cfg = LlamaConfig {
+            vocab_size: 256,
+            hidden_size: 384, // 6 query heads x 64
+            intermediate_size: 1024,
+            num_hidden_layers: 2,
+            num_attention_heads: 6,
+            num_key_value_heads: 2,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            tie_word_embeddings: true,
+            max_seq_len: 64,
+        };
+        let (heads, kv_heads, hd) = (6, 2, 64);
+        let kv_dim = kv_heads * hd;
+        let mut q8 = QuantizedKvCache::new(&cfg);
+        assert_eq!(q8.physical_bytes(), 2 * 2 * 64 * (128 + 8));
+
+        // 12x outliers on two channels, as RoPE produces.
+        let f = |i: usize, m: usize| {
+            let base = ((i * m % 101) as f32 / 101.0 - 0.5) * 1.6;
+            if (i % 64) == 7 || (i % 64) == 39 {
+                base * 12.0
+            } else {
+                base
+            }
+        };
+        let n_max = 37usize;
+        let k_all: Vec<f32> = (0..n_max * kv_dim).map(|i| f(i, 19)).collect();
+        let v_all: Vec<f32> = (0..n_max * kv_dim).map(|i| f(i, 29)).collect();
+        for pos in 0..n_max {
+            for kvh in 0..kv_heads {
+                let off = pos * kv_dim + kvh * 64;
+                q8.store_k_head64(1, kvh, pos, &k_all[off..off + 64]);
+                q8.store_v_head64(1, kvh, pos, &v_all[off..off + 64]);
+            }
+        }
+
+        for pos in [0usize, 7, 15, 36] {
+            let q: Vec<f32> = (0..heads * hd).map(|i| f(i + pos * 13, 37)).collect();
+            let mut sc_f32 = vec![0.0f32; (pos + 1) * heads];
+            let mut sc_q8 = vec![0.0f32; (pos + 1) * heads];
+            let mut out_f32 = vec![0.0f32; heads * hd];
+            let mut out_q8 = vec![0.0f32; heads * hd];
+
+            causal_gqa_attention(
+                &q,
+                &k_all,
+                &v_all,
+                &mut sc_f32,
+                &mut out_f32,
+                heads,
+                heads / kv_heads,
+                hd,
+                kv_dim,
+                pos,
+                0.125,
+            );
+            causal_gqa_attention_q8(
+                &q,
+                &q8,
+                1,
+                &mut sc_q8,
+                &mut out_q8,
+                heads,
+                heads / kv_heads,
+                pos,
+                0.125,
+            );
+
+            let cos = logit_cosine_f64(&out_f32, &out_q8);
+            assert!(
+                cos > 0.99985,
+                "Hadamard Q8 KV attention cosine at pos={pos} too low: {cos}"
+            );
         }
     }
 }

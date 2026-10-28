@@ -1,11 +1,14 @@
 //! Terminal chat on a Kronos-compiled SmolLM2-Instruct model.
 //!
 //! Usage: `kronos_chat <model_dir> [flags]`
-//!   `--mode M`            `b4`, `b5`, `b6` or `pQOGDH` (default `p55454`)
+//!   `--mode M`            `nf4`, `nf4g128`, `nf3nf4`, `nf3`, `b4`, `b5`, `b6` or `pQOGDH` (default `p55454`)
 //!   `--calib FILE`        calibration text, needed once to compile each mode
 //!   `--calib-tokens N`    (default 16384)
+//!   `--cache-dir DIR`     optional directory to read/write compiled `.k2tb` caches
 //!   `--ctx N`             context window in tokens (default 2048)
 //!   `--threads N`         (default 8)
+//!   `--fp32-kv`           use an `FP32` KV cache instead of the default INT8 one
+//!   `--draft DIR`         draft model for speculative decoding (`--draft-mode M`)
 //!   `--temp T`, `--top-k K`, `--top-p P`, `--repeat-penalty R`, `--max-new N`, `--seed N`
 //!   `--system TEXT`       system prompt
 //!   `--ane`               prefill on the Neural Engine (`ane` feature, models in `<model_dir>/ane`)
@@ -32,8 +35,11 @@ fn main() {
     eprintln!("loading {} ({mode})...", model_dir.display());
     let default_threads = kronos_2t::thread_pool::default_inference_threads() as f64;
     let calib_opt = calib.as_deref().map(|c| (Path::new(c), calib_tokens));
-    let mut model = ChatModel::load(
+    let cache_dir_flag = flag("--cache-dir");
+    let cache_dir_opt = cache_dir_flag.as_deref().map(Path::new);
+    let mut model = ChatModel::load_with_cache_dir(
         model_dir,
+        cache_dir_opt,
         &mode,
         num("--ctx", 2048.0) as usize,
         num("--threads", default_threads) as usize,
@@ -43,13 +49,20 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1);
     });
+    if args.iter().any(|a| a == "--fp32-kv") {
+        model.enable_q8_kv_cache(false);
+    } else if args.iter().any(|a| a == "--q8-kv") {
+        model.enable_q8_kv_cache(true);
+    }
     if let Some(draft_dir) = flag("--draft") {
         let draft_mode = flag("--draft-mode").unwrap_or_else(|| mode.clone());
         eprintln!("attaching speculative draft {} ({draft_mode})...", draft_dir);
-        model.attach_draft(Path::new(&draft_dir), &draft_mode, calib_opt).unwrap_or_else(|e| {
-            eprintln!("draft error: {e}");
-            std::process::exit(1);
-        });
+        model
+            .attach_draft_with_cache_dir(Path::new(&draft_dir), cache_dir_opt, &draft_mode, calib_opt)
+            .unwrap_or_else(|e| {
+                eprintln!("draft error: {e}");
+                std::process::exit(1);
+            });
     }
     if args.iter().any(|a| a == "--ane") {
         #[cfg(all(feature = "ane", target_os = "macos"))]

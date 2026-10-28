@@ -90,6 +90,48 @@ runs at about 133 GMAC/s per core, 85% of `sdot` peak; an `i8mm` (`SMMLA`) versi
 same, since `SMMLA` peaks only 1.2x higher on the M4. The Metal GPU is 4–10x faster than any CPU
 result for prefill.
 
+## Chat model: SmolLM2-1.7B-Instruct
+
+Measured on the current code. Quality: 32 WikiText-2 chunks, 16k WikiText train tokens for
+calibration, int8 KV cache. The full-precision reference scores 12.81 PPL.
+
+| Mode | Bits | Weights | KV cache (2048 ctx) | PPL | KL | Top-1 | pp256, 8T |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| p55454 | 4.72 | 963 MB | 25.5 MB | 13.29 | 0.051 | 89.0% | 509 tok/s |
+| nf4g128 | 4.13 | 842 MB | 25.5 MB | 13.52 | 0.066 | 88.0% | 606 tok/s |
+
+`nf4g128` uses a 16-level Lloyd-Max codebook with one scale per 128 weights: 13% smaller and
+19% faster at prefill than p55454, with slightly higher KL. The FP32 KV cache takes 96 MB.
+
+Chat decode through `kronos_server` (median of 3 interleaved runs, tok/s):
+
+| Workload | Previous release, p55454 | p55454 | nf4g128 |
+|---|---:|---:|---:|
+| Summarize a 290-token passage | 100 | 125 | 143 |
+| 250-word essay on that passage | 100 | 121 | 141 |
+| 250-word story | 110 | 131 | 147 |
+
+With `--ane`, prompt prefill runs on the Neural Engine: the first token of a 290-token prompt
+arrives in about 340 ms instead of 650–850 ms, with the same output quality (WikiText PPL
+12.05 vs 12.06 for CPU prefill).
+
+## MoE streaming experiment
+
+`bench_800b` models an 812B-parameter mixture-of-experts layout (80 layers, 7168 hidden,
+top-8 of 225 experts) with synthetic weights, reading experts from the SSD with `F_NOCACHE`.
+Measured on the same M4 Pro:
+
+| Case | tok/s | Notes |
+|---|---:|---|
+| All experts read from SSD | 0.78 | 5.9 GB/s SSD reads |
+| Zipf-distributed routing, RAM cache + prefetch | 1.64 | 47% of experts hit the cache |
+| All active experts already in RAM | 13–24 | Upper bound; does not fit in 24 GB at 3 bits |
+
+Real MoE models are trained to spread tokens evenly across experts, so the cache hit rate
+will be lower than with Zipf routing. On FFN layers from SmolLM2-1.7B, 3-bit NF3 experts reach
+0.96 output cosine to FP32 and 2-bit VQ2 0.86. On the full 1.7B model, 2-bit VQ2 scores
+35 PPL against 12.8, too lossy to use.
+
 ## Remaining limitations
 
 - GPU prefill is far ahead; CPU prefill trails llama.cpp for some quant types.

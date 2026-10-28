@@ -3,11 +3,12 @@
 //! Usage: `wikitext_ppl <model_dir> <token_ids_file> [flags]`
 //!   `--chunks N`        evaluation chunks (default 64)
 //!   `--ctx N`           chunk length (default 256)
-//!   `--modes LIST`      comma list of `q40,b4,mk,b5` (default all)
+//!   `--modes LIST`      comma list of `vq2,vq2g128,v2b4,v2b5,q40,b4,mk,b5,pQOGDH`
 //!   `--calib-ids FILE`  GPTQ calibration token ids (default: 8 built-in passages)
 //!   `--calib-tokens N`  tokens taken from `--calib-ids` (default 8192)
-//!   `--cache-dir DIR`   reuse/save compiled Bipolar engines
-//!   `--sdot`            use the `SDOT` kernel
+//!   `--cache-dir DIR`   reuse/save compiled engines
+//!   `--sdot`            use the `SDOT` kernel and batched prefill
+//!   `--q8-kv`           use the INT8 Hadamard KV cache
 //!   `--speed`           also measure decode tok/s
 //!   `--prefill`         also measure batched prompt processing (pp = ctx) tok/s
 //!
@@ -114,6 +115,13 @@ fn compile_or_load(
         eprintln!("  loaded cached {}", path.display());
         return eng;
     }
+    if let Some(stem) = model_dir.file_name().and_then(|s| s.to_str()) {
+        let chat_path = Path::new(dir).join(format!("{stem}-kronos-{mode_key}.k2tb"));
+        if let Ok(eng) = RealLlamaEngine::load_bipolar(model_dir, &chat_path, n_ctx) {
+            eprintln!("  loaded cached {}", chat_path.display());
+            return eng;
+        }
+    }
     let eng = fp32.compile_sequential_bipolar_gptq(mode, calib_sequences, 8);
     std::fs::create_dir_all(dir).expect("create cache dir");
     eng.save_bipolar(&path).expect("save bipolar cache");
@@ -193,8 +201,75 @@ fn main() {
                 "In-house GGUF Q4_0 reimpl",
                 fp32.compile_from_reference(RealWeightMode::GgufQ4_0, None),
             ),
-            "b4" | "mk" | "b5" => {
+            "nf4" | "nf4g128" | "nf3nf4" | "nf3nf4g128" | "nf3" | "nf3g128" | "vq2" | "vq2g128"
+            | "v2b4" | "v2b5" | "b4" | "mk" | "b5" => {
                 let (label, mode) = match m {
+                    "nf4" => (
+                        "Kronos NF4-4.25b + GPTQ",
+                        RealWeightMode::KronosNfGptq {
+                            bits: 4,
+                            scale_group_chunks: 1,
+                        },
+                    ),
+                    "nf4g128" => (
+                        "Kronos NF4-4.125b + GPTQ",
+                        RealWeightMode::KronosNfGptq {
+                            bits: 4,
+                            scale_group_chunks: 2,
+                        },
+                    ),
+                    "nf3nf4" => (
+                        "Kronos Mixed NF3/NF4 + GPTQ",
+                        RealWeightMode::KronosNfMixedGptq {
+                            attn_head_bits: 4,
+                            ffn_bits: 3,
+                            scale_group_chunks: 1,
+                        },
+                    ),
+                    "nf3nf4g128" => (
+                        "Kronos Mixed NF3/NF4 G128",
+                        RealWeightMode::KronosNfMixedGptq {
+                            attn_head_bits: 4,
+                            ffn_bits: 3,
+                            scale_group_chunks: 2,
+                        },
+                    ),
+                    "nf3" => (
+                        "Kronos NF3-3.25b + GPTQ",
+                        RealWeightMode::KronosNfGptq {
+                            bits: 3,
+                            scale_group_chunks: 1,
+                        },
+                    ),
+                    "nf3g128" => (
+                        "Kronos NF3-3.125b + GPTQ",
+                        RealWeightMode::KronosNfGptq {
+                            bits: 3,
+                            scale_group_chunks: 2,
+                        },
+                    ),
+                    "vq2" => (
+                        "Kronos VQ2-2.25b + GPTQ",
+                        RealWeightMode::KronosVq2Gptq { scale_group_chunks: 1 },
+                    ),
+                    "vq2g128" => (
+                        "Kronos VQ2-2.125b + GPTQ",
+                        RealWeightMode::KronosVq2Gptq { scale_group_chunks: 2 },
+                    ),
+                    "v2b4" => (
+                        "Kronos Mixed VQ2/B4 + GPTQ",
+                        RealWeightMode::KronosVq2MixedGptq {
+                            attn_head_planes: 4,
+                            scale_group_chunks: 1,
+                        },
+                    ),
+                    "v2b5" => (
+                        "Kronos Mixed VQ2/B5 + GPTQ",
+                        RealWeightMode::KronosVq2MixedGptq {
+                            attn_head_planes: 5,
+                            scale_group_chunks: 1,
+                        },
+                    ),
                     "b4" => ("Kronos Bipolar-4 + GPTQ", RealWeightMode::KronosBipolarGptq { num_planes: 4 }),
                     "mk" => ("Kronos Bipolar Mixed-K + GPTQ", RealWeightMode::KronosBipolarGptqMixedK),
                     _ => ("Kronos Bipolar-5 + GPTQ", RealWeightMode::KronosBipolarGptq { num_planes: 5 }),
@@ -224,6 +299,11 @@ fn main() {
             if eng.mode != RealWeightMode::GgufQ4_0 {
                 eng.repack_sdot();
             }
+        }
+    }
+    if args.iter().any(|a| a == "--q8-kv") {
+        for (_, eng) in candidates.iter_mut() {
+            eng.enable_q8_kv_cache(true);
         }
     }
     fp32.set_num_threads(p_cores);
@@ -273,16 +353,17 @@ fn main() {
     }
 
     println!(
-        "\n  {:<32} | {:>6} | {:>7} | {:>18} | {:>8} | {:>7}",
-        "Engine / Mode", "Bits", "RAM", "PPL (± stderr)", "KL(nat)", "Top-1%"
+        "\n  {:<32} | {:>6} | {:>7} | {:>7} | {:>18} | {:>8} | {:>7}",
+        "Engine / Mode", "Bits", "Wt RAM", "KV RAM", "PPL (± stderr)", "KL(nat)", "Top-1%"
     );
-    println!("  {}", "-".repeat(94));
+    println!("  {}", "-".repeat(104));
     let (ppl, se, _, _) = fp32_acc.report();
     println!(
-        "  {:<32} | {:>5.2}b | {:>6.1}M | {:>9.4} ± {:<6.4} | {:>8} | {:>7}",
+        "  {:<32} | {:>5.2}b | {:>6.1}M | {:>6.2}M | {:>9.4} ± {:<6.4} | {:>8} | {:>7}",
         "Exact FP32 Reference",
         fp32.physical_bits_per_weight(),
         fp32.resident_weight_bytes() as f64 / (1024.0 * 1024.0),
+        fp32.kv_cache_bytes() as f64 / (1024.0 * 1024.0),
         ppl,
         se,
         "-",
@@ -291,10 +372,11 @@ fn main() {
     for ((label, eng), acc) in candidates.iter().zip(cand_acc.iter()) {
         let (ppl, se, kl, top1) = acc.report();
         println!(
-            "  {:<32} | {:>5.2}b | {:>6.1}M | {:>9.4} ± {:<6.4} | {:>8.5} | {:>6.2}%",
+            "  {:<32} | {:>5.2}b | {:>6.1}M | {:>6.2}M | {:>9.4} ± {:<6.4} | {:>8.5} | {:>6.2}%",
             label,
             eng.physical_bits_per_weight(),
             eng.resident_weight_bytes() as f64 / (1024.0 * 1024.0),
+            eng.kv_cache_bytes() as f64 / (1024.0 * 1024.0),
             ppl,
             se,
             kl,

@@ -12,8 +12,9 @@ use crate::k2t_format::CompiledSwiGluExpert;
 use crate::lut_gemv::GROUP_SIZE;
 use crate::simd_lut::{
     bf16_to_f32, decode_nibble_code, default_register_codebook_64, f32_to_bf16,
-    FusedBase3LutMatrix, FusedBipolarLutMatrix, MultiPlaneTernaryMatrix, SimdPackedMatrix,
-    QUANT_CHUNK_BLOCKS, SIMD_ROW_STRIPE,
+    FusedBase3LutMatrix, FusedBipolarLutMatrix, MultiPlaneTernaryMatrix, NfSdotMatrix,
+    SimdPackedMatrix, Vq2LutMatrix, NF3_DEFAULT_CODEBOOK_I8, NF4_DEFAULT_CODEBOOK_I8,
+    QUANT_CHUNK_BLOCKS, SIMD_ROW_STRIPE, VQ2_GAUSSIAN_RING_16,
 };
 
 /// Output of multi-rank Kronecker compilation for a single `[rows, cols]` matrix.
@@ -1093,6 +1094,712 @@ fn quantize_stripe_batch_bipolar(
                             let e = err[j];
                             if e != 0.0 {
                                 for (dst, &u_val) in work[r * cols + t0..r * cols + t1].iter_mut().zip(u_tail) {
+                                    *dst -= e * u_val;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Compiles `[rows, cols]` weights into a 2-bit Hadamard VQ [`Vq2LutMatrix`] with block-2 GPTQ.
+/// `scale_group_chunks` 1, 2, 4 give 2.25, 2.125, 2.0625 bpw.
+pub fn compile_hadamard_gptq_vq2(
+    weights: &[f32],
+    rows: usize,
+    cols: usize,
+    scale_group_chunks: usize,
+    hessian: Option<&FullRowGptqHessian>,
+    num_threads: usize,
+) -> Vq2LutMatrix {
+    assert_eq!(weights.len(), rows * cols);
+    assert!(rows > 0 && cols > 0 && cols.is_multiple_of(HADAMARD_BLOCK));
+    assert!((1..=8).contains(&scale_group_chunks));
+    if let Some(h) = hessian {
+        assert_eq!(h.cols, cols);
+        assert_eq!(h.h_inv_chol_upper.len(), cols * cols);
+    }
+
+    let pairs_per_row = cols / 2;
+    let num_stripes = rows.div_ceil(SIMD_ROW_STRIPE);
+    let num_chunks = cols / HADAMARD_BLOCK;
+    let num_scale_groups = num_chunks.div_ceil(scale_group_chunks);
+
+    let mut flat_pairs = vec![0u8; rows * pairs_per_row];
+    let mut bf16_chunk_scales = vec![0u16; num_stripes * num_scale_groups * SIMD_ROW_STRIPE];
+
+    let workers = num_threads.max(1).min(num_stripes);
+    let stripes_per_worker = num_stripes.div_ceil(workers);
+    let u_slice = hessian.map(|h| h.h_inv_chol_upper.as_slice());
+
+    std::thread::scope(|s| {
+        let mut rem_w = weights;
+        let mut rem_p = flat_pairs.as_mut_slice();
+        let mut rem_scales = bf16_chunk_scales.as_mut_slice();
+        let mut stripe_cursor = 0usize;
+
+        while stripe_cursor < num_stripes && !rem_w.is_empty() {
+            let take_stripes = stripes_per_worker.min(num_stripes - stripe_cursor);
+            let row_start = stripe_cursor * SIMD_ROW_STRIPE;
+            let row_end = ((stripe_cursor + take_stripes) * SIMD_ROW_STRIPE).min(rows);
+            let take_rows = row_end - row_start;
+
+            let (w_chunk, next_w) = rem_w.split_at(take_rows * cols);
+            let (p_chunk, next_p) = rem_p.split_at_mut(take_rows * pairs_per_row);
+            let (sc_chunk, next_sc) =
+                rem_scales.split_at_mut(take_stripes * num_scale_groups * SIMD_ROW_STRIPE);
+
+            rem_w = next_w;
+            rem_p = next_p;
+            rem_scales = next_sc;
+            stripe_cursor += take_stripes;
+
+            s.spawn(move || {
+                quantize_stripe_batch_vq2(
+                    w_chunk,
+                    p_chunk,
+                    sc_chunk,
+                    take_rows,
+                    cols,
+                    num_chunks,
+                    scale_group_chunks,
+                    num_scale_groups,
+                    u_slice,
+                );
+            });
+        }
+    });
+
+    let packed_data = Vq2LutMatrix::pack_interleaved(&flat_pairs, rows, cols);
+
+    Vq2LutMatrix {
+        rows,
+        cols,
+        scale_group_chunks,
+        num_stripes,
+        num_chunks,
+        num_scale_groups,
+        packed_data,
+        bf16_chunk_scales,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quantize_stripe_batch_vq2(
+    w_chunk: &[f32],
+    p_chunk: &mut [u8],
+    sc_chunk: &mut [u16],
+    take_rows: usize,
+    cols: usize,
+    num_chunks: usize,
+    sgc: usize,
+    nsg: usize,
+    u_slice: Option<&[f32]>,
+) {
+    let ratios = [0.58f32, 0.66, 0.74, 0.82, 0.90, 0.98, 1.06, 1.15, 1.25, 1.36, 1.48];
+    const TAIL_TILE: usize = 512;
+    let pairs_per_row = cols / 2;
+    let max_group_len = sgc * HADAMARD_BLOCK;
+    let max_group_pairs = max_group_len / 2;
+
+    let mut work = vec![0.0f32; SIMD_ROW_STRIPE * cols];
+    let mut errs = vec![vec![0.0f32; max_group_len]; SIMD_ROW_STRIPE];
+    let mut blk_work = vec![0.0f32; max_group_len];
+    let mut best_pairs = vec![0u8; max_group_pairs];
+    let mut cand_pairs = vec![0u8; max_group_pairs];
+    let mut cand_err = vec![0.0f32; max_group_len];
+
+    for g0 in (0..take_rows).step_by(SIMD_ROW_STRIPE) {
+        let g_rows = (take_rows - g0).min(SIMD_ROW_STRIPE);
+        let local_stripe = g0 / SIMD_ROW_STRIPE;
+        for r in 0..g_rows {
+            let dst = &mut work[r * cols..(r + 1) * cols];
+            dst.copy_from_slice(&w_chunk[(g0 + r) * cols..(g0 + r + 1) * cols]);
+            fwht64_signed_inplace(dst);
+        }
+
+        for sg in 0..nsg {
+            let c_start = sg * sgc;
+            let c_end = (c_start + sgc).min(num_chunks);
+            let col_s = c_start * HADAMARD_BLOCK;
+            let col_e = c_end * HADAMARD_BLOCK;
+            let group_len = col_e - col_s;
+            let group_pairs = group_len / 2;
+
+            for (r, err_out) in errs.iter_mut().enumerate().take(g_rows) {
+                let sub = &work[r * cols + col_s..r * cols + col_e];
+                err_out[..group_len].fill(0.0);
+                let sum_sq: f32 = sub.iter().map(|&v| v * v).sum();
+                let rms = (sum_sq / (group_len as f32)).sqrt();
+                if rms <= 1e-12 {
+                    p_chunk[(g0 + r) * pairs_per_row + col_s / 2..(g0 + r) * pairs_per_row + col_e / 2]
+                        .fill(0);
+                    sc_chunk[(local_stripe * nsg + sg) * SIMD_ROW_STRIPE + r] = 0;
+                    continue;
+                }
+
+                let mut best_loss = f32::INFINITY;
+                let mut best_bf16 = 0u16;
+
+                let mut eval_delta = |d_bf16: u16,
+                                      best_loss: &mut f32,
+                                      best_bf16: &mut u16,
+                                      best_pairs: &mut [u8],
+                                      err_out: &mut [f32]| {
+                    let delta = bf16_to_f32(d_bf16);
+                    if delta <= 0.0 {
+                        return;
+                    }
+                    let mut du = [0.0f32; 16];
+                    let mut dv = [0.0f32; 16];
+                    for k in 0..16 {
+                        du[k] = VQ2_GAUSSIAN_RING_16[k].0 * delta;
+                        dv[k] = VQ2_GAUSSIAN_RING_16[k].1 * delta;
+                    }
+                    blk_work[..group_len].copy_from_slice(sub);
+                    let mut loss = 0.0f32;
+
+                    if let Some(u_mat) = u_slice {
+                        for (m, cp_slot) in cand_pairs[..group_pairs].iter_mut().enumerate() {
+                            let j0 = 2 * m;
+                            let j1 = j0 + 1;
+                            let gc0 = col_s + j0;
+                            let gc1 = col_s + j1;
+                            let w0 = blk_work[j0];
+                            let w1 = blk_work[j1];
+                            let inv_u00 = 1.0 / u_mat[gc0 * cols + gc0].max(1e-12);
+                            let u01 = u_mat[gc0 * cols + gc1];
+                            let inv_u11 = 1.0 / u_mat[gc1 * cols + gc1].max(1e-12);
+
+                            let mut b_k = 0usize;
+                            let mut b_l = f32::INFINITY;
+                            let mut b_e0 = 0.0f32;
+                            let mut b_e1 = 0.0f32;
+                            for k in 0..16 {
+                                let e0 = (w0 - du[k]) * inv_u00;
+                                let e1 = ((w1 - dv[k]) - e0 * u01) * inv_u11;
+                                let lk = e0 * e0 + e1 * e1;
+                                if lk < b_l {
+                                    b_l = lk;
+                                    b_k = k;
+                                    b_e0 = e0;
+                                    b_e1 = e1;
+                                }
+                            }
+                            *cp_slot = b_k as u8;
+                            cand_err[j0] = b_e0;
+                            cand_err[j1] = b_e1;
+                            loss += b_l;
+                            if loss >= *best_loss {
+                                return;
+                            }
+
+                            if j1 + 1 < group_len {
+                                let u_sub0 = &u_mat[gc0 * cols + gc1 + 1..gc0 * cols + col_e];
+                                let u_sub1 = &u_mat[gc1 * cols + gc1 + 1..gc1 * cols + col_e];
+                                for (k_slot, (&u0k, &u1k)) in blk_work[j1 + 1..group_len]
+                                    .iter_mut()
+                                    .zip(u_sub0.iter().zip(u_sub1.iter()))
+                                {
+                                    *k_slot -= b_e0 * u0k + b_e1 * u1k;
+                                }
+                            }
+                        }
+                    } else {
+                        for (m, cp_slot) in cand_pairs[..group_pairs].iter_mut().enumerate() {
+                            let w0 = blk_work[2 * m];
+                            let w1 = blk_work[2 * m + 1];
+                            let mut b_k = 0usize;
+                            let mut b_l = f32::INFINITY;
+                            for k in 0..16 {
+                                let d0 = w0 - du[k];
+                                let d1 = w1 - dv[k];
+                                let lk = d0 * d0 + d1 * d1;
+                                if lk < b_l {
+                                    b_l = lk;
+                                    b_k = k;
+                                }
+                            }
+                            *cp_slot = b_k as u8;
+                            loss += b_l;
+                        }
+                    }
+
+                    if loss < *best_loss {
+                        *best_loss = loss;
+                        *best_bf16 = d_bf16;
+                        best_pairs[..group_pairs].copy_from_slice(&cand_pairs[..group_pairs]);
+                        err_out[..group_len].copy_from_slice(&cand_err[..group_len]);
+                    }
+                };
+
+                for &rat in &ratios {
+                    eval_delta(
+                        f32_to_bf16(rms * rat),
+                        &mut best_loss,
+                        &mut best_bf16,
+                        &mut best_pairs,
+                        err_out,
+                    );
+                }
+
+                // Least-squares BF16 scale refit on the chosen points.
+                let mut dot_wc = 0.0f32;
+                let mut dot_cc = 0.0f32;
+                for m in 0..group_pairs {
+                    let (u, v) = VQ2_GAUSSIAN_RING_16[best_pairs[m] as usize];
+                    dot_wc += sub[2 * m] * u + sub[2 * m + 1] * v;
+                    dot_cc += u * u + v * v;
+                }
+                if dot_cc > 1e-12 && dot_wc > 0.0 {
+                    let ls_bf16 = f32_to_bf16(dot_wc / dot_cc);
+                    if ls_bf16 != best_bf16 {
+                        eval_delta(
+                            ls_bf16,
+                            &mut best_loss,
+                            &mut best_bf16,
+                            &mut best_pairs,
+                            err_out,
+                        );
+                    }
+                }
+
+                sc_chunk[(local_stripe * nsg + sg) * SIMD_ROW_STRIPE + r] = best_bf16;
+                let row = g0 + r;
+                p_chunk[row * pairs_per_row + col_s / 2..row * pairs_per_row + col_e / 2]
+                    .copy_from_slice(&best_pairs[..group_pairs]);
+            }
+
+            // Propagate this group's error to the remaining columns.
+            if let (true, Some(u_mat)) = (col_e < cols, u_slice) {
+                for t0 in (col_e..cols).step_by(TAIL_TILE) {
+                    let t1 = (t0 + TAIL_TILE).min(cols);
+                    for j in 0..group_len {
+                        let g_col = col_s + j;
+                        let u_tail = &u_mat[g_col * cols + t0..g_col * cols + t1];
+                        for (r, err) in errs.iter().enumerate().take(g_rows) {
+                            let e = err[j];
+                            if e != 0.0 {
+                                for (dst, &u_val) in work[r * cols + t0..r * cols + t1]
+                                    .iter_mut()
+                                    .zip(u_tail)
+                                {
+                                    *dst -= e * u_val;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Fits a symmetric INT8 Lloyd-Max codebook (16 levels for NF4, 8 for NF3) to the Hadamard-rotated
+/// weights. Returns `(codebook, top positive centroid in RMS units)`.
+pub fn fit_empirical_nf_codebook(
+    weights: &[f32],
+    rows: usize,
+    cols: usize,
+    bits: usize,
+    scale_group_chunks: usize,
+) -> ([i8; 16], f32) {
+    assert!(bits == 3 || bits == 4);
+    const HIST_BINS: usize = 2000;
+    const Z_MAX: f32 = 5.0;
+    const BIN_W: f32 = Z_MAX / (HIST_BINS as f32);
+
+    let default_cb = if bits == 4 {
+        (NF4_DEFAULT_CODEBOOK_I8, 2.7326f32)
+    } else {
+        (NF3_DEFAULT_CODEBOOK_I8, 2.1520f32)
+    };
+
+    let num_chunks = cols / HADAMARD_BLOCK;
+    let sgc = scale_group_chunks.max(1);
+    let nsg = num_chunks.div_ceil(sgc);
+    let step = (rows / 512).max(1);
+
+    let mut hist = vec![0u64; HIST_BINS];
+    let mut total_samples = 0u64;
+    let mut row_buf = vec![0.0f32; cols];
+
+    for r in (0..rows).step_by(step) {
+        row_buf.copy_from_slice(&weights[r * cols..(r + 1) * cols]);
+        fwht64_signed_inplace(&mut row_buf);
+        for sg in 0..nsg {
+            let col_s = sg * sgc * HADAMARD_BLOCK;
+            let col_e = ((sg + 1) * sgc * HADAMARD_BLOCK).min(cols);
+            let sub = &row_buf[col_s..col_e];
+            let sum_sq: f32 = sub.iter().map(|&v| v * v).sum();
+            let rms = (sum_sq / (sub.len() as f32)).sqrt();
+            if rms <= 1e-12 {
+                continue;
+            }
+            let inv_rms = 1.0 / rms;
+            for &v in sub {
+                let z = v.abs() * inv_rms;
+                let bin = ((z / BIN_W) as usize).min(HIST_BINS - 1);
+                hist[bin] += 1;
+                total_samples += 1;
+            }
+        }
+    }
+
+    if total_samples < 256 {
+        return default_cb;
+    }
+
+    let half = 1usize << (bits - 1);
+    let mut mu: Vec<f64> = if bits == 4 {
+        vec![0.1284, 0.3881, 0.6568, 0.9424, 1.2562, 1.6180, 2.0690, 2.7326]
+    } else {
+        vec![0.2451, 0.7560, 1.3439, 2.1520]
+    };
+
+    for _ in 0..24 {
+        let mut bounds = vec![0usize; half + 1];
+        bounds[0] = 0;
+        bounds[half] = HIST_BINS;
+        for m in 0..(half - 1) {
+            let mid = 0.5 * (mu[m] + mu[m + 1]);
+            bounds[m + 1] = ((mid / (BIN_W as f64)).round() as usize).clamp(bounds[m], HIST_BINS);
+        }
+        for m in 0..half {
+            let mut w_sum = 0.0f64;
+            let mut c_sum = 0u64;
+            for (b, &cnt) in hist[bounds[m]..bounds[m + 1]].iter().enumerate() {
+                if cnt > 0 {
+                    let x = ((bounds[m] + b) as f64 + 0.5) * (BIN_W as f64);
+                    w_sum += (cnt as f64) * x;
+                    c_sum += cnt;
+                }
+            }
+            if c_sum > 0 {
+                mu[m] = w_sum / (c_sum as f64);
+            }
+        }
+        for m in 1..half {
+            if mu[m] <= mu[m - 1] + 1e-4 {
+                mu[m] = mu[m - 1] + 0.05;
+            }
+        }
+    }
+
+    let mu_top = mu[half - 1].max(0.5);
+    let mut q_pos = vec![0i32; half];
+    for m in 0..half {
+        q_pos[m] = ((127.0 * mu[m] / mu_top).round() as i32).clamp(1, 127);
+    }
+    q_pos[half - 1] = 127;
+    // Keep entries strictly increasing so each is unique.
+    for m in (0..half - 1).rev() {
+        if q_pos[m] >= q_pos[m + 1] {
+            q_pos[m] = (q_pos[m + 1] - 1).max(1);
+        }
+    }
+    for m in 1..half {
+        if q_pos[m] <= q_pos[m - 1] {
+            q_pos[m] = (q_pos[m - 1] + 1).min(127);
+        }
+    }
+
+    let mut cb = [0i8; 16];
+    for m in 0..half {
+        cb[half - 1 - m] = (-q_pos[m]) as i8;
+        cb[half + m] = q_pos[m] as i8;
+    }
+    (cb, mu_top as f32)
+}
+
+/// Compiles `[rows, cols]` weights into an [`NfSdotMatrix`] (`bits` 4 or 3) with Hadamard GPTQ
+/// and least-squares BF16 scale refit.
+pub fn compile_hadamard_gptq_nf(
+    weights: &[f32],
+    rows: usize,
+    cols: usize,
+    bits: usize,
+    scale_group_chunks: usize,
+    hessian: Option<&FullRowGptqHessian>,
+    num_threads: usize,
+) -> NfSdotMatrix {
+    assert_eq!(weights.len(), rows * cols);
+    assert!(rows > 0 && cols > 0 && cols.is_multiple_of(HADAMARD_BLOCK));
+    assert!(bits == 3 || bits == 4, "NF-SDOT bits must be 3 or 4");
+    assert!((1..=8).contains(&scale_group_chunks));
+    if let Some(h) = hessian {
+        assert_eq!(h.cols, cols);
+        assert_eq!(h.h_inv_chol_upper.len(), cols * cols);
+    }
+
+    let (codebook, mu_top) =
+        fit_empirical_nf_codebook(weights, rows, cols, bits, scale_group_chunks);
+
+    let num_stripes = rows.div_ceil(SIMD_ROW_STRIPE);
+    let num_chunks = cols / HADAMARD_BLOCK;
+    let num_scale_groups = num_chunks.div_ceil(scale_group_chunks);
+
+    let mut flat_indices = vec![0u8; rows * cols];
+    let mut bf16_scales = vec![0u16; num_stripes * num_scale_groups * SIMD_ROW_STRIPE];
+
+    let workers = num_threads.max(1).min(num_stripes);
+    let stripes_per_worker = num_stripes.div_ceil(workers);
+    let u_slice = hessian.map(|h| h.h_inv_chol_upper.as_slice());
+
+    std::thread::scope(|s| {
+        let mut rem_w = weights;
+        let mut rem_idx = flat_indices.as_mut_slice();
+        let mut rem_scales = bf16_scales.as_mut_slice();
+        let mut stripe_cursor = 0usize;
+
+        while stripe_cursor < num_stripes && !rem_w.is_empty() {
+            let take_stripes = stripes_per_worker.min(num_stripes - stripe_cursor);
+            let row_start = stripe_cursor * SIMD_ROW_STRIPE;
+            let row_end = ((stripe_cursor + take_stripes) * SIMD_ROW_STRIPE).min(rows);
+            let take_rows = row_end - row_start;
+
+            let (w_chunk, next_w) = rem_w.split_at(take_rows * cols);
+            let (idx_chunk, next_idx) = rem_idx.split_at_mut(take_rows * cols);
+            let (sc_chunk, next_sc) =
+                rem_scales.split_at_mut(take_stripes * num_scale_groups * SIMD_ROW_STRIPE);
+
+            rem_w = next_w;
+            rem_idx = next_idx;
+            rem_scales = next_sc;
+            stripe_cursor += take_stripes;
+
+            s.spawn(move || {
+                quantize_stripe_batch_nf(
+                    w_chunk,
+                    idx_chunk,
+                    sc_chunk,
+                    take_rows,
+                    cols,
+                    num_chunks,
+                    bits,
+                    scale_group_chunks,
+                    num_scale_groups,
+                    &codebook,
+                    mu_top,
+                    u_slice,
+                );
+            });
+        }
+    });
+
+    NfSdotMatrix::from_indices(
+        &flat_indices,
+        &bf16_scales,
+        rows,
+        cols,
+        bits,
+        scale_group_chunks,
+        codebook,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quantize_stripe_batch_nf(
+    w_chunk: &[f32],
+    idx_chunk: &mut [u8],
+    sc_chunk: &mut [u16],
+    take_rows: usize,
+    cols: usize,
+    num_chunks: usize,
+    bits: usize,
+    sgc: usize,
+    nsg: usize,
+    codebook: &[i8; 16],
+    mu_top: f32,
+    u_slice: Option<&[f32]>,
+) {
+    let ratios = [
+        0.74f32, 0.80, 0.86, 0.91, 0.96, 1.00, 1.04, 1.09, 1.15, 1.22, 1.30,
+    ];
+    const TAIL_TILE: usize = 512;
+    let half = 1usize << (bits - 1);
+    let levels = 1usize << bits;
+    let mut cb_f = [0.0f32; 16];
+    for k in 0..levels {
+        cb_f[k] = codebook[k] as f32;
+    }
+    // Decision thresholds at codebook midpoints.
+    let mut pos_th = [0.0f32; 7];
+    for (m, th) in pos_th.iter_mut().enumerate().take(half - 1) {
+        *th = 0.5 * (cb_f[half + m] + cb_f[half + m + 1]);
+    }
+
+    let quant_nearest = |w: f32, inv_delta: f32| -> usize {
+        let aw = w.abs() * inv_delta;
+        let mag = if bits == 4 {
+            if aw < pos_th[3] {
+                if aw < pos_th[1] {
+                    usize::from(aw >= pos_th[0])
+                } else {
+                    2 + usize::from(aw >= pos_th[2])
+                }
+            } else if aw < pos_th[5] {
+                4 + usize::from(aw >= pos_th[4])
+            } else {
+                6 + usize::from(aw >= pos_th[6])
+            }
+        } else if aw < pos_th[1] {
+            usize::from(aw >= pos_th[0])
+        } else {
+            2 + usize::from(aw >= pos_th[2])
+        };
+        if w >= 0.0 {
+            half + mag
+        } else {
+            half - 1 - mag
+        }
+    };
+
+    let max_group_len = sgc * HADAMARD_BLOCK;
+    let mut work = vec![0.0f32; SIMD_ROW_STRIPE * cols];
+    let mut errs = vec![vec![0.0f32; max_group_len]; SIMD_ROW_STRIPE];
+    let mut blk_work = vec![0.0f32; max_group_len];
+    let mut best_idx = vec![0u8; max_group_len];
+    let mut cand_idx = vec![0u8; max_group_len];
+    let mut cand_err = vec![0.0f32; max_group_len];
+
+    for g0 in (0..take_rows).step_by(SIMD_ROW_STRIPE) {
+        let g_rows = (take_rows - g0).min(SIMD_ROW_STRIPE);
+        let local_stripe = g0 / SIMD_ROW_STRIPE;
+        for r in 0..g_rows {
+            let dst = &mut work[r * cols..(r + 1) * cols];
+            dst.copy_from_slice(&w_chunk[(g0 + r) * cols..(g0 + r + 1) * cols]);
+            fwht64_signed_inplace(dst);
+        }
+
+        for sg in 0..nsg {
+            let c_start = sg * sgc;
+            let c_end = (c_start + sgc).min(num_chunks);
+            let col_s = c_start * HADAMARD_BLOCK;
+            let col_e = c_end * HADAMARD_BLOCK;
+            let group_len = col_e - col_s;
+
+            for (r, err_out) in errs.iter_mut().enumerate().take(g_rows) {
+                let sub = &work[r * cols + col_s..r * cols + col_e];
+                err_out[..group_len].fill(0.0);
+                let sum_sq: f32 = sub.iter().map(|&v| v * v).sum();
+                let rms = (sum_sq / (group_len as f32)).sqrt();
+                if rms <= 1e-12 {
+                    idx_chunk[(g0 + r) * cols + col_s..(g0 + r) * cols + col_e]
+                        .fill((half - 1) as u8);
+                    sc_chunk[(local_stripe * nsg + sg) * SIMD_ROW_STRIPE + r] = 0;
+                    continue;
+                }
+
+                let base_delta = rms * (mu_top / 127.0);
+                let mut best_loss = f32::INFINITY;
+                let mut best_bf16 = 0u16;
+
+                let mut eval_delta = |d_bf16: u16,
+                                      best_loss: &mut f32,
+                                      best_bf16: &mut u16,
+                                      best_idx: &mut [u8],
+                                      err_out: &mut [f32]| {
+                    let delta = bf16_to_f32(d_bf16);
+                    if delta <= 0.0 {
+                        return;
+                    }
+                    let inv_delta = 1.0 / delta;
+                    blk_work[..group_len].copy_from_slice(sub);
+                    let mut loss = 0.0f32;
+
+                    if let Some(u_mat) = u_slice {
+                        for j in 0..group_len {
+                            let g_col = col_s + j;
+                            let wj = blk_work[j];
+                            let k = quant_nearest(wj, inv_delta);
+                            cand_idx[j] = k as u8;
+                            let w_hat = cb_f[k] * delta;
+                            let err = (wj - w_hat) / u_mat[g_col * cols + g_col].max(1e-12);
+                            cand_err[j] = err;
+                            loss += err * err;
+                            if loss >= *best_loss {
+                                return;
+                            }
+                            if j + 1 < group_len {
+                                let u_sub = &u_mat[g_col * cols + g_col + 1..g_col * cols + col_e];
+                                for (k_slot, &u_jk) in blk_work[j + 1..group_len].iter_mut().zip(u_sub) {
+                                    *k_slot -= err * u_jk;
+                                }
+                            }
+                        }
+                    } else {
+                        for j in 0..group_len {
+                            let wj = blk_work[j];
+                            let k = quant_nearest(wj, inv_delta);
+                            cand_idx[j] = k as u8;
+                            let diff = wj - cb_f[k] * delta;
+                            loss += diff * diff;
+                        }
+                    }
+
+                    if loss < *best_loss {
+                        *best_loss = loss;
+                        *best_bf16 = d_bf16;
+                        best_idx[..group_len].copy_from_slice(&cand_idx[..group_len]);
+                        err_out[..group_len].copy_from_slice(&cand_err[..group_len]);
+                    }
+                };
+
+                for &rat in &ratios {
+                    eval_delta(
+                        f32_to_bf16(base_delta * rat),
+                        &mut best_loss,
+                        &mut best_bf16,
+                        &mut best_idx,
+                        err_out,
+                    );
+                }
+
+                // Least-squares BF16 scale refit on the chosen centroids.
+                let mut dot_wc = 0.0f32;
+                let mut dot_cc = 0.0f32;
+                for j in 0..group_len {
+                    let c_val = cb_f[best_idx[j] as usize];
+                    dot_wc += sub[j] * c_val;
+                    dot_cc += c_val * c_val;
+                }
+                if dot_cc > 1e-12 && dot_wc > 0.0 {
+                    let ls_bf16 = f32_to_bf16(dot_wc / dot_cc);
+                    if ls_bf16 != best_bf16 {
+                        eval_delta(
+                            ls_bf16,
+                            &mut best_loss,
+                            &mut best_bf16,
+                            &mut best_idx,
+                            err_out,
+                        );
+                    }
+                }
+
+                sc_chunk[(local_stripe * nsg + sg) * SIMD_ROW_STRIPE + r] = best_bf16;
+                let row = g0 + r;
+                idx_chunk[row * cols + col_s..row * cols + col_e]
+                    .copy_from_slice(&best_idx[..group_len]);
+            }
+
+            // Propagate this group's error to the remaining columns.
+            if let (true, Some(u_mat)) = (col_e < cols, u_slice) {
+                for t0 in (col_e..cols).step_by(TAIL_TILE) {
+                    let t1 = (t0 + TAIL_TILE).min(cols);
+                    for j in 0..group_len {
+                        let g_col = col_s + j;
+                        let u_tail = &u_mat[g_col * cols + t0..g_col * cols + t1];
+                        for (r, err) in errs.iter().enumerate().take(g_rows) {
+                            let e = err[j];
+                            if e != 0.0 {
+                                for (dst, &u_val) in work[r * cols + t0..r * cols + t1]
+                                    .iter_mut()
+                                    .zip(u_tail)
+                                {
                                     *dst -= e * u_val;
                                 }
                             }

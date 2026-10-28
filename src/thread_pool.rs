@@ -25,7 +25,9 @@ fn pin_macos_p_core_qos() {}
 
 #[inline]
 fn spin_or_yield(spins: &mut u32) {
-    if *spins < 1024 {
+    // Skew between workers is normally a tile or less; spin ~8 us, then yield in case a worker was
+    // preempted mid-tile.
+    if *spins < 32_768 {
         std::hint::spin_loop();
         *spins += 1;
     } else {
@@ -77,11 +79,12 @@ pub fn default_inference_threads() -> usize {
 #[repr(align(128))]
 struct CachePadded<T>(T);
 
-/// Ultra-low-latency (`~80 ns`) sense-reversing atomic spin barrier for single-dispatch megakernels.
+/// Sense-reversing spin barrier with a per-phase work cursor.
 pub struct SpinBarrier {
     num_threads: usize,
     count: CachePadded<AtomicUsize>,
     phase: CachePadded<AtomicUsize>,
+    work_cursor: CachePadded<AtomicUsize>,
 }
 
 impl SpinBarrier {
@@ -91,6 +94,7 @@ impl SpinBarrier {
             num_threads: num_threads.max(1),
             count: CachePadded(AtomicUsize::new(0)),
             phase: CachePadded(AtomicUsize::new(0)),
+            work_cursor: CachePadded(AtomicUsize::new(0)),
         }
     }
 
@@ -99,15 +103,29 @@ impl SpinBarrier {
         self.num_threads
     }
 
-    /// Synchronizes all `num_threads` participants in place without leaving the worker closure.
+    /// Claims the next `[start, end)` tile of the current phase. The cursor resets at [`Self::wait`].
+    #[inline]
+    pub fn claim_work(&self, grain: usize, total: usize) -> Option<(usize, usize)> {
+        let g = grain.max(1);
+        let start = self.work_cursor.0.fetch_add(g, Ordering::Relaxed);
+        if start >= total {
+            None
+        } else {
+            Some((start, (start + g).min(total)))
+        }
+    }
+
+    /// Waits for all threads and resets the work cursor for the next phase.
     #[inline]
     pub fn wait(&self) {
         if self.num_threads <= 1 {
+            self.work_cursor.0.store(0, Ordering::Relaxed);
             return;
         }
         let p = self.phase.0.load(Ordering::Acquire);
         if self.count.0.fetch_add(1, Ordering::AcqRel) + 1 == self.num_threads {
             self.count.0.store(0, Ordering::Relaxed);
+            self.work_cursor.0.store(0, Ordering::Relaxed);
             self.phase.0.store(p.wrapping_add(1), Ordering::Release);
         } else {
             let mut spins = 0u32;
@@ -125,6 +143,7 @@ struct DispatchHeader {
     /// `0` = park excess workers, `1` = `parallel_for`, `2` = `execute_all`.
     mode: AtomicUsize,
     total_items: AtomicUsize,
+    for_grain: AtomicUsize,
     num_participants: AtomicUsize,
     task_fn: AtomicUsize,
     task_ctx: AtomicUsize,
@@ -135,6 +154,7 @@ struct GlobalPoolState {
     dispatch_gate: Mutex<()>,
     spawned_workers: Mutex<usize>,
     header: CachePadded<DispatchHeader>,
+    for_cursor: CachePadded<AtomicUsize>,
     active_remaining: CachePadded<AtomicUsize>,
     /// Bitmask (`1u64 << w_id`) of workers currently parked on their private `Condvar`.
     sleeping_mask: CachePadded<AtomicU64>,
@@ -153,11 +173,13 @@ fn global_pool() -> &'static GlobalPoolState {
             epoch: AtomicUsize::new(0),
             mode: AtomicUsize::new(0),
             total_items: AtomicUsize::new(0),
+            for_grain: AtomicUsize::new(1),
             num_participants: AtomicUsize::new(1),
             task_fn: AtomicUsize::new(0),
             task_ctx: AtomicUsize::new(0),
             barrier_ptr: AtomicUsize::new(0),
         }),
+        for_cursor: CachePadded(AtomicUsize::new(0)),
         active_remaining: CachePadded(AtomicUsize::new(0)),
         sleeping_mask: CachePadded(AtomicU64::new(0)),
         worker_park: std::array::from_fn(|_| CachePadded((Mutex::new(()), Condvar::new()))),
@@ -200,12 +222,8 @@ fn worker_loop(st: &'static GlobalPoolState, w_id: usize, initial_epoch: usize) 
             if e != seen_epoch {
                 break e;
             }
-            if !park_now && !st.force_park.0.load(Ordering::Relaxed) && spun < 8224 {
-                if spun < 8192 {
-                    std::hint::spin_loop();
-                } else {
-                    thread::yield_now();
-                }
+            if !park_now && !st.force_park.0.load(Ordering::Relaxed) && spun < 262_144 {
+                std::hint::spin_loop();
                 spun += 1;
             } else {
                 let (lock, cvar) = &st.worker_park[w_id].0;
@@ -244,11 +262,15 @@ fn execute_worker_wave(st: &GlobalPoolState, worker_id: usize, n_part: usize) {
     let ctx = st.header.0.task_ctx.load(Ordering::Relaxed);
     if mode == 1 {
         let total = st.header.0.total_items.load(Ordering::Relaxed);
-        let start = (total * worker_id) / n_part;
-        let end = (total * (worker_id + 1)) / n_part;
-        if start < end {
-            // SAFETY: `fn_addr` matches `trampoline_for::<F>` for the live caller frame.
-            let runner: unsafe fn(usize, usize, usize) = unsafe { std::mem::transmute(fn_addr) };
+        let tile = st.header.0.for_grain.load(Ordering::Relaxed).max(1);
+        // SAFETY: `fn_addr` was set from `trampoline_for::<F>` for the caller's live frame.
+        let runner: unsafe fn(usize, usize, usize) = unsafe { std::mem::transmute(fn_addr) };
+        loop {
+            let start = st.for_cursor.0.fetch_add(tile, Ordering::Relaxed);
+            if start >= total {
+                break;
+            }
+            let end = (start + tile).min(total);
             unsafe { runner(ctx, start, end) };
         }
     } else if mode == 2 {
@@ -313,16 +335,17 @@ impl SpinThreadPool {
         self.num_threads
     }
 
-    /// Executes `f(item_start, item_end)` over `0..total_items` across `num_threads` P-cores.
+    /// Runs `f(start, end)` over `0..total_items` in `grain`-sized tiles claimed dynamically.
     #[inline]
-    pub fn parallel_for<F>(&self, total_items: usize, _grain: usize, f: F)
+    pub fn parallel_for<F>(&self, total_items: usize, grain: usize, f: F)
     where
         F: Fn(usize, usize) + Sync,
     {
         if total_items == 0 {
             return;
         }
-        if self.num_threads <= 1 || total_items < self.num_threads {
+        let g = grain.max(1);
+        if self.num_threads <= 1 || total_items <= g {
             f(0, total_items);
             return;
         }
@@ -333,12 +356,17 @@ impl SpinThreadPool {
             closure(start, end);
         }
 
+        let raw_tile = total_items.div_ceil(self.num_threads * 4).max(g);
+        let tile = raw_tile.div_ceil(g) * g;
+
         let st = self.st;
         let _gate = st.dispatch_gate.lock().unwrap();
         ensure_workers_locked(st, self.num_threads);
         st.force_park.0.store(false, Ordering::Relaxed);
+        st.for_cursor.0.store(0, Ordering::Relaxed);
         st.header.0.mode.store(1, Ordering::Relaxed);
         st.header.0.total_items.store(total_items, Ordering::Relaxed);
+        st.header.0.for_grain.store(tile, Ordering::Relaxed);
         st.header.0.num_participants.store(self.num_threads, Ordering::SeqCst);
         st.header
             .0

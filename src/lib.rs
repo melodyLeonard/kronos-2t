@@ -20,6 +20,7 @@
 //! - [`safetensors`]: Zero-copy pure-Rust `.safetensors` (`BF16`/`F16`/`F32`) `mmap` loader.
 //! - [`bpe_tokenizer`]: Pure-Rust `SmolLM2`/`GPT-2` byte-level BPE tokenizer (`vocab.json` + `merges.txt`).
 //! - [`real_llm`]: Real pretrained `LlamaForCausalLM` (`SmolLM2-135M`) `FP32` vs Multi-Plane NEON LUT verifier.
+//! - [`moe_800b`]: 800B-class sparse MoE engine streaming `.k2tm` experts from NVMe with an SLRU cache.
 
 pub mod accel;
 pub mod bpe_tokenizer;
@@ -34,6 +35,7 @@ pub mod json;
 pub mod k2t_format;
 pub mod lut_gemv;
 pub mod mmap_pager;
+pub mod moe_800b;
 pub mod prefetch;
 pub mod real_llm;
 pub mod router;

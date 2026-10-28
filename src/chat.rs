@@ -75,9 +75,46 @@ pub struct Completion {
     pub prefill_unit: &'static str,
 }
 
-/// `b4`, `b5`, `b6` or `pQOGDH` (plane counts 4–6 for qkv, o, gate_up, down, lm_head).
+/// Parses a mode key: `nf4`, `nf3`, `nf3nf4` (optional `g128`), `vq2`, `vq2g128`, `v2b4`, `v2b5`,
+/// `b4`, `b5`, `b6`, or `pQOGDH` (plane counts for qkv, o, gate_up, down, lm_head).
 pub fn parse_mode(m: &str) -> Result<RealWeightMode, String> {
     Ok(match m {
+        "nf4" => RealWeightMode::KronosNfGptq {
+            bits: 4,
+            scale_group_chunks: 1,
+        },
+        "nf4g128" => RealWeightMode::KronosNfGptq {
+            bits: 4,
+            scale_group_chunks: 2,
+        },
+        "nf3nf4" => RealWeightMode::KronosNfMixedGptq {
+            attn_head_bits: 4,
+            ffn_bits: 3,
+            scale_group_chunks: 1,
+        },
+        "nf3nf4g128" => RealWeightMode::KronosNfMixedGptq {
+            attn_head_bits: 4,
+            ffn_bits: 3,
+            scale_group_chunks: 2,
+        },
+        "nf3" => RealWeightMode::KronosNfGptq {
+            bits: 3,
+            scale_group_chunks: 1,
+        },
+        "nf3g128" => RealWeightMode::KronosNfGptq {
+            bits: 3,
+            scale_group_chunks: 2,
+        },
+        "vq2" => RealWeightMode::KronosVq2Gptq { scale_group_chunks: 1 },
+        "vq2g128" => RealWeightMode::KronosVq2Gptq { scale_group_chunks: 2 },
+        "v2b4" => RealWeightMode::KronosVq2MixedGptq {
+            attn_head_planes: 4,
+            scale_group_chunks: 1,
+        },
+        "v2b5" => RealWeightMode::KronosVq2MixedGptq {
+            attn_head_planes: 5,
+            scale_group_chunks: 1,
+        },
         "b4" => RealWeightMode::KronosBipolarGptq { num_planes: 4 },
         "b5" => RealWeightMode::KronosBipolarGptq { num_planes: 5 },
         "b6" => RealWeightMode::KronosBipolarGptq { num_planes: 6 },
@@ -85,7 +122,11 @@ pub fn parse_mode(m: &str) -> Result<RealWeightMode, String> {
             let d: Vec<usize> = p[1..].bytes().map(|b| (b - b'0') as usize).collect();
             RealWeightMode::KronosBipolarGptqPlanes { qkv: d[0], o: d[1], gate_up: d[2], down: d[3], head: d[4] }
         }
-        other => return Err(format!("unknown mode {other}; use b4, b5, b6 or pQOGDH (digits 4-6)")),
+        other => {
+            return Err(format!(
+                "unknown mode {other}; use nf4, nf4g128, nf3nf4, nf3nf4g128, nf3, nf3g128, vq2, vq2g128, v2b4, v2b5, b4, b5, b6 or pQOGDH (digits 4-6)"
+            ));
+        }
     })
 }
 
@@ -104,13 +145,22 @@ pub fn compile(model_dir: &Path, mode: RealWeightMode, calib_text: &str, calib_t
 
 fn load_or_compile_engine(
     model_dir: &Path,
+    cache_dir: Option<&Path>,
     mode_key: &str,
     ctx: usize,
     threads: usize,
     calib: Option<(&Path, usize)>,
 ) -> Result<RealLlamaEngine, String> {
     let mode = parse_mode(mode_key)?;
-    let cache = model_dir.join(format!("kronos-{mode_key}.k2tb"));
+    let cache = match cache_dir {
+        Some(dir) => {
+            let tag = model_dir
+                .file_name()
+                .map_or_else(|| "model".to_string(), |s| s.to_string_lossy().into_owned());
+            dir.join(format!("{tag}-kronos-{mode_key}.k2tb"))
+        }
+        None => model_dir.join(format!("kronos-{mode_key}.k2tb")),
+    };
     let mut engine = match RealLlamaEngine::load_bipolar(model_dir, &cache, ctx) {
         Ok(e) => e,
         Err(_) => {
@@ -119,6 +169,9 @@ fn load_or_compile_engine(
             })?;
             let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
             eprintln!("compiling {} ({mode_key}), one time only; this takes minutes...", model_dir.display());
+            if let Some(parent) = cache.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+            }
             compile(model_dir, mode, &text, n)?
                 .save_bipolar(&cache)
                 .map_err(|e| format!("save {}: {e}", cache.display()))?;
@@ -184,7 +237,23 @@ impl ChatModel {
         threads: usize,
         calib: Option<(&Path, usize)>,
     ) -> Result<Self, String> {
-        let engine = load_or_compile_engine(model_dir, mode_key, ctx, threads, calib)?;
+        Self::load_with_cache_dir(model_dir, None, mode_key, ctx, threads, calib)
+    }
+
+    /// Like [`Self::load`], with `.k2tb` caches in `cache_dir` if given, else `model_dir`.
+    pub fn load_with_cache_dir(
+        model_dir: &Path,
+        cache_dir: Option<&Path>,
+        mode_key: &str,
+        ctx: usize,
+        threads: usize,
+        calib: Option<(&Path, usize)>,
+    ) -> Result<Self, String> {
+        let mut engine = load_or_compile_engine(model_dir, cache_dir, mode_key, ctx, threads, calib)?;
+        // INT8 KV cache by default for `head_dim == 64`.
+        if engine.cfg.head_dim() == 64 {
+            engine.enable_q8_kv_cache(true);
+        }
         let vocab_size = engine.cfg.vocab_size;
         let tok = BpeTokenizer::from_model_dir(model_dir).map_err(|e| format!("tokenizer: {e}"))?;
         let special =
@@ -211,6 +280,16 @@ impl ChatModel {
         })
     }
 
+    /// Toggles the Hadamard INT8 KV cache.
+    pub fn enable_q8_kv_cache(&mut self, enable: bool) {
+        self.engine.enable_q8_kv_cache(enable);
+        self.cached.clear();
+        if let Some(d) = self.draft.as_mut() {
+            d.engine.enable_q8_kv_cache(enable);
+            d.cached.clear();
+        }
+    }
+
     /// Attaches a fast Kronos draft model (e.g. `SmolLM2-135M-Instruct`) for **100% lossless**
     /// speculative decoding (exact greedy match at `temp == 0` and exact Leviathan-Chen rejection
     /// sampling at `temp > 0`), sharing the global P-core thread pool with zero thread contention!
@@ -220,13 +299,28 @@ impl ChatModel {
         draft_mode_key: &str,
         calib: Option<(&Path, usize)>,
     ) -> Result<(), String> {
+        self.attach_draft_with_cache_dir(draft_dir, None, draft_mode_key, calib)
+    }
+
+    /// Like [`Self::attach_draft`], with caches in `cache_dir` if given.
+    pub fn attach_draft_with_cache_dir(
+        &mut self,
+        draft_dir: &Path,
+        cache_dir: Option<&Path>,
+        draft_mode_key: &str,
+        calib: Option<(&Path, usize)>,
+    ) -> Result<(), String> {
         let threads = self.engine.num_threads();
-        let draft_eng = load_or_compile_engine(draft_dir, draft_mode_key, self.ctx, threads, calib)?;
+        let mut draft_eng =
+            load_or_compile_engine(draft_dir, cache_dir, draft_mode_key, self.ctx, threads, calib)?;
         if draft_eng.cfg.vocab_size != self.engine.cfg.vocab_size {
             return Err(format!(
                 "draft vocab_size ({}) != target vocab_size ({})",
                 draft_eng.cfg.vocab_size, self.engine.cfg.vocab_size
             ));
+        }
+        if self.engine.is_q8_kv_enabled() {
+            draft_eng.enable_q8_kv_cache(true);
         }
         self.draft = Some(DraftEngine { engine: draft_eng, cached: Vec::new() });
         Ok(())
@@ -417,9 +511,10 @@ impl ChatModel {
             true
         };
 
-        let mut cur_draft_k = 3usize; // `1 + 3 = 4` (`NT = 4` single NEON tile); scales to `7` (`NT = 8` tile) on streaks!
+        let mut cur_draft_k = if params.temperature <= 0.0 { 3usize } else { 2usize };
         let mut zero_accept_streak = 0usize;
         let mut draft_cooldown = 0usize;
+        let mut cooldown_step = 16usize;
         'outer: loop {
             if is_stop(next, self.im_end, self.tok.eos_token_id) {
                 finish = FinishReason::Stop;
@@ -592,9 +687,10 @@ impl ChatModel {
                 }
 
                 if accepted_all {
-                    // All `drafted` tokens accepted -> bonus token `drafted + 1` is FREE; step up to `NT = 8` (`1 + 7`)!
-                    cur_draft_k = SPEC_DRAFT_K_GREEDY;
+                    // All drafts accepted: widen the lookahead.
+                    cur_draft_k = if cur_draft_k < 4 { 4 } else { SPEC_DRAFT_K_GREEDY };
                     zero_accept_streak = 0;
+                    cooldown_step = 16;
                     self.cached.push(batch[drafted]);
                     let bonus_logits = &self.scratch.verify_logits[drafted * vocab..(drafted + 1) * vocab];
                     let rec = &reply[reply.len().saturating_sub(64)..];
@@ -607,15 +703,17 @@ impl ChatModel {
                         &mut self.scratch.top_heap,
                     );
                 } else {
-                    cur_draft_k = 3;
+                    cur_draft_k = if params.temperature <= 0.0 && accepted_in_round >= 2 { 3 } else { 2 };
                     if accepted_in_round == 0 {
                         zero_accept_streak += 1;
                         if zero_accept_streak >= 2 {
-                            draft_cooldown = 8;
+                            draft_cooldown = cooldown_step;
+                            cooldown_step = (cooldown_step * 2).min(64);
                             zero_accept_streak = 0;
                         }
                     } else {
                         zero_accept_streak = 0;
+                        cooldown_step = 16;
                     }
                 }
                 continue;
