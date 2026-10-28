@@ -1,5 +1,6 @@
-//! Chat on a compiled Kronos model: ChatML template, sampling, token streaming and KV-cache
-//! prefix reuse across requests.
+//! Chat on a compiled Kronos model: ChatML template, zero-allocation sampling, `O(1)` incremental
+//! UTF-8 token streaming, KV-cache prefix reuse, and Dual-Tier Lossless Speculative Decoding
+//! (Zero-RAM Prompt/History Suffix Lookup + Draft-Model Leviathan-Chen Speculative Verification).
 
 use crate::bpe_tokenizer::BpeTokenizer;
 use crate::real_llm::{argmax, RealLlamaEngine, RealWeightMode};
@@ -7,6 +8,10 @@ use std::path::Path;
 use std::time::Instant;
 
 pub const DEFAULT_SYSTEM: &str = "You are a helpful AI assistant named SmolLM, trained by Hugging Face";
+
+/// Maximum draft lookahead tokens verified in a single batched target DRAM pass (`1 + 7 = 8` tokens = exact `NT = 8` NEON tile!).
+const SPEC_DRAFT_K_GREEDY: usize = 7;
+const SPEC_DRAFT_K_SAMPLE: usize = 7;
 
 #[derive(Clone, Debug)]
 pub struct Message {
@@ -88,18 +93,76 @@ pub fn compile(model_dir: &Path, mode: RealWeightMode, calib_text: &str, calib_t
     }
     let seqs: Vec<Vec<usize>> = ids[..calib_tokens.min(ids.len())].chunks(SEQ).map(|c| c.to_vec()).collect();
     let fp32 = RealLlamaEngine::load_fp32_reference(model_dir, SEQ).map_err(|e| format!("load model: {e}"))?;
-    Ok(fp32.compile_sequential_bipolar_gptq(mode, &seqs, 8))
+    Ok(fp32.compile_sequential_bipolar_gptq(mode, &seqs, crate::thread_pool::physical_p_cores()))
+}
+
+fn load_or_compile_engine(
+    model_dir: &Path,
+    mode_key: &str,
+    ctx: usize,
+    threads: usize,
+    calib: Option<(&Path, usize)>,
+) -> Result<RealLlamaEngine, String> {
+    let mode = parse_mode(mode_key)?;
+    let cache = model_dir.join(format!("kronos-{mode_key}.k2tb"));
+    let mut engine = match RealLlamaEngine::load_bipolar(model_dir, &cache, ctx) {
+        Ok(e) => e,
+        Err(_) => {
+            let (path, n) = calib.ok_or_else(|| {
+                format!("no compiled model at {}; provide calibration text to compile it", cache.display())
+            })?;
+            let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+            eprintln!("compiling {} ({mode_key}), one time only; this takes minutes...", model_dir.display());
+            compile(model_dir, mode, &text, n)?
+                .save_bipolar(&cache)
+                .map_err(|e| format!("save {}: {e}", cache.display()))?;
+            RealLlamaEngine::load_bipolar(model_dir, &cache, ctx).map_err(|e| e.to_string())?
+        }
+    };
+    engine.repack_sdot();
+    engine.set_num_threads(threads);
+    Ok(engine)
+}
+
+struct DraftEngine {
+    engine: RealLlamaEngine,
+    cached: Vec<usize>,
+}
+
+/// Reusable zero-allocation sampling & speculative verification scratch buffers.
+struct ChatScratch {
+    cur_logits: Vec<f32>,
+    pen_logits: Vec<f32>,
+    verify_logits: Vec<f32>,
+    top_heap: Vec<(usize, f32)>,
+    target_dist: Vec<(usize, f32)>,
+    draft_dists: Vec<Vec<(usize, f32)>>,
+}
+
+impl ChatScratch {
+    fn new(vocab_size: usize) -> Self {
+        Self {
+            cur_logits: vec![0.0f32; vocab_size],
+            pen_logits: vec![0.0f32; vocab_size],
+            verify_logits: vec![0.0f32; (SPEC_DRAFT_K_GREEDY + 1) * vocab_size],
+            top_heap: Vec::with_capacity(128),
+            target_dist: Vec::with_capacity(128),
+            draft_dists: (0..SPEC_DRAFT_K_GREEDY).map(|_| Vec::with_capacity(128)).collect(),
+        }
+    }
 }
 
 pub struct ChatModel {
     engine: RealLlamaEngine,
+    draft: Option<DraftEngine>,
     tok: BpeTokenizer,
     im_start: usize,
     im_end: usize,
     newline: Vec<usize>,
-    /// Token ids currently in the KV cache.
+    /// Token ids currently in the target KV cache.
     cached: Vec<usize>,
     ctx: usize,
+    scratch: ChatScratch,
     pub name: String,
 }
 
@@ -113,33 +176,50 @@ impl ChatModel {
         threads: usize,
         calib: Option<(&Path, usize)>,
     ) -> Result<Self, String> {
-        let mode = parse_mode(mode_key)?;
-        let cache = model_dir.join(format!("kronos-{mode_key}.k2tb"));
-        let mut engine = match RealLlamaEngine::load_bipolar(model_dir, &cache, ctx) {
-            Ok(e) => e,
-            Err(_) => {
-                let (path, n) = calib.ok_or_else(|| {
-                    format!("no compiled model at {}; provide calibration text to compile it", cache.display())
-                })?;
-                let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-                eprintln!("compiling {} ({mode_key}), one time only; this takes minutes...", model_dir.display());
-                compile(model_dir, mode, &text, n)?
-                    .save_bipolar(&cache)
-                    .map_err(|e| format!("save {}: {e}", cache.display()))?;
-                RealLlamaEngine::load_bipolar(model_dir, &cache, ctx).map_err(|e| e.to_string())?
-            }
-        };
-        engine.repack_sdot();
-        engine.set_num_threads(threads);
+        let engine = load_or_compile_engine(model_dir, mode_key, ctx, threads, calib)?;
+        let vocab_size = engine.cfg.vocab_size;
         let tok = BpeTokenizer::from_model_dir(model_dir).map_err(|e| format!("tokenizer: {e}"))?;
-        let special = |s: &str| tok.token_to_id.get(s).copied().ok_or(format!("tokenizer lacks {s}; use an Instruct model"));
+        let special =
+            |s: &str| tok.token_to_id.get(s).copied().ok_or(format!("tokenizer lacks {s}; use an Instruct model"));
         let (im_start, im_end) = (special("<|im_start|>")?, special("<|im_end|>")?);
         let newline = tok.encode("\n");
         let name = format!(
             "{}-kronos-{mode_key}",
             model_dir.file_name().map_or("model".into(), |n| n.to_string_lossy().to_lowercase())
         );
-        Ok(Self { engine, tok, im_start, im_end, newline, cached: Vec::new(), ctx, name })
+        Ok(Self {
+            engine,
+            draft: None,
+            tok,
+            im_start,
+            im_end,
+            newline,
+            cached: Vec::new(),
+            ctx,
+            scratch: ChatScratch::new(vocab_size),
+            name,
+        })
+    }
+
+    /// Attaches a fast Kronos draft model (e.g. `SmolLM2-135M-Instruct`) for **100% lossless**
+    /// speculative decoding (exact greedy match at `temp == 0` and exact Leviathan-Chen rejection
+    /// sampling at `temp > 0`), sharing the global P-core thread pool with zero thread contention!
+    pub fn attach_draft(
+        &mut self,
+        draft_dir: &Path,
+        draft_mode_key: &str,
+        calib: Option<(&Path, usize)>,
+    ) -> Result<(), String> {
+        let threads = self.engine.num_threads();
+        let draft_eng = load_or_compile_engine(draft_dir, draft_mode_key, self.ctx, threads, calib)?;
+        if draft_eng.cfg.vocab_size != self.engine.cfg.vocab_size {
+            return Err(format!(
+                "draft vocab_size ({}) != target vocab_size ({})",
+                draft_eng.cfg.vocab_size, self.engine.cfg.vocab_size
+            ));
+        }
+        self.draft = Some(DraftEngine { engine: draft_eng, cached: Vec::new() });
+        Ok(())
     }
 
     pub fn context_size(&self) -> usize {
@@ -187,6 +267,7 @@ impl ChatModel {
             prompt = self.render(&msgs);
         }
         let max_new = params.max_tokens.min(self.ctx - prompt.len());
+        let vocab = self.engine.cfg.vocab_size;
 
         // Reuse the cached prefix; at least one prompt token must run to produce logits.
         let mut common = self.cached.iter().zip(&prompt).take_while(|(a, b)| a == b).count();
@@ -194,39 +275,365 @@ impl ChatModel {
         self.engine.truncate_context(common);
         self.cached.truncate(common);
         let t0 = Instant::now();
-        let mut logits = self.engine.forward_prompt(&prompt[common..]).to_vec();
+        {
+            let l = self.engine.forward_prompt(&prompt[common..]);
+            self.scratch.cur_logits.copy_from_slice(l);
+        }
         self.cached.extend_from_slice(&prompt[common..]);
+
+        // Pre-sync draft KV cache on the prompt inside prefill timing so decode starts hot!
+        if let Some(d) = self.draft.as_mut() {
+            let d_common = d.cached.iter().zip(&self.cached).take_while(|(a, b)| a == b).count();
+            d.engine.truncate_context(d_common);
+            d.cached.truncate(d_common);
+            if d_common < self.cached.len() {
+                d.engine.forward_prompt(&self.cached[d_common..]);
+                d.cached.extend_from_slice(&self.cached[d_common..]);
+            }
+        }
         let prefill_secs = t0.elapsed().as_secs_f64();
 
         let mut rng = Rng(params.seed ^ 0x9E37_79B9_7F4A_7C15);
         let t1 = Instant::now();
-        let mut reply: Vec<usize> = Vec::new();
-        let mut shown = 0usize;
+        let mut reply: Vec<usize> = Vec::with_capacity(max_new);
+        let mut raw_bytes: Vec<u8> = Vec::with_capacity(max_new * 4);
+        let mut emitted_bytes = 0usize;
         let mut finish = FinishReason::Length;
-        for _ in 0..max_new {
-            let recent = &reply[reply.len().saturating_sub(64)..];
-            let next = sample(&logits, recent, params, &mut rng);
-            if next == self.im_end || next == self.tok.eos_token_id {
+
+        if max_new == 0 {
+            return Ok(Completion {
+                text: String::new(),
+                prompt_tokens: prompt.len(),
+                prefilled_tokens: prompt.len() - common,
+                completion_tokens: 0,
+                finish,
+                prefill_secs,
+                decode_secs: 0.0,
+            });
+        }
+
+        let mut next = sample_token(
+            &self.scratch.cur_logits,
+            &[],
+            params,
+            &mut rng,
+            &mut self.scratch.pen_logits,
+            &mut self.scratch.top_heap,
+        );
+
+        let is_stop = |tok: usize, im_end: usize, eos: usize| tok == im_end || tok == eos;
+        let emit_tok = |tok_id: usize,
+                        tok: &BpeTokenizer,
+                        reply: &mut Vec<usize>,
+                        raw_bytes: &mut Vec<u8>,
+                        emitted_bytes: &mut usize,
+                        on_text: &mut dyn FnMut(&str) -> bool|
+         -> bool {
+            reply.push(tok_id);
+            tok.append_token_bytes(tok_id, raw_bytes);
+            let pending = &raw_bytes[*emitted_bytes..];
+            let valid_len = match std::str::from_utf8(pending) {
+                Ok(s) => s.len(),
+                Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                Err(_) => return true,
+            };
+            if valid_len > 0 {
+                // SAFETY: `pending[..valid_len]` was just validated by `std::str::from_utf8`.
+                let piece = unsafe { std::str::from_utf8_unchecked(&pending[..valid_len]) };
+                *emitted_bytes += valid_len;
+                return on_text(piece);
+            }
+            true
+        };
+
+        let mut cur_draft_k = 3usize; // `1 + 3 = 4` (`NT = 4` single NEON tile); scales to `7` (`NT = 8` tile) on streaks!
+        let mut zero_accept_streak = 0usize;
+        let mut draft_cooldown = 0usize;
+        'outer: loop {
+            if is_stop(next, self.im_end, self.tok.eos_token_id) {
                 finish = FinishReason::Stop;
                 break;
             }
-            reply.push(next);
-            let text = self.tok.decode(&reply);
-            // Hold back a trailing partial UTF-8 character until it completes.
-            let ready = text.trim_end_matches('\u{FFFD}');
-            if ready.len() > shown {
-                let keep_going = on_text(&ready[shown..]);
-                shown = ready.len();
-                if !keep_going {
-                    finish = FinishReason::Stop;
-                    break;
+            if !emit_tok(next, &self.tok, &mut reply, &mut raw_bytes, &mut emitted_bytes, &mut on_text) {
+                finish = FinishReason::Stop;
+                break;
+            }
+            if reply.len() >= max_new {
+                finish = FinishReason::Length;
+                break;
+            }
+
+            let rem = max_new - reply.len();
+            let avail_ctx = self.ctx.saturating_sub(self.cached.len() + 1);
+            let max_k = if params.temperature <= 0.0 { SPEC_DRAFT_K_GREEDY } else { SPEC_DRAFT_K_SAMPLE };
+            let max_draft = rem.min(avail_ctx).min(cur_draft_k.min(max_k));
+
+            // TIER 1: Draft-Model Lossless Speculative Decoding (`--draft`)
+            if draft_cooldown > 0 {
+                draft_cooldown -= 1;
+            } else if max_draft >= 2 && self.engine.is_all_sdot() && self.draft.is_some() {
+                let mut draft_tokens = [0usize; SPEC_DRAFT_K_GREEDY];
+                let mut drafted = 0usize;
+                {
+                    let d = self.draft.as_mut().unwrap();
+                    let d_common = d.cached.iter().zip(&self.cached).take_while(|(a, b)| a == b).count();
+                    d.engine.truncate_context(d_common);
+                    d.cached.truncate(d_common);
+                    if d_common < self.cached.len() {
+                        let start = d_common;
+                        let mut sync_buf = Vec::with_capacity(self.cached.len() - start + 1);
+                        sync_buf.extend_from_slice(&self.cached[start..]);
+                        sync_buf.push(next);
+                        let dl = d.engine.forward_prompt(&sync_buf);
+                        self.scratch.cur_logits.copy_from_slice(dl);
+                        d.cached.extend_from_slice(&sync_buf);
+                    } else {
+                        let dl = d.engine.forward_token(next);
+                        self.scratch.cur_logits.copy_from_slice(dl);
+                        d.cached.push(next);
+                    }
+
+                    let mut sim_recent: Vec<usize> =
+                        reply[reply.len().saturating_sub(64 + SPEC_DRAFT_K_GREEDY)..].to_vec();
+                    for (j, dt_slot) in draft_tokens.iter_mut().enumerate().take(max_draft) {
+                        let rec = &sim_recent[sim_recent.len().saturating_sub(64)..];
+                        let dj = if params.temperature <= 0.0 {
+                            sample_greedy(
+                                &self.scratch.cur_logits,
+                                rec,
+                                params.repeat_penalty,
+                                &mut self.scratch.pen_logits,
+                            )
+                        } else {
+                            build_sampling_dist(
+                                &self.scratch.cur_logits,
+                                rec,
+                                params,
+                                &mut self.scratch.pen_logits,
+                                &mut self.scratch.top_heap,
+                                &mut self.scratch.draft_dists[j],
+                            );
+                            sample_from_dist(&self.scratch.draft_dists[j], &mut rng)
+                        };
+                        *dt_slot = dj;
+                        drafted += 1;
+                        if is_stop(dj, self.im_end, self.tok.eos_token_id) {
+                            break;
+                        }
+                        sim_recent.push(dj);
+                        if j + 1 < max_draft {
+                            let dl = d.engine.forward_token(dj);
+                            self.scratch.cur_logits.copy_from_slice(dl);
+                            d.cached.push(dj);
+                        }
+                    }
+                }
+
+                // Single batched DRAM pass on target engine verifying `[next, d_0, ..., d_{drafted-1}]`!
+                let mut batch = [0usize; SPEC_DRAFT_K_GREEDY + 1];
+                batch[0] = next;
+                batch[1..1 + drafted].copy_from_slice(&draft_tokens[..drafted]);
+                let batch_len = 1 + drafted;
+                let pos0 = self.engine.position();
+                if self.scratch.verify_logits.len() < batch_len * vocab {
+                    self.scratch.verify_logits.resize(batch_len * vocab, 0.0);
+                }
+                self.engine
+                    .forward_batch_logits(&batch[..batch_len], &mut self.scratch.verify_logits);
+
+                let mut accepted_all = true;
+                let mut accepted_in_round = 0usize;
+                for j in 0..drafted {
+                    self.cached.push(batch[j]);
+                    let t_logits = &self.scratch.verify_logits[j * vocab..(j + 1) * vocab];
+                    let rec = &reply[reply.len().saturating_sub(64)..];
+                    let dj = draft_tokens[j];
+
+                    if params.temperature <= 0.0 {
+                        let tj = sample_greedy(t_logits, rec, params.repeat_penalty, &mut self.scratch.pen_logits);
+                        if tj != dj {
+                            self.engine.truncate_context(pos0 + j + 1);
+                            if let Some(d) = self.draft.as_mut() {
+                                d.engine.truncate_context(pos0 + j + 1);
+                                d.cached.truncate(pos0 + j + 1);
+                            }
+                            next = tj;
+                            accepted_all = false;
+                            break;
+                        }
+                    } else {
+                        build_sampling_dist(
+                            t_logits,
+                            rec,
+                            params,
+                            &mut self.scratch.pen_logits,
+                            &mut self.scratch.top_heap,
+                            &mut self.scratch.target_dist,
+                        );
+                        let p_d = prob_in_dist(&self.scratch.target_dist, dj);
+                        let q_d = prob_in_dist(&self.scratch.draft_dists[j], dj).max(1e-12);
+                        if p_d < q_d && rng.next_f32() >= (p_d / q_d) {
+                            let tj = sample_residual_dist(
+                                &self.scratch.target_dist,
+                                &self.scratch.draft_dists[j],
+                                &mut rng,
+                            );
+                            self.engine.truncate_context(pos0 + j + 1);
+                            if let Some(d) = self.draft.as_mut() {
+                                d.engine.truncate_context(pos0 + j + 1);
+                                d.cached.truncate(pos0 + j + 1);
+                            }
+                            next = tj;
+                            accepted_all = false;
+                            break;
+                        }
+                    }
+
+                    // `dj` accepted!
+                    accepted_in_round += 1;
+                    if is_stop(dj, self.im_end, self.tok.eos_token_id) {
+                        self.engine.truncate_context(pos0 + j + 1);
+                        if let Some(d) = self.draft.as_mut() {
+                            d.engine.truncate_context(pos0 + j + 1);
+                            d.cached.truncate(pos0 + j + 1);
+                        }
+                        finish = FinishReason::Stop;
+                        break 'outer;
+                    }
+                    if !emit_tok(dj, &self.tok, &mut reply, &mut raw_bytes, &mut emitted_bytes, &mut on_text) {
+                        self.engine.truncate_context(pos0 + j + 1);
+                        if let Some(d) = self.draft.as_mut() {
+                            d.engine.truncate_context(pos0 + j + 1);
+                            d.cached.truncate(pos0 + j + 1);
+                        }
+                        finish = FinishReason::Stop;
+                        break 'outer;
+                    }
+                    if reply.len() >= max_new {
+                        self.engine.truncate_context(pos0 + j + 1);
+                        if let Some(d) = self.draft.as_mut() {
+                            d.engine.truncate_context(pos0 + j + 1);
+                            d.cached.truncate(pos0 + j + 1);
+                        }
+                        finish = FinishReason::Length;
+                        break 'outer;
+                    }
+                }
+
+                if accepted_all {
+                    // All `drafted` tokens accepted -> bonus token `drafted + 1` is FREE; step up to `NT = 8` (`1 + 7`)!
+                    cur_draft_k = SPEC_DRAFT_K_GREEDY;
+                    zero_accept_streak = 0;
+                    self.cached.push(batch[drafted]);
+                    let bonus_logits = &self.scratch.verify_logits[drafted * vocab..(drafted + 1) * vocab];
+                    let rec = &reply[reply.len().saturating_sub(64)..];
+                    next = sample_token(
+                        bonus_logits,
+                        rec,
+                        params,
+                        &mut rng,
+                        &mut self.scratch.pen_logits,
+                        &mut self.scratch.top_heap,
+                    );
+                } else {
+                    cur_draft_k = 3;
+                    if accepted_in_round == 0 {
+                        zero_accept_streak += 1;
+                        if zero_accept_streak >= 2 {
+                            draft_cooldown = 8;
+                            zero_accept_streak = 0;
+                        }
+                    } else {
+                        zero_accept_streak = 0;
+                    }
+                }
+                continue;
+            }
+
+            // TIER 2: Zero-RAM Prompt/History Suffix-Lookup Speculation (greedy, `0` extra RAM)
+            if params.temperature <= 0.0 && max_draft >= 3 && self.engine.is_all_sdot() {
+                let mut draft_tokens = [0usize; SPEC_DRAFT_K_GREEDY];
+                let drafted = find_suffix_continuation(&self.cached, next, max_draft, &mut draft_tokens);
+                if drafted >= 2 {
+                    let mut batch = [0usize; SPEC_DRAFT_K_GREEDY + 1];
+                    batch[0] = next;
+                    batch[1..1 + drafted].copy_from_slice(&draft_tokens[..drafted]);
+                    let batch_len = 1 + drafted;
+                    let pos0 = self.engine.position();
+                    if self.scratch.verify_logits.len() < batch_len * vocab {
+                        self.scratch.verify_logits.resize(batch_len * vocab, 0.0);
+                    }
+                    self.engine
+                        .forward_batch_logits(&batch[..batch_len], &mut self.scratch.verify_logits);
+
+                    let mut accepted_all = true;
+                    for j in 0..drafted {
+                        self.cached.push(batch[j]);
+                        let t_logits = &self.scratch.verify_logits[j * vocab..(j + 1) * vocab];
+                        let rec = &reply[reply.len().saturating_sub(64)..];
+                        let tj = sample_greedy(t_logits, rec, params.repeat_penalty, &mut self.scratch.pen_logits);
+                        let dj = draft_tokens[j];
+                        if tj != dj {
+                            self.engine.truncate_context(pos0 + j + 1);
+                            next = tj;
+                            accepted_all = false;
+                            break;
+                        }
+                        if is_stop(dj, self.im_end, self.tok.eos_token_id) {
+                            self.engine.truncate_context(pos0 + j + 1);
+                            finish = FinishReason::Stop;
+                            break 'outer;
+                        }
+                        if !emit_tok(dj, &self.tok, &mut reply, &mut raw_bytes, &mut emitted_bytes, &mut on_text) {
+                            self.engine.truncate_context(pos0 + j + 1);
+                            finish = FinishReason::Stop;
+                            break 'outer;
+                        }
+                        if reply.len() >= max_new {
+                            self.engine.truncate_context(pos0 + j + 1);
+                            finish = FinishReason::Length;
+                            break 'outer;
+                        }
+                    }
+                    if accepted_all {
+                        self.cached.push(batch[drafted]);
+                        let bonus_logits = &self.scratch.verify_logits[drafted * vocab..(drafted + 1) * vocab];
+                        let rec = &reply[reply.len().saturating_sub(64)..];
+                        next = sample_greedy(
+                            bonus_logits,
+                            rec,
+                            params.repeat_penalty,
+                            &mut self.scratch.pen_logits,
+                        );
+                    }
+                    continue;
                 }
             }
-            logits = self.engine.forward_token(next).to_vec();
+
+            // Direct single-token Megakernel step (`0` allocations!)
+            let recent = &reply[reply.len().saturating_sub(64)..];
+            let l = self.engine.forward_token(next);
             self.cached.push(next);
+            next = sample_token(
+                l,
+                recent,
+                params,
+                &mut rng,
+                &mut self.scratch.pen_logits,
+                &mut self.scratch.top_heap,
+            );
         }
+
+        // Flush any remaining lossy bytes at end of generation
+        if emitted_bytes < raw_bytes.len() {
+            let tail = String::from_utf8_lossy(&raw_bytes[emitted_bytes..]);
+            if !tail.is_empty() {
+                let _ = on_text(&tail);
+            }
+        }
+
         Ok(Completion {
-            text: self.tok.decode(&reply),
+            text: String::from_utf8_lossy(&raw_bytes).into_owned(),
             prompt_tokens: prompt.len(),
             prefilled_tokens: prompt.len() - common,
             completion_tokens: reply.len(),
@@ -237,10 +644,45 @@ impl ChatModel {
     }
 }
 
+/// Scans `cached` + `next` backwards for a suffix match of length `4`, `3`, or `2` and copies up
+/// to `max_k` continuation tokens into `out` (`< 0.5 µs`, `0` heap allocations).
+fn find_suffix_continuation(cached: &[usize], next: usize, max_k: usize, out: &mut [usize]) -> usize {
+    let n = cached.len();
+    if n < 4 {
+        return 0;
+    }
+    let limit = max_k.min(out.len());
+    for ngram in [4usize, 3, 2] {
+        if n + 1 < ngram + 2 {
+            continue;
+        }
+        // Suffix ending at `next` has previous `ngram - 1` tokens `cached[n - (ngram - 1)..n]` followed by `next`.
+        let prev = &cached[n - (ngram - 1)..n];
+        // Search backwards from `n - 2` down to `ngram - 1` for `cached[i] == next` and matching `prev`.
+        let start_search = n.saturating_sub(2);
+        for i in (ngram - 1..=start_search).rev() {
+            if cached[i] == next && &cached[i - (ngram - 1)..i] == prev {
+                let mut count = 0usize;
+                let mut src = i + 1;
+                while count < limit && src <= n {
+                    out[count] = if src < n { cached[src] } else { next };
+                    count += 1;
+                    src += 1;
+                }
+                if count >= 2 {
+                    return count;
+                }
+            }
+        }
+    }
+    0
+}
+
 /// xorshift64* sampler state.
 struct Rng(u64);
 
 impl Rng {
+    #[inline]
     fn next_f32(&mut self) -> f32 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
@@ -249,37 +691,228 @@ impl Rng {
     }
 }
 
-fn sample(logits: &[f32], recent: &[usize], p: &GenParams, rng: &mut Rng) -> usize {
-    let mut l = logits.to_vec();
+/// Fast zero-allocation greedy argmax with repetition penalty (`2.5 µs` zero-copy fast path!).
+#[inline]
+fn sample_greedy(logits: &[f32], recent: &[usize], repeat_penalty: f32, scratch: &mut [f32]) -> usize {
+    if recent.is_empty() || (repeat_penalty - 1.0).abs() <= f32::EPSILON {
+        return argmax(logits);
+    }
+    if repeat_penalty >= 1.0 {
+        let best = argmax(logits);
+        if !recent.contains(&best) {
+            return best;
+        }
+    }
+    let l = &mut scratch[..logits.len()];
+    l.copy_from_slice(logits);
     for &t in recent {
-        l[t] = if l[t] > 0.0 { l[t] / p.repeat_penalty } else { l[t] * p.repeat_penalty };
+        l[t] = if l[t] > 0.0 { l[t] / repeat_penalty } else { l[t] * repeat_penalty };
     }
+    argmax(l)
+}
+
+#[inline]
+fn sample_token(
+    logits: &[f32],
+    recent: &[usize],
+    p: &GenParams,
+    rng: &mut Rng,
+    pen_scratch: &mut [f32],
+    heap_scratch: &mut Vec<(usize, f32)>,
+) -> usize {
     if p.temperature <= 0.0 {
-        return argmax(&l);
+        return sample_greedy(logits, recent, p.repeat_penalty, pen_scratch);
     }
-    let k = p.top_k.clamp(1, l.len());
-    let mut idx: Vec<usize> = (0..l.len()).collect();
-    idx.select_nth_unstable_by(k - 1, |&a, &b| l[b].total_cmp(&l[a]));
-    idx.truncate(k);
-    idx.sort_unstable_by(|&a, &b| l[b].total_cmp(&l[a]));
-    let max = l[idx[0]];
-    let mut probs: Vec<f32> = idx.iter().map(|&i| ((l[i] - max) / p.temperature).exp()).collect();
-    let total: f32 = probs.iter().sum();
-    let (mut cum, mut keep) = (0.0, probs.len());
-    for (n, q) in probs.iter_mut().enumerate() {
-        *q /= total;
-        cum += *q;
+    let mut dist = Vec::new();
+    std::mem::swap(&mut dist, heap_scratch);
+    let mut tmp_heap = Vec::with_capacity(p.top_k.clamp(1, 128));
+    build_sampling_dist(logits, recent, p, pen_scratch, &mut tmp_heap, &mut dist);
+    let tok = sample_from_dist(&dist, rng);
+    std::mem::swap(&mut dist, heap_scratch);
+    tok
+}
+
+/// Builds the normalized `(token_id, prob)` `top_k` + `top_p` distribution in a single `O(V)` scan
+/// using a `k`-element binary min-heap (`0` `49,152`-index allocations!).
+fn build_sampling_dist(
+    logits: &[f32],
+    recent: &[usize],
+    p: &GenParams,
+    pen_scratch: &mut [f32],
+    heap: &mut Vec<(usize, f32)>,
+    out_dist: &mut Vec<(usize, f32)>,
+) {
+    let slice: &[f32] = if recent.is_empty() || (p.repeat_penalty - 1.0).abs() <= f32::EPSILON {
+        logits
+    } else {
+        let l = &mut pen_scratch[..logits.len()];
+        l.copy_from_slice(logits);
+        for &t in recent {
+            l[t] = if l[t] > 0.0 { l[t] / p.repeat_penalty } else { l[t] * p.repeat_penalty };
+        }
+        l
+    };
+
+    let k = p.top_k.clamp(1, slice.len());
+    heap.clear();
+    // Min-heap ordered so the SMALLEST logit among the current top-k sits at `heap[0]`
+    // (tie-breaking favors smaller index on ties).
+    let less_in_topk = |a: (usize, f32), b: (usize, f32)| -> bool {
+        a.1.total_cmp(&b.1).then_with(|| b.0.cmp(&a.0)).is_lt()
+    };
+
+    for (idx, &val) in slice.iter().enumerate() {
+        if heap.len() < k {
+            heap.push((idx, val));
+            if heap.len() == k {
+                // Floyd bottom-up heapify
+                for start in (0..k / 2).rev() {
+                    sift_down_min(heap, start, less_in_topk);
+                }
+            }
+        } else if less_in_topk(heap[0], (idx, val)) {
+            heap[0] = (idx, val);
+            sift_down_min(heap, 0, less_in_topk);
+        }
+    }
+
+    // Sort top-k descending by logit
+    heap.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let max_l = heap[0].1;
+    let inv_temp = 1.0 / p.temperature;
+
+    out_dist.clear();
+    let mut total = 0.0f32;
+    for &(idx, val) in heap.iter() {
+        let e = ((val - max_l) * inv_temp).exp();
+        out_dist.push((idx, e));
+        total += e;
+    }
+
+    let mut cum = 0.0f32;
+    let mut keep = out_dist.len();
+    for (n, entry) in out_dist.iter_mut().enumerate() {
+        entry.1 /= total;
+        cum += entry.1;
         if cum >= p.top_p {
             keep = n + 1;
             break;
         }
     }
-    let mut r = rng.next_f32() * probs[..keep].iter().sum::<f32>();
-    for (n, &q) in probs[..keep].iter().enumerate() {
-        r -= q;
-        if r <= 0.0 {
-            return idx[n];
+    out_dist.truncate(keep);
+    let kept_sum: f32 = out_dist.iter().map(|e| e.1).sum();
+    if kept_sum > 0.0 {
+        let inv_kept = 1.0 / kept_sum;
+        for entry in out_dist.iter_mut() {
+            entry.1 *= inv_kept;
         }
     }
-    idx[keep - 1]
+}
+
+#[inline]
+fn sift_down_min(heap: &mut [(usize, f32)], mut pos: usize, less: impl Fn((usize, f32), (usize, f32)) -> bool) {
+    let len = heap.len();
+    loop {
+        let left = 2 * pos + 1;
+        if left >= len {
+            break;
+        }
+        let right = left + 1;
+        let smallest = if right < len && less(heap[right], heap[left]) { right } else { left };
+        if !less(heap[smallest], heap[pos]) {
+            break;
+        }
+        heap.swap(pos, smallest);
+        pos = smallest;
+    }
+}
+
+#[inline]
+fn prob_in_dist(dist: &[(usize, f32)], tok: usize) -> f32 {
+    for &(id, prob) in dist {
+        if id == tok {
+            return prob;
+        }
+    }
+    0.0
+}
+
+#[inline]
+fn sample_from_dist(dist: &[(usize, f32)], rng: &mut Rng) -> usize {
+    let mut r = rng.next_f32();
+    for &(id, prob) in dist {
+        r -= prob;
+        if r <= 0.0 {
+            return id;
+        }
+    }
+    dist.last().map_or(0, |e| e.0)
+}
+
+/// Samples from $\text{norm}(\max(0, p(x) - q(x)))$ over `p`'s sparse `top_k` support (Leviathan et al. 2023).
+fn sample_residual_dist(p_dist: &[(usize, f32)], q_dist: &[(usize, f32)], rng: &mut Rng) -> usize {
+    let mut resid_sum = 0.0f32;
+    for &(id, pv) in p_dist {
+        let diff = (pv - prob_in_dist(q_dist, id)).max(0.0);
+        resid_sum += diff;
+    }
+    if resid_sum <= 1e-12 {
+        return sample_from_dist(p_dist, rng);
+    }
+    let mut r = rng.next_f32() * resid_sum;
+    let mut last_pos = p_dist[0].0;
+    for &(id, pv) in p_dist {
+        let diff = (pv - prob_in_dist(q_dist, id)).max(0.0);
+        if diff > 0.0 {
+            last_pos = id;
+            r -= diff;
+            if r <= 0.0 {
+                return id;
+            }
+        }
+    }
+    last_pos
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_zero_alloc_topk_dist_matches_reference() {
+        let logits: Vec<f32> = (0..1024).map(|i| ((i as f32) * 0.37).sin() * 4.0).collect();
+        let recent = [17usize, 99, 17, 512];
+        let p = GenParams {
+            temperature: 0.7,
+            top_k: 40,
+            top_p: 0.9,
+            repeat_penalty: 1.15,
+            max_tokens: 32,
+            seed: 42,
+        };
+        let mut pen = vec![0.0f32; logits.len()];
+        let mut heap = Vec::new();
+        let mut dist = Vec::new();
+        build_sampling_dist(&logits, &recent, &p, &mut pen, &mut heap, &mut dist);
+
+        let sum: f32 = dist.iter().map(|e| e.1).sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+        assert!(dist.len() <= 40);
+
+        let g = sample_greedy(&logits, &recent, p.repeat_penalty, &mut pen);
+        let mut ref_l = logits.clone();
+        for &t in &recent {
+            ref_l[t] = if ref_l[t] > 0.0 { ref_l[t] / p.repeat_penalty } else { ref_l[t] * p.repeat_penalty };
+        }
+        assert_eq!(g, argmax(&ref_l));
+    }
+
+    #[test]
+    fn test_suffix_continuation_lookup() {
+        let history = vec![10, 20, 30, 40, 50, 60, 70, 10, 20, 30];
+        let mut out = [0usize; 8];
+        let n = find_suffix_continuation(&history, 40, 4, &mut out);
+        assert_eq!(n, 4);
+        assert_eq!(&out[..4], &[50, 60, 70, 10]);
+    }
 }

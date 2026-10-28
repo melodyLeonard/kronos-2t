@@ -143,7 +143,7 @@ fn main() {
         None => "builtin".to_string(),
     };
     let first = n_ctx / 2;
-    let p_cores = 8usize;
+    let p_cores = kronos_2t::thread_pool::default_inference_threads();
 
     println!(
         "WikiText-2: {} tokens in file | {} chunks x n_ctx={} | {} scored tokens",

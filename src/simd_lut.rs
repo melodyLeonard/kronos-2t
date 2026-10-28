@@ -2949,6 +2949,252 @@ impl Int8ChunkActivation {
         }
     }
 
+    /// Fuses `FWHT-64` + `INT8` chunk quantization completely in SIMD registers (`0` intermediate buffer writes).
+    #[inline]
+    pub fn populate_fwht(&mut self, x: &[f32]) {
+        assert_eq!(x.len(), self.cols);
+        let nc = self.cols / 64;
+        let qp = self.q.as_mut_ptr();
+        let sp = self.scales.as_mut_ptr();
+        let sump = self.sums.as_mut_ptr();
+        for c in 0..nc {
+            // SAFETY: `c < nc` indexes valid disjoint 64-byte / 1-element chunk slots.
+            unsafe {
+                Self::populate_chunk_fwht_raw(qp, sp, sump, c, &x[c * 64..(c + 1) * 64], None);
+            }
+        }
+    }
+
+    /// Fuses `RMSNorm` scaling (`(x * inv_rms) * weight`) + `FWHT-64` + `INT8` chunk quantization in registers.
+    #[inline]
+    pub fn populate_rmsnorm_fwht(&mut self, x: &[f32], weight: &[f32], inv_rms: f32) {
+        assert_eq!(x.len(), self.cols);
+        assert_eq!(weight.len(), self.cols);
+        let nc = self.cols / 64;
+        let qp = self.q.as_mut_ptr();
+        let sp = self.scales.as_mut_ptr();
+        let sump = self.sums.as_mut_ptr();
+        for c in 0..nc {
+            // SAFETY: `c < nc` indexes valid disjoint 64-byte / 1-element chunk slots.
+            unsafe {
+                Self::populate_chunk_fwht_raw(
+                    qp,
+                    sp,
+                    sump,
+                    c,
+                    &x[c * 64..(c + 1) * 64],
+                    Some((&weight[c * 64..(c + 1) * 64], inv_rms)),
+                );
+            }
+        }
+    }
+
+    /// Quantizes a single 64-float block `x64` at chunk index `c` with optional `(rms_weight64, inv_rms)`
+    /// fused directly into in-register `FWHT-64` + `INT8` quantization.
+    ///
+    /// # Safety
+    /// `q_base` must be valid for `(c + 1) * 64` `i8` writes (disjoint for distinct `c`), and
+    /// `scales_base` / `sums_base` must be valid at offset `c`.
+    #[inline]
+    pub unsafe fn populate_chunk_fwht_raw(
+        q_base: *mut i8,
+        scales_base: *mut f32,
+        sums_base: *mut i32,
+        c: usize,
+        x64: &[f32],
+        rms_weight_inv: Option<(&[f32], f32)>,
+    ) {
+        debug_assert_eq!(x64.len(), 64);
+        #[cfg(target_arch = "aarch64")]
+        {
+            // SAFETY: NEON is baseline on `aarch64`; caller guarantees chunk pointer bounds.
+            unsafe {
+                Self::populate_chunk_fwht_neon(q_base, scales_base, sums_base, c, x64, rms_weight_inv);
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            unsafe {
+                Self::populate_chunk_fwht_scalar(q_base, scales_base, sums_base, c, x64, rms_weight_inv);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn populate_chunk_fwht_neon(
+        q_base: *mut i8,
+        scales_base: *mut f32,
+        sums_base: *mut i32,
+        c: usize,
+        x64: &[f32],
+        rms_weight_inv: Option<(&[f32], f32)>,
+    ) {
+        use crate::hadamard::{rademacher_sign_masks_64, RADEMACHER_TABLE_64};
+        use std::arch::aarch64::*;
+
+        let fallback_masks;
+        let mptr = if c < RADEMACHER_TABLE_64.len() {
+            RADEMACHER_TABLE_64[c].as_ptr()
+        } else {
+            fallback_masks = rademacher_sign_masks_64(c);
+            fallback_masks.as_ptr()
+        };
+        let scale = vdupq_n_f32(0.125);
+        let xp = x64.as_ptr();
+        let mut v = [vdupq_n_f32(0.0); 16];
+
+        if let Some((w64, inv_rms)) = rms_weight_inv {
+            debug_assert_eq!(w64.len(), 64);
+            let wp = w64.as_ptr();
+            let vinv = vdupq_n_f32(inv_rms);
+            for (k, slot) in v.iter_mut().enumerate() {
+                // SAFETY: `k * 4 + 4 <= 64` for `x64`, `w64`, and `masks`.
+                unsafe {
+                    let xn = vmulq_f32(vmulq_f32(vld1q_f32(xp.add(k * 4)), vinv), vld1q_f32(wp.add(k * 4)));
+                    let m = vld1q_u32(mptr.add(k * 4));
+                    *slot = vmulq_f32(vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(xn), m)), scale);
+                }
+            }
+        } else {
+            for (k, slot) in v.iter_mut().enumerate() {
+                // SAFETY: `k * 4 + 4 <= 64` for `x64` and `masks`.
+                unsafe {
+                    let raw = vld1q_u32(xp.add(k * 4).cast::<u32>());
+                    let m = vld1q_u32(mptr.add(k * 4));
+                    *slot = vmulq_f32(vreinterpretq_f32_u32(veorq_u32(raw, m)), scale);
+                }
+            }
+        }
+
+        let neg_mask_1 = unsafe { vld1q_u32([0u32, 0x8000_0000, 0, 0x8000_0000].as_ptr()) };
+        for slot in &mut v {
+            let x = *slot;
+            let sum1 = vtrn1q_f32(x, x);
+            let sub1 = vtrn2q_f32(x, x);
+            let b1 = vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(sub1), neg_mask_1));
+            let s1 = vaddq_f32(sum1, b1);
+            let lo = vget_low_f32(s1);
+            let hi = vget_high_f32(s1);
+            *slot = vcombine_f32(vadd_f32(lo, hi), vsub_f32(lo, hi));
+        }
+
+        for vec_h in [1usize, 2, 4, 8] {
+            let step = vec_h * 2;
+            let mut i = 0usize;
+            while i < 16 {
+                for j in i..i + vec_h {
+                    let a = v[j];
+                    let b = v[j + vec_h];
+                    v[j] = vaddq_f32(a, b);
+                    v[j + vec_h] = vsubq_f32(a, b);
+                }
+                i += step;
+            }
+        }
+
+        let mut vmax0 = vmaxq_f32(vabsq_f32(v[0]), vabsq_f32(v[1]));
+        let mut vmax1 = vmaxq_f32(vabsq_f32(v[2]), vabsq_f32(v[3]));
+        for k in (4..16).step_by(4) {
+            vmax0 = vmaxq_f32(vmax0, vmaxq_f32(vabsq_f32(v[k]), vabsq_f32(v[k + 1])));
+            vmax1 = vmaxq_f32(vmax1, vmaxq_f32(vabsq_f32(v[k + 2]), vabsq_f32(v[k + 3])));
+        }
+        let max_abs = vmaxvq_f32(vmaxq_f32(vmax0, vmax1));
+        // SAFETY: caller guarantees `q_base.add(c * 64)` (`64` bytes), `scales_base.add(c)`, `sums_base.add(c)`.
+        unsafe {
+            let qc = q_base.add(c * 64);
+            if max_abs <= f32::EPSILON {
+                let z = vdupq_n_s8(0);
+                vst1q_s8(qc, z);
+                vst1q_s8(qc.add(16), z);
+                vst1q_s8(qc.add(32), z);
+                vst1q_s8(qc.add(48), z);
+                *scales_base.add(c) = 0.0;
+                *sums_base.add(c) = 0;
+                return;
+            }
+            let inv = vdupq_n_f32(127.0 / max_abs);
+            let mut vsum = vdupq_n_s32(0);
+            for b in 0..4 {
+                let q0 = vcvtnq_s32_f32(vmulq_f32(v[b * 4], inv));
+                let q1 = vcvtnq_s32_f32(vmulq_f32(v[b * 4 + 1], inv));
+                let q2 = vcvtnq_s32_f32(vmulq_f32(v[b * 4 + 2], inv));
+                let q3 = vcvtnq_s32_f32(vmulq_f32(v[b * 4 + 3], inv));
+                vsum = vaddq_s32(vsum, vaddq_s32(vaddq_s32(q0, q1), vaddq_s32(q2, q3)));
+                let h0 = vcombine_s16(vmovn_s32(q0), vmovn_s32(q1));
+                let h1 = vcombine_s16(vmovn_s32(q2), vmovn_s32(q3));
+                vst1q_s8(qc.add(b * 16), vcombine_s8(vmovn_s16(h0), vmovn_s16(h1)));
+            }
+            *scales_base.add(c) = max_abs / 127.0;
+            *sums_base.add(c) = vaddvq_s32(vsum);
+        }
+    }
+
+    #[cfg(any(not(target_arch = "aarch64"), test))]
+    unsafe fn populate_chunk_fwht_scalar(
+        q_base: *mut i8,
+        scales_base: *mut f32,
+        sums_base: *mut i32,
+        c: usize,
+        x64: &[f32],
+        rms_weight_inv: Option<(&[f32], f32)>,
+    ) {
+        use crate::hadamard::{rademacher_sign_masks_64, RADEMACHER_TABLE_64};
+        let fallback_masks;
+        let masks = if c < RADEMACHER_TABLE_64.len() {
+            &RADEMACHER_TABLE_64[c]
+        } else {
+            fallback_masks = rademacher_sign_masks_64(c);
+            &fallback_masks
+        };
+        let mut block = [0.0f32; 64];
+        if let Some((w64, inv_rms)) = rms_weight_inv {
+            for i in 0..64 {
+                let xn = (x64[i] * inv_rms) * w64[i];
+                block[i] = f32::from_bits(xn.to_bits() ^ masks[i]) * 0.125;
+            }
+        } else {
+            for i in 0..64 {
+                block[i] = f32::from_bits(x64[i].to_bits() ^ masks[i]) * 0.125;
+            }
+        }
+        let mut h = 1usize;
+        while h < 64 {
+            let step = h * 2;
+            let mut i = 0usize;
+            while i < 64 {
+                for j in i..i + h {
+                    let a = block[j];
+                    let b = block[j + h];
+                    block[j] = a + b;
+                    block[j + h] = a - b;
+                }
+                i += step;
+            }
+            h *= 2;
+        }
+        let max_abs = block.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        // SAFETY: caller guarantees valid chunk pointers at `c`.
+        unsafe {
+            let qc = std::slice::from_raw_parts_mut(q_base.add(c * 64), 64);
+            if max_abs <= f32::EPSILON {
+                qc.fill(0);
+                *scales_base.add(c) = 0.0;
+                *sums_base.add(c) = 0;
+                return;
+            }
+            let inv = 127.0 / max_abs;
+            let mut sum = 0i32;
+            for (dst, &v) in qc.iter_mut().zip(block.iter()) {
+                let qv = (v * inv).round_ties_even() as i32;
+                sum += qv;
+                *dst = qv as i8;
+            }
+            *scales_base.add(c) = max_abs / 127.0;
+            *sums_base.add(c) = sum;
+        }
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "neon")]
     unsafe fn populate_neon(&mut self, x: &[f32]) {
@@ -3009,9 +3255,12 @@ impl Int8ChunkActivation {
     }
 }
 
-/// Bipolar weights for `SDOT`: `q = (2 u_lo - 15) + sum_{p>=4} 2^p s_p`. The low 4 planes are
-/// nibble-packed for `sdot`; planes `4..B` stay on the LUT path.
-/// Nibble layout: `[stripe, chunk, col16, row4, 2 x 16 bytes]`, byte `4 * row + t` = cols `t`, `t + 4`.
+/// Pure-`SDOT` Bipolar weights (`B in 4..=6`): `q = 2 u - (2^B - 1)`, where `u in [0, 2^B - 1] <= 63`
+/// has bit 7 = `0` and therefore executes in a single signed `sdot` pass with zero LUT fallback!
+///
+/// - Low 4 planes `data`: `[stripe, chunk, col16, row4, 2 x 16 bytes]`, byte `4 * row + t` = cols `t`, `t + 4`.
+/// - High planes `hi_data` (`0` bytes for `B=4`, `128 B/chunk` for `B=5`, `256 B/chunk` for `B=6`):
+///   tile-aligned `[stripe, chunk, ...]` bitplanes spliced directly into bits `4..B` via 1-cycle `vbslq_u8`.
 #[derive(Clone, Debug)]
 pub struct Nibble4SdotMatrix {
     pub rows: usize,
@@ -3019,7 +3268,7 @@ pub struct Nibble4SdotMatrix {
     pub num_stripes: usize,
     pub num_chunks: usize,
     pub data: Vec<u8>,
-    /// Bipolar planes `4..num_planes`.
+    /// Bipolar planes `4..num_planes` (`0`, `1`, or `2`).
     pub hi_planes: usize,
     pub hi_data: Vec<u8>,
     /// `BF16` chunk scales `[num_stripes, num_chunks, SIMD_ROW_STRIPE]`.
@@ -3027,10 +3276,12 @@ pub struct Nibble4SdotMatrix {
 }
 
 impl Nibble4SdotMatrix {
-    /// Repacks a `4..=6`-plane [`FusedBipolarLutMatrix`].
+    /// Repacks a `4..=6`-plane [`FusedBipolarLutMatrix`] into Pure-`SDOT` tile-aligned layout.
     pub fn from_bipolar(m: &FusedBipolarLutMatrix) -> Self {
         assert!((4..=6).contains(&m.num_planes), "SDOT repack requires 4..=6 planes");
+        let hi_planes = m.num_planes - 4;
         let mut data = vec![0u8; m.num_stripes * m.num_chunks * 512];
+        let mut hi_data = vec![0u8; m.num_stripes * m.num_chunks * 128 * hi_planes];
         let mut codes = vec![0u8; m.cols];
         for r in 0..m.rows {
             m.unpack_row_codes(r, &mut codes);
@@ -3039,20 +3290,25 @@ impl Nibble4SdotMatrix {
             for (col, &u) in codes.iter().enumerate() {
                 let (c, k, w) = (col / 64, (col % 64) / 16, col % 16);
                 let half = w / 8;
+                let sub = w / 4;
                 let t = w % 4;
                 let byte = ((stripe * m.num_chunks + c) * 4 + k) * 128 + g * 32 + half * 16 + j * 4 + t;
                 let lo = u & 0x0F;
                 data[byte] |= if (w % 8) < 4 { lo } else { lo << 4 };
-            }
-        }
-        let hi_planes = m.num_planes - 4;
-        let mut hi_data = vec![0u8; m.num_stripes * m.octets_per_row * hi_planes * SIMD_ROW_STRIPE];
-        for so in 0..m.num_stripes * m.octets_per_row {
-            for p in 0..hi_planes {
-                let src = (so * m.num_planes + 4 + p) * SIMD_ROW_STRIPE;
-                let dst = (so * hi_planes + p) * SIMD_ROW_STRIPE;
-                hi_data[dst..dst + SIMD_ROW_STRIPE]
-                    .copy_from_slice(&m.interleaved_data[src..src + SIMD_ROW_STRIPE]);
+                if hi_planes == 1 {
+                    let hi_byte = ((stripe * m.num_chunks + c) * 2 + (k / 2)) * 64 + g * 16 + j * 4 + t;
+                    let bit_pos = if (k & 1) == 0 { 4 + sub } else { sub };
+                    hi_data[hi_byte] |= ((u >> 4) & 1) << bit_pos;
+                } else if hi_planes == 2 {
+                    let hi_byte = ((stripe * m.num_chunks + c) * 4 + k) * 64 + g * 16 + j * 4 + t;
+                    let shift = match sub {
+                        0 => 4,
+                        1 => 6,
+                        2 => 2,
+                        _ => 0,
+                    };
+                    hi_data[hi_byte] |= ((u >> 4) & 0x03) << shift;
+                }
             }
         }
         Self {
@@ -3081,20 +3337,30 @@ impl Nibble4SdotMatrix {
         assert_eq!(out.len(), self.cols);
         let (stripe, lane) = (r / SIMD_ROW_STRIPE, r % SIMD_ROW_STRIPE);
         let (g, j) = (lane / 4, lane % 4);
-        let opr = self.cols / 8;
         let max_odd = (1i32 << self.num_planes()) - 1;
         for (col, dst) in out.iter_mut().enumerate() {
             let (c, k, w) = (col / 64, (col % 64) / 16, col % 16);
+            let sub = w / 4;
+            let t = w % 4;
             let byte = self.data[((stripe * self.num_chunks + c) * 4 + k) * 128
                 + g * 32
                 + (w / 8) * 16
                 + j * 4
-                + w % 4];
+                + t];
             let mut u = (if (w % 8) < 4 { byte & 0x0F } else { byte >> 4 }) as i32;
-            for p in 0..self.hi_planes {
-                let hb = self.hi_data
-                    [((stripe * opr + col / 8) * self.hi_planes + p) * SIMD_ROW_STRIPE + lane];
-                u |= (((hb >> (col % 8)) & 1) as i32) << (4 + p);
+            if self.hi_planes == 1 {
+                let hb = self.hi_data[((stripe * self.num_chunks + c) * 2 + (k / 2)) * 64 + g * 16 + j * 4 + t];
+                let bit_pos = if (k & 1) == 0 { 4 + sub } else { sub };
+                u |= (((hb >> bit_pos) & 1) as i32) << 4;
+            } else if self.hi_planes == 2 {
+                let hb = self.hi_data[((stripe * self.num_chunks + c) * 4 + k) * 64 + g * 16 + j * 4 + t];
+                let shift = match sub {
+                    0 => 4,
+                    1 => 6,
+                    2 => 2,
+                    _ => 0,
+                };
+                u |= (((hb >> shift) & 0x03) as i32) << 4;
             }
             let delta = bf16_to_f32(
                 self.bf16_chunk_scales[(stripe * self.num_chunks + c) * SIMD_ROW_STRIPE + lane],
@@ -3108,7 +3374,8 @@ impl Nibble4SdotMatrix {
 ///
 /// # Safety
 /// `stripe_end <= matrix.num_stripes`, `out_base` valid for `matrix.rows` floats on disjoint ranges.
-/// `blut` must carry `int8` activations, plus populated LUTs when `matrix.hi_planes > 0`.
+/// `blut` must carry `int8` activations (`lut_enabled` is not required even when `hi_planes > 0`).
+#[inline]
 pub unsafe fn nibble4_sdot_stripe_range(
     matrix: &Nibble4SdotMatrix,
     blut: &BipolarActivationLut,
@@ -3117,25 +3384,90 @@ pub unsafe fn nibble4_sdot_stripe_range(
     out_base: *mut f32,
 ) {
     debug_assert_eq!(matrix.cols, blut.cols);
+    let act = blut.int8.as_ref().expect("int8 activations required for Nibble4");
+    // SAFETY: Caller upholds bounds.
+    unsafe { nibble4_sdot_stripe_range_int8(matrix, act, stripe_start, stripe_end, out_base) };
+}
+
+/// Direct Pure-`SDOT` execution of stripes `[stripe_start, stripe_end)` from [`Int8ChunkActivation`].
+///
+/// # Safety
+/// `stripe_end <= matrix.num_stripes`, `out_base` valid for `matrix.rows` floats on disjoint ranges.
+#[inline]
+pub unsafe fn nibble4_sdot_stripe_range_int8(
+    matrix: &Nibble4SdotMatrix,
+    act: &Int8ChunkActivation,
+    stripe_start: usize,
+    stripe_end: usize,
+    out_base: *mut f32,
+) {
+    debug_assert_eq!(matrix.cols, act.cols);
+    // SAFETY: `act` buffers have lengths `cols`, `cols/64`, `cols/64`.
+    unsafe {
+        nibble4_sdot_stripe_range_raw(
+            matrix,
+            act.q.as_ptr(),
+            act.scales.as_ptr(),
+            act.sums.as_ptr(),
+            stripe_start,
+            stripe_end,
+            out_base,
+        );
+    }
+}
+
+/// Raw-pointer Pure-`SDOT` execution of stripes `[stripe_start, stripe_end)` (allows zero-barrier
+/// worker-stack L1D activation quantization without heap allocations or cross-core cache traffic).
+///
+/// # Safety
+/// `xq` valid for `matrix.cols` bytes, `xscales`/`xsums` valid for `matrix.num_chunks` elements,
+/// `stripe_end <= matrix.num_stripes`, `out_base` valid for `matrix.rows` floats on disjoint ranges.
+#[inline]
+pub unsafe fn nibble4_sdot_stripe_range_raw(
+    matrix: &Nibble4SdotMatrix,
+    xq: *const i8,
+    xscales: *const f32,
+    xsums: *const i32,
+    stripe_start: usize,
+    stripe_end: usize,
+    out_base: *mut f32,
+) {
     debug_assert!(stripe_end <= matrix.num_stripes);
-    debug_assert!(matrix.hi_planes == 0 || blut.lut_enabled);
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: Apple/ARMv8.4 targets have `dotprod`; caller upholds bounds.
-        unsafe { nibble4_sdot_stripe_range_neon(matrix, blut, stripe_start, stripe_end, out_base) }
+        unsafe {
+            match matrix.hi_planes {
+                0 => sdot_decode_neon::<0>(matrix, xq, xscales, xsums, stripe_start, stripe_end, out_base),
+                1 => sdot_decode_neon::<1>(matrix, xq, xscales, xsums, stripe_start, stripe_end, out_base),
+                2 => sdot_decode_neon::<2>(matrix, xq, xscales, xsums, stripe_start, stripe_end, out_base),
+                _ => unreachable!("hi_planes must be 0, 1, or 2"),
+            }
+        }
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
         // SAFETY: Caller upholds bounds.
-        unsafe {
-            nibble4_sdot_stripe_range_scalar(
-                matrix,
-                blut.int8.as_ref().expect("int8 activations"),
-                stripe_start,
-                stripe_end,
-                out_base,
-            )
+        let nc = matrix.num_chunks;
+        let q_s = unsafe { std::slice::from_raw_parts(xq, matrix.cols) };
+        let sc_s = unsafe { std::slice::from_raw_parts(xscales, nc) };
+        let mut row = vec![0.0f32; matrix.cols];
+        for s in stripe_start..stripe_end {
+            for lane in 0..SIMD_ROW_STRIPE {
+                let r = s * SIMD_ROW_STRIPE + lane;
+                if r >= matrix.rows {
+                    break;
+                }
+                matrix.dequantize_row_rotated(r, &mut row);
+                let mut acc = 0.0f32;
+                for (c, (wc, qc)) in row.chunks_exact(64).zip(q_s.chunks_exact(64)).enumerate() {
+                    let dot: f32 = wc.iter().zip(qc.iter()).map(|(&w, &q)| w * q as f32).sum();
+                    acc += dot * sc_s[c];
+                }
+                unsafe { *out_base.add(r) = acc };
+            }
         }
+        let _ = xsums;
     }
 }
 
@@ -3177,7 +3509,7 @@ unsafe fn sdot_lane<const L: i32>(
     b: std::arch::aarch64::int8x16_t,
 ) -> std::arch::aarch64::int32x4_t {
     // SAFETY: `sdot` (FEAT_DotProd) is baseline on every Apple-silicon / ARMv8.4+ target; `a` holds
-    // nibbles `0..=15` so reading it as signed bytes is exact.
+    // unsigned codes `0..=63` (bit 7 == 0) so reading it as signed bytes is exact.
     unsafe {
         core::arch::asm!(
             "sdot {acc:v}.4s, {a:v}.16b, {b:v}.4b[{l}]",
@@ -3192,138 +3524,373 @@ unsafe fn sdot_lane<const L: i32>(
 }
 
 #[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn unpack_sdot_quad<const HP: usize>(
+    va: std::arch::aarch64::uint8x16_t,
+    vb: std::arch::aarch64::uint8x16_t,
+    hi_ptr: *const u8,
+    sc_idx: usize,
+    k: usize,
+    g: usize,
+    mask_0f: std::arch::aarch64::uint8x16_t,
+    mask_hi: std::arch::aarch64::uint8x16_t,
+) -> (
+    std::arch::aarch64::uint8x16_t,
+    std::arch::aarch64::uint8x16_t,
+    std::arch::aarch64::uint8x16_t,
+    std::arch::aarch64::uint8x16_t,
+) {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON is baseline on `aarch64`; caller guarantees `hi_ptr` bounds when `HP > 0`.
+    unsafe {
+        let la = vandq_u8(va, mask_0f);
+        let ha = vshrq_n_u8::<4>(va);
+        let lb = vandq_u8(vb, mask_0f);
+        let hb = vshrq_n_u8::<4>(vb);
+        if HP == 0 {
+            (la, ha, lb, hb)
+        } else if HP == 1 {
+            let h = vld1q_u8(hi_ptr.add((sc_idx * 2 + (k >> 1)) * 64 + g * 16));
+            if (k & 1) == 0 {
+                (
+                    vbslq_u8(mask_hi, h, la),
+                    vbslq_u8(mask_hi, vshrq_n_u8::<1>(h), ha),
+                    vbslq_u8(mask_hi, vshrq_n_u8::<2>(h), lb),
+                    vbslq_u8(mask_hi, vshrq_n_u8::<3>(h), hb),
+                )
+            } else {
+                (
+                    vbslq_u8(mask_hi, vshlq_n_u8::<4>(h), la),
+                    vbslq_u8(mask_hi, vshlq_n_u8::<3>(h), ha),
+                    vbslq_u8(mask_hi, vshlq_n_u8::<2>(h), lb),
+                    vbslq_u8(mask_hi, vshlq_n_u8::<1>(h), hb),
+                )
+            }
+        } else {
+            let h = vld1q_u8(hi_ptr.add((sc_idx * 4 + k) * 64 + g * 16));
+            (
+                vbslq_u8(mask_hi, h, la),
+                vbslq_u8(mask_hi, vshrq_n_u8::<2>(h), ha),
+                vbslq_u8(mask_hi, vshlq_n_u8::<2>(h), lb),
+                vbslq_u8(mask_hi, vshlq_n_u8::<4>(h), hb),
+            )
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sdot_accum_16cols<const HP: usize, const K_ODD: bool>(
+    mut acc: std::arch::aarch64::int32x4_t,
+    va: std::arch::aarch64::uint8x16_t,
+    vb: std::arch::aarch64::uint8x16_t,
+    h: std::arch::aarch64::uint8x16_t,
+    x16: std::arch::aarch64::int8x16_t,
+    mask_0f: std::arch::aarch64::uint8x16_t,
+    mask_hi: std::arch::aarch64::uint8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON + `sdot` are baseline on Apple Silicon; codes are in `0..=63`.
+    unsafe {
+        let la = vandq_u8(va, mask_0f);
+        let ha = vshrq_n_u8::<4>(va);
+        let lb = vandq_u8(vb, mask_0f);
+        let hb = vshrq_n_u8::<4>(vb);
+        let (ula, uha, ulb, uhb) = if HP == 0 {
+            (la, ha, lb, hb)
+        } else if HP == 1 {
+            if !K_ODD {
+                (
+                    vbslq_u8(mask_hi, h, la),
+                    vbslq_u8(mask_hi, vshrq_n_u8::<1>(h), ha),
+                    vbslq_u8(mask_hi, vshrq_n_u8::<2>(h), lb),
+                    vbslq_u8(mask_hi, vshrq_n_u8::<3>(h), hb),
+                )
+            } else {
+                (
+                    vbslq_u8(mask_hi, vshlq_n_u8::<4>(h), la),
+                    vbslq_u8(mask_hi, vshlq_n_u8::<3>(h), ha),
+                    vbslq_u8(mask_hi, vshlq_n_u8::<2>(h), lb),
+                    vbslq_u8(mask_hi, vshlq_n_u8::<1>(h), hb),
+                )
+            }
+        } else {
+            (
+                vbslq_u8(mask_hi, h, la),
+                vbslq_u8(mask_hi, vshrq_n_u8::<2>(h), ha),
+                vbslq_u8(mask_hi, vshlq_n_u8::<2>(h), lb),
+                vbslq_u8(mask_hi, vshlq_n_u8::<4>(h), hb),
+            )
+        };
+        acc = sdot_lane::<0>(acc, ula, x16);
+        acc = sdot_lane::<1>(acc, uha, x16);
+        acc = sdot_lane::<2>(acc, ulb, x16);
+        acc = sdot_lane::<3>(acc, uhb, x16);
+    }
+    acc
+}
+
+#[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn nibble4_sdot_stripe_range_neon(
+unsafe fn sdot_decode_neon<const HP: usize>(
     matrix: &Nibble4SdotMatrix,
-    blut: &BipolarActivationLut,
+    xq: *const i8,
+    xscales: *const f32,
+    xsums: *const i32,
     stripe_start: usize,
     stripe_end: usize,
     out_base: *mut f32,
 ) {
     use std::arch::aarch64::*;
-    let act = blut.int8.as_ref().expect("int8 activations required for Nibble4");
+    let max_odd: i32 = (1i32 << (4 + HP)) - 1;
     let nc = matrix.num_chunks;
-    let hp = matrix.hi_planes;
-    let mask = vdupq_n_u8(0x0F);
+    let mask_0f = vdupq_n_u8(0x0F);
+    let mask_hi = vdupq_n_u8(if HP == 1 { 0x10 } else { 0x30 });
+    let zero_u8 = vdupq_n_u8(0);
     let data = matrix.data.as_ptr();
+    let hi_ptr = matrix.hi_data.as_ptr();
     let scales = matrix.bf16_chunk_scales.as_ptr();
-    let xq = act.q.as_ptr();
 
-    for s in stripe_start..stripe_end {
-        let mut f = [vdupq_n_f32(0.0); 4];
+    let mut s = stripe_start;
+
+    // 2-STRIPE (`32`-ROW) ZERO-SPILL PURE-SDOT FAST PATH:
+    // Uses exactly 16 persistent registers (`fa[4], fb[4], aa[4], ab[4]`), leaving 16 free NEON
+    // scratch registers (`0` stack spills across `B=4, 5, 6`), loading `h` once per 32-col pair on `B=5`!
+    while s + 2 <= stripe_end {
+        let mut fa = [vdupq_n_f32(0.0); 4];
+        let mut fb = [vdupq_n_f32(0.0); 4];
+
         for c in 0..nc {
-            let sx = act.scales[c];
+            let sx = unsafe { *xscales.add(c) };
             if sx == 0.0 {
                 continue;
             }
-            // Two accumulators per 4-row group break the `sdot` dependency chain.
-            let mut a = [vdupq_n_s32(0); 4];
-            let mut b = [vdupq_n_s32(0); 4];
-            for k in 0..4 {
-                // SAFETY: `c * 64 + k * 16 + 16 <= cols`; the block offset stays inside `data`.
+            let sc_a = s * nc + c;
+            let sc_b = (s + 1) * nc + c;
+            let mut aa = [vdupq_n_s32(0); 4];
+            let mut ab = [vdupq_n_s32(0); 4];
+
+            for kp in 0..2 {
+                let k0 = kp * 2;
+                let k1 = k0 + 1;
+                // SAFETY: `c * 64 + 64 <= cols`; block offsets stay inside `data` and `hi_data`.
                 unsafe {
-                    let x16 = vld1q_s8(xq.add(c * 64 + k * 16));
-                    let blk = data.add(((s * nc + c) * 4 + k) * 128);
+                    let x0 = vld1q_s8(xq.add(c * 64 + k0 * 16));
+                    let x1 = vld1q_s8(xq.add(c * 64 + k1 * 16));
+                    let blk_a0 = data.add((sc_a * 4 + k0) * 128);
+                    let blk_a1 = data.add((sc_a * 4 + k1) * 128);
+                    let blk_b0 = data.add((sc_b * 4 + k0) * 128);
+                    let blk_b1 = data.add((sc_b * 4 + k1) * 128);
                     for g in 0..4 {
-                        let va = vld1q_u8(blk.add(g * 32));
-                        let vb = vld1q_u8(blk.add(g * 32 + 16));
-                        a[g] = sdot_lane::<0>(a[g], vandq_u8(va, mask), x16);
-                        b[g] = sdot_lane::<1>(b[g], vshrq_n_u8::<4>(va), x16);
-                        a[g] = sdot_lane::<2>(a[g], vandq_u8(vb, mask), x16);
-                        b[g] = sdot_lane::<3>(b[g], vshrq_n_u8::<4>(vb), x16);
+                        let (ha0, ha1, hb0, hb1) = if HP == 0 {
+                            (zero_u8, zero_u8, zero_u8, zero_u8)
+                        } else if HP == 1 {
+                            let ha = vld1q_u8(hi_ptr.add((sc_a * 2 + kp) * 64 + g * 16));
+                            let hb = vld1q_u8(hi_ptr.add((sc_b * 2 + kp) * 64 + g * 16));
+                            (ha, ha, hb, hb)
+                        } else {
+                            (
+                                vld1q_u8(hi_ptr.add((sc_a * 4 + k0) * 64 + g * 16)),
+                                vld1q_u8(hi_ptr.add((sc_a * 4 + k1) * 64 + g * 16)),
+                                vld1q_u8(hi_ptr.add((sc_b * 4 + k0) * 64 + g * 16)),
+                                vld1q_u8(hi_ptr.add((sc_b * 4 + k1) * 64 + g * 16)),
+                            )
+                        };
+                        aa[g] = sdot_accum_16cols::<HP, false>(
+                            aa[g],
+                            vld1q_u8(blk_a0.add(g * 32)),
+                            vld1q_u8(blk_a0.add(g * 32 + 16)),
+                            ha0,
+                            x0,
+                            mask_0f,
+                            mask_hi,
+                        );
+                        ab[g] = sdot_accum_16cols::<HP, false>(
+                            ab[g],
+                            vld1q_u8(blk_b0.add(g * 32)),
+                            vld1q_u8(blk_b0.add(g * 32 + 16)),
+                            hb0,
+                            x0,
+                            mask_0f,
+                            mask_hi,
+                        );
+                        aa[g] = sdot_accum_16cols::<HP, true>(
+                            aa[g],
+                            vld1q_u8(blk_a1.add(g * 32)),
+                            vld1q_u8(blk_a1.add(g * 32 + 16)),
+                            ha1,
+                            x1,
+                            mask_0f,
+                            mask_hi,
+                        );
+                        ab[g] = sdot_accum_16cols::<HP, true>(
+                            ab[g],
+                            vld1q_u8(blk_b1.add(g * 32)),
+                            vld1q_u8(blk_b1.add(g * 32 + 16)),
+                            hb1,
+                            x1,
+                            mask_0f,
+                            mask_hi,
+                        );
                     }
                 }
             }
-            let offset = vdupq_n_s32(15 * act.sums[c]);
-            let vsx = vdupq_n_f32(sx);
-            let mut lo = [vdupq_n_f32(0.0); 4];
-            for g in 0..4 {
-                let dot = vsubq_s32(vshlq_n_s32::<1>(vaddq_s32(a[g], b[g])), offset);
-                lo[g] = vmulq_f32(vcvtq_f32_s32(dot), vsx);
-            }
 
-            if hp > 0 {
-                // SAFETY: `s < num_stripes`, `c < num_chunks`; LUTs populated by the caller.
-                let hi = unsafe { nibble4_hi_planes_chunk(matrix, blut, s, c) };
+            let offset = vdupq_n_s32(max_odd * unsafe { *xsums.add(c) });
+            let vsx = vdupq_n_f32(sx);
+            // SAFETY: scale offsets `sc_a * 16 + 16` and `sc_b * 16 + 16` are within `bf16_chunk_scales`.
+            unsafe {
+                let bfa0 = vld1q_u16(scales.add(sc_a * SIMD_ROW_STRIPE));
+                let bfa1 = vld1q_u16(scales.add(sc_a * SIMD_ROW_STRIPE + 8));
+                let wsa = [
+                    vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(bfa0))),
+                    vreinterpretq_f32_u32(vshll_high_n_u16::<16>(bfa0)),
+                    vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(bfa1))),
+                    vreinterpretq_f32_u32(vshll_high_n_u16::<16>(bfa1)),
+                ];
                 for g in 0..4 {
-                    lo[g] = vaddq_f32(lo[g], hi[g]);
+                    let dot = vsubq_s32(vshlq_n_s32::<1>(aa[g]), offset);
+                    fa[g] = vfmaq_f32(fa[g], vmulq_f32(vcvtq_f32_s32(dot), vsx), wsa[g]);
+                }
+
+                let bfb0 = vld1q_u16(scales.add(sc_b * SIMD_ROW_STRIPE));
+                let bfb1 = vld1q_u16(scales.add(sc_b * SIMD_ROW_STRIPE + 8));
+                let wsb = [
+                    vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(bfb0))),
+                    vreinterpretq_f32_u32(vshll_high_n_u16::<16>(bfb0)),
+                    vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(bfb1))),
+                    vreinterpretq_f32_u32(vshll_high_n_u16::<16>(bfb1)),
+                ];
+                for g in 0..4 {
+                    let dot = vsubq_s32(vshlq_n_s32::<1>(ab[g]), offset);
+                    fb[g] = vfmaq_f32(fb[g], vmulq_f32(vcvtq_f32_s32(dot), vsx), wsb[g]);
                 }
             }
+        }
 
-            for g in 0..4 {
-                // SAFETY: scale index `(s * nc + c) * 16 + g * 4 + 4 <= len`.
+        for (st_idx, f_arr) in [(s, &fa), (s + 1, &fb)] {
+            let row_start = st_idx * SIMD_ROW_STRIPE;
+            let valid = (matrix.rows - row_start).min(SIMD_ROW_STRIPE);
+            // SAFETY: writes stay strictly within `row_start + valid <= matrix.rows`.
+            unsafe {
+                let dst = out_base.add(row_start);
+                if valid == SIMD_ROW_STRIPE {
+                    vst1q_f32(dst, f_arr[0]);
+                    vst1q_f32(dst.add(4), f_arr[1]);
+                    vst1q_f32(dst.add(8), f_arr[2]);
+                    vst1q_f32(dst.add(12), f_arr[3]);
+                } else {
+                    let mut tmp = [0.0f32; SIMD_ROW_STRIPE];
+                    for (g, fg) in f_arr.iter().enumerate() {
+                        vst1q_f32(tmp.as_mut_ptr().add(g * 4), *fg);
+                    }
+                    std::ptr::copy_nonoverlapping(tmp.as_ptr(), dst, valid);
+                }
+            }
+        }
+        s += 2;
+    }
+
+    // 1-STRIPE TAIL:
+    while s < stripe_end {
+        let mut f = [vdupq_n_f32(0.0); 4];
+        for c in 0..nc {
+            let sx = unsafe { *xscales.add(c) };
+            if sx == 0.0 {
+                continue;
+            }
+            let sc_idx = s * nc + c;
+            let mut a = [vdupq_n_s32(0); 4];
+            let mut b = [vdupq_n_s32(0); 4];
+            for kp in 0..2 {
+                let k0 = kp * 2;
+                let k1 = k0 + 1;
+                // SAFETY: `c * 64 + 64 <= cols`; block offsets stay inside `data` and `hi_data`.
                 unsafe {
-                    let ws = vreinterpretq_f32_u32(vshll_n_u16::<16>(vld1_u16(
-                        scales.add((s * nc + c) * SIMD_ROW_STRIPE + g * 4),
-                    )));
-                    f[g] = vfmaq_f32(f[g], lo[g], ws);
+                    let x0 = vld1q_s8(xq.add(c * 64 + k0 * 16));
+                    let x1 = vld1q_s8(xq.add(c * 64 + k1 * 16));
+                    let blk0 = data.add((sc_idx * 4 + k0) * 128);
+                    let blk1 = data.add((sc_idx * 4 + k1) * 128);
+                    for g in 0..4 {
+                        let (h0, h1) = if HP == 0 {
+                            (zero_u8, zero_u8)
+                        } else if HP == 1 {
+                            let h = vld1q_u8(hi_ptr.add((sc_idx * 2 + kp) * 64 + g * 16));
+                            (h, h)
+                        } else {
+                            (
+                                vld1q_u8(hi_ptr.add((sc_idx * 4 + k0) * 64 + g * 16)),
+                                vld1q_u8(hi_ptr.add((sc_idx * 4 + k1) * 64 + g * 16)),
+                            )
+                        };
+                        a[g] = sdot_accum_16cols::<HP, false>(
+                            a[g],
+                            vld1q_u8(blk0.add(g * 32)),
+                            vld1q_u8(blk0.add(g * 32 + 16)),
+                            h0,
+                            x0,
+                            mask_0f,
+                            mask_hi,
+                        );
+                        b[g] = sdot_accum_16cols::<HP, true>(
+                            b[g],
+                            vld1q_u8(blk1.add(g * 32)),
+                            vld1q_u8(blk1.add(g * 32 + 16)),
+                            h1,
+                            x1,
+                            mask_0f,
+                            mask_hi,
+                        );
+                    }
+                }
+            }
+            let offset = vdupq_n_s32(max_odd * unsafe { *xsums.add(c) });
+            let vsx = vdupq_n_f32(sx);
+            // SAFETY: scale offset `sc_idx * 16 + 16 <= bf16_chunk_scales.len()`.
+            unsafe {
+                let bf0 = vld1q_u16(scales.add(sc_idx * SIMD_ROW_STRIPE));
+                let bf1 = vld1q_u16(scales.add(sc_idx * SIMD_ROW_STRIPE + 8));
+                let ws = [
+                    vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(bf0))),
+                    vreinterpretq_f32_u32(vshll_high_n_u16::<16>(bf0)),
+                    vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(bf1))),
+                    vreinterpretq_f32_u32(vshll_high_n_u16::<16>(bf1)),
+                ];
+                for g in 0..4 {
+                    let dot = vsubq_s32(vshlq_n_s32::<1>(vaddq_s32(a[g], b[g])), offset);
+                    f[g] = vfmaq_f32(f[g], vmulq_f32(vcvtq_f32_s32(dot), vsx), ws[g]);
                 }
             }
         }
         let row_start = s * SIMD_ROW_STRIPE;
         let valid = (matrix.rows - row_start).min(SIMD_ROW_STRIPE);
-        let mut tmp = [0.0f32; SIMD_ROW_STRIPE];
-        // SAFETY: `tmp` holds 16 floats; writes stay within `row_start + valid <= rows`.
+        // SAFETY: writes stay within `row_start + valid <= rows`.
         unsafe {
-            for (g, fg) in f.iter().enumerate() {
-                vst1q_f32(tmp.as_mut_ptr().add(g * 4), *fg);
-            }
-            std::ptr::copy_nonoverlapping(tmp.as_ptr(), out_base.add(row_start), valid);
-        }
-    }
-}
-
-/// High bipolar planes `4..B` of stripe `s`, chunk `c`: `16 * sum_p 2^(p-4) * sum(s_p * x)` per row.
-///
-/// # Safety
-/// `s < matrix.num_stripes`, `c < matrix.num_chunks`, `matrix.hi_planes > 0`, `blut` LUTs populated.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn nibble4_hi_planes_chunk(
-    matrix: &Nibble4SdotMatrix,
-    blut: &BipolarActivationLut,
-    s: usize,
-    c: usize,
-) -> [std::arch::aarch64::float32x4_t; 4] {
-    use std::arch::aarch64::*;
-    let hp = matrix.hi_planes;
-    let opr = matrix.cols / 8;
-    let mask = vdupq_n_u8(0x0F);
-    let hi_data = matrix.hi_data.as_ptr();
-    let mut h_lo = vdupq_n_s16(0);
-    let mut h_hi = vdupq_n_s16(0);
-    for o in c * BIPOLAR_OCTETS_PER_CHUNK..(c + 1) * BIPOLAR_OCTETS_PER_CHUNK {
-        // SAFETY: `2 * o + 1 < num_quads`; plane offsets stay inside `hi_data`.
-        unsafe {
-            let tbl_lo = vld1q_s8(blut.lut4.as_ptr().add(2 * o).cast::<i8>());
-            let tbl_hi = vld1q_s8(blut.lut4.as_ptr().add(2 * o + 1).cast::<i8>());
-            for p in 0..hp {
-                let codes = vld1q_u8(hi_data.add(((s * opr + o) * hp + p) * SIMD_ROW_STRIPE));
-                let v_lo = vqtbl1q_s8(tbl_lo, vandq_u8(codes, mask));
-                let v_hi = vqtbl1q_s8(tbl_hi, vshrq_n_u8::<4>(codes));
-                let sum_lo = vaddl_s8(vget_low_s8(v_lo), vget_low_s8(v_hi));
-                let sum_hi = vaddl_high_s8(v_lo, v_hi);
-                if p == 0 {
-                    h_lo = vaddq_s16(h_lo, sum_lo);
-                    h_hi = vaddq_s16(h_hi, sum_hi);
-                } else {
-                    h_lo = vaddq_s16(h_lo, vshlq_n_s16::<1>(sum_lo));
-                    h_hi = vaddq_s16(h_hi, vshlq_n_s16::<1>(sum_hi));
+            let dst = out_base.add(row_start);
+            if valid == SIMD_ROW_STRIPE {
+                vst1q_f32(dst, f[0]);
+                vst1q_f32(dst.add(4), f[1]);
+                vst1q_f32(dst.add(8), f[2]);
+                vst1q_f32(dst.add(12), f[3]);
+            } else {
+                let mut tmp = [0.0f32; SIMD_ROW_STRIPE];
+                for (g, fg) in f.iter().enumerate() {
+                    vst1q_f32(tmp.as_mut_ptr().add(g * 4), *fg);
                 }
+                std::ptr::copy_nonoverlapping(tmp.as_ptr(), dst, valid);
             }
         }
+        s += 1;
     }
-    let vls = vdupq_n_f32(16.0 * blut.chunk_scales[c]);
-    [
-        vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(h_lo))), vls),
-        vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(h_lo)), vls),
-        vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(h_hi))), vls),
-        vmulq_f32(vcvtq_f32_s32(vmovl_high_s16(h_hi)), vls),
-    ]
 }
 
 /// Executes stripes `[stripe_start, stripe_end)` for several tokens: row `r` of token `t` (with
 /// activations `acts[t]`) goes to `out_base[t * out_stride + r]`.
+///
+/// Uses an **L1D-cache-tiled stripe-outer Pure-`SDOT` loop** (`C_TILE = 16` chunks = `8.5–12.5 KB`
+/// weight tile, `NT = 8` register-tiled token accumulators) so weights stream from DRAM **once (`1x`)**
+/// regardless of prompt length!
 ///
 /// # Safety
 /// As [`nibble4_sdot_stripe_range`], with `out_base` valid for `acts.len() * out_stride` floats.
@@ -3335,23 +3902,19 @@ pub unsafe fn nibble4_sdot_batch_stripe_range(
     out_base: *mut f32,
     out_stride: usize,
 ) {
+    if acts.is_empty() || stripe_start >= stripe_end {
+        return;
+    }
     #[cfg(target_arch = "aarch64")]
     {
-        let mut t = 0;
-        while t < acts.len() {
-            let n = (acts.len() - t).min(4);
-            // SAFETY: caller upholds bounds; each group writes its own tokens' rows.
-            unsafe {
-                let out = out_base.add(t * out_stride);
-                let a = &acts[t..t + n];
-                match n {
-                    4 => nibble4_batch_neon::<4>(matrix, a, stripe_start, stripe_end, out, out_stride),
-                    3 => nibble4_batch_neon::<3>(matrix, a, stripe_start, stripe_end, out, out_stride),
-                    2 => nibble4_batch_neon::<2>(matrix, a, stripe_start, stripe_end, out, out_stride),
-                    _ => nibble4_batch_neon::<1>(matrix, a, stripe_start, stripe_end, out, out_stride),
-                }
+        // SAFETY: caller upholds bounds.
+        unsafe {
+            match matrix.hi_planes {
+                0 => sdot_batch_stripe_outer_neon::<0>(matrix, acts, stripe_start, stripe_end, out_base, out_stride),
+                1 => sdot_batch_stripe_outer_neon::<1>(matrix, acts, stripe_start, stripe_end, out_base, out_stride),
+                2 => sdot_batch_stripe_outer_neon::<2>(matrix, acts, stripe_start, stripe_end, out_base, out_stride),
+                _ => unreachable!("hi_planes must be 0, 1, or 2"),
             }
-            t += n;
         }
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -3367,7 +3930,7 @@ pub unsafe fn nibble4_sdot_batch_stripe_range(
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn nibble4_batch_neon<const NT: usize>(
+unsafe fn sdot_batch_stripe_outer_neon<const HP: usize>(
     matrix: &Nibble4SdotMatrix,
     acts: &[BipolarActivationLut],
     stripe_start: usize,
@@ -3375,74 +3938,177 @@ unsafe fn nibble4_batch_neon<const NT: usize>(
     out_base: *mut f32,
     out_stride: usize,
 ) {
+    const C_TILE: usize = 16;
+    let nc = matrix.num_chunks;
+    let n_tok = acts.len();
+
+    for s in stripe_start..stripe_end {
+        let mut c_base = 0usize;
+        while c_base < nc {
+            let c_end = (c_base + C_TILE).min(nc);
+            let first_tile = c_base == 0;
+            let mut t = 0usize;
+            while t + 8 <= n_tok {
+                // SAFETY: `t + 8 <= n_tok`, `s < num_stripes`, `c_end <= nc`.
+                unsafe {
+                    sdot_batch_tile_neon::<HP, 8>(
+                        matrix,
+                        &acts[t..t + 8],
+                        s,
+                        c_base,
+                        c_end,
+                        first_tile,
+                        out_base.add(t * out_stride),
+                        out_stride,
+                    );
+                }
+                t += 8;
+            }
+            if t + 4 <= n_tok {
+                unsafe {
+                    sdot_batch_tile_neon::<HP, 4>(
+                        matrix,
+                        &acts[t..t + 4],
+                        s,
+                        c_base,
+                        c_end,
+                        first_tile,
+                        out_base.add(t * out_stride),
+                        out_stride,
+                    );
+                }
+                t += 4;
+            }
+            if t + 2 <= n_tok {
+                unsafe {
+                    sdot_batch_tile_neon::<HP, 2>(
+                        matrix,
+                        &acts[t..t + 2],
+                        s,
+                        c_base,
+                        c_end,
+                        first_tile,
+                        out_base.add(t * out_stride),
+                        out_stride,
+                    );
+                }
+                t += 2;
+            }
+            if t < n_tok {
+                unsafe {
+                    sdot_batch_tile_neon::<HP, 1>(
+                        matrix,
+                        &acts[t..t + 1],
+                        s,
+                        c_base,
+                        c_end,
+                        first_tile,
+                        out_base.add(t * out_stride),
+                        out_stride,
+                    );
+                }
+            }
+            c_base = c_end;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn sdot_batch_tile_neon<const HP: usize, const NT: usize>(
+    matrix: &Nibble4SdotMatrix,
+    acts: &[BipolarActivationLut],
+    s: usize,
+    c_base: usize,
+    c_end: usize,
+    first_tile: bool,
+    out_base: *mut f32,
+    out_stride: usize,
+) {
     use std::arch::aarch64::*;
     let i8a: [&Int8ChunkActivation; NT] =
         std::array::from_fn(|t| acts[t].int8.as_ref().expect("int8 activations required for Nibble4"));
+    let max_odd: i32 = (1i32 << (4 + HP)) - 1;
     let nc = matrix.num_chunks;
-    let mask = vdupq_n_u8(0x0F);
+    let mask_0f = vdupq_n_u8(0x0F);
+    let mask_hi = vdupq_n_u8(if HP == 1 { 0x10 } else { 0x30 });
     let data = matrix.data.as_ptr();
+    let hi_ptr = matrix.hi_data.as_ptr();
     let scales = matrix.bf16_chunk_scales.as_ptr();
+    let row_start = s * SIMD_ROW_STRIPE;
+    let valid = (matrix.rows - row_start).min(SIMD_ROW_STRIPE);
+    let full_stripe = valid == SIMD_ROW_STRIPE;
 
-    for s in stripe_start..stripe_end {
-        let mut f = [[0.0f32; SIMD_ROW_STRIPE]; NT];
-        for c in 0..nc {
-            let hi: [Option<[float32x4_t; 4]>; NT] = std::array::from_fn(|t| {
-                (matrix.hi_planes > 0 && i8a[t].scales[c] != 0.0)
-                    // SAFETY: `s`, `c` in range; caller populated LUTs.
-                    .then(|| unsafe { nibble4_hi_planes_chunk(matrix, &acts[t], s, c) })
-            });
-            for g in 0..4 {
-                // One 4-row group at a time keeps the per-token accumulators in registers.
-                let mut acc = [vdupq_n_s32(0); NT];
-                for k in 0..4 {
-                    // SAFETY: `c * 64 + k * 16 + 16 <= cols`; the block offset stays inside `data`.
-                    unsafe {
-                        let blk = data.add(((s * nc + c) * 4 + k) * 128 + g * 32);
-                        let va = vld1q_u8(blk);
-                        let vb = vld1q_u8(blk.add(16));
-                        let (la, ha) = (vandq_u8(va, mask), vshrq_n_u8::<4>(va));
-                        let (lb, hb) = (vandq_u8(vb, mask), vshrq_n_u8::<4>(vb));
-                        for t in 0..NT {
-                            let x16 = vld1q_s8(i8a[t].q.as_ptr().add(c * 64 + k * 16));
-                            let mut a = acc[t];
-                            a = sdot_lane::<0>(a, la, x16);
-                            a = sdot_lane::<1>(a, ha, x16);
-                            a = sdot_lane::<2>(a, lb, x16);
-                            a = sdot_lane::<3>(a, hb, x16);
-                            acc[t] = a;
-                        }
-                    }
-                }
-                // SAFETY: scale index `(s * nc + c) * 16 + g * 4 + 4 <= len`.
-                let ws = unsafe {
-                    vreinterpretq_f32_u32(vshll_n_u16::<16>(vld1_u16(
-                        scales.add((s * nc + c) * SIMD_ROW_STRIPE + g * 4),
-                    )))
-                };
-                for t in 0..NT {
-                    let sx = i8a[t].scales[c];
-                    if sx == 0.0 {
-                        continue;
-                    }
-                    let dot = vsubq_s32(vshlq_n_s32::<1>(acc[t]), vdupq_n_s32(15 * i8a[t].sums[c]));
-                    let mut v = vmulq_f32(vcvtq_f32_s32(dot), vdupq_n_f32(sx));
-                    if let Some(h) = hi[t] {
-                        v = vaddq_f32(v, h[g]);
-                    }
-                    // SAFETY: `f[t]` holds 16 floats.
-                    unsafe {
-                        let fp = f[t].as_mut_ptr().add(g * 4);
-                        vst1q_f32(fp, vfmaq_f32(vld1q_f32(fp), v, ws));
+    for g in 0..4 {
+        let g_off = g * 4;
+        if g_off >= valid {
+            break;
+        }
+        let g_valid = (valid - g_off).min(4);
+        let mut facc: [float32x4_t; NT] = if first_tile {
+            [vdupq_n_f32(0.0); NT]
+        } else if full_stripe || g_valid == 4 {
+            std::array::from_fn(|t| unsafe { vld1q_f32(out_base.add(t * out_stride + row_start + g_off)) })
+        } else {
+            std::array::from_fn(|t| unsafe {
+                let mut tmp = [0.0f32; 4];
+                std::ptr::copy_nonoverlapping(out_base.add(t * out_stride + row_start + g_off), tmp.as_mut_ptr(), g_valid);
+                vld1q_f32(tmp.as_ptr())
+            })
+        };
+
+        for c in c_base..c_end {
+            let sc_idx = s * nc + c;
+            let mut acc = [vdupq_n_s32(0); NT];
+            for k in 0..4 {
+                // SAFETY: `c * 64 + k * 16 + 16 <= cols`; block offsets stay inside `data` and `hi_data`.
+                unsafe {
+                    let blk = data.add((sc_idx * 4 + k) * 128 + g * 32);
+                    let va = vld1q_u8(blk);
+                    let vb = vld1q_u8(blk.add(16));
+                    let (ula, uha, ulb, uhb) =
+                        unpack_sdot_quad::<HP>(va, vb, hi_ptr, sc_idx, k, g, mask_0f, mask_hi);
+                    let col_off = c * 64 + k * 16;
+                    for t in 0..NT {
+                        let x16 = vld1q_s8(i8a[t].q.as_ptr().add(col_off));
+                        let mut a = acc[t];
+                        a = sdot_lane::<0>(a, ula, x16);
+                        a = sdot_lane::<1>(a, uha, x16);
+                        a = sdot_lane::<2>(a, ulb, x16);
+                        a = sdot_lane::<3>(a, uhb, x16);
+                        acc[t] = a;
                     }
                 }
             }
+            // SAFETY: `(sc_idx * 16 + g * 4 + 4) <= bf16_chunk_scales.len()`.
+            let ws = unsafe {
+                vreinterpretq_f32_u32(vshll_n_u16::<16>(vld1_u16(
+                    scales.add(sc_idx * SIMD_ROW_STRIPE + g * 4),
+                )))
+            };
+            for t in 0..NT {
+                let sx = i8a[t].scales[c];
+                if sx != 0.0 {
+                    let dot = vsubq_s32(vshlq_n_s32::<1>(acc[t]), vdupq_n_s32(max_odd * i8a[t].sums[c]));
+                    let v = vmulq_f32(vcvtq_f32_s32(dot), vdupq_n_f32(sx));
+                    facc[t] = vfmaq_f32(facc[t], v, ws);
+                }
+            }
         }
-        let row_start = s * SIMD_ROW_STRIPE;
-        let valid = (matrix.rows - row_start).min(SIMD_ROW_STRIPE);
-        for (t, ft) in f.iter().enumerate() {
-            // SAFETY: rows `row_start..row_start + valid` of token `t` are inside the caller's output.
+
+        for (t, &ft) in facc.iter().enumerate() {
+            // SAFETY: writes stay strictly within `row_start + valid <= out_stride` for token `t`.
             unsafe {
-                std::ptr::copy_nonoverlapping(ft.as_ptr(), out_base.add(t * out_stride + row_start), valid);
+                let dst = out_base.add(t * out_stride + row_start + g_off);
+                if full_stripe || g_valid == 4 {
+                    vst1q_f32(dst, ft);
+                } else {
+                    let mut tmp = [0.0f32; 4];
+                    vst1q_f32(tmp.as_mut_ptr(), ft);
+                    std::ptr::copy_nonoverlapping(tmp.as_ptr(), dst, g_valid);
+                }
             }
         }
     }
@@ -4007,18 +4673,71 @@ mod tests {
     }
 
     #[test]
+    fn test_fused_rmsnorm_fwht_int8_bit_exact() {
+        use crate::hadamard::fwht64_signed_inplace;
+        let cols = 1536;
+        let x: Vec<f32> = (0..cols)
+            .map(|c| if c / 64 == 5 { 0.0 } else { ((c as f32) * 0.43).sin() * 2.1 })
+            .collect();
+        let w: Vec<f32> = (0..cols).map(|c| 0.75 + ((c as f32) * 0.13).cos() * 0.4).collect();
+        let inv_rms = 0.8125f32;
+
+        // 1. Direct FWHT + INT8
+        let mut x_rot = x.clone();
+        fwht64_signed_inplace(&mut x_rot);
+        let mut ref_a = Int8ChunkActivation::new_zeroed(cols);
+        ref_a.populate(&x_rot);
+
+        let mut fused_a = Int8ChunkActivation::new_zeroed(cols);
+        fused_a.populate_fwht(&x);
+        assert_eq!(fused_a.q, ref_a.q);
+        assert_eq!(fused_a.scales, ref_a.scales);
+        assert_eq!(fused_a.sums, ref_a.sums);
+
+        // 2. RMSNorm + FWHT + INT8 (+ scalar parity)
+        let mut x_norm: Vec<f32> = x.iter().zip(&w).map(|(&xi, &wi)| (xi * inv_rms) * wi).collect();
+        fwht64_signed_inplace(&mut x_norm);
+        ref_a.populate(&x_norm);
+
+        fused_a.populate_rmsnorm_fwht(&x, &w, inv_rms);
+        assert_eq!(fused_a.q, ref_a.q);
+        assert_eq!(fused_a.scales, ref_a.scales);
+        assert_eq!(fused_a.sums, ref_a.sums);
+
+        let mut scalar_a = Int8ChunkActivation::new_zeroed(cols);
+        for c in 0..cols / 64 {
+            unsafe {
+                Int8ChunkActivation::populate_chunk_fwht_scalar(
+                    scalar_a.q.as_mut_ptr(),
+                    scalar_a.scales.as_mut_ptr(),
+                    scalar_a.sums.as_mut_ptr(),
+                    c,
+                    &x[c * 64..(c + 1) * 64],
+                    Some((&w[c * 64..(c + 1) * 64], inv_rms)),
+                );
+            }
+        }
+        assert_eq!(fused_a.q, scalar_a.q);
+        assert_eq!(fused_a.scales, scalar_a.scales);
+        assert_eq!(fused_a.sums, scalar_a.sums);
+    }
+
+    #[test]
     fn test_nibble4_batch_matches_single() {
         use crate::compiler::compile_hadamard_gptq_bipolar;
-        let (rows, cols) = (40, 192);
+        // Exercise non-multiple-of-32 rows, multi-tile cols (`1536 > 1024`), every `NT` tail (`15 = 8+4+2+1`),
+        // and `lut_enabled = false` for all `4, 5, 6` bit-plane counts!
+        let (rows, cols) = (54, 1536);
         let weights: Vec<f32> = (0..rows * cols)
             .map(|idx| (((idx * 7919 + 13) % 1009) as f32 / 1009.0 - 0.5) * 0.3)
             .collect();
         for np in [4, 5, 6] {
-            let n = Nibble4SdotMatrix::from_bipolar(&compile_hadamard_gptq_bipolar(&weights, rows, cols, np, None, 2));
-            let acts: Vec<BipolarActivationLut> = (0..7)
+            let n = Nibble4SdotMatrix::from_bipolar(&compile_hadamard_gptq_bipolar(&weights, rows, cols, np, None, 4));
+            let acts: Vec<BipolarActivationLut> = (0..15)
                 .map(|t| {
                     let x: Vec<f32> = (0..cols).map(|c| ((c * (t + 3)) as f32 * 0.11).sin()).collect();
                     let mut b = BipolarActivationLut::new_zeroed(cols);
+                    b.lut_enabled = false;
                     b.int8 = Some(Int8ChunkActivation::new_zeroed(cols));
                     b.populate(&x);
                     b

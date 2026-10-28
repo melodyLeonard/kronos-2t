@@ -29,17 +29,27 @@ fn main() {
     let calib_tokens = num("--calib-tokens", 16384.0) as usize;
 
     eprintln!("loading {} ({mode})...", model_dir.display());
+    let default_threads = kronos_2t::thread_pool::default_inference_threads() as f64;
+    let calib_opt = calib.as_deref().map(|c| (Path::new(c), calib_tokens));
     let mut model = ChatModel::load(
         model_dir,
         &mode,
         num("--ctx", 2048.0) as usize,
-        num("--threads", 8.0) as usize,
-        calib.as_deref().map(|c| (Path::new(c), calib_tokens)),
+        num("--threads", default_threads) as usize,
+        calib_opt,
     )
     .unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
+    if let Some(draft_dir) = flag("--draft") {
+        let draft_mode = flag("--draft-mode").unwrap_or_else(|| mode.clone());
+        eprintln!("attaching speculative draft {} ({draft_mode})...", draft_dir);
+        model.attach_draft(Path::new(&draft_dir), &draft_mode, calib_opt).unwrap_or_else(|e| {
+            eprintln!("draft error: {e}");
+            std::process::exit(1);
+        });
+    }
     let mut params = GenParams {
         temperature: num("--temp", 0.7) as f32,
         top_k: num("--top-k", 40.0) as usize,

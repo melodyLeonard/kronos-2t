@@ -15,7 +15,7 @@ pub const HADAMARD_BLOCK: usize = 64;
 
 /// Precomputed compile-time Rademacher sign-flip masks for the first 64 blocks (`cols <= 4,096`),
 /// eliminating all runtime SplitMix64 PRNG arithmetic on the critical token-generation path.
-const RADEMACHER_TABLE_64: [[u32; HADAMARD_BLOCK]; 64] = {
+pub(crate) const RADEMACHER_TABLE_64: [[u32; HADAMARD_BLOCK]; 64] = {
     let mut table = [[0u32; HADAMARD_BLOCK]; 64];
     let mut b = 0;
     while b < 64 {

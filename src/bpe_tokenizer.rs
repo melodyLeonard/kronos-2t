@@ -165,26 +165,31 @@ impl BpeTokenizer {
         }
     }
 
+    /// Appends the raw UTF-8 bytes of a single token `id` to `raw_bytes` in `O(1)` time.
+    #[inline]
+    pub fn append_token_bytes(&self, id: usize, raw_bytes: &mut Vec<u8>) {
+        let Some(tok) = self.id_to_token.get(id) else {
+            return;
+        };
+        if tok.starts_with("<|") && tok.ends_with("|>") {
+            raw_bytes.extend_from_slice(tok.as_bytes());
+            return;
+        }
+        for ch in tok.chars() {
+            if let Some(&b) = self.char_to_byte.get(&ch) {
+                raw_bytes.push(b);
+            } else {
+                let mut buf = [0u8; 4];
+                raw_bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+
     /// Decodes a sequence of token IDs back into a UTF-8 `String`.
     pub fn decode(&self, ids: &[usize]) -> String {
-        let mut raw_bytes = Vec::new();
+        let mut raw_bytes = Vec::with_capacity(ids.len() * 4);
         for &id in ids {
-            let Some(tok) = self.id_to_token.get(id) else {
-                continue;
-            };
-            // Special tokens (`<|endoftext|>`, `<|im_start|>`, etc.) decode literally
-            if tok.starts_with("<|") && tok.ends_with("|>") {
-                raw_bytes.extend_from_slice(tok.as_bytes());
-                continue;
-            }
-            for ch in tok.chars() {
-                if let Some(&b) = self.char_to_byte.get(&ch) {
-                    raw_bytes.push(b);
-                } else {
-                    let mut buf = [0u8; 4];
-                    raw_bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                }
-            }
+            self.append_token_bytes(id, &mut raw_bytes);
         }
         String::from_utf8_lossy(&raw_bytes).into_owned()
     }

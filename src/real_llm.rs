@@ -16,13 +16,14 @@ use crate::compiler::{
 use crate::hadamard::{fwht64_signed_inplace, ifwht64_signed_inplace};
 use crate::safetensors::{JsonCursor, SafeTensorsFile};
 use crate::simd_lut::{
-    simd_lut_base3_gemv, simd_lut_base3_stripe_range, simd_lut_bipolar_gemv,
-    simd_lut_bipolar_stripe_range, simd_lut_gemv_multiplane, BipolarActivationLut,
-    nibble4_sdot_batch_stripe_range, nibble4_sdot_stripe_range, FusedBase3LutMatrix, FusedBipolarLutMatrix, GgufQ4_0Matrix,
+    nibble4_sdot_batch_stripe_range, nibble4_sdot_stripe_range, nibble4_sdot_stripe_range_int8,
+    nibble4_sdot_stripe_range_raw, simd_lut_base3_gemv, simd_lut_base3_stripe_range,
+    simd_lut_bipolar_gemv, simd_lut_bipolar_stripe_range, simd_lut_gemv_multiplane,
+    BipolarActivationLut, FusedBase3LutMatrix, FusedBipolarLutMatrix, GgufQ4_0Matrix,
     Int8ChunkActivation, MultiPlaneTernaryMatrix, Nibble4SdotMatrix, QuantizedActivationLut,
     SIMD_ROW_STRIPE,
 };
-use crate::thread_pool::SpinThreadPool;
+use crate::thread_pool::{physical_p_cores, SpinBarrier, SpinThreadPool};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -510,6 +511,79 @@ pub struct ActivationCalibration {
     head_in_scales: Vec<f32>,
 }
 
+/// Reusable zero-allocation batch workspace for [`RealLlamaEngine::forward_prompt`] and speculative verification.
+#[derive(Default)]
+struct PromptScratch {
+    hidden: Vec<f32>,
+    acts_h: Vec<BipolarActivationLut>,
+    acts_i: Vec<BipolarActivationLut>,
+    qkv: Vec<f32>,
+    attn: Vec<f32>,
+    proj: Vec<f32>,
+    gate_up: Vec<f32>,
+    sw: Vec<f32>,
+    scores: Vec<f32>,
+}
+
+impl PromptScratch {
+    fn ensure_capacity(
+        &mut self,
+        n: usize,
+        cfg: &LlamaConfig,
+        qkv_rows: usize,
+        lut_h: bool,
+        lut_i: bool,
+    ) {
+        let h = cfg.hidden_size;
+        let inter = cfg.intermediate_size;
+        let kv_group = (cfg.num_attention_heads / cfg.num_key_value_heads).max(1);
+        let score_stride = if cfg.head_dim() == 64 {
+            cfg.max_seq_len
+        } else {
+            kv_group * cfg.max_seq_len
+        };
+        if self.hidden.len() < n * h {
+            self.hidden.resize(n * h, 0.0);
+        }
+        if self.qkv.len() < n * qkv_rows {
+            self.qkv.resize(n * qkv_rows, 0.0);
+        }
+        if self.attn.len() < n * h {
+            self.attn.resize(n * h, 0.0);
+        }
+        if self.proj.len() < n * h {
+            self.proj.resize(n * h, 0.0);
+        }
+        if self.gate_up.len() < n * 2 * inter {
+            self.gate_up.resize(n * 2 * inter, 0.0);
+        }
+        if self.sw.len() < n * inter {
+            self.sw.resize(n * inter, 0.0);
+        }
+        if self.scores.len() < n * score_stride {
+            self.scores.resize(n * score_stride, 0.0);
+        }
+        while self.acts_h.len() < n {
+            let mut b = BipolarActivationLut::new_zeroed(h);
+            b.lut_enabled = lut_h;
+            b.int8 = Some(Int8ChunkActivation::new_zeroed(h));
+            self.acts_h.push(b);
+        }
+        for b in &mut self.acts_h[..n] {
+            b.lut_enabled = lut_h;
+        }
+        while self.acts_i.len() < n {
+            let mut b = BipolarActivationLut::new_zeroed(inter);
+            b.lut_enabled = lut_i;
+            b.int8 = Some(Int8ChunkActivation::new_zeroed(inter));
+            self.acts_i.push(b);
+        }
+        for b in &mut self.acts_i[..n] {
+            b.lut_enabled = lut_i;
+        }
+    }
+}
+
 /// Pre-allocated zero-allocation execution workspace and KV cache for [`RealLlamaEngine`].
 struct LlamaWorkspace {
     pos: usize,
@@ -532,6 +606,7 @@ struct LlamaWorkspace {
     q8_hidden_scales: Vec<f32>,
     q8_inter_vals: Vec<i8>,
     q8_inter_scales: Vec<f32>,
+    prompt_scratch: PromptScratch,
 }
 
 impl LlamaWorkspace {
@@ -559,6 +634,7 @@ impl LlamaWorkspace {
             q8_hidden_scales: vec![0.0f32; cfg.hidden_size / 32],
             q8_inter_vals: vec![0i8; cfg.intermediate_size],
             q8_inter_scales: vec![0.0f32; cfg.intermediate_size / 32],
+            prompt_scratch: PromptScratch::default(),
         }
     }
 
@@ -583,13 +659,19 @@ pub struct RealLlamaEngine {
 }
 
 impl RealLlamaEngine {
-    /// Configures persistent P-core thread pool (`num_threads <= 1` disables threading).
+    /// Configures persistent P-core thread pool (`num_threads <= 1` disables threading and parks workers).
     pub fn set_num_threads(&mut self, num_threads: usize) {
         if num_threads <= 1 {
+            SpinThreadPool::park_idle_workers();
             self.pool = None;
         } else {
             self.pool = Some(SpinThreadPool::new(num_threads));
         }
+    }
+
+    /// Configures the engine to use all physical Performance cores (`10` on M4 Pro).
+    pub fn set_default_p_cores(&mut self) {
+        self.set_num_threads(physical_p_cores());
     }
 
     /// Current worker thread count (`1` when single-core).
@@ -1507,11 +1589,8 @@ impl RealLlamaEngine {
         }
         repack(&mut self.lm_head);
 
-        let is_lut = |b: &LinearBackend| match b {
-            LinearBackend::FusedBipolar(_) => true,
-            LinearBackend::Nibble4(m) => m.hi_planes > 0,
-            _ => false,
-        };
+        // Pure-`SDOT` executes all `4..=6` planes directly from `Int8ChunkActivation` with zero D4 LUTs!
+        let is_lut = |b: &LinearBackend| matches!(b, LinearBackend::FusedBipolar(_));
         let hidden_lut = is_lut(&self.lm_head)
             || self.layers.iter().any(|l| is_lut(&l.qkv_proj) || is_lut(&l.o_proj) || is_lut(&l.gate_up_proj));
         let inter_lut = self.layers.iter().any(|l| is_lut(&l.down_proj));
@@ -1701,7 +1780,33 @@ impl RealLlamaEngine {
         self.ws.reset();
     }
 
-    /// Executes one full 30-layer causal step for `token_id` and returns a slice of `[vocab_size]` logits.
+    /// Returns `true` when every projection uses Pure-`SDOT` [`Nibble4SdotMatrix`].
+    #[inline]
+    pub fn is_all_sdot(&self) -> bool {
+        let is_sdot = |b: &LinearBackend| matches!(b, LinearBackend::Nibble4(_));
+        is_sdot(&self.lm_head)
+            && self.layers.iter().all(|l| {
+                is_sdot(&l.qkv_proj)
+                    && is_sdot(&l.o_proj)
+                    && is_sdot(&l.gate_up_proj)
+                    && is_sdot(&l.down_proj)
+                    && l.o_inv_scale.is_none()
+                    && l.down_inv_scale.is_none()
+            })
+    }
+
+    #[inline]
+    fn can_run_sdot_megakernel(&self) -> bool {
+        self.cfg.head_dim() == 64
+            && self.cfg.hidden_size <= 4096
+            && self.cfg.hidden_size.is_multiple_of(64)
+            && self.cfg.intermediate_size.is_multiple_of(64)
+            && self.ws.blut_hidden.int8.is_some()
+            && self.ws.blut_inter.int8.is_some()
+            && self.is_all_sdot()
+    }
+
+    /// Executes one full causal step for `token_id` and returns a slice of `[vocab_size]` logits.
     pub fn forward_token(&mut self, token_id: usize) -> &[f32] {
         assert!(
             self.ws.pos < self.cfg.max_seq_len,
@@ -1709,6 +1814,9 @@ impl RealLlamaEngine {
             self.ws.pos,
             self.cfg.max_seq_len
         );
+        if self.can_run_sdot_megakernel() {
+            return self.forward_token_sdot_megakernel(token_id);
+        }
         let pos = self.ws.pos;
         let h_dim = self.cfg.hidden_size;
         let inter_dim = self.cfg.intermediate_size;
@@ -1996,22 +2104,360 @@ impl RealLlamaEngine {
         &self.ws.logits
     }
 
+    /// Single-dispatch persistent P-core megakernel for Pure-`SDOT` (`4/5/6`-bit) decode.
+    ///
+    /// Executes all Transformer layers + `lm_head` inside **one** thread-pool dispatch with:
+    /// - In-register fused `RMSNorm + FWHT-64 + Int8ChunkActivation` quantization (`0` `norm_buf` writes),
+    /// - 64-row head-aligned `qkv_proj` fused directly with NEON `RoPE` and `KV` cache writes,
+    /// - Multi-head parallel `GQA Attention` fused directly into in-register `FWHT-64 + Int8Quant` (`0` `attn_out` writes),
+    /// - Worker-local 64-row L1-fused `[gate; up] -> SwiGLU -> FWHT-64 -> Int8Quant` (`0` extra barrier),
+    /// - Even-stripe (`32`-row) worker partitions so 100% of stripes hit the 2-stripe `16`-accumulator NEON fast path.
+    fn forward_token_sdot_megakernel(&mut self, token_id: usize) -> &[f32] {
+        let pos = self.ws.pos;
+        let seq_len = pos + 1;
+        let h_dim = self.cfg.hidden_size;
+        let inter_dim = self.cfg.intermediate_size;
+        let nc_h = h_dim / 64;
+        let nc_i = inter_dim / 64;
+        let num_q_heads = self.cfg.num_attention_heads;
+        let num_kv_heads = self.cfg.num_key_value_heads;
+        let kv_dim = self.cfg.kv_dim();
+        let kv_group = num_q_heads / num_kv_heads;
+        let attn_scale = 1.0 / 8.0f32; // `head_dim == 64` -> `1 / sqrt(64) == 0.125`
+        let max_seq_len = self.cfg.max_seq_len;
+        let layer_kv_stride = max_seq_len * kv_dim;
+        let eps = self.cfg.rms_norm_eps;
+
+        let LinearBackend::Nibble4(head_mat) = &self.lm_head else {
+            unreachable!("megakernel requires Nibble4 lm_head");
+        };
+        if self.embed_f32_rows.is_empty() {
+            head_mat.dequantize_row_rotated(token_id, &mut self.ws.hidden);
+            ifwht64_signed_inplace(&mut self.ws.hidden);
+        } else {
+            self.ws
+                .hidden
+                .copy_from_slice(&self.embed_f32_rows[token_id * h_dim..(token_id + 1) * h_dim]);
+        }
+
+        let rope_row = &self.rope_cos_sin[pos * 64..(pos + 1) * 64];
+        let layers = &self.layers;
+        let final_norm = &self.final_norm;
+
+        let hidden_addr = self.ws.hidden.as_mut_ptr() as usize;
+        let qkv_addr = self.ws.qkv_buf.as_mut_ptr() as usize;
+        let proj_addr = self.ws.proj_out.as_mut_ptr() as usize;
+        let gu_addr = self.ws.gate_up_buf.as_mut_ptr() as usize;
+        let scores_addr = self.ws.scores.as_mut_ptr() as usize;
+        let k_cache_addr = self.ws.k_cache.as_mut_ptr() as usize;
+        let v_cache_addr = self.ws.v_cache.as_mut_ptr() as usize;
+        let logits_addr = self.ws.logits.as_mut_ptr() as usize;
+
+        let (act_h_addr, act_hq_addr, act_hs_addr, act_hsum_addr) = {
+            let a = self.ws.blut_hidden.int8.as_mut().unwrap();
+            (
+                (a as *const Int8ChunkActivation) as usize,
+                a.q.as_mut_ptr() as usize,
+                a.scales.as_mut_ptr() as usize,
+                a.sums.as_mut_ptr() as usize,
+            )
+        };
+        let (act_i_addr, act_iq_addr, act_is_addr, act_isum_addr) = {
+            let a = self.ws.blut_inter.int8.as_mut().unwrap();
+            (
+                (a as *const Int8ChunkActivation) as usize,
+                a.q.as_mut_ptr() as usize,
+                a.scales.as_mut_ptr() as usize,
+                a.sums.as_mut_ptr() as usize,
+            )
+        };
+
+        let even_stripes = |num_stripes: usize, tid: usize, nt: usize| -> (usize, usize) {
+            let pairs = num_stripes.div_ceil(2);
+            let s0 = (((pairs * tid) / nt) * 2).min(num_stripes);
+            let s1 = (((pairs * (tid + 1)) / nt) * 2).min(num_stripes);
+            (s0, s1)
+        };
+
+        let kernel = |tid: usize, nt: usize, barrier: &SpinBarrier| {
+            let hidden_ptr = hidden_addr as *mut f32;
+            let qkv_ptr = qkv_addr as *mut f32;
+            let proj_ptr = proj_addr as *mut f32;
+            let gu_ptr = gu_addr as *mut f32;
+            let scores_ptr = scores_addr as *mut f32;
+            let k_cache_ptr = k_cache_addr as *mut f32;
+            let v_cache_ptr = v_cache_addr as *mut f32;
+            let logits_ptr = logits_addr as *mut f32;
+            let act_hq = act_hq_addr as *mut i8;
+            let act_hs = act_hs_addr as *mut f32;
+            let act_hsum = act_hsum_addr as *mut i32;
+            let act_iq = act_iq_addr as *mut i8;
+            let act_is = act_is_addr as *mut f32;
+            let act_isum = act_isum_addr as *mut i32;
+
+            // Worker-private L1D stack buffers (`4.6 KB`): eliminates 3 cross-core barriers per layer!
+            let mut lq = [0i8; 4096];
+            let mut ls = [0.0f32; 64];
+            let mut lsum = [0i32; 64];
+
+            let qh0 = (num_q_heads * tid) / nt;
+            let qh1 = (num_q_heads * (tid + 1)) / nt;
+            let ic0 = (nc_i * tid) / nt;
+            let ic1 = (nc_i * (tid + 1)) / nt;
+
+            for (l_idx, layer) in layers.iter().enumerate() {
+                let (
+                    LinearBackend::Nibble4(qkv_mat),
+                    LinearBackend::Nibble4(o_mat),
+                    LinearBackend::Nibble4(gu_mat),
+                    LinearBackend::Nibble4(down_mat),
+                ) = (&layer.qkv_proj, &layer.o_proj, &layer.gate_up_proj, &layer.down_proj)
+                else {
+                    unreachable!();
+                };
+                let kv_base = l_idx * layer_kv_stride;
+
+                // 1. Zero-Barrier Worker-Local `input_norm + FWHT-64 + INT8` -> 64-Row `qkv_proj + RoPE + KV Store`
+                let qkv_heads = qkv_mat.rows / 64;
+                let b0 = (qkv_heads * tid) / nt;
+                let b1 = (qkv_heads * (tid + 1)) / nt;
+                if b0 < b1 {
+                    // SAFETY: `hidden` is globally synchronized and read-only here; `(lq, ls, lsum)` are worker-private
+                    // stack arrays (`h_dim <= 4096`), and `[b0*4, b1*4)` writes disjoint 64-row head blocks.
+                    unsafe {
+                        let hidden_ro = std::slice::from_raw_parts(hidden_ptr, h_dim);
+                        let inv_rms = 1.0 / (dot_f32_fast(hidden_ro, hidden_ro) / (h_dim as f32) + eps).sqrt();
+                        for c in 0..nc_h {
+                            Int8ChunkActivation::populate_chunk_fwht_raw(
+                                lq.as_mut_ptr(),
+                                ls.as_mut_ptr(),
+                                lsum.as_mut_ptr(),
+                                c,
+                                &hidden_ro[c * 64..(c + 1) * 64],
+                                Some((&layer.input_norm[c * 64..(c + 1) * 64], inv_rms)),
+                            );
+                        }
+                        nibble4_sdot_stripe_range_raw(
+                            qkv_mat,
+                            lq.as_ptr(),
+                            ls.as_ptr(),
+                            lsum.as_ptr(),
+                            b0 * 4,
+                            b1 * 4,
+                            qkv_ptr,
+                        );
+                        for b in b0..b1 {
+                            let head_s = std::slice::from_raw_parts_mut(qkv_ptr.add(b * 64), 64);
+                            if b < num_q_heads {
+                                apply_llama_rope_head64(head_s, rope_row);
+                            } else if b < num_q_heads + num_kv_heads {
+                                let kvh = b - num_q_heads;
+                                apply_llama_rope_head64(head_s, rope_row);
+                                std::ptr::copy_nonoverlapping(
+                                    head_s.as_ptr(),
+                                    k_cache_ptr.add(kv_base + pos * kv_dim + kvh * 64),
+                                    64,
+                                );
+                            } else {
+                                let kvh = b - num_q_heads - num_kv_heads;
+                                std::ptr::copy_nonoverlapping(
+                                    head_s.as_ptr(),
+                                    v_cache_ptr.add(kv_base + pos * kv_dim + kvh * 64),
+                                    64,
+                                );
+                            }
+                        }
+                    }
+                }
+                barrier.wait();
+
+                // 2. Parallel Per-Head `GQA Attention` + Fused In-Register `FWHT-64 + INT8 Quantization`
+                if qh0 < qh1 {
+                    // SAFETY: `qkv_buf[..h_dim]`, `k_cache`, `v_cache` are immutable; each `qh` owns `scores[qh*max_seq_len..]`
+                    // and writes exclusively to Hadamard chunk `c = qh` of `act_h`.
+                    unsafe {
+                        let k_layer = std::slice::from_raw_parts(k_cache_ptr.add(kv_base), seq_len * kv_dim);
+                        let v_layer = std::slice::from_raw_parts(v_cache_ptr.add(kv_base), seq_len * kv_dim);
+                        let mut out_head = [0.0f32; 64];
+                        for qh in qh0..qh1 {
+                            let q_head = std::slice::from_raw_parts(qkv_ptr.add(qh * 64), 64);
+                            let sc = std::slice::from_raw_parts_mut(scores_ptr.add(qh * max_seq_len), seq_len);
+                            let off = (qh / kv_group) * 64;
+                            causal_gqa_head64(q_head, k_layer, v_layer, sc, &mut out_head, kv_dim, off, attn_scale);
+                            Int8ChunkActivation::populate_chunk_fwht_raw(
+                                act_hq,
+                                act_hs,
+                                act_hsum,
+                                qh,
+                                &out_head,
+                                None,
+                            );
+                        }
+                    }
+                }
+                barrier.wait();
+
+                // 3. Parallel `o_proj` + Fused Disjoint Residual `hidden += proj_out`
+                let (os0, os1) = even_stripes(o_mat.num_stripes, tid, nt);
+                if os0 < os1 {
+                    // SAFETY: `act_h` immutable; `[os0*16, os1*16)` partitions `proj_out` and `hidden` disjointly.
+                    unsafe {
+                        let act_h_ref = &*(act_h_addr as *const Int8ChunkActivation);
+                        nibble4_sdot_stripe_range_int8(o_mat, act_h_ref, os0, os1, proj_ptr);
+                        let r0 = os0 * SIMD_ROW_STRIPE;
+                        let r1 = (os1 * SIMD_ROW_STRIPE).min(h_dim);
+                        add_inplace(
+                            std::slice::from_raw_parts_mut(hidden_ptr.add(r0), r1 - r0),
+                            std::slice::from_raw_parts(proj_ptr.add(r0), r1 - r0),
+                        );
+                    }
+                }
+                barrier.wait();
+
+                // 4. Zero-Barrier Worker-Local `post_attn_norm + FWHT-64 + INT8` -> L1-Fused 64-Row `[gate; up] -> SwiGLU -> FWHT-64 -> INT8`
+                if ic0 < ic1 {
+                    // SAFETY: `hidden` is read-only after barrier 3; `(lq, ls, lsum)` are worker-private stack buffers;
+                    // each `ic` writes disjoint 64-float slices of `gate_up_buf` and `act_i[ic]`.
+                    unsafe {
+                        let hidden_ro = std::slice::from_raw_parts(hidden_ptr, h_dim);
+                        let inv_rms = 1.0 / (dot_f32_fast(hidden_ro, hidden_ro) / (h_dim as f32) + eps).sqrt();
+                        for c in 0..nc_h {
+                            Int8ChunkActivation::populate_chunk_fwht_raw(
+                                lq.as_mut_ptr(),
+                                ls.as_mut_ptr(),
+                                lsum.as_mut_ptr(),
+                                c,
+                                &hidden_ro[c * 64..(c + 1) * 64],
+                                Some((&layer.post_attn_norm[c * 64..(c + 1) * 64], inv_rms)),
+                            );
+                        }
+                        let mut sw64 = [0.0f32; 64];
+                        for ic in ic0..ic1 {
+                            nibble4_sdot_stripe_range_raw(
+                                gu_mat,
+                                lq.as_ptr(),
+                                ls.as_ptr(),
+                                lsum.as_ptr(),
+                                ic * 4,
+                                ic * 4 + 4,
+                                gu_ptr,
+                            );
+                            nibble4_sdot_stripe_range_raw(
+                                gu_mat,
+                                lq.as_ptr(),
+                                ls.as_ptr(),
+                                lsum.as_ptr(),
+                                (nc_i + ic) * 4,
+                                (nc_i + ic) * 4 + 4,
+                                gu_ptr,
+                            );
+                            let g64 = std::slice::from_raw_parts(gu_ptr.add(ic * 64), 64);
+                            let u64 = std::slice::from_raw_parts(gu_ptr.add(inter_dim + ic * 64), 64);
+                            swiglu_activate(g64, u64, &mut sw64);
+                            Int8ChunkActivation::populate_chunk_fwht_raw(
+                                act_iq,
+                                act_is,
+                                act_isum,
+                                ic,
+                                &sw64,
+                                None,
+                            );
+                        }
+                    }
+                }
+                barrier.wait();
+
+                // 5. Parallel `down_proj` + Fused Disjoint Residual `hidden += proj_out`
+                let (ds0, ds1) = even_stripes(down_mat.num_stripes, tid, nt);
+                if ds0 < ds1 {
+                    unsafe {
+                        let act_i_ref = &*(act_i_addr as *const Int8ChunkActivation);
+                        nibble4_sdot_stripe_range_int8(down_mat, act_i_ref, ds0, ds1, proj_ptr);
+                        let r0 = ds0 * SIMD_ROW_STRIPE;
+                        let r1 = (ds1 * SIMD_ROW_STRIPE).min(h_dim);
+                        add_inplace(
+                            std::slice::from_raw_parts_mut(hidden_ptr.add(r0), r1 - r0),
+                            std::slice::from_raw_parts(proj_ptr.add(r0), r1 - r0),
+                        );
+                    }
+                }
+                barrier.wait();
+            }
+
+            // 6. Zero-Barrier Worker-Local `final_norm + FWHT-64 + INT8` -> Parallel `lm_head`
+            let (hs0, hs1) = even_stripes(head_mat.num_stripes, tid, nt);
+            if hs0 < hs1 {
+                unsafe {
+                    let hidden_ro = std::slice::from_raw_parts(hidden_ptr, h_dim);
+                    let inv_rms = 1.0 / (dot_f32_fast(hidden_ro, hidden_ro) / (h_dim as f32) + eps).sqrt();
+                    for c in 0..nc_h {
+                        Int8ChunkActivation::populate_chunk_fwht_raw(
+                            lq.as_mut_ptr(),
+                            ls.as_mut_ptr(),
+                            lsum.as_mut_ptr(),
+                            c,
+                            &hidden_ro[c * 64..(c + 1) * 64],
+                            Some((&final_norm[c * 64..(c + 1) * 64], inv_rms)),
+                        );
+                    }
+                    nibble4_sdot_stripe_range_raw(
+                        head_mat,
+                        lq.as_ptr(),
+                        ls.as_ptr(),
+                        lsum.as_ptr(),
+                        hs0,
+                        hs1,
+                        logits_ptr,
+                    );
+                }
+            }
+        };
+
+        if let Some(pool) = self.pool.as_ref() {
+            // For sub-1B L2/SLC-resident models (`h_dim <= 1024`), 8 P-cores divide `nc_i` (`24` / `40`)
+            // and `lm_head` (`1536` pairs) evenly while leaving 2 P-cores free for OS/desktop interrupts.
+            let max_decode_nt = if h_dim <= 1024 { 8 } else { usize::MAX };
+            pool.execute_up_to(max_decode_nt, kernel);
+        } else {
+            let b1 = SpinBarrier::new(1);
+            kernel(0, 1, &b1);
+        }
+
+        self.ws.pos += 1;
+        &self.ws.logits
+    }
+
     /// Runs a prompt as one batch (SDOT engines, see [`Self::repack_sdot`]) and returns the logits
     /// after its last token. Other engines fall back to token-by-token decoding.
     pub fn forward_prompt(&mut self, tokens: &[usize]) -> &[f32] {
         assert!(!tokens.is_empty());
-        let is_sdot = |b: &LinearBackend| matches!(b, LinearBackend::Nibble4(_));
-        let all_sdot = is_sdot(&self.lm_head)
-            && self.layers.iter().all(|l| {
-                is_sdot(&l.qkv_proj) && is_sdot(&l.o_proj) && is_sdot(&l.gate_up_proj) && is_sdot(&l.down_proj)
-            });
-        if !all_sdot || tokens.len() == 1 {
+        if !self.is_all_sdot() || tokens.len() == 1 {
             for &t in &tokens[..tokens.len() - 1] {
                 self.forward_token(t);
             }
             return self.forward_token(tokens[tokens.len() - 1]);
         }
+        self.forward_batch_sdot_impl(tokens, None);
+        &self.ws.logits
+    }
 
+    /// Runs `tokens` (`len = m`) through one batched pass and writes `[m, vocab_size]` logits into
+    /// `out_logits` (used for single-DRAM-sweep Lossless Speculative Decoding verification!).
+    pub fn forward_batch_logits(&mut self, tokens: &[usize], out_logits: &mut [f32]) {
+        assert!(!tokens.is_empty());
+        let vocab = self.cfg.vocab_size;
+        assert!(out_logits.len() >= tokens.len() * vocab);
+        if !self.is_all_sdot() || tokens.len() == 1 {
+            for (t, &tok) in tokens.iter().enumerate() {
+                let l = self.forward_token(tok);
+                out_logits[t * vocab..(t + 1) * vocab].copy_from_slice(l);
+            }
+            return;
+        }
+        self.forward_batch_sdot_impl(tokens, Some(&mut out_logits[..tokens.len() * vocab]));
+    }
+
+    fn forward_batch_sdot_impl(&mut self, tokens: &[usize], all_logits_out: Option<&mut [f32]>) {
         let n = tokens.len();
         let pos0 = self.ws.pos;
         assert!(pos0 + n <= self.cfg.max_seq_len, "prompt exceeds max_seq_len");
@@ -2025,9 +2471,16 @@ impl RealLlamaEngine {
         let attn_scale = 1.0 / (head_dim as f32).sqrt();
         let layer_kv_stride = self.cfg.max_seq_len * kv_dim;
         let eps = self.cfg.rms_norm_eps;
-        let pool = self.pool.as_ref();
+        let lut_h = self.ws.blut_hidden.lut_enabled;
+        let lut_i = self.ws.blut_inter.lut_enabled;
 
-        let mut hidden = vec![0.0f32; n * h];
+        self.ws
+            .prompt_scratch
+            .ensure_capacity(n, &self.cfg, qkv_rows, lut_h, lut_i);
+
+        let pool = self.pool.as_ref();
+        let ps = &mut self.ws.prompt_scratch;
+        let hidden = &mut ps.hidden[..n * h];
         for (t, &tok) in tokens.iter().enumerate() {
             let row = &mut hidden[t * h..(t + 1) * h];
             if self.embed_f32_rows.is_empty() {
@@ -2039,28 +2492,24 @@ impl RealLlamaEngine {
                 row.copy_from_slice(&self.embed_f32_rows[tok * h..(tok + 1) * h]);
             }
         }
-        let new_acts = |cols: usize, lut: bool| -> Vec<BipolarActivationLut> {
-            (0..n)
-                .map(|_| {
-                    let mut b = BipolarActivationLut::new_zeroed(cols);
-                    b.lut_enabled = lut;
-                    b.int8 = Some(Int8ChunkActivation::new_zeroed(cols));
-                    b
-                })
-                .collect()
+        let acts_h = &mut ps.acts_h[..n];
+        let acts_i = &mut ps.acts_i[..n];
+        let qkv = &mut ps.qkv[..n * qkv_rows];
+        let attn = &mut ps.attn[..n * h];
+        let proj = &mut ps.proj[..n * h];
+        let gate_up = &mut ps.gate_up[..n * 2 * inter];
+        let sw = &mut ps.sw[..n * inter];
+        let score_stride = if head_dim == 64 {
+            self.cfg.max_seq_len
+        } else {
+            kv_group.max(1) * self.cfg.max_seq_len
         };
-        let mut acts_h = new_acts(h, self.ws.blut_hidden.lut_enabled);
-        let mut acts_i = new_acts(inter, self.ws.blut_inter.lut_enabled);
-        let mut qkv = vec![0.0f32; n * qkv_rows];
-        let mut attn = vec![0.0f32; n * h];
-        let mut proj = vec![0.0f32; n * h];
-        let mut gate_up = vec![0.0f32; n * 2 * inter];
-        let mut sw = vec![0.0f32; n * inter];
+        let scores_all = &mut ps.scores[..n * score_stride];
 
         for (l_idx, layer) in self.layers.iter().enumerate() {
             let kv_base = l_idx * layer_kv_stride;
-            prompt_populate(pool, &hidden, h, Some((&layer.input_norm, eps)), &mut acts_h);
-            prompt_gemm(pool, &layer.qkv_proj, &acts_h, &mut qkv);
+            prompt_populate(pool, hidden, h, Some((&layer.input_norm, eps)), acts_h);
+            prompt_gemm(pool, &layer.qkv_proj, acts_h, qkv);
 
             let k_ptr = self.ws.k_cache.as_mut_ptr() as usize;
             let v_ptr = self.ws.v_cache.as_mut_ptr() as usize;
@@ -2071,7 +2520,9 @@ impl RealLlamaEngine {
                 for t in a..b {
                     let pos = pos0 + t;
                     // SAFETY: token `t` owns row `t` of `qkv` and cache slot `pos`.
-                    let row = unsafe { std::slice::from_raw_parts_mut((qkv_ptr as *mut f32).add(t * qkv_rows), qkv_rows) };
+                    let row = unsafe {
+                        std::slice::from_raw_parts_mut((qkv_ptr as *mut f32).add(t * qkv_rows), qkv_rows)
+                    };
                     let rope_row = &rope[pos * head_dim..(pos + 1) * head_dim];
                     let (q, kv) = row.split_at_mut(h);
                     let (k, v) = kv.split_at_mut(kv_dim);
@@ -2088,17 +2539,20 @@ impl RealLlamaEngine {
             let k_cache = &self.ws.k_cache[kv_base..];
             let v_cache = &self.ws.v_cache[kv_base..];
             let attn_ptr = attn.as_mut_ptr() as usize;
-            let qkv_ref = &qkv;
+            let scores_ptr = scores_all.as_mut_ptr() as usize;
+            let qkv_ref = &*qkv;
             par_range(pool, n, |a, b| {
-                let mut scores = vec![0.0f32; cfg.max_seq_len * cfg.num_attention_heads];
                 for t in a..b {
-                    // SAFETY: token `t` owns row `t` of `attn`.
+                    // SAFETY: token `t` owns row `t` of `attn` and `scores_all`.
                     let dst = unsafe { std::slice::from_raw_parts_mut((attn_ptr as *mut f32).add(t * h), h) };
+                    let sc = unsafe {
+                        std::slice::from_raw_parts_mut((scores_ptr as *mut f32).add(t * score_stride), score_stride)
+                    };
                     causal_gqa_attention(
                         &qkv_ref[t * qkv_rows..t * qkv_rows + h],
                         k_cache,
                         v_cache,
-                        &mut scores,
+                        sc,
                         dst,
                         cfg.num_attention_heads,
                         kv_group,
@@ -2110,36 +2564,59 @@ impl RealLlamaEngine {
                 }
             });
 
-            prompt_populate(pool, &attn, h, None, &mut acts_h);
-            prompt_gemm(pool, &layer.o_proj, &acts_h, &mut proj);
-            add_inplace(&mut hidden, &proj);
+            prompt_populate(pool, attn, h, None, acts_h);
+            prompt_gemm(pool, &layer.o_proj, acts_h, proj);
+            add_inplace(hidden, proj);
 
-            prompt_populate(pool, &hidden, h, Some((&layer.post_attn_norm, eps)), &mut acts_h);
-            prompt_gemm(pool, &layer.gate_up_proj, &acts_h, &mut gate_up);
-            for (gu, out) in gate_up.chunks_exact(2 * inter).zip(sw.chunks_exact_mut(inter)) {
-                let (g, u) = gu.split_at(inter);
-                swiglu_activate(g, u, out);
-            }
-            prompt_populate(pool, &sw, inter, None, &mut acts_i);
-            prompt_gemm(pool, &layer.down_proj, &acts_i, &mut proj);
-            add_inplace(&mut hidden, &proj);
+            prompt_populate(pool, hidden, h, Some((&layer.post_attn_norm, eps)), acts_h);
+            prompt_gemm(pool, &layer.gate_up_proj, acts_h, gate_up);
+            let gu_ref = &*gate_up;
+            let sw_ptr = sw.as_mut_ptr() as usize;
+            par_range(pool, n, |a, b| {
+                for t in a..b {
+                    let gu = &gu_ref[t * 2 * inter..(t + 1) * 2 * inter];
+                    let (g, u) = gu.split_at(inter);
+                    // SAFETY: token `t` owns row `t` of `sw`.
+                    let out = unsafe { std::slice::from_raw_parts_mut((sw_ptr as *mut f32).add(t * inter), inter) };
+                    swiglu_activate(g, u, out);
+                }
+            });
+            prompt_populate(pool, sw, inter, None, acts_i);
+            prompt_gemm(pool, &layer.down_proj, acts_i, proj);
+            add_inplace(hidden, proj);
         }
 
-        // LM head for the last token only.
-        rms_norm(&hidden[(n - 1) * h..], &self.final_norm, eps, &mut self.ws.norm_buf);
-        fwht64_signed_inplace(&mut self.ws.norm_buf);
-        self.ws.blut_hidden.populate(&self.ws.norm_buf);
-        self.lm_head.forward_exec(
-            &self.ws.norm_buf,
-            None,
-            Some(&self.ws.blut_hidden),
-            &self.ws.q8_hidden_vals,
-            &self.ws.q8_hidden_scales,
-            pool,
-            &mut self.ws.logits,
-        );
+        if let Some(out_all) = all_logits_out {
+            prompt_populate(pool, hidden, h, Some((&self.final_norm, eps)), acts_h);
+            prompt_gemm(pool, &self.lm_head, acts_h, out_all);
+            let vocab = self.cfg.vocab_size;
+            self.ws.logits.copy_from_slice(&out_all[(n - 1) * vocab..n * vocab]);
+        } else {
+            let last_h = &hidden[(n - 1) * h..];
+            if !self.ws.blut_hidden.lut_enabled {
+                let inv_rms = 1.0 / (dot_f32_fast(last_h, last_h) / (h as f32) + eps).sqrt();
+                self.ws
+                    .blut_hidden
+                    .int8
+                    .as_mut()
+                    .unwrap()
+                    .populate_rmsnorm_fwht(last_h, &self.final_norm, inv_rms);
+            } else {
+                rms_norm(last_h, &self.final_norm, eps, &mut self.ws.norm_buf);
+                fwht64_signed_inplace(&mut self.ws.norm_buf);
+                self.ws.blut_hidden.populate(&self.ws.norm_buf);
+            }
+            self.lm_head.forward_exec(
+                &self.ws.norm_buf,
+                None,
+                Some(&self.ws.blut_hidden),
+                &self.ws.q8_hidden_vals,
+                &self.ws.q8_hidden_scales,
+                pool,
+                &mut self.ws.logits,
+            );
+        }
         self.ws.pos += n;
-        &self.ws.logits
     }
 
     /// Greedy autoregressive generation (`temperature = 0`) returning `(generated_token_ids, tokens_per_sec)`.
@@ -2213,7 +2690,7 @@ fn par_range(pool: Option<&SpinThreadPool>, n: usize, f: impl Fn(usize, usize) +
     }
 }
 
-/// Per token: optional RMSNorm, Hadamard rotation, then activation quantization into `acts[t]`.
+/// Per token: fused in-register optional RMSNorm + Hadamard rotation + INT8 activation quantization (`0` heap allocations!).
 fn prompt_populate(
     pool: Option<&SpinThreadPool>,
     x: &[f32],
@@ -2223,16 +2700,29 @@ fn prompt_populate(
 ) {
     let acts_ptr = acts.as_mut_ptr() as usize;
     par_range(pool, acts.len(), |a, b| {
-        let mut buf = vec![0.0f32; dim];
+        let mut fallback_buf: Option<Vec<f32>> = None;
         for t in a..b {
             let row = &x[t * dim..(t + 1) * dim];
-            match norm {
-                Some((w, eps)) => rms_norm(row, w, eps, &mut buf),
-                None => buf.copy_from_slice(row),
-            }
-            fwht64_signed_inplace(&mut buf);
             // SAFETY: token `t` is owned by exactly one range.
-            unsafe { (*(acts_ptr as *mut BipolarActivationLut).add(t)).populate(&buf) };
+            let act = unsafe { &mut *(acts_ptr as *mut BipolarActivationLut).add(t) };
+            if !act.lut_enabled {
+                let i8a = act.int8.as_mut().expect("int8 activations");
+                match norm {
+                    Some((w, eps)) => {
+                        let inv_rms = 1.0 / (dot_f32_fast(row, row) / (dim as f32) + eps).sqrt();
+                        i8a.populate_rmsnorm_fwht(row, w, inv_rms);
+                    }
+                    None => i8a.populate_fwht(row),
+                }
+            } else {
+                let buf = fallback_buf.get_or_insert_with(|| vec![0.0f32; dim]);
+                match norm {
+                    Some((w, eps)) => rms_norm(row, w, eps, buf),
+                    None => buf.copy_from_slice(row),
+                }
+                fwht64_signed_inplace(buf);
+                act.populate(buf);
+            }
         }
     });
 }
@@ -2274,6 +2764,42 @@ fn build_rope_table(cfg: &LlamaConfig) -> Vec<f32> {
 }
 
 #[inline]
+fn apply_llama_rope_head64(head: &mut [f32], rope_row: &[f32]) {
+    debug_assert_eq!(head.len(), 64);
+    debug_assert_eq!(rope_row.len(), 64);
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on `aarch64` and `head`/`rope_row` hold 64 floats.
+        unsafe { apply_llama_rope_head64_neon(head, rope_row) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        apply_llama_rope_precomp(head, 1, 64, 32, rope_row);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn apply_llama_rope_head64_neon(head: &mut [f32], rope_row: &[f32]) {
+    use std::arch::aarch64::*;
+    let hp = head.as_mut_ptr();
+    let cp = rope_row.as_ptr();
+    let sp = unsafe { cp.add(32) };
+    for k in 0..8 {
+        let i = k * 4;
+        // SAFETY: `i + 4 <= 32` and `32 + i + 4 <= 64`.
+        unsafe {
+            let x0 = vld1q_f32(hp.add(i));
+            let x1 = vld1q_f32(hp.add(32 + i));
+            let c = vld1q_f32(cp.add(i));
+            let s = vld1q_f32(sp.add(i));
+            vst1q_f32(hp.add(i), vsubq_f32(vmulq_f32(x0, c), vmulq_f32(x1, s)));
+            vst1q_f32(hp.add(32 + i), vaddq_f32(vmulq_f32(x1, c), vmulq_f32(x0, s)));
+        }
+    }
+}
+
+#[inline]
 fn apply_llama_rope_precomp(
     buf: &mut [f32],
     num_heads: usize,
@@ -2281,6 +2807,12 @@ fn apply_llama_rope_precomp(
     half_dim: usize,
     rope_row: &[f32],
 ) {
+    if head_dim == 64 && half_dim == 32 {
+        for h in 0..num_heads {
+            apply_llama_rope_head64(&mut buf[h * 64..(h + 1) * 64], rope_row);
+        }
+        return;
+    }
     let cos_s = &rope_row[..half_dim];
     let sin_s = &rope_row[half_dim..head_dim];
     for h in 0..num_heads {
@@ -2293,6 +2825,43 @@ fn apply_llama_rope_precomp(
             let s = sin_s[i];
             x0_slice[i] = x0 * c - x1 * s;
             x1_slice[i] = x1 * c + x0 * s;
+        }
+    }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn causal_gqa_head64(
+    q_head: &[f32],
+    k_layer_cache: &[f32],
+    v_layer_cache: &[f32],
+    sc: &mut [f32],
+    out_head: &mut [f32; 64],
+    kv_dim: usize,
+    off: usize,
+    attn_scale: f32,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: `q_head.len() == 64`, `off + 64 <= kv_dim`, caches hold `sc.len()` rows.
+        unsafe { attn_scores_head64_neon(q_head, k_layer_cache, kv_dim, off, attn_scale, sc) };
+        let max_score = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let inv_sum = 1.0 / softmax_unnorm_inplace(sc, max_score);
+        // SAFETY: as above, with `out_head.len() == 64`.
+        unsafe { attn_values_head64_neon(sc, v_layer_cache, kv_dim, off, inv_sum, out_head) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for (t, dst) in sc.iter_mut().enumerate() {
+            let k_head = &k_layer_cache[t * kv_dim + off..t * kv_dim + off + 64];
+            *dst = dot_f32_fast(q_head, k_head) * attn_scale;
+        }
+        let max_score = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let inv_sum = 1.0 / softmax_unnorm_inplace(sc, max_score);
+        out_head.fill(0.0);
+        for (t, &s) in sc.iter().enumerate() {
+            let v_head = &v_layer_cache[t * kv_dim + off..t * kv_dim + off + 64];
+            axpy_f32_fast(out_head, v_head, s * inv_sum);
         }
     }
 }
