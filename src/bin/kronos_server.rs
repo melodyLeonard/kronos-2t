@@ -7,7 +7,8 @@
 //!   `--mode M`, `--calib FILE`, `--calib-tokens N`, `--ctx N`, `--threads N` as in `kronos_chat`
 //!
 //! Endpoints: `POST /v1/chat/completions` (with `"stream": true` for server-sent events),
-//! `GET /v1/models`, `GET /health`. Requests are served one generation at a time.
+//! `GET /v1/models`, `GET /health`, and a web chat page at `/`. Requests are served one generation
+//! at a time.
 
 use kronos_2t::chat::{ChatModel, Completion, GenParams, Message};
 use kronos_2t::json::{quote, Json};
@@ -19,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_BODY: usize = 4 << 20;
+const CHAT_PAGE: &str = include_str!("chat.html");
 const MAX_HEADER: usize = 64 << 10;
 
 struct Server {
@@ -216,6 +218,9 @@ fn handle(srv: &Server, mut stream: TcpStream) {
     };
     if req.method == "OPTIONS" {
         return respond(&mut stream, 204, "text/plain", "");
+    }
+    if req.method == "GET" && (req.path == "/" || req.path == "/index.html") {
+        return respond(&mut stream, 200, "text/html; charset=utf-8", CHAT_PAGE);
     }
     if let Some(key) = &srv.api_key {
         let ok = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")) == Some(key.as_str());

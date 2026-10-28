@@ -81,6 +81,8 @@ reply = client.chat.completions.create(
 print(reply.choices[0].message.content)
 ```
 
+Open `http://127.0.0.1:8080/` for a web chat page served by the same process.
+
 Endpoints: `POST /v1/chat/completions` (`stream: true` sends server-sent events), `GET /v1/models`,
 `GET /health`. Supported request fields: `messages`, `temperature`, `top_p`, `top_k`,
 `max_tokens`, `repetition_penalty`, `seed`, `stream`. The server binds to `127.0.0.1` by
