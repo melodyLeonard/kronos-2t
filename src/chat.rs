@@ -2,7 +2,8 @@
 //! UTF-8 token streaming, KV-cache prefix reuse, and Dual-Tier Lossless Speculative Decoding
 //! (Zero-RAM Prompt/History Suffix Lookup + Draft-Model Leviathan-Chen Speculative Verification).
 
-use crate::bpe_tokenizer::BpeTokenizer;
+use crate::bpe_tokenizer::{BpeTokenizer, PreTokenizerKind};
+use crate::json::{quote, Json};
 use crate::real_llm::{argmax, RealLlamaEngine, RealWeightMode};
 use std::path::Path;
 use std::time::Instant;
@@ -12,20 +13,54 @@ use std::time::Instant;
 const ANE_MIN_NEW_TOKENS: usize = 32;
 
 pub const DEFAULT_SYSTEM: &str = "You are a helpful AI assistant named SmolLM, trained by Hugging Face";
+pub const DEFAULT_SYSTEM_QWEN: &str = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
 
 /// Maximum draft lookahead tokens verified in a single batched target DRAM pass (`1 + 7 = 8` tokens = exact `NT = 8` NEON tile!).
 const SPEC_DRAFT_K_GREEDY: usize = 7;
 const SPEC_DRAFT_K_SAMPLE: usize = 7;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    /// Raw JSON object string for arguments, e.g. `{"path":"index.html","content":"..."}`.
+    pub arguments: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub tool_call_id: Option<String>,
 }
 
 impl Message {
     pub fn new(role: &str, content: &str) -> Self {
-        Self { role: role.to_string(), content: content.to_string() }
+        Self {
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant_tool_calls(content: &str, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content: content.to_string(),
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_result(tool_call_id: &str, content: &str) -> Self {
+        Self {
+            role: "tool".to_string(),
+            content: content.to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.to_string()),
+        }
     }
 }
 
@@ -50,6 +85,7 @@ impl Default for GenParams {
 pub enum FinishReason {
     Stop,
     Length,
+    ToolCalls,
 }
 
 impl FinishReason {
@@ -57,6 +93,7 @@ impl FinishReason {
         match self {
             FinishReason::Stop => "stop",
             FinishReason::Length => "length",
+            FinishReason::ToolCalls => "tool_calls",
         }
     }
 }
@@ -64,6 +101,7 @@ impl FinishReason {
 #[derive(Clone, Debug)]
 pub struct Completion {
     pub text: String,
+    pub tool_calls: Vec<ToolCall>,
     pub prompt_tokens: usize,
     /// Prompt tokens actually run (the rest came from the KV cache).
     pub prefilled_tokens: usize,
@@ -75,10 +113,18 @@ pub struct Completion {
     pub prefill_unit: &'static str,
 }
 
-/// Parses a mode key: `nf4`, `nf3`, `nf3nf4` (optional `g128`), `vq2`, `vq2g128`, `v2b4`, `v2b5`,
-/// `b4`, `b5`, `b6`, or `pQOGDH` (plane counts for qkv, o, gate_up, down, lm_head).
+/// Parses a mode key: `nf5`, `nf4`, `nf3`, `nf3nf4` (optional `g128`), `nfpQOGDH` (`G=64`),
+/// `nfgQOGDH` (`G=128`), `vq2`, `vq2g128`, `v2b4`, `v2b5`, `b4`, `b5`, `b6`, or `pQOGDH`.
 pub fn parse_mode(m: &str) -> Result<RealWeightMode, String> {
     Ok(match m {
+        "nf5" => RealWeightMode::KronosNfGptq {
+            bits: 5,
+            scale_group_chunks: 1,
+        },
+        "nf5g128" => RealWeightMode::KronosNfGptq {
+            bits: 5,
+            scale_group_chunks: 2,
+        },
         "nf4" => RealWeightMode::KronosNfGptq {
             bits: 4,
             scale_group_chunks: 1,
@@ -118,19 +164,34 @@ pub fn parse_mode(m: &str) -> Result<RealWeightMode, String> {
         "b4" => RealWeightMode::KronosBipolarGptq { num_planes: 4 },
         "b5" => RealWeightMode::KronosBipolarGptq { num_planes: 5 },
         "b6" => RealWeightMode::KronosBipolarGptq { num_planes: 6 },
+        p if p.len() == 8
+            && (p.starts_with("nfp") || p.starts_with("nfg"))
+            && p[3..].bytes().all(|b| (b'3'..=b'5').contains(&b)) =>
+        {
+            let d: Vec<usize> = p[3..].bytes().map(|b| (b - b'0') as usize).collect();
+            let sgc = if p.starts_with("nfg") { 2 } else { 1 };
+            RealWeightMode::KronosNfPlanesGptq {
+                qkv: d[0],
+                o: d[1],
+                gate_up: d[2],
+                down: d[3],
+                head: d[4],
+                scale_group_chunks: sgc,
+            }
+        }
         p if p.len() == 6 && p.starts_with('p') && p[1..].bytes().all(|b| (b'4'..=b'6').contains(&b)) => {
             let d: Vec<usize> = p[1..].bytes().map(|b| (b - b'0') as usize).collect();
             RealWeightMode::KronosBipolarGptqPlanes { qkv: d[0], o: d[1], gate_up: d[2], down: d[3], head: d[4] }
         }
         other => {
             return Err(format!(
-                "unknown mode {other}; use nf4, nf4g128, nf3nf4, nf3nf4g128, nf3, nf3g128, vq2, vq2g128, v2b4, v2b5, b4, b5, b6 or pQOGDH (digits 4-6)"
+                "unknown mode {other}; use nf5, nf5g128, nf4, nf4g128, nf3nf4, nf3nf4g128, nf3, nf3g128, nfpQOGDH, nfgQOGDH (digits 3-5), vq2, vq2g128, v2b4, v2b5, b4, b5, b6 or pQOGDH (digits 4-6)"
             ));
         }
     })
 }
 
-/// Compiles `model_dir` with GPTQ on `calib_text` (one-time, minutes).
+/// Compiles `model_dir` with streaming layer-by-layer Hadamard GPTQ on `calib_text` (one-time, `< 10 GiB` peak RAM even on `14B`).
 pub fn compile(model_dir: &Path, mode: RealWeightMode, calib_text: &str, calib_tokens: usize) -> Result<RealLlamaEngine, String> {
     const SEQ: usize = 512;
     let tok = BpeTokenizer::from_model_dir(model_dir).map_err(|e| format!("tokenizer: {e}"))?;
@@ -139,8 +200,13 @@ pub fn compile(model_dir: &Path, mode: RealWeightMode, calib_text: &str, calib_t
         return Err("calibration text is too short (need at least 512 tokens)".to_string());
     }
     let seqs: Vec<Vec<usize>> = ids[..calib_tokens.min(ids.len())].chunks(SEQ).map(|c| c.to_vec()).collect();
-    let fp32 = RealLlamaEngine::load_fp32_reference(model_dir, SEQ).map_err(|e| format!("load model: {e}"))?;
-    Ok(fp32.compile_sequential_bipolar_gptq(mode, &seqs, crate::thread_pool::physical_p_cores()))
+    RealLlamaEngine::compile_streaming_gptq_from_dir(
+        model_dir,
+        mode,
+        &seqs,
+        crate::thread_pool::physical_p_cores(),
+    )
+    .map_err(|e| format!("streaming GPTQ compile: {e}"))
 }
 
 fn load_or_compile_engine(
@@ -217,7 +283,6 @@ pub struct ChatModel {
     tok: BpeTokenizer,
     im_start: usize,
     im_end: usize,
-    newline: Vec<usize>,
     /// Token ids currently in the target KV cache.
     cached: Vec<usize>,
     ctx: usize,
@@ -250,16 +315,16 @@ impl ChatModel {
         calib: Option<(&Path, usize)>,
     ) -> Result<Self, String> {
         let mut engine = load_or_compile_engine(model_dir, cache_dir, mode_key, ctx, threads, calib)?;
-        // INT8 KV cache by default for `head_dim == 64`.
-        if engine.cfg.head_dim() == 64 {
+        // Hadamard INT8 KV cache by default for both `head_dim == 64` (SmolLM2) and `128` (Qwen2.5).
+        if matches!(engine.cfg.head_dim(), 64 | 128) {
             engine.enable_q8_kv_cache(true);
         }
         let vocab_size = engine.cfg.vocab_size;
         let tok = BpeTokenizer::from_model_dir(model_dir).map_err(|e| format!("tokenizer: {e}"))?;
         let special =
             |s: &str| tok.token_to_id.get(s).copied().ok_or(format!("tokenizer lacks {s}; use an Instruct model"));
-        let (im_start, im_end) = (special("<|im_start|>")?, special("<|im_end|>")?);
-        let newline = tok.encode("\n");
+        let im_start = special("<|im_start|>")?;
+        let im_end = special("<|im_end|>")?;
         let name = format!(
             "{}-kronos-{mode_key}",
             model_dir.file_name().map_or("model".into(), |n| n.to_string_lossy().to_lowercase())
@@ -270,7 +335,6 @@ impl ChatModel {
             tok,
             im_start,
             im_end,
-            newline,
             cached: Vec::new(),
             ctx,
             scratch: ChatScratch::new(vocab_size),
@@ -287,6 +351,25 @@ impl ChatModel {
         if let Some(d) = self.draft.as_mut() {
             d.engine.enable_q8_kv_cache(enable);
             d.cached.clear();
+        }
+    }
+
+    pub fn is_q8_kv_enabled(&self) -> bool {
+        self.engine.is_q8_kv_enabled()
+    }
+
+    pub fn resident_weight_bytes(&self) -> usize {
+        self.engine.resident_weight_bytes()
+    }
+
+    pub fn kv_cache_bytes(&self) -> usize {
+        self.engine.kv_cache_bytes()
+    }
+
+    pub fn default_system(&self) -> &'static str {
+        match self.tok.pre_tokenizer {
+            PreTokenizerKind::Qwen2 => DEFAULT_SYSTEM_QWEN,
+            PreTokenizerKind::SmolLm2DigitsGpt2 => DEFAULT_SYSTEM,
         }
     }
 
@@ -373,22 +456,14 @@ impl ChatModel {
 
     /// ChatML prompt ending with an open assistant turn; adds the default system prompt if none.
     pub fn render(&self, messages: &[Message]) -> Vec<usize> {
-        let mut ids = Vec::new();
-        let mut turn = |role: &str, content: &str| {
-            ids.push(self.im_start);
-            ids.extend(self.tok.encode(&format!("{role}\n{content}")));
-            ids.push(self.im_end);
-            ids.extend(&self.newline);
-        };
-        if messages.first().is_none_or(|m| m.role != "system") {
-            turn("system", DEFAULT_SYSTEM);
-        }
-        for m in messages {
-            turn(&m.role, &m.content);
-        }
-        ids.push(self.im_start);
-        ids.extend(self.tok.encode("assistant\n"));
-        ids
+        self.render_with_tools(messages, &[])
+    }
+
+    /// Renders a ChatML / Qwen2.5 tool-calling prompt (including `<tools>` system block,
+    /// `<tool_call>` assistant turns, and grouped `<tool_response>` user turns) into token IDs.
+    pub fn render_with_tools(&self, messages: &[Message], tools_json: &[String]) -> Vec<usize> {
+        let prompt_str = render_chatml_prompt(messages, tools_json, self.default_system());
+        self.tok.encode(&prompt_str)
     }
 
     /// Generates a reply, calling `on_text` with each new piece of text; return `false` from it
@@ -398,18 +473,34 @@ impl ChatModel {
         &mut self,
         messages: &[Message],
         params: &GenParams,
+        on_text: impl FnMut(&str) -> bool,
+    ) -> Result<Completion, String> {
+        self.generate_with_tools(messages, &[], params, on_text)
+    }
+
+    /// Like [`Self::generate`], with optional OpenAI/Qwen2.5 JSON tool signatures (`tools_json`).
+    /// Automatically parses `<tool_call>...</tool_call>` blocks into [`Completion::tool_calls`]
+    /// and sets [`FinishReason::ToolCalls`] when tools are invoked.
+    pub fn generate_with_tools(
+        &mut self,
+        messages: &[Message],
+        tools_json: &[String],
+        params: &GenParams,
         mut on_text: impl FnMut(&str) -> bool,
     ) -> Result<Completion, String> {
         let mut msgs = messages.to_vec();
         let reserve = params.max_tokens.min(self.ctx / 2).max(1);
-        let mut prompt = self.render(&msgs);
+        let mut prompt = self.render_with_tools(&msgs, tools_json);
         while prompt.len() + reserve > self.ctx {
             let first = usize::from(msgs.first().is_some_and(|m| m.role == "system"));
             if msgs.len() <= first + 1 {
                 return Err(format!("prompt of {} tokens exceeds the {}-token context", prompt.len(), self.ctx));
             }
             msgs.remove(first);
-            prompt = self.render(&msgs);
+            while msgs.get(first).is_some_and(|m| m.role == "tool") && msgs.len() > first + 1 {
+                msgs.remove(first);
+            }
+            prompt = self.render_with_tools(&msgs, tools_json);
         }
         let max_new = params.max_tokens.min(self.ctx - prompt.len());
         let vocab = self.engine.cfg.vocab_size;
@@ -467,6 +558,7 @@ impl ChatModel {
         if max_new == 0 {
             return Ok(Completion {
                 text: String::new(),
+                tool_calls: Vec::new(),
                 prompt_tokens: prompt.len(),
                 prefilled_tokens: prompt.len() - common,
                 completion_tokens: 0,
@@ -486,7 +578,13 @@ impl ChatModel {
             &mut self.scratch.top_heap,
         );
 
-        let is_stop = |tok: usize, im_end: usize, eos: usize| tok == im_end || tok == eos;
+        let im_start_tok = self.im_start;
+        let is_stop = move |tok_id: usize, im_end: usize, tok: &BpeTokenizer| {
+            tok_id == im_end
+                || tok_id == im_start_tok
+                || tok_id == tok.eos_token_id
+                || tok.eos_token_ids.contains(&tok_id)
+        };
         let emit_tok = |tok_id: usize,
                         tok: &BpeTokenizer,
                         reply: &mut Vec<usize>,
@@ -516,7 +614,7 @@ impl ChatModel {
         let mut draft_cooldown = 0usize;
         let mut cooldown_step = 16usize;
         'outer: loop {
-            if is_stop(next, self.im_end, self.tok.eos_token_id) {
+            if is_stop(next, self.im_end, &self.tok) {
                 finish = FinishReason::Stop;
                 break;
             }
@@ -583,7 +681,7 @@ impl ChatModel {
                         };
                         *dt_slot = dj;
                         drafted += 1;
-                        if is_stop(dj, self.im_end, self.tok.eos_token_id) {
+                        if is_stop(dj, self.im_end, &self.tok) {
                             break;
                         }
                         sim_recent.push(dj);
@@ -657,7 +755,7 @@ impl ChatModel {
 
                     // `dj` accepted!
                     accepted_in_round += 1;
-                    if is_stop(dj, self.im_end, self.tok.eos_token_id) {
+                    if is_stop(dj, self.im_end, &self.tok) {
                         self.engine.truncate_context(pos0 + j + 1);
                         if let Some(d) = self.draft.as_mut() {
                             d.engine.truncate_context(pos0 + j + 1);
@@ -736,6 +834,7 @@ impl ChatModel {
                         .forward_batch_logits(&batch[..batch_len], &mut self.scratch.verify_logits);
 
                     let mut accepted_all = true;
+                    let mut accepted_in_round = 0usize;
                     for j in 0..drafted {
                         self.cached.push(batch[j]);
                         let t_logits = &self.scratch.verify_logits[j * vocab..(j + 1) * vocab];
@@ -748,7 +847,8 @@ impl ChatModel {
                             accepted_all = false;
                             break;
                         }
-                        if is_stop(dj, self.im_end, self.tok.eos_token_id) {
+                        accepted_in_round += 1;
+                        if is_stop(dj, self.im_end, &self.tok) {
                             self.engine.truncate_context(pos0 + j + 1);
                             finish = FinishReason::Stop;
                             break 'outer;
@@ -765,6 +865,7 @@ impl ChatModel {
                         }
                     }
                     if accepted_all {
+                        cur_draft_k = if cur_draft_k < 5 { 5 } else { SPEC_DRAFT_K_GREEDY };
                         self.cached.push(batch[drafted]);
                         let bonus_logits = &self.scratch.verify_logits[drafted * vocab..(drafted + 1) * vocab];
                         let rec = &reply[reply.len().saturating_sub(64)..];
@@ -774,6 +875,8 @@ impl ChatModel {
                             params.repeat_penalty,
                             &mut self.scratch.pen_logits,
                         );
+                    } else {
+                        cur_draft_k = if accepted_in_round >= 2 { 4 } else { 3 };
                     }
                     continue;
                 }
@@ -801,20 +904,346 @@ impl ChatModel {
             }
         }
 
+        let decode_secs = t1.elapsed().as_secs_f64();
+        let raw_text = String::from_utf8_lossy(&raw_bytes).into_owned();
+        let (text, tool_calls) = if !tools_json.is_empty() || raw_text.contains("<tool_call>") {
+            let (prose, calls) = parse_qwen_tool_calls(&raw_text);
+            if calls.is_empty() {
+                (raw_text, Vec::new())
+            } else {
+                if finish == FinishReason::Stop {
+                    finish = FinishReason::ToolCalls;
+                }
+                (prose, calls)
+            }
+        } else {
+            (raw_text, Vec::new())
+        };
+
         Ok(Completion {
-            text: String::from_utf8_lossy(&raw_bytes).into_owned(),
+            text,
+            tool_calls,
             prompt_tokens: prompt.len(),
             prefilled_tokens: prompt.len() - common,
             completion_tokens: reply.len(),
             finish,
             prefill_secs,
-            decode_secs: t1.elapsed().as_secs_f64(),
+            decode_secs,
             prefill_unit,
         })
     }
 }
 
-/// Scans `cached` + `next` backwards for a suffix match of length `4`, `3`, or `2` and copies up
+/// Renders a ChatML / Qwen2.5 tool-calling conversation into its exact prompt string
+/// (matching `Qwen2.5-Coder-Instruct`'s Jinja `chat_template` bit-for-bit).
+pub fn render_chatml_prompt(messages: &[Message], tools_json: &[String], default_system: &str) -> String {
+    let mut out = String::new();
+    let (sys_content, start_idx) = if messages.first().is_some_and(|m| m.role == "system") {
+        (messages[0].content.as_str(), 1usize)
+    } else {
+        (default_system, 0usize)
+    };
+
+    out.push_str("<|im_start|>system\n");
+    out.push_str(sys_content);
+    if !tools_json.is_empty() {
+        out.push_str(
+            "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>",
+        );
+        for tool in tools_json {
+            out.push('\n');
+            out.push_str(tool.trim());
+        }
+        out.push_str(
+            "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>",
+        );
+    }
+    out.push_str("<|im_end|>\n");
+
+    for (idx, m) in messages.iter().enumerate().skip(start_idx) {
+        if m.role == "assistant" && !m.tool_calls.is_empty() {
+            out.push_str("<|im_start|>assistant");
+            if !m.content.is_empty() {
+                out.push('\n');
+                out.push_str(&m.content);
+            }
+            for tc in &m.tool_calls {
+                let args_obj = if tc.arguments.trim().is_empty() {
+                    "{}"
+                } else {
+                    tc.arguments.trim()
+                };
+                out.push_str("\n<tool_call>\n{\"name\": ");
+                out.push_str(&quote(&tc.name));
+                out.push_str(", \"arguments\": ");
+                out.push_str(args_obj);
+                out.push_str("}\n</tool_call>");
+            }
+            out.push_str("<|im_end|>\n");
+        } else if m.role == "tool" {
+            let prev_is_tool = idx > start_idx && messages[idx - 1].role == "tool";
+            if !prev_is_tool {
+                out.push_str("<|im_start|>user");
+            }
+            out.push_str("\n<tool_response>\n");
+            out.push_str(&m.content);
+            out.push_str("\n</tool_response>");
+            let next_is_tool = idx + 1 < messages.len() && messages[idx + 1].role == "tool";
+            if !next_is_tool {
+                out.push_str("<|im_end|>\n");
+            }
+        } else {
+            out.push_str("<|im_start|>");
+            out.push_str(&m.role);
+            out.push('\n');
+            out.push_str(&m.content);
+            out.push_str("<|im_end|>\n");
+        }
+    }
+    out.push_str("<|im_start|>assistant\n");
+    out
+}
+
+/// Extracts Qwen2.5 `<tool_call>...</tool_call>` JSON invocations from `text`, returning
+/// `(remaining_prose, parsed_tool_calls)` using JSON-string-aware brace matching so literal
+/// `</tool_call>` substrings inside string arguments never corrupt parsing.
+pub fn parse_qwen_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    const OPEN_TAG: &str = "<tool_call>";
+    const CLOSE_TAG: &str = "</tool_call>";
+
+    let mut prose = String::new();
+    let mut calls = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel) = text[cursor..].find(OPEN_TAG) {
+        let tag_start = cursor + rel;
+        prose.push_str(&text[cursor..tag_start]);
+        let mut p = tag_start + OPEN_TAG.len();
+        let rest = &text[p..];
+
+        // Skip whitespace and optional ```json / ``` fence.
+        let trimmed_ws = rest.trim_start();
+        p += rest.len() - trimmed_ws.len();
+        if text[p..].starts_with("```") {
+            p += 3;
+            if let Some(nl) = text[p..].find('\n') {
+                p += nl + 1;
+            }
+        }
+
+        let Some(brace_rel) = text[p..].find('{') else {
+            prose.push_str(&text[tag_start..]);
+            cursor = text.len();
+            break;
+        };
+        let obj_start = p + brace_rel;
+        let Some(obj_end) = find_balanced_json_object_end(&text[obj_start..]).map(|len| obj_start + len) else {
+            prose.push_str(&text[tag_start..]);
+            cursor = text.len();
+            break;
+        };
+
+        let json_slice = &text[obj_start..obj_end];
+        let parsed = Json::parse(json_slice).ok().and_then(|v| {
+            let fn_obj = v.get("function").unwrap_or(&v);
+            let name = fn_obj.get("name").and_then(Json::as_str)?.to_string();
+            let arguments = match fn_obj.get("arguments") {
+                Some(Json::Str(s)) => s.clone(),
+                Some(other) => other.stringify(),
+                None => "{}".to_string(),
+            };
+            Some((name, arguments))
+        });
+
+        let Some((name, arguments)) = parsed else {
+            prose.push_str(&text[tag_start..obj_end]);
+            cursor = obj_end;
+            continue;
+        };
+
+        calls.push(ToolCall {
+            id: format!("call_{}", calls.len()),
+            name,
+            arguments,
+        });
+
+        let mut after = obj_end;
+        let t1 = text[after..].trim_start();
+        after += text[after..].len() - t1.len();
+        if text[after..].starts_with("```") {
+            after += 3;
+            let t2 = text[after..].trim_start();
+            after += text[after..].len() - t2.len();
+        }
+        if text[after..].starts_with(CLOSE_TAG) {
+            after += CLOSE_TAG.len();
+        }
+        cursor = after;
+    }
+
+    if cursor < text.len() {
+        prose.push_str(&text[cursor..]);
+    }
+    if calls.is_empty() && text.contains("```json") {
+        let (fenced_prose, fenced_calls) = parse_fenced_json_tool_calls(text);
+        if !fenced_calls.is_empty() {
+            return (fenced_prose, fenced_calls);
+        }
+    }
+    if calls.is_empty() && text.contains("\"name\"") && text.contains("\"arguments\"") {
+        let (bare_prose, bare_calls) = parse_bare_json_tool_calls(text);
+        if !bare_calls.is_empty() {
+            return (bare_prose, bare_calls);
+        }
+    }
+    (prose.trim().to_string(), calls)
+}
+
+fn parse_bare_json_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    let mut prose = String::new();
+    let mut calls = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel) = text[cursor..].find('{') {
+        let obj_start = cursor + rel;
+        // Require the bare JSON tool object to start at the beginning of a line (after optional spaces).
+        let line_prefix = text[cursor..obj_start]
+            .rsplit('\n')
+            .next()
+            .unwrap_or("");
+        if !line_prefix.trim().is_empty() {
+            prose.push_str(&text[cursor..=obj_start]);
+            cursor = obj_start + 1;
+            continue;
+        }
+        let Some(obj_len) = find_balanced_json_object_end(&text[obj_start..]) else {
+            prose.push_str(&text[cursor..=obj_start]);
+            cursor = obj_start + 1;
+            continue;
+        };
+        let obj_end = obj_start + obj_len;
+        let parsed = Json::parse(&text[obj_start..obj_end]).ok().and_then(|v| {
+            let name = v.get("name").and_then(Json::as_str)?.to_string();
+            let args_val = v.get("arguments")?;
+            let arguments = match args_val {
+                Json::Str(s) => s.clone(),
+                other => other.stringify(),
+            };
+            Some((name, arguments))
+        });
+        let Some((name, arguments)) = parsed else {
+            prose.push_str(&text[cursor..obj_end]);
+            cursor = obj_end;
+            continue;
+        };
+        prose.push_str(&text[cursor..obj_start]);
+        calls.push(ToolCall {
+            id: format!("call_{}", calls.len()),
+            name,
+            arguments,
+        });
+        let mut after = obj_end;
+        let t = text[after..].trim_start();
+        let ws_len = text[after..].len() - t.len();
+        if t.starts_with("</tool_call>") {
+            after += ws_len + "</tool_call>".len();
+        } else if t.starts_with("```") {
+            after += ws_len + 3;
+        }
+        cursor = after;
+    }
+    if cursor < text.len() {
+        prose.push_str(&text[cursor..]);
+    }
+    (prose.trim().to_string(), calls)
+}
+
+fn parse_fenced_json_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    const FENCE: &str = "```json";
+    let mut prose = String::new();
+    let mut calls = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel) = text[cursor..].find(FENCE) {
+        let fence_start = cursor + rel;
+        let body_start = fence_start + FENCE.len();
+        let trimmed = text[body_start..].trim_start();
+        let p = body_start + (text[body_start..].len() - trimmed.len());
+        let Some(obj_len) = find_balanced_json_object_end(&text[p..]) else {
+            prose.push_str(&text[cursor..body_start]);
+            cursor = body_start;
+            continue;
+        };
+        let obj_end = p + obj_len;
+        let parsed = Json::parse(&text[p..obj_end]).ok().and_then(|v| {
+            let name = v.get("name").and_then(Json::as_str)?.to_string();
+            let args_val = v.get("arguments")?;
+            let arguments = match args_val {
+                Json::Str(s) => s.clone(),
+                other => other.stringify(),
+            };
+            Some((name, arguments))
+        });
+        let Some((name, arguments)) = parsed else {
+            prose.push_str(&text[cursor..obj_end]);
+            cursor = obj_end;
+            continue;
+        };
+        prose.push_str(&text[cursor..fence_start]);
+        calls.push(ToolCall {
+            id: format!("call_{}", calls.len()),
+            name,
+            arguments,
+        });
+        let mut after = obj_end;
+        let t = text[after..].trim_start();
+        after += text[after..].len() - t.len();
+        if text[after..].starts_with("```") {
+            after += 3;
+        }
+        cursor = after;
+    }
+    if cursor < text.len() {
+        prose.push_str(&text[cursor..]);
+    }
+    (prose.trim().to_string(), calls)
+}
+
+fn find_balanced_json_object_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first().copied() != Some(b'{') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    for (idx, &b) in bytes.iter().enumerate() {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if b == b'\\' {
+                esc = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Scans `cached` + `next` backwards for an exact suffix match of length `5`, `4`, or `3` and copies up
 /// to `max_k` continuation tokens into `out` (`< 0.5 µs`, `0` heap allocations).
 fn find_suffix_continuation(cached: &[usize], next: usize, max_k: usize, out: &mut [usize]) -> usize {
     let n = cached.len();
@@ -822,7 +1251,7 @@ fn find_suffix_continuation(cached: &[usize], next: usize, max_k: usize, out: &m
         return 0;
     }
     let limit = max_k.min(out.len());
-    for ngram in [4usize, 3, 2] {
+    for ngram in [5usize, 4, 3] {
         if n + 1 < ngram + 2 {
             continue;
         }
@@ -1084,5 +1513,90 @@ mod tests {
         let n = find_suffix_continuation(&history, 40, 4, &mut out);
         assert_eq!(n, 4);
         assert_eq!(&out[..4], &[50, 60, 70, 10]);
+    }
+
+    #[test]
+    fn test_qwen25_tool_chat_template_exact_jinja_match() {
+        let tools = vec![
+            r#"{"type":"function","function":{"name":"write_file","parameters":{"type":"object"}}}"#.to_string(),
+        ];
+        let msgs = vec![
+            Message::new("user", "Build index.html"),
+            Message::assistant_tool_calls(
+                "",
+                vec![
+                    ToolCall {
+                        id: "call_0".to_string(),
+                        name: "write_file".to_string(),
+                        arguments: r#"{"path":"index.html","content":"<h1>Hi</h1>"}"#.to_string(),
+                    },
+                    ToolCall {
+                        id: "call_1".to_string(),
+                        name: "list_dir".to_string(),
+                        arguments: r#"{"path":"."}"#.to_string(),
+                    },
+                ],
+            ),
+            Message::tool_result("call_0", "wrote 11 bytes"),
+            Message::tool_result("call_1", "index.html"),
+        ];
+
+        let rendered = render_chatml_prompt(&msgs, &tools, DEFAULT_SYSTEM_QWEN);
+        let expected = concat!(
+            "<|im_start|>system\n",
+            "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
+            "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n",
+            "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
+            r#"{"type":"function","function":{"name":"write_file","parameters":{"type":"object"}}}"#,
+            "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n",
+            "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n",
+            "<|im_start|>user\nBuild index.html<|im_end|>\n",
+            "<|im_start|>assistant\n<tool_call>\n",
+            r#"{"name": "write_file", "arguments": {"path":"index.html","content":"<h1>Hi</h1>"}}"#,
+            "\n</tool_call>\n<tool_call>\n",
+            r#"{"name": "list_dir", "arguments": {"path":"."}}"#,
+            "\n</tool_call><|im_end|>\n",
+            "<|im_start|>user\n<tool_response>\nwrote 11 bytes\n</tool_response>\n<tool_response>\nindex.html\n</tool_response><|im_end|>\n",
+            "<|im_start|>assistant\n",
+        );
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn test_parse_qwen_tool_calls_with_embedded_tags_and_fences() {
+        let raw = concat!(
+            "Creating the file and running a quick check.\n",
+            "<tool_call>\n",
+            r#"{"name": "write_file", "arguments": {"path": "doc.html", "content": "<pre>literal </tool_call> inside HTML</pre>"}}"#,
+            "\n</tool_call>\n",
+            "<tool_call>\n```json\n",
+            r#"{"name": "run_command", "arguments": {"cmd": "ls -la"}}"#,
+            "\n```\n</tool_call>",
+        );
+        let (prose, calls) = parse_qwen_tool_calls(raw);
+        assert_eq!(prose, "Creating the file and running a quick check.");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "write_file");
+        let args0 = Json::parse(&calls[0].arguments).unwrap();
+        assert_eq!(
+            args0.get("content").and_then(Json::as_str),
+            Some("<pre>literal </tool_call> inside HTML</pre>")
+        );
+        assert_eq!(calls[1].name, "run_command");
+        let args1 = Json::parse(&calls[1].arguments).unwrap();
+        assert_eq!(args1.get("cmd").and_then(Json::as_str), Some("ls -la"));
+
+        let bare = concat!(
+            "Checking CSS and JS endpoints:\n",
+            r#"{"name": "run_command", "arguments": {"cmd": "curl -fsSI http://127.0.0.1:18123/style.css"}}"#,
+            "\n",
+            r#"{"name": "run_command", "arguments": {"cmd": "curl -fsSI http://127.0.0.1:18123/app.js"}}"#,
+            "\n```",
+        );
+        let (b_prose, b_calls) = parse_qwen_tool_calls(bare);
+        assert_eq!(b_prose, "Checking CSS and JS endpoints:");
+        assert_eq!(b_calls.len(), 2);
+        assert_eq!(b_calls[0].name, "run_command");
+        assert_eq!(b_calls[1].name, "run_command");
     }
 }

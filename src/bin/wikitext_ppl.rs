@@ -201,9 +201,23 @@ fn main() {
                 "In-house GGUF Q4_0 reimpl",
                 fp32.compile_from_reference(RealWeightMode::GgufQ4_0, None),
             ),
-            "nf4" | "nf4g128" | "nf3nf4" | "nf3nf4g128" | "nf3" | "nf3g128" | "vq2" | "vq2g128"
-            | "v2b4" | "v2b5" | "b4" | "mk" | "b5" => {
+            "nf5" | "nf5g128" | "nf4" | "nf4g128" | "nf3nf4" | "nf3nf4g128" | "nf3" | "nf3g128"
+            | "vq2" | "vq2g128" | "v2b4" | "v2b5" | "b4" | "mk" | "b5" => {
                 let (label, mode) = match m {
+                    "nf5" => (
+                        "Kronos NF5-5.25b + GPTQ",
+                        RealWeightMode::KronosNfGptq {
+                            bits: 5,
+                            scale_group_chunks: 1,
+                        },
+                    ),
+                    "nf5g128" => (
+                        "Kronos NF5-5.125b + GPTQ",
+                        RealWeightMode::KronosNfGptq {
+                            bits: 5,
+                            scale_group_chunks: 2,
+                        },
+                    ),
                     "nf4" => (
                         "Kronos NF4-4.25b + GPTQ",
                         RealWeightMode::KronosNfGptq {
@@ -274,6 +288,23 @@ fn main() {
                     "mk" => ("Kronos Bipolar Mixed-K + GPTQ", RealWeightMode::KronosBipolarGptqMixedK),
                     _ => ("Kronos Bipolar-5 + GPTQ", RealWeightMode::KronosBipolarGptq { num_planes: 5 }),
                 };
+                (label, compile_or_load(&fp32, model_dir, mode, m, &calib_tag, &calib_sequences, cache_dir.as_deref(), n_ctx))
+            }
+            // `nfpQOGDH` (`G=64`) / `nfgQOGDH` (`G=128`): NF bits `3..=5` per role.
+            p if p.len() == 8 && (p.starts_with("nfp") || p.starts_with("nfg")) => {
+                let d: Vec<usize> = p[3..].bytes().map(|b| (b - b'0') as usize).collect();
+                let sgc = if p.starts_with("nfg") { 2 } else { 1 };
+                let mode = RealWeightMode::KronosNfPlanesGptq {
+                    qkv: d[0],
+                    o: d[1],
+                    gate_up: d[2],
+                    down: d[3],
+                    head: d[4],
+                    scale_group_chunks: sgc,
+                };
+                let g_tag = if sgc == 2 { "G128" } else { "G64" };
+                let label: &'static str =
+                    Box::leak(format!("Kronos NF {} {}", &p[3..], g_tag).into_boxed_str());
                 (label, compile_or_load(&fp32, model_dir, mode, m, &calib_tag, &calib_sequences, cache_dir.as_deref(), n_ctx))
             }
             // `pQOGDH`: planes for qkv, o, gate_up, down, lm_head (e.g. `p44455`).

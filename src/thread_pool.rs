@@ -24,14 +24,34 @@ fn pin_macos_p_core_qos() {
 fn pin_macos_p_core_qos() {}
 
 #[inline]
+fn ensure_caller_p_core_qos() {
+    thread_local! {
+        static PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    PINNED.with(|p| {
+        if !p.get() {
+            pin_macos_p_core_qos();
+            p.set(true);
+        }
+    });
+}
+
+#[inline(always)]
+fn spin_pause4() {
+    std::hint::spin_loop();
+    std::hint::spin_loop();
+    std::hint::spin_loop();
+    std::hint::spin_loop();
+}
+
+#[inline]
 fn spin_or_yield(spins: &mut u32) {
-    // Skew between workers is normally a tile or less; spin ~8 us, then yield in case a worker was
-    // preempted mid-tile.
-    if *spins < 32_768 {
-        std::hint::spin_loop();
+    // Never call sched_yield: Darwin XNU swtch_pri sets TH_SFLAG_DEPRESSED and migrates workers to E-cores.
+    if *spins < 196_608 {
+        spin_pause4();
         *spins += 1;
     } else {
-        thread::yield_now();
+        thread::sleep(std::time::Duration::from_micros(5));
     }
 }
 
@@ -68,11 +88,16 @@ pub fn physical_p_cores() -> usize {
     thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(1)
 }
 
-/// Optimal default inference thread count on interactive workstations (`8` on a `10`-P-core M4 Pro,
-/// leaving `2` P-cores free for OS/desktop daemons to prevent synchronous barrier priority inversion).
+/// Leaves headroom on high-core-count P-core clusters so OS/tool activity does not spill workers onto E-cores.
 pub fn default_inference_threads() -> usize {
     let p = physical_p_cores();
-    if p >= 10 { p - 2 } else { p }
+    if p >= 10 {
+        p - 3
+    } else if p >= 6 {
+        p - 1
+    } else {
+        p
+    }
 }
 
 /// 128-byte cache-line wrapper preventing false sharing across Apple M-series P-core L1 caches.
@@ -103,15 +128,24 @@ impl SpinBarrier {
         self.num_threads
     }
 
-    /// Claims the next `[start, end)` tile of the current phase. The cursor resets at [`Self::wait`].
+    /// Claims the next `[start, end)` tile, tapering grain on the final wave to reduce tail skew.
     #[inline]
     pub fn claim_work(&self, grain: usize, total: usize) -> Option<(usize, usize)> {
         let g = grain.max(1);
-        let start = self.work_cursor.0.fetch_add(g, Ordering::Relaxed);
+        let approx = self.work_cursor.0.load(Ordering::Relaxed);
+        if approx >= total {
+            return None;
+        }
+        let step = if g > 1 && total - approx <= self.num_threads * g {
+            (g / 4).max(1)
+        } else {
+            g
+        };
+        let start = self.work_cursor.0.fetch_add(step, Ordering::Relaxed);
         if start >= total {
             None
         } else {
-            Some((start, (start + g).min(total)))
+            Some((start, (start + step).min(total)))
         }
     }
 
@@ -222,8 +256,8 @@ fn worker_loop(st: &'static GlobalPoolState, w_id: usize, initial_epoch: usize) 
             if e != seen_epoch {
                 break e;
             }
-            if !park_now && !st.force_park.0.load(Ordering::Relaxed) && spun < 262_144 {
-                std::hint::spin_loop();
+            if !park_now && !st.force_park.0.load(Ordering::Relaxed) && spun < 98_304 {
+                spin_pause4();
                 spun += 1;
             } else {
                 let (lock, cvar) = &st.worker_park[w_id].0;
@@ -359,6 +393,7 @@ impl SpinThreadPool {
         let raw_tile = total_items.div_ceil(self.num_threads * 4).max(g);
         let tile = raw_tile.div_ceil(g) * g;
 
+        ensure_caller_p_core_qos();
         let st = self.st;
         let _gate = st.dispatch_gate.lock().unwrap();
         ensure_workers_locked(st, self.num_threads);
@@ -429,6 +464,7 @@ impl SpinThreadPool {
             closure(tid, nt, barrier);
         }
 
+        ensure_caller_p_core_qos();
         let barrier = SpinBarrier::new(nt);
         let st = self.st;
         let _gate = st.dispatch_gate.lock().unwrap();

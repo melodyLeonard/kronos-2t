@@ -12,9 +12,10 @@ use crate::k2t_format::CompiledSwiGluExpert;
 use crate::lut_gemv::GROUP_SIZE;
 use crate::simd_lut::{
     bf16_to_f32, decode_nibble_code, default_register_codebook_64, f32_to_bf16,
-    FusedBase3LutMatrix, FusedBipolarLutMatrix, MultiPlaneTernaryMatrix, NfSdotMatrix,
-    SimdPackedMatrix, Vq2LutMatrix, NF3_DEFAULT_CODEBOOK_I8, NF4_DEFAULT_CODEBOOK_I8,
-    QUANT_CHUNK_BLOCKS, SIMD_ROW_STRIPE, VQ2_GAUSSIAN_RING_16,
+    nf_expand_codebook32, FusedBase3LutMatrix, FusedBipolarLutMatrix, MultiPlaneTernaryMatrix,
+    NfSdotMatrix, SimdPackedMatrix, Vq2LutMatrix, NF3_DEFAULT_CODEBOOK_I8,
+    NF4_DEFAULT_CODEBOOK_I8, NF5_DEFAULT_POS_CODEBOOK_I8, QUANT_CHUNK_BLOCKS, SIMD_ROW_STRIPE,
+    VQ2_GAUSSIAN_RING_16,
 };
 
 /// Output of multi-rank Kronecker compilation for a single `[rows, cols]` matrix.
@@ -1398,8 +1399,8 @@ fn quantize_stripe_batch_vq2(
     }
 }
 
-/// Fits a symmetric INT8 Lloyd-Max codebook (16 levels for NF4, 8 for NF3) to the Hadamard-rotated
-/// weights. Returns `(codebook, top positive centroid in RMS units)`.
+/// Fits a symmetric INT8 Lloyd-Max codebook (32 levels for NF5, 16 for NF4, 8 for NF3) to the
+/// Hadamard-rotated weights. Returns `(codebook, top positive centroid in RMS units)`.
 pub fn fit_empirical_nf_codebook(
     weights: &[f32],
     rows: usize,
@@ -1407,15 +1408,15 @@ pub fn fit_empirical_nf_codebook(
     bits: usize,
     scale_group_chunks: usize,
 ) -> ([i8; 16], f32) {
-    assert!(bits == 3 || bits == 4);
+    assert!(bits == 3 || bits == 4 || bits == 5);
     const HIST_BINS: usize = 2000;
     const Z_MAX: f32 = 5.0;
     const BIN_W: f32 = Z_MAX / (HIST_BINS as f32);
 
-    let default_cb = if bits == 4 {
-        (NF4_DEFAULT_CODEBOOK_I8, 2.7326f32)
-    } else {
-        (NF3_DEFAULT_CODEBOOK_I8, 2.1520f32)
+    let default_cb = match bits {
+        5 => (NF5_DEFAULT_POS_CODEBOOK_I8, 3.2500f32),
+        4 => (NF4_DEFAULT_CODEBOOK_I8, 2.7326f32),
+        _ => (NF3_DEFAULT_CODEBOOK_I8, 2.1520f32),
     };
 
     let num_chunks = cols / HADAMARD_BLOCK;
@@ -1454,10 +1455,13 @@ pub fn fit_empirical_nf_codebook(
     }
 
     let half = 1usize << (bits - 1);
-    let mut mu: Vec<f64> = if bits == 4 {
-        vec![0.1284, 0.3881, 0.6568, 0.9424, 1.2562, 1.6180, 2.0690, 2.7326]
-    } else {
-        vec![0.2451, 0.7560, 1.3439, 2.1520]
+    let mut mu: Vec<f64> = match bits {
+        5 => vec![
+            0.068, 0.205, 0.343, 0.483, 0.626, 0.773, 0.925, 1.084, 1.252, 1.432, 1.628, 1.845,
+            2.092, 2.382, 2.743, 3.250,
+        ],
+        4 => vec![0.1284, 0.3881, 0.6568, 0.9424, 1.2562, 1.6180, 2.0690, 2.7326],
+        _ => vec![0.2451, 0.7560, 1.3439, 2.1520],
     };
 
     for _ in 0..24 {
@@ -1508,14 +1512,20 @@ pub fn fit_empirical_nf_codebook(
     }
 
     let mut cb = [0i8; 16];
-    for m in 0..half {
-        cb[half - 1 - m] = (-q_pos[m]) as i8;
-        cb[half + m] = q_pos[m] as i8;
+    if bits == 5 {
+        for m in 0..16 {
+            cb[m] = q_pos[m] as i8;
+        }
+    } else {
+        for m in 0..half {
+            cb[half - 1 - m] = (-q_pos[m]) as i8;
+            cb[half + m] = q_pos[m] as i8;
+        }
     }
     (cb, mu_top as f32)
 }
 
-/// Compiles `[rows, cols]` weights into an [`NfSdotMatrix`] (`bits` 4 or 3) with Hadamard GPTQ
+/// Compiles `[rows, cols]` weights into an [`NfSdotMatrix`] (`bits` 5, 4, or 3) with Hadamard GPTQ
 /// and least-squares BF16 scale refit.
 pub fn compile_hadamard_gptq_nf(
     weights: &[f32],
@@ -1528,7 +1538,10 @@ pub fn compile_hadamard_gptq_nf(
 ) -> NfSdotMatrix {
     assert_eq!(weights.len(), rows * cols);
     assert!(rows > 0 && cols > 0 && cols.is_multiple_of(HADAMARD_BLOCK));
-    assert!(bits == 3 || bits == 4, "NF-SDOT bits must be 3 or 4");
+    assert!(
+        bits == 3 || bits == 4 || bits == 5,
+        "NF-SDOT bits must be 3, 4, or 5"
+    );
     assert!((1..=8).contains(&scale_group_chunks));
     if let Some(h) = hessian {
         assert_eq!(h.cols, cols);
@@ -1622,19 +1635,44 @@ fn quantize_stripe_batch_nf(
     const TAIL_TILE: usize = 512;
     let half = 1usize << (bits - 1);
     let levels = 1usize << bits;
-    let mut cb_f = [0.0f32; 16];
+    let cb32 = nf_expand_codebook32(bits, codebook);
+    let mut cb_f = [0.0f32; 32];
     for k in 0..levels {
-        cb_f[k] = codebook[k] as f32;
+        cb_f[k] = cb32[k] as f32;
     }
     // Decision thresholds at codebook midpoints.
-    let mut pos_th = [0.0f32; 7];
+    let mut pos_th = [0.0f32; 15];
     for (m, th) in pos_th.iter_mut().enumerate().take(half - 1) {
         *th = 0.5 * (cb_f[half + m] + cb_f[half + m + 1]);
     }
 
     let quant_nearest = |w: f32, inv_delta: f32| -> usize {
         let aw = w.abs() * inv_delta;
-        let mag = if bits == 4 {
+        let mag = if bits == 5 {
+            if aw < pos_th[7] {
+                if aw < pos_th[3] {
+                    if aw < pos_th[1] {
+                        usize::from(aw >= pos_th[0])
+                    } else {
+                        2 + usize::from(aw >= pos_th[2])
+                    }
+                } else if aw < pos_th[5] {
+                    4 + usize::from(aw >= pos_th[4])
+                } else {
+                    6 + usize::from(aw >= pos_th[6])
+                }
+            } else if aw < pos_th[11] {
+                if aw < pos_th[9] {
+                    8 + usize::from(aw >= pos_th[8])
+                } else {
+                    10 + usize::from(aw >= pos_th[10])
+                }
+            } else if aw < pos_th[13] {
+                12 + usize::from(aw >= pos_th[12])
+            } else {
+                14 + usize::from(aw >= pos_th[14])
+            }
+        } else if bits == 4 {
             if aw < pos_th[3] {
                 if aw < pos_th[1] {
                     usize::from(aw >= pos_th[0])

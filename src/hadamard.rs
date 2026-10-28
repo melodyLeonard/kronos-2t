@@ -13,12 +13,11 @@
 /// Block size of the orthogonal Walsh-Hadamard rotation (matches `QUANT_CHUNK_BLOCKS * GROUP_SIZE = 64`).
 pub const HADAMARD_BLOCK: usize = 64;
 
-/// Precomputed compile-time Rademacher sign-flip masks for the first 64 blocks (`cols <= 4,096`),
-/// eliminating all runtime SplitMix64 PRNG arithmetic on the critical token-generation path.
-pub(crate) const RADEMACHER_TABLE_64: [[u32; HADAMARD_BLOCK]; 64] = {
-    let mut table = [[0u32; HADAMARD_BLOCK]; 64];
+/// Compile-time Rademacher sign masks for up to 256 blocks (`cols <= 16,384`).
+pub(crate) static RADEMACHER_TABLE_64: [[u32; HADAMARD_BLOCK]; 256] = {
+    let mut table = [[0u32; HADAMARD_BLOCK]; 256];
     let mut b = 0;
-    while b < 64 {
+    while b < 256 {
         table[b] = rademacher_sign_masks_64(b);
         b += 1;
     }

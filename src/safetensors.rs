@@ -6,9 +6,9 @@
 //! weight copies until requested.
 
 use crate::mmap_pager::sys::RawMmap;
-use crate::simd_lut::bf16_to_f32;
+use crate::simd_lut::{bf16_to_f32, f32_to_bf16};
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io;
 use std::path::Path;
 
@@ -69,6 +69,35 @@ impl<'a> TensorView<'a> {
         let n = self.numel();
         let mut out = vec![0.0f32; n];
         decode_bytes_to_f32(self.dtype, self.raw_bytes, &mut out);
+        out
+    }
+
+    /// Decodes the entire tensor directly into `BF16` (`Vec<u16>`) without an intermediate `Vec<f32>`.
+    pub fn to_bf16_vec(&self) -> Vec<u16> {
+        let n = self.numel();
+        let mut out = Vec::with_capacity(n);
+        match self.dtype {
+            TensorDtype::BF16 => {
+                assert_eq!(self.raw_bytes.len(), n * 2);
+                for chunk in self.raw_bytes.chunks_exact(2) {
+                    out.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+                }
+            }
+            TensorDtype::F16 => {
+                assert_eq!(self.raw_bytes.len(), n * 2);
+                for chunk in self.raw_bytes.chunks_exact(2) {
+                    let v = f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+                    out.push(f32_to_bf16(v));
+                }
+            }
+            TensorDtype::F32 => {
+                assert_eq!(self.raw_bytes.len(), n * 4);
+                for chunk in self.raw_bytes.chunks_exact(4) {
+                    let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    out.push(f32_to_bf16(v));
+                }
+            }
+        }
         out
     }
 }
@@ -179,6 +208,131 @@ impl SafeTensorsFile {
             raw_bytes: &self.mmap.as_slice()[abs_start..abs_end],
         })
     }
+
+    /// Hints the OS kernel (`POSIX_MADV_DONTNEED`) to reclaim interior 16 KiB VM pages of `name`.
+    pub fn release_tensor_pages(&self, name: &str) {
+        const VM_PAGE: usize = 16_384;
+        if let Some(meta) = self.tensors.get(name) {
+            let abs_start = self.data_section_offset + meta.data_start;
+            let abs_end = self.data_section_offset + meta.data_end;
+            let page_start = (abs_start + (VM_PAGE - 1)) & !(VM_PAGE - 1);
+            let page_end = abs_end & !(VM_PAGE - 1);
+            if page_end > page_start && page_end <= self.byte_len() {
+                self.mmap.advise_dontneed(page_start, page_end - page_start);
+            }
+        }
+    }
+}
+
+/// Unified single-file (`model.safetensors`) or multi-shard (`model.safetensors.index.json`) store.
+pub struct SafeTensorsStore {
+    shards: Vec<SafeTensorsFile>,
+    weight_map: HashMap<String, usize>,
+}
+
+impl SafeTensorsStore {
+    /// Opens `model_dir/model.safetensors` if present, otherwise `model_dir/model.safetensors.index.json`.
+    pub fn open_dir(model_dir: &Path) -> io::Result<Self> {
+        let single = model_dir.join("model.safetensors");
+        if single.exists() {
+            let st = SafeTensorsFile::open(&single)?;
+            let weight_map = st.tensors.keys().map(|k| (k.clone(), 0usize)).collect();
+            return Ok(Self {
+                shards: vec![st],
+                weight_map,
+            });
+        }
+
+        let index_path = model_dir.join("model.safetensors.index.json");
+        let text = fs::read_to_string(&index_path)?;
+        let entries = parse_safetensors_index(&text)
+            .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+
+        let mut shard_names: Vec<String> = Vec::new();
+        let mut name_to_idx: HashMap<String, usize> = HashMap::new();
+        let mut weight_map: HashMap<String, usize> = HashMap::with_capacity(entries.len());
+
+        for (tensor_name, shard_file) in entries {
+            let idx = if let Some(&i) = name_to_idx.get(&shard_file) {
+                i
+            } else {
+                let i = shard_names.len();
+                shard_names.push(shard_file.clone());
+                name_to_idx.insert(shard_file, i);
+                i
+            };
+            weight_map.insert(tensor_name, idx);
+        }
+
+        let mut shards = Vec::with_capacity(shard_names.len());
+        for shard_file in &shard_names {
+            shards.push(SafeTensorsFile::open(&model_dir.join(shard_file))?);
+        }
+
+        Ok(Self { shards, weight_map })
+    }
+
+    #[inline]
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.weight_map.contains_key(name)
+    }
+
+    pub fn tensor(&self, name: &str) -> Result<TensorView<'_>, String> {
+        let &shard_idx = self
+            .weight_map
+            .get(name)
+            .ok_or_else(|| format!("missing tensor '{name}' in safetensors store"))?;
+        self.shards[shard_idx].tensor(name)
+    }
+
+    pub fn release_tensor_pages(&self, name: &str) {
+        if let Some(&shard_idx) = self.weight_map.get(name) {
+            self.shards[shard_idx].release_tensor_pages(name);
+        }
+    }
+}
+
+fn parse_safetensors_index(index_json: &str) -> Result<Vec<(String, String)>, String> {
+    let mut cur = JsonCursor::new(index_json);
+    cur.expect_byte(b'{')?;
+    let mut out = Vec::new();
+    if cur.peek() == Some(b'}') {
+        cur.expect_byte(b'}')?;
+        return Ok(out);
+    }
+    loop {
+        let key = cur.parse_string()?;
+        cur.expect_byte(b':')?;
+        if key == "weight_map" {
+            cur.expect_byte(b'{')?;
+            if cur.peek() != Some(b'}') {
+                loop {
+                    let tensor = cur.parse_string()?;
+                    cur.expect_byte(b':')?;
+                    let shard = cur.parse_string()?;
+                    out.push((tensor, shard));
+                    if cur.peek() == Some(b',') {
+                        cur.expect_byte(b',')?;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            cur.expect_byte(b'}')?;
+        } else {
+            cur.skip_value()?;
+        }
+        if cur.peek() == Some(b',') {
+            cur.expect_byte(b',')?;
+        } else {
+            break;
+        }
+    }
+    cur.expect_byte(b'}')?;
+    if out.is_empty() {
+        return Err("model.safetensors.index.json contained empty weight_map".to_string());
+    }
+    Ok(out)
 }
 
 /// Minimal zero-dependency JSON cursor shared by `safetensors` and `bpe_tokenizer`.
@@ -545,6 +699,39 @@ mod tests {
         let mut row1 = [0.0f32; 3];
         tv.copy_row_f32(1, &mut row1);
         assert_eq!(&row1, &all[3..6]);
+        let bf = tv.to_bf16_vec();
+        assert_eq!(bf.len(), 6);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_sharded_safetensors_store() {
+        let dir = std::env::temp_dir().join("kronos_test_sharded_st");
+        let _ = fs::create_dir_all(&dir);
+        let write_shard = |file_name: &str, tensor_name: &str, val: f32| {
+            let raw = f32_to_bf16(val).to_le_bytes();
+            let hdr = format!(
+                r#"{{"{tensor_name}":{{"dtype":"BF16","shape":[1,1],"data_offsets":[0,2]}}}}"#
+            );
+            let mut f = File::create(dir.join(file_name)).unwrap();
+            f.write_all(&(hdr.len() as u64).to_le_bytes()).unwrap();
+            f.write_all(hdr.as_bytes()).unwrap();
+            f.write_all(&raw).unwrap();
+        };
+        write_shard("model-00001-of-00002.safetensors", "a.weight", 3.5);
+        write_shard("model-00002-of-00002.safetensors", "b.bias", -1.25);
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"metadata":{"total_size":4},"weight_map":{"a.weight":"model-00001-of-00002.safetensors","b.bias":"model-00002-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let store = SafeTensorsStore::open_dir(&dir).unwrap();
+        assert!(store.has_tensor("a.weight"));
+        assert!(store.has_tensor("b.bias"));
+        assert!(!store.has_tensor("c.bias"));
+        assert_eq!(store.tensor("a.weight").unwrap().to_f32_vec(), vec![3.5]);
+        assert_eq!(store.tensor("b.bias").unwrap().to_f32_vec(), vec![-1.25]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

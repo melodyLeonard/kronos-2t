@@ -87,7 +87,14 @@ fn main() {
     let system: Vec<Message> = flag("--system").map(|s| Message::new("system", &s)).into_iter().collect();
     let mut history = system.clone();
 
-    eprintln!("{} ready · /reset /exit", model.name);
+    eprintln!(
+        "{} ready (weights {:.2} GiB + {} {:.2} GiB @ ctx={}) · /reset /exit",
+        model.name,
+        model.resident_weight_bytes() as f64 / (1u64 << 30) as f64,
+        if model.is_q8_kv_enabled() { "Q8-KV" } else { "FP32-KV" },
+        model.kv_cache_bytes() as f64 / (1u64 << 30) as f64,
+        model.context_size(),
+    );
     let stdin = io::stdin();
     let mut out = io::stdout();
     loop {

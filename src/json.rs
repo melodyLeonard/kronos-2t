@@ -56,6 +56,59 @@ impl Json {
             _ => None,
         }
     }
+
+    pub fn as_obj(&self) -> Option<&[(String, Json)]> {
+        match self {
+            Json::Obj(kv) => Some(kv),
+            _ => None,
+        }
+    }
+
+    /// Serializes this value into compact canonical JSON text.
+    pub fn stringify(&self) -> String {
+        let mut out = String::new();
+        self.write_into(&mut out);
+        out
+    }
+
+    fn write_into(&self, out: &mut String) {
+        match self {
+            Json::Null => out.push_str("null"),
+            Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Json::Num(n) => {
+                if !n.is_finite() {
+                    out.push_str("null");
+                } else if n.fract() == 0.0 && *n >= (i64::MIN as f64) && *n <= (i64::MAX as f64) {
+                    out.push_str(&format!("{}", *n as i64));
+                } else {
+                    out.push_str(&format!("{n}"));
+                }
+            }
+            Json::Str(s) => out.push_str(&quote(s)),
+            Json::Arr(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    item.write_into(out);
+                }
+                out.push(']');
+            }
+            Json::Obj(kv) => {
+                out.push('{');
+                for (i, (k, v)) in kv.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&quote(k));
+                    out.push(':');
+                    v.write_into(out);
+                }
+                out.push('}');
+            }
+        }
+    }
 }
 
 const MAX_DEPTH: usize = 64;
