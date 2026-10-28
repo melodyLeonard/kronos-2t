@@ -7,6 +7,10 @@ use crate::real_llm::{argmax, RealLlamaEngine, RealWeightMode};
 use std::path::Path;
 use std::time::Instant;
 
+/// Minimum new prompt tokens before Neural Engine prefill beats extending the CPU cache.
+#[cfg(all(feature = "ane", target_os = "macos"))]
+const ANE_MIN_NEW_TOKENS: usize = 32;
+
 pub const DEFAULT_SYSTEM: &str = "You are a helpful AI assistant named SmolLM, trained by Hugging Face";
 
 /// Maximum draft lookahead tokens verified in a single batched target DRAM pass (`1 + 7 = 8` tokens = exact `NT = 8` NEON tile!).
@@ -67,6 +71,8 @@ pub struct Completion {
     pub finish: FinishReason,
     pub prefill_secs: f64,
     pub decode_secs: f64,
+    /// `"ane"` when the Neural Engine ran the prefill, else `"cpu"`.
+    pub prefill_unit: &'static str,
 }
 
 /// `b4`, `b5`, `b6` or `pQOGDH` (plane counts 4–6 for qkv, o, gate_up, down, lm_head).
@@ -164,6 +170,8 @@ pub struct ChatModel {
     ctx: usize,
     scratch: ChatScratch,
     pub name: String,
+    #[cfg(all(feature = "ane", target_os = "macos"))]
+    ane: Vec<(usize, crate::coreml::CoreMlModel)>,
 }
 
 impl ChatModel {
@@ -198,6 +206,8 @@ impl ChatModel {
             ctx,
             scratch: ChatScratch::new(vocab_size),
             name,
+            #[cfg(all(feature = "ane", target_os = "macos"))]
+            ane: Vec::new(),
         })
     }
 
@@ -224,6 +234,47 @@ impl ChatModel {
 
     pub fn context_size(&self) -> usize {
         self.ctx
+    }
+
+    /// Loads Neural Engine prefill models `prefill_s<N>.mlmodelc` from `dir` (see
+    /// `ane/export_prefill.py`); returns the prompt-length buckets found.
+    #[cfg(all(feature = "ane", target_os = "macos"))]
+    pub fn enable_ane(&mut self, dir: &Path) -> Result<Vec<usize>, String> {
+        use crate::coreml::{ComputeUnits, CoreMlModel};
+        let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let Some(n) = name.strip_prefix("prefill_s").and_then(|r| r.strip_suffix(".mlmodelc")) else {
+                continue;
+            };
+            let seq: usize = n.parse().map_err(|_| format!("bad bucket name {name}"))?;
+            if seq <= self.ctx {
+                let mut m = CoreMlModel::load(&e.path(), ComputeUnits::CpuAndNeuralEngine)?;
+                // The first prediction pays a one-time Neural Engine setup cost.
+                let h = self.engine.cfg.hidden_size;
+                m.predict("x", &[1, seq, h], &vec![0.0; seq * h], &["hidden"])?;
+                self.ane.push((seq, m));
+            }
+        }
+        self.ane.sort_by_key(|(s, _)| *s);
+        Ok(self.ane.iter().map(|(s, _)| *s).collect())
+    }
+
+    /// Prefills `prompt` from an empty cache on the Neural Engine, if a bucket fits.
+    #[cfg(all(feature = "ane", target_os = "macos"))]
+    fn ane_prefill(&mut self, prompt: &[usize]) -> Option<Result<Vec<f32>, String>> {
+        let n = prompt.len();
+        let (seq, model) = self.ane.iter_mut().find(|(s, _)| *s >= n)?;
+        let seq = *seq;
+        let h = self.engine.cfg.hidden_size;
+        let mut x = vec![0.0f32; seq * h];
+        for (t, &tok) in prompt.iter().enumerate() {
+            self.engine.embed(tok, &mut x[t * h..(t + 1) * h]);
+        }
+        Some(model.predict("x", &[1, seq, h], &x, &["hidden", "keys", "values"]).map(|out| {
+            self.engine.load_prefix_kv(&out[1], &out[2], seq, n);
+            self.engine.logits_from_hidden(&out[0][(n - 1) * h..n * h]).to_vec()
+        }))
     }
 
     /// ChatML prompt ending with an open assistant turn; adds the default system prompt if none.
@@ -275,9 +326,28 @@ impl ChatModel {
         self.engine.truncate_context(common);
         self.cached.truncate(common);
         let t0 = Instant::now();
-        {
-            let l = self.engine.forward_prompt(&prompt[common..]);
-            self.scratch.cur_logits.copy_from_slice(l);
+        let mut prefill_unit = "cpu";
+        #[cfg(all(feature = "ane", target_os = "macos"))]
+        // The Neural Engine recomputes the whole prompt from position 0; worth it once there is
+        // a meaningful amount of new text, even when a shared prefix (system prompt) is cached.
+        let ane_logits = if prompt.len() - common >= ANE_MIN_NEW_TOKENS {
+            self.ane_prefill(&prompt).transpose()?
+        } else {
+            None
+        };
+        #[cfg(not(all(feature = "ane", target_os = "macos")))]
+        let ane_logits: Option<Vec<f32>> = None;
+        match ane_logits {
+            Some(l) => {
+                prefill_unit = "ane";
+                common = 0;
+                self.cached.clear();
+                self.scratch.cur_logits.copy_from_slice(&l);
+            }
+            None => {
+                let l = self.engine.forward_prompt(&prompt[common..]);
+                self.scratch.cur_logits.copy_from_slice(l);
+            }
         }
         self.cached.extend_from_slice(&prompt[common..]);
 
@@ -308,6 +378,7 @@ impl ChatModel {
                 completion_tokens: 0,
                 finish,
                 prefill_secs,
+                prefill_unit,
                 decode_secs: 0.0,
             });
         }
@@ -640,6 +711,7 @@ impl ChatModel {
             finish,
             prefill_secs,
             decode_secs: t1.elapsed().as_secs_f64(),
+            prefill_unit,
         })
     }
 }

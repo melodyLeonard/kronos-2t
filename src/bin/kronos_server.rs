@@ -4,6 +4,7 @@
 //!   `--host H`            bind address (default 127.0.0.1)
 //!   `--port P`            (default 8080)
 //!   `--api-key KEY`       require `Authorization: Bearer KEY`
+//!   `--ane`               prefill on the Neural Engine (`ane` feature, models in `<model_dir>/ane`)
 //!   `--mode M`, `--calib FILE`, `--calib-tokens N`, `--ctx N`, `--threads N` as in `kronos_chat`
 //!
 //! Endpoints: `POST /v1/chat/completions` (with `"stream": true` for server-sent events),
@@ -272,6 +273,18 @@ fn main() {
             eprintln!("draft error: {e}");
             std::process::exit(1);
         });
+    }
+    if args.iter().any(|a| a == "--ane") {
+        #[cfg(all(feature = "ane", target_os = "macos"))]
+        match model.enable_ane(&model_dir.join("ane")) {
+            Ok(b) => eprintln!("Neural Engine prefill buckets: {b:?}"),
+            Err(e) => eprintln!("Neural Engine disabled: {e}"),
+        }
+        #[cfg(not(all(feature = "ane", target_os = "macos")))]
+        {
+            let _ = &mut model;
+            eprintln!("built without the `ane` feature; prefilling on CPU");
+        }
     }
     let addr = format!("{}:{}", flag("--host").unwrap_or_else(|| "127.0.0.1".into()), num("--port", 8080.0) as u16);
     let listener = TcpListener::bind(&addr).unwrap_or_else(|e| {

@@ -13,6 +13,7 @@
 //! - [`accel`]: Parallel SYRK / Cholesky / triangular inverse for GPTQ.
 //! - [`chat`]: Chat template, sampling and streaming on a compiled model.
 //! - [`json`]: Minimal JSON values for the HTTP API.
+//! - [`coreml`]: Core ML runner for Neural Engine prefill (`ane` feature).
 //! - [`compiler`]: BitNet $b1.58$ ternary quantizer & Multi-Rank Kronecker `.k2t` factorizer.
 //! - [`engine`]: Zero-allocation multi-layer sparse inference runtime.
 //! - [`demo_model`]: Trainable `.k2t`-compiled language & 1,200-token Needle-in-a-Haystack suite.
@@ -24,6 +25,8 @@ pub mod accel;
 pub mod bpe_tokenizer;
 pub mod chat;
 pub mod compiler;
+#[cfg(all(feature = "ane", target_os = "macos"))]
+pub mod coreml;
 pub mod demo_model;
 pub mod engine;
 pub mod hadamard;

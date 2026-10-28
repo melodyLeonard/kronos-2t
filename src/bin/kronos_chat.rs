@@ -8,6 +8,7 @@
 //!   `--threads N`         (default 8)
 //!   `--temp T`, `--top-k K`, `--top-p P`, `--repeat-penalty R`, `--max-new N`, `--seed N`
 //!   `--system TEXT`       system prompt
+//!   `--ane`               prefill on the Neural Engine (`ane` feature, models in `<model_dir>/ane`)
 //!
 //! Commands: `/reset` clears the conversation, `/exit` quits.
 
@@ -50,6 +51,18 @@ fn main() {
             std::process::exit(1);
         });
     }
+    if args.iter().any(|a| a == "--ane") {
+        #[cfg(all(feature = "ane", target_os = "macos"))]
+        match model.enable_ane(&model_dir.join("ane")) {
+            Ok(b) => eprintln!("Neural Engine prefill buckets: {b:?}"),
+            Err(e) => eprintln!("Neural Engine disabled: {e}"),
+        }
+        #[cfg(not(all(feature = "ane", target_os = "macos")))]
+        {
+            let _ = &mut model;
+            eprintln!("built without the `ane` feature; prefilling on CPU");
+        }
+    }
     let mut params = GenParams {
         temperature: num("--temp", 0.7) as f32,
         top_k: num("--top-k", 40.0) as usize,
@@ -90,9 +103,10 @@ fn main() {
         match result {
             Ok(c) => {
                 println!(
-                    "\n[{} prompt tok ({} new) @ {:.0} tok/s · {} reply tok @ {:.1} tok/s]",
+                    "\n[{} prompt tok ({} new, {}) @ {:.0} tok/s · {} reply tok @ {:.1} tok/s]",
                     c.prompt_tokens,
                     c.prefilled_tokens,
+                    c.prefill_unit,
                     c.prefilled_tokens as f64 / c.prefill_secs.max(1e-9),
                     c.completion_tokens,
                     c.completion_tokens as f64 / c.decode_secs.max(1e-9)

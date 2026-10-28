@@ -1,3 +1,4 @@
 /target
 /models
 *.k2t
+.DS_Store

@@ -5,8 +5,16 @@ edition = "2021"
 description = "Sub-bit Kronecker-synthesized, multiplication-free sparse inference engine"
 default-run = "kronos-2t"
 
+[features]
+# Core ML (Neural Engine) prompt prefill on macOS.
+ane = []
+
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+[[bin]]
+name = "hybrid_bench"
+required-features = ["ane"]
