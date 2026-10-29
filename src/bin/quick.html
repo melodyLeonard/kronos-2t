@@ -1283,6 +1283,14 @@ $("q-form").onsubmit = async (e) => {
           p.className = "q-pill";
           p.textContent = `verified · ${j.checks_run} checks`;
           badgeRow.appendChild(p);
+        } else if (j.type === "jev_verification") {
+          if (j.passed || j.rolled_back) {
+            const p = document.createElement("span");
+            p.className = "q-pill";
+            const pct = Math.round((j.score || 0) * 100);
+            p.textContent = j.rolled_back ? `jev ${pct}% · restored` : `jev ${pct}%`;
+            badgeRow.appendChild(p);
+          }
         } else if (j.type === "step_stats") {
           const u = j.usage || {};
           const rate = (u.completion_tokens / Math.max(u.decode_secs || 1e-3, 1e-3)).toFixed(1);

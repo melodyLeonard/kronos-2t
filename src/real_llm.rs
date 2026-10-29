@@ -2842,7 +2842,129 @@ impl RealLlamaEngine {
             self.cfg.num_hidden_layers * layer_params + self.cfg.vocab_size * self.cfg.hidden_size;
         (self.linear_weight_bytes() as f64 * 8.0) / (total_params as f64)
     }
+}
 
+/// Compact snapshot of CPU KV-cache positions `0..len` for non-destructive single-pass scoring.
+pub enum KvPrefixSnapshot {
+    Q8 {
+        len: usize,
+        k_q8: Vec<i8>,
+        v_q8: Vec<i8>,
+        k_scales: Vec<f32>,
+        v_scales: Vec<f32>,
+    },
+    Fp32 {
+        len: usize,
+        k: Vec<f32>,
+        v: Vec<f32>,
+    },
+}
+
+impl RealLlamaEngine {
+    /// Saves the first `n` CPU KV-cache positions (`None` on Metal-backed engines).
+    pub fn save_kv_prefix(&self, n: usize) -> Option<KvPrefixSnapshot> {
+        #[cfg(target_os = "macos")]
+        if self.metal.is_some() {
+            return None;
+        }
+        let len = n.min(self.ws.pos);
+        if let Some(q8) = self.ws.q8_kv.as_ref() {
+            let heads = q8.num_layers * q8.num_kv_heads;
+            let hd = q8.head_dim;
+            let mut k_q8 = vec![0i8; heads * len * hd];
+            let mut v_q8 = vec![0i8; heads * len * hd];
+            let mut k_scales = vec![0.0f32; heads * len];
+            let mut v_scales = vec![0.0f32; heads * len];
+            if len > 0 {
+                for h in 0..heads {
+                    let src = h * q8.cap_seq_len;
+                    let dst = h * len;
+                    k_q8[dst * hd..(dst + len) * hd]
+                        .copy_from_slice(&q8.k_q8[src * hd..(src + len) * hd]);
+                    v_q8[dst * hd..(dst + len) * hd]
+                        .copy_from_slice(&q8.v_q8[src * hd..(src + len) * hd]);
+                    k_scales[dst..dst + len].copy_from_slice(&q8.k_scales[src..src + len]);
+                    v_scales[dst..dst + len].copy_from_slice(&q8.v_scales[src..src + len]);
+                }
+            }
+            Some(KvPrefixSnapshot::Q8 {
+                len,
+                k_q8,
+                v_q8,
+                k_scales,
+                v_scales,
+            })
+        } else {
+            let kvd = self.cfg.kv_dim();
+            let layers = self.layers.len();
+            let mut k = vec![0.0f32; layers * len * kvd];
+            let mut v = vec![0.0f32; layers * len * kvd];
+            if len > 0 && !self.ws.k_cache.is_empty() {
+                let stride = self.cfg.max_seq_len * kvd;
+                for l in 0..layers {
+                    let src = l * stride;
+                    let dst = l * len * kvd;
+                    k[dst..dst + len * kvd].copy_from_slice(&self.ws.k_cache[src..src + len * kvd]);
+                    v[dst..dst + len * kvd].copy_from_slice(&self.ws.v_cache[src..src + len * kvd]);
+                }
+            }
+            Some(KvPrefixSnapshot::Fp32 { len, k, v })
+        }
+    }
+
+    /// Restores a previously saved CPU KV-cache prefix and sets `pos = total_pos`.
+    pub fn restore_kv_prefix(&mut self, snap: &KvPrefixSnapshot, total_pos: usize) {
+        match snap {
+            KvPrefixSnapshot::Q8 {
+                len,
+                k_q8,
+                v_q8,
+                k_scales,
+                v_scales,
+            } => {
+                if let Some(q8) = self.ws.q8_kv.as_mut() {
+                    let len = *len;
+                    if len > 0 {
+                        q8.ensure_seq_capacity(total_pos.max(len), total_pos);
+                        let heads = q8.num_layers * q8.num_kv_heads;
+                        let hd = q8.head_dim;
+                        for h in 0..heads {
+                            let src = h * len;
+                            let dst = h * q8.cap_seq_len;
+                            q8.k_q8[dst * hd..(dst + len) * hd]
+                                .copy_from_slice(&k_q8[src * hd..(src + len) * hd]);
+                            q8.v_q8[dst * hd..(dst + len) * hd]
+                                .copy_from_slice(&v_q8[src * hd..(src + len) * hd]);
+                            q8.k_scales[dst..dst + len]
+                                .copy_from_slice(&k_scales[src..src + len]);
+                            q8.v_scales[dst..dst + len]
+                                .copy_from_slice(&v_scales[src..src + len]);
+                        }
+                    }
+                }
+            }
+            KvPrefixSnapshot::Fp32 { len, k, v } => {
+                let len = *len;
+                if len > 0 {
+                    self.ws.ensure_fp32_kv(&self.cfg);
+                    let kvd = self.cfg.kv_dim();
+                    let stride = self.cfg.max_seq_len * kvd;
+                    for l in 0..self.layers.len() {
+                        let src = l * len * kvd;
+                        let dst = l * stride;
+                        self.ws.k_cache[dst..dst + len * kvd]
+                            .copy_from_slice(&k[src..src + len * kvd]);
+                        self.ws.v_cache[dst..dst + len * kvd]
+                            .copy_from_slice(&v[src..src + len * kvd]);
+                    }
+                }
+            }
+        }
+        self.ws.pos = total_pos.min(self.cfg.max_seq_len);
+    }
+}
+
+impl RealLlamaEngine {
     /// Drops KV-cache entries after the first `n` tokens.
     pub fn truncate_context(&mut self, n: usize) {
         self.ws.pos = self.ws.pos.min(n);

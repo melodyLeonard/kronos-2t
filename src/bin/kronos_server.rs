@@ -756,6 +756,17 @@ fn stream_agent_loop_sse(srv: &Server, stream: &mut TcpStream, spec: StreamTurnS
 
     let mut model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
     let run_res = run_agent_turn(&mut model, &mut history, &tools_json, &cfg, |ev| match ev {
+        AgentEvent::JevDecision { plan } => write_sse(&format!(
+            r#"{{"type":"jev_decision","route":{},"confidence":{:.3},"margin":{:.3},"used_neural":{},"pruned_tools":{},"prefetched_files":{},"rubric_items":{},"elapsed_ms":{:.2}}}"#,
+            quote(plan.route.as_str()),
+            plan.route_choice.confidence,
+            plan.route_choice.margin,
+            plan.route_choice.used_neural,
+            plan.pruned_tool_count,
+            plan.prefetched_files.len(),
+            plan.rubric.len(),
+            plan.elapsed_ms,
+        )),
         AgentEvent::ContextCompacted {
             before_tokens,
             after_tokens,
@@ -858,6 +869,19 @@ fn stream_agent_loop_sse(srv: &Server, stream: &mut TcpStream, spec: StreamTurnS
                 details.join(",")
             ))
         }
+        AgentEvent::JevVerification {
+            step,
+            eval,
+            rolled_back,
+        } => write_sse(&format!(
+            r#"{{"type":"jev_verification","step":{step},"passed":{},"score":{:.3},"confidence":{:.3},"predicates":{},"rolled_back":{},"elapsed_ms":{:.2}}}"#,
+            eval.passed,
+            eval.score.expected,
+            eval.score.confidence,
+            eval.predicates.len(),
+            rolled_back,
+            eval.elapsed_ms,
+        )),
         AgentEvent::Done { .. } => true,
     });
 

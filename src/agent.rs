@@ -89,6 +89,9 @@ pub struct CompactionReport {
 }
 
 pub enum AgentEvent<'a> {
+    JevDecision {
+        plan: &'a crate::jev::JevPrepassPlan,
+    },
     ContextCompacted {
         before_tokens: usize,
         after_tokens: usize,
@@ -128,6 +131,11 @@ pub enum AgentEvent<'a> {
     Verified {
         step: usize,
         report: &'a VerificationReport,
+    },
+    JevVerification {
+        step: usize,
+        eval: &'a crate::jev::JevRubricEvaluation,
+        rolled_back: bool,
     },
     Done {
         steps: usize,
@@ -3135,6 +3143,287 @@ fn verify_web_dom_and_css_semantics(workdir: &Path) -> Result<Option<String>, St
     }
 }
 
+fn extract_relative_js_specifiers(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw_line in src.lines() {
+        let line = raw_line.trim();
+        if line.starts_with("//") || line.starts_with("/*") || line.starts_with('*') {
+            continue;
+        }
+        if (line.starts_with("import ") || line.starts_with("export ")) && line.contains(" from ") {
+            if let Some((_, rhs)) = line.rsplit_once(" from ") {
+                if let Some(spec) = first_quoted_literal(rhs.trim()) {
+                    if spec.starts_with("./") || spec.starts_with("../") {
+                        out.push(spec);
+                    }
+                }
+            }
+        } else if line.starts_with("import ") {
+            if let Some(spec) = first_quoted_literal(line.trim_start_matches("import ").trim()) {
+                if spec.starts_with("./") || spec.starts_with("../") {
+                    out.push(spec);
+                }
+            }
+        }
+        let mut rest = line;
+        while let Some(idx) = rest.find("require(") {
+            let after = &rest[idx + "require(".len()..];
+            if let Some(spec) = first_quoted_literal(after.trim_start()) {
+                if spec.starts_with("./") || spec.starts_with("../") {
+                    out.push(spec);
+                }
+            }
+            rest = after;
+        }
+    }
+    out
+}
+
+fn first_quoted_literal(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let q = *bytes.first()?;
+    if q != b'\'' && q != b'"' {
+        return None;
+    }
+    let mut end = 1usize;
+    while end < bytes.len() {
+        if bytes[end] == b'\\' {
+            end += 2;
+            continue;
+        }
+        if bytes[end] == q {
+            return Some(s[1..end].to_string());
+        }
+        end += 1;
+    }
+    None
+}
+
+fn resolve_relative_module_exists(base_dir: &Path, spec: &str) -> bool {
+    let clean = spec.split(['?', '#']).next().unwrap_or(spec);
+    let candidate = base_dir.join(clean);
+    if candidate.is_file() {
+        return true;
+    }
+    for ext in [".js", ".mjs", ".ts", ".tsx", ".jsx", ".json", ".css"] {
+        let with_ext = PathBuf::from(format!("{}{ext}", candidate.display()));
+        if with_ext.is_file() {
+            return true;
+        }
+    }
+    for idx in ["index.js", "index.mjs", "index.ts", "index.tsx"] {
+        if candidate.join(idx).is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+fn detect_truncation_stub_line(ext: &str, src: &str) -> Option<(usize, String)> {
+    let stub_phrases = [
+        "rest of code",
+        "rest of the code",
+        "rest of implementation",
+        "rest of file",
+        "existing code here",
+        "remaining code here",
+        "omitted for brevity",
+    ];
+    for (idx, raw) in src.lines().enumerate() {
+        let trimmed = raw.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        let is_comment = trimmed.starts_with("//")
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('#')
+            || trimmed.starts_with("<!--");
+        if is_comment && stub_phrases.iter().any(|p| lower.contains(p)) {
+            return Some((idx + 1, truncate_utf8(trimmed, 80)));
+        }
+    }
+    if matches!(ext, "html" | "htm") {
+        let lower = src.to_ascii_lowercase();
+        if let Some(b_start) = lower.find("<body") {
+            if let Some(gt) = lower[b_start..].find('>') {
+                let body_after = &src[b_start + gt + 1..];
+                let body_inner = match lower[b_start + gt + 1..].find("</body>") {
+                    Some(end) => &body_after[..end],
+                    None => body_after,
+                };
+                if body_inner.chars().filter(|c| !c.is_whitespace()).count() < 12 {
+                    return Some((1, "empty <body> placeholder".to_string()));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn verify_local_imports_and_anti_stubs(
+    workdir: &Path,
+    modified_files: &[String],
+) -> Result<Option<String>, String> {
+    let mut issues = Vec::new();
+    let mut checked = 0usize;
+    for rel in modified_files {
+        let Ok(full) = resolve_jailed_path(workdir, rel) else {
+            continue;
+        };
+        if !full.is_file() {
+            continue;
+        }
+        let ext = full
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(
+            ext.as_str(),
+            "js" | "mjs" | "ts" | "tsx" | "jsx" | "rs" | "py" | "html" | "htm" | "css"
+        ) {
+            continue;
+        }
+        let Ok(src) = fs::read_to_string(&full) else {
+            continue;
+        };
+        checked += 1;
+        if let Some((ln, snippet)) = detect_truncation_stub_line(&ext, &src) {
+            issues.push(format!(
+                "`{rel}` line {ln}: incomplete truncation placeholder (`{snippet}`)"
+            ));
+        }
+        let parent = full.parent().unwrap_or(workdir);
+        if matches!(ext.as_str(), "js" | "mjs" | "ts" | "tsx" | "jsx") {
+            for spec in extract_relative_js_specifiers(&src) {
+                if !resolve_relative_module_exists(parent, &spec) {
+                    issues.push(format!(
+                        "`{rel}`: unresolved local module import `{spec}`"
+                    ));
+                }
+            }
+        } else if ext == "rs" {
+            for (idx, raw) in src.lines().enumerate() {
+                let t = raw.trim();
+                let mod_rest = t
+                    .strip_prefix("pub mod ")
+                    .or_else(|| t.strip_prefix("pub(crate) mod "))
+                    .or_else(|| t.strip_prefix("mod "));
+                if let Some(rest) = mod_rest {
+                    if let Some(name) = rest.strip_suffix(';') {
+                        let clean = name.trim();
+                        if !clean.is_empty()
+                            && clean.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            && !parent.join(format!("{clean}.rs")).is_file()
+                            && !parent.join(clean).join("mod.rs").is_file()
+                        {
+                            issues.push(format!(
+                                "`{rel}` line {}: `mod {clean};` has no `{clean}.rs` or `{clean}/mod.rs`",
+                                idx + 1
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !issues.is_empty() {
+        Err(issues.join("\n"))
+    } else if checked > 0 {
+        Ok(Some(format!("imports & completeness ok ({checked} file(s))")))
+    } else {
+        Ok(None)
+    }
+}
+
+fn verify_web_headless_dom_runtime(
+    workdir: &Path,
+    modified_files: &[String],
+) -> Result<Option<String>, String> {
+    let touched_web = modified_files.iter().any(|p| {
+        let l = p.to_ascii_lowercase();
+        l.ends_with(".html") || l.ends_with(".htm") || l.ends_with(".js")
+    });
+    if !touched_web {
+        return Ok(None);
+    }
+    let html_rel = if workdir.join("index.html").is_file() {
+        "index.html".to_string()
+    } else {
+        match list_workspace_files(workdir)
+            .into_iter()
+            .find(|e| e.path.to_ascii_lowercase().ends_with(".html"))
+        {
+            Some(e) => e.path,
+            None => return Ok(None),
+        }
+    };
+
+    let harness = concat!(
+        "const fs=require('fs'),path=require('path'),vm=require('vm');",
+        "const htmlPath=process.argv[1];",
+        "const html=fs.readFileSync(htmlPath,'utf8');",
+        "const base=path.dirname(htmlPath);",
+        "const re=/<script\\b([^>]*)\\bsrc\\s*=\\s*[\"']([^\"']+)[\"'][^>]*>/gi;",
+        "const scripts=[];let m;",
+        "while((m=re.exec(html))!==null){",
+        "const attrs=(m[1]||'').toLowerCase();const src=m[2].split(/[?#]/)[0];",
+        "if(attrs.includes('module')||/^(https?:|\\/\\/)/i.test(src))continue;",
+        "const fp=path.resolve(base,src);",
+        "if(fs.existsSync(fp)&&fs.statSync(fp).isFile())scripts.push([src,fs.readFileSync(fp,'utf8')]);",
+        "}",
+        "if(!scripts.length)process.exit(0);",
+        "function mkEl(){let p;const fn=function(){return p;};",
+        "p=new Proxy(fn,{get(_t,k){",
+        "if(k===Symbol.toPrimitive)return()=>'';",
+        "if(k===Symbol.iterator)return function*(){};",
+        "if(k==='length')return 0;",
+        "if(k==='checked'||k==='disabled')return false;",
+        "if(k==='value'||k==='textContent'||k==='innerHTML'||k==='id'||k==='className')return '';",
+        "if(k==='dataset'||k==='style')return new Proxy({},{get:()=>'',set:()=>true});",
+        "if(k==='classList')return{add(){},remove(){},toggle(){return false;},contains(){return false;}};",
+        "if(k==='getBoundingClientRect')return()=>({width:800,height:600,top:0,left:0,right:800,bottom:600});",
+        "if(k==='querySelectorAll'||k==='getElementsByClassName'||k==='getElementsByTagName'||k==='children')return[];",
+        "return p;},set(){return true;},apply(){return p;}});return p;}",
+        "const rootEl=mkEl();const store=new Map();",
+        "const storage={getItem:k=>store.has(k)?store.get(k):null,setItem:(k,v)=>{store.set(String(k),String(v));},removeItem:k=>store.delete(k),clear:()=>store.clear()};",
+        "const cbs=[];",
+        "const doc=new Proxy({body:rootEl,documentElement:rootEl,head:rootEl,readyState:'complete',",
+        "getElementById:()=>mkEl(),querySelector:()=>mkEl(),querySelectorAll:()=>[],createElement:()=>mkEl(),createTextNode:()=>mkEl(),createDocumentFragment:()=>mkEl(),",
+        "addEventListener:(ev,cb)=>{if(ev==='DOMContentLoaded'&&typeof cb==='function')cbs.push(cb);}},",
+        "{get(t,k){return k in t?t[k]:mkEl();},set(t,k,v){t[k]=v;return true;}});",
+        "const ctx={console:{log(){},warn(){},error(){},info(){}},setTimeout:()=>1,clearTimeout(){},setInterval:()=>1,clearInterval(){},",
+        "requestAnimationFrame:()=>1,cancelAnimationFrame(){},fetch:()=>Promise.resolve({ok:true,json:async()=>({}),text:async()=>''}),",
+        "localStorage:storage,sessionStorage:storage,navigator:{clipboard:{writeText:async()=>{}},userAgent:'KronosCheck'},",
+        "location:{href:'http://127.0.0.1/',pathname:'/',search:'',hash:'',reload(){}},history:{pushState(){},replaceState(){}},",
+        "matchMedia:()=>({matches:false,addEventListener(){},removeEventListener(){}}),",
+        "Event:class{constructor(t){this.type=t;}preventDefault(){}stopPropagation(){}},",
+        "CustomEvent:class{constructor(t,o){this.type=t;this.detail=o&&o.detail;}},",
+        "IntersectionObserver:class{observe(){}unobserve(){}disconnect(){}},",
+        "ResizeObserver:class{observe(){}unobserve(){}disconnect(){}},",
+        "MutationObserver:class{observe(){}disconnect(){}},",
+        "alert(){},confirm:()=>true,prompt:()=>'',document:doc};",
+        "ctx.window=ctx;ctx.globalThis=ctx;ctx.self=ctx;",
+        "const box=vm.createContext(ctx);",
+        "for(const[name,code]of scripts){",
+        "if(/^\\s*(import|export)\\b/m.test(code))continue;",
+        "vm.runInContext(code,box,{filename:name,timeout:600});",
+        "}",
+        "for(const cb of cbs){cb({type:'DOMContentLoaded',target:doc,preventDefault(){}});}"
+    );
+    let cmd = format!(
+        "if command -v node >/dev/null 2>&1; then node -e {} {}; fi",
+        shell_single_quote(harness),
+        shell_single_quote(&html_rel)
+    );
+    let out = run_shell_command_with_timeout(workdir, &cmd, 5, 9500);
+    if !out.starts_with("exit_code=0") {
+        Err(format!(
+            "`{html_rel}` headless DOM runtime smoke test failed:\n{out}"
+        ))
+    } else {
+        Ok(Some(format!("headless DOM runtime ok ({html_rel})")))
+    }
+}
+
 /// Runs post-edit structural, cross-file DOM/CSS, and runtime compiler smoke checks on the workspace.
 pub fn verify_workspace_work(
     workdir: &Path,
@@ -3147,6 +3436,12 @@ pub fn verify_workspace_work(
 
     match validate_workspace(workdir) {
         Ok(()) => details.push("syntax & local asset integrity ok".to_string()),
+        Err(e) => errors.push(e),
+    }
+
+    match verify_local_imports_and_anti_stubs(workdir, modified_files) {
+        Ok(Some(note)) => details.push(note),
+        Ok(None) => {}
         Err(e) => errors.push(e),
     }
 
@@ -3207,6 +3502,13 @@ pub fn verify_workspace_work(
     if js_checked > 0 {
         details.push(format!("V8 `node --check` passed ({js_checked} file(s))"));
     }
+    if errors.is_empty() {
+        match verify_web_headless_dom_runtime(workdir, modified_files) {
+            Ok(Some(note)) => details.push(note),
+            Ok(None) => {}
+            Err(e) => errors.push(e),
+        }
+    }
     if py_checked > 0 {
         details.push(format!("`python3 -m py_compile` passed ({py_checked} file(s))"));
     }
@@ -3244,7 +3546,77 @@ pub fn verify_workspace_work(
         elapsed_ms,
     })
 }
-/// Runs an iterative tool-calling and post-work verification repair loop while preserving the KV-cache prefix.
+
+#[derive(Clone, Debug)]
+struct WorkspaceCheckpoint {
+    workdir: PathBuf,
+    entries: Vec<(PathBuf, Option<Vec<u8>>)>,
+    oracle_ok: bool,
+    score: f32,
+}
+
+impl WorkspaceCheckpoint {
+    fn capture(
+        workdir: &Path,
+        tracked_rel_paths: &[String],
+        oracle_ok: bool,
+        score: f32,
+    ) -> Self {
+        let mut entries = Vec::with_capacity(tracked_rel_paths.len());
+        for rel in tracked_rel_paths {
+            if let Ok(full) = resolve_jailed_path(workdir, rel) {
+                let data = if full.is_file() {
+                    fs::read(&full).ok()
+                } else {
+                    None
+                };
+                entries.push((full, data));
+            }
+        }
+        Self {
+            workdir: workdir.to_path_buf(),
+            entries,
+            oracle_ok,
+            score,
+        }
+    }
+
+    fn restore(&self) {
+        for (full, maybe_bytes) in &self.entries {
+            match maybe_bytes {
+                Some(bytes) => {
+                    if let Some(parent) = full.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::write(full, bytes);
+                }
+                None => {
+                    if full.is_file() {
+                        let _ = fs::remove_file(full);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn strip_injected_prompt_headers(user_content: &str) -> &str {
+    let mut cur = user_content.trim();
+    for marker in [
+        "[Device Context",
+        "[Workspace Context Snapshot",
+        "[Attached ",
+    ] {
+        if cur.starts_with(marker) {
+            if let Some(idx) = cur.find("\n\n") {
+                cur = cur[idx + 2..].trim();
+            }
+        }
+    }
+    cur
+}
+
+/// Runs an iterative tool-calling and Jev-verified monotonic repair loop while preserving the KV-cache prefix.
 pub fn run_agent_turn(
     model: &mut ChatModel,
     history: &mut Vec<Message>,
@@ -3257,16 +3629,75 @@ pub fn run_agent_turn(
         let sys_prompt = build_initial_system_prompt(&active_workdir);
         history.insert(0, Message::new("system", &sys_prompt));
     }
+    let sys_prompt_snapshot = history
+        .first()
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    let raw_last_user = history
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    let clean_user_goal = strip_injected_prompt_headers(&raw_last_user).to_string();
+    let recent_has_prefetch = raw_last_user.contains("[Workspace Context Snapshot");
+    let history_used_tools = history
+        .iter()
+        .any(|m| m.role == "tool" || !m.tool_calls.is_empty());
+    let has_images = raw_last_user.contains("[Image Attachment")
+        || raw_last_user.contains(".kronos_media/");
+    let allow_computer = crate::device::global_device_manager()
+        .current_config()
+        .allow_computer_control;
+    let forced_route = if tools_json.is_empty() {
+        Some(TurnRoute::Chat)
+    } else if tools_json.len() == 1 && tools_json[0].contains("\"use_computer\"") {
+        Some(TurnRoute::Computer)
+    } else if cfg.expect_tool_call {
+        Some(TurnRoute::Agent)
+    } else {
+        None
+    };
+
+    let jev_plan = crate::jev::plan_turn_with_jev(
+        Some(model),
+        &sys_prompt_snapshot,
+        &clean_user_goal,
+        forced_route,
+        has_images,
+        &active_workdir,
+        history_used_tools,
+        tools_json,
+        allow_computer,
+        recent_has_prefetch,
+    );
+    if !on_event(AgentEvent::JevDecision { plan: &jev_plan }) {
+        return Err("cancelled".to_string());
+    }
+    if let Some(ref block) = jev_plan.prefetch_block {
+        if let Some(last_u) = history.iter_mut().rev().find(|m| m.role == "user") {
+            last_u.content = format!("{block}\n\n{}", last_u.content);
+        }
+    }
+    let active_tools: &[String] = if tools_json.is_empty() {
+        tools_json
+    } else {
+        &jev_plan.active_tools_json
+    };
+
     let t_start = Instant::now();
     let mut touched_files = false;
     let mut used_any_tools = false;
     let mut repair_attempts = 0usize;
+    let max_repairs = 3usize;
     let mut unresolved_edits: Vec<(String, String)> = Vec::new();
     let mut modified_files: Vec<String> = Vec::new();
+    let mut tracked_files: Vec<String> = Vec::new();
+    let mut best_checkpoint: Option<WorkspaceCheckpoint> = None;
 
     for step in 1..=cfg.max_steps {
         let comp_rep =
-            compact_conversation_history(model, history, tools_json, &active_workdir, false);
+            compact_conversation_history(model, history, active_tools, &active_workdir, false);
         if comp_rep.compacted
             && !on_event(AgentEvent::ContextCompacted {
                 before_tokens: comp_rep.before_tokens,
@@ -3288,7 +3719,7 @@ pub fn run_agent_turn(
         let mut alive = true;
         let mut last_prog_bytes = 0usize;
         let mut last_prog_target = String::new();
-        let mut comp = model.generate_with_tools(history, tools_json, &cfg.params, |piece| {
+        let mut comp = model.generate_with_tools(history, active_tools, &cfg.params, |piece| {
             alive = filter.push(piece, |prose| on_event(AgentEvent::TextDelta(prose)));
             if alive {
                 if let Some((t_name, t_target, bytes)) = filter.active_tool_progress() {
@@ -3321,7 +3752,8 @@ pub fn run_agent_turn(
 
         if comp.tool_calls.is_empty() {
             history.push(Message::new("assistant", &comp.text));
-            if !unresolved_edits.is_empty() && repair_attempts < 2 && step < cfg.max_steps {
+            if !unresolved_edits.is_empty() && repair_attempts < max_repairs && step < cfg.max_steps
+            {
                 repair_attempts += 1;
                 let report = unresolved_edits
                     .iter()
@@ -3349,41 +3781,142 @@ pub fn run_agent_turn(
                 ));
                 continue;
             }
+
+            let oracle_res = if touched_files {
+                Some(verify_workspace_work(
+                    &active_workdir,
+                    &modified_files,
+                    cfg.cmd_timeout_secs,
+                ))
+            } else {
+                None
+            };
+            if let Some(Ok(ref v_rep)) = oracle_res {
+                let _ = on_event(AgentEvent::Verified {
+                    step,
+                    report: v_rep,
+                });
+            }
+            let oracle_err = oracle_res
+                .as_ref()
+                .and_then(|r| r.as_ref().err().map(String::as_str));
+
+            let jev_eval = crate::jev::evaluate_rubric(
+                Some(model),
+                &clean_user_goal,
+                &jev_plan.rubric,
+                &active_workdir,
+                &modified_files,
+                used_any_tools,
+                oracle_err,
+                &comp.text,
+            );
+
+            let cur_oracle_ok = oracle_err.is_none();
             if touched_files {
-                match verify_workspace_work(&active_workdir, &modified_files, cfg.cmd_timeout_secs) {
-                    Ok(v_rep) => {
-                        let _ = on_event(AgentEvent::Verified {
-                            step,
-                            report: &v_rep,
-                        });
+                let is_new_high_water = match best_checkpoint.as_ref() {
+                    None => true,
+                    Some(prev) if prev.workdir != active_workdir => true,
+                    Some(prev) => {
+                        (cur_oracle_ok && !prev.oracle_ok)
+                            || (cur_oracle_ok == prev.oracle_ok
+                                && jev_eval.score.expected >= prev.score - 0.01)
                     }
-                    Err(report) if repair_attempts < 2 && step < cfg.max_steps => {
-                        repair_attempts += 1;
-                        if !on_event(AgentEvent::ValidationRepair {
-                            step,
-                            report: &report,
-                        }) {
-                            return Err("cancelled".to_string());
-                        }
-                        history.push(Message::new(
-                            "user",
-                            &format!(
-                                "Post-edit verification failed:\n{report}\nFix every reported issue using `edit_file` or `write_file` before finishing."
-                            ),
-                        ));
-                        continue;
-                    }
-                    Err(_) => {}
+                };
+                if is_new_high_water {
+                    best_checkpoint = Some(WorkspaceCheckpoint::capture(
+                        &active_workdir,
+                        &tracked_files,
+                        cur_oracle_ok,
+                        jev_eval.score.expected,
+                    ));
                 }
             }
-            if cfg.expect_tool_call && !used_any_tools && repair_attempts < 2 && step < cfg.max_steps {
+
+            let needs_tool_kick = cfg.expect_tool_call && !used_any_tools;
+            if (!jev_eval.passed || needs_tool_kick)
+                && !active_tools.is_empty()
+                && repair_attempts < max_repairs
+                && step < cfg.max_steps
+            {
+                let mut rolled_back = false;
+                if let Some(ref prev) = best_checkpoint {
+                    if prev.workdir == active_workdir
+                        && prev.oracle_ok
+                        && !cur_oracle_ok
+                        && jev_eval.score.expected + 0.08 < prev.score
+                    {
+                        prev.restore();
+                        rolled_back = true;
+                    }
+                }
+                if (!jev_plan.rubric.is_empty() || jev_eval.ungrounded_claim)
+                    && !on_event(AgentEvent::JevVerification {
+                        step,
+                        eval: &jev_eval,
+                        rolled_back,
+                    })
+                {
+                    return Err("cancelled".to_string());
+                }
                 repair_attempts += 1;
+                if needs_tool_kick && !used_any_tools {
+                    let report = if jev_eval.unmet_summary.is_empty() {
+                        "requested tool action has not been executed yet"
+                    } else {
+                        jev_eval.unmet_summary.as_str()
+                    };
+                    if !on_event(AgentEvent::ValidationRepair { step, report }) {
+                        return Err("cancelled".to_string());
+                    }
+                    history.push(Message::new(
+                        "user",
+                        "No tool call was emitted yet, so the requested action has not run. Emit a <tool_call> now (using `use_computer` for macOS app or file actions, or `switch_workspace`/`write_file`/`edit_file`/`read_file`/`list_dir`/`run_command` for workspace actions) before replying.",
+                    ));
+                    continue;
+                }
+
+                let repair_report = if let Some(err) = oracle_err {
+                    err.to_string()
+                } else {
+                    jev_eval.unmet_summary.clone()
+                };
+                if !on_event(AgentEvent::ValidationRepair {
+                    step,
+                    report: &repair_report,
+                }) {
+                    return Err("cancelled".to_string());
+                }
+                let rollback_note = if rolled_back {
+                    "The last breaking edit was rolled back to the previous verified checkpoint. "
+                } else {
+                    ""
+                };
                 history.push(Message::new(
                     "user",
-                    "No tool call was emitted yet, so the requested action has not run. Emit a <tool_call> now (using `use_computer` for macOS app or file actions, or `switch_workspace`/`write_file`/`edit_file`/`read_file`/`list_dir`/`run_command` for workspace actions) before replying.",
+                    &format!(
+                        "{rollback_note}Verification found unmet requirements:\n{}\nApply a targeted fix using `edit_file` or `write_file` now before finishing.",
+                        jev_eval.unmet_summary
+                    ),
                 ));
                 continue;
             }
+
+            let mut final_rolled_back = false;
+            if let Some(ref prev) = best_checkpoint {
+                if prev.workdir == active_workdir && prev.oracle_ok && !cur_oracle_ok {
+                    prev.restore();
+                    final_rolled_back = true;
+                }
+            }
+            if !jev_plan.rubric.is_empty() || !jev_eval.passed {
+                let _ = on_event(AgentEvent::JevVerification {
+                    step,
+                    eval: &jev_eval,
+                    rolled_back: final_rolled_back,
+                });
+            }
+
             let secs = t_start.elapsed().as_secs_f64();
             let _ = on_event(AgentEvent::Done {
                 steps: step,
@@ -3404,6 +3937,14 @@ pub fn run_agent_turn(
             let is_file_mutation = matches!(tc.name.as_str(), "write_file" | "edit_file");
             if is_file_mutation {
                 touched_files = true;
+                if let Some(raw_p) = Json::parse(&tc.arguments)
+                    .ok()
+                    .and_then(|j| j.get("path").and_then(Json::as_str).map(str::to_string))
+                {
+                    if !raw_p.is_empty() && !tracked_files.iter().any(|p| p == &raw_p) {
+                        tracked_files.push(raw_p);
+                    }
+                }
             }
             if !on_event(AgentEvent::ToolStart { step, call: tc }) {
                 return Err("cancelled".to_string());
@@ -3413,6 +3954,8 @@ pub fn run_agent_turn(
                 active_workdir.clone_from(next_dir);
                 touched_files = false;
                 modified_files.clear();
+                tracked_files.clear();
+                best_checkpoint = None;
                 unresolved_edits.clear();
                 if !on_event(AgentEvent::WorkspaceChanged {
                     workdir: &active_workdir,
@@ -3429,6 +3972,9 @@ pub fn run_agent_turn(
                     .diff
                     .as_ref()
                     .map_or_else(|| raw_target.clone(), |d| d.path.clone());
+                if !target_path.is_empty() && !tracked_files.iter().any(|p| p == &target_path) {
+                    tracked_files.push(target_path.clone());
+                }
                 if outcome.ok {
                     unresolved_edits.retain(|(p, _)| p != &target_path && p != &raw_target);
                     if !target_path.is_empty() && !modified_files.iter().any(|p| p == &target_path) {
@@ -3456,6 +4002,16 @@ pub fn run_agent_turn(
                 return Err("cancelled".to_string());
             }
             history.push(Message::tool_result(&tc.id, &outcome.output));
+        }
+    }
+
+    if let Some(ref prev) = best_checkpoint {
+        if prev.workdir == active_workdir
+            && prev.oracle_ok
+            && verify_workspace_work(&active_workdir, &modified_files, cfg.cmd_timeout_secs)
+                .is_err()
+        {
+            prev.restore();
         }
     }
 
@@ -3981,6 +4537,72 @@ mod tests {
         );
         assert!(wrote_in_new.ok);
         assert_eq!(wrote_in_new.diff.unwrap().path, "index.html");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_zero_hallucination_imports_stubs_dom_runtime_and_checkpoint_rollback() {
+        let dir = std::env::temp_dir().join(format!("kronos_jev_oracle_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(
+            dir.join("index.html"),
+            "<!doctype html><html><head><title>App</title><script src=\"app.js\"></script></head><body><h1 id=\"hdr\">Dashboard</h1></body></html>",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("app.js"),
+            "const titleEl = document.getElementById('hdr');\n",
+        )
+        .unwrap();
+        let tracked = vec!["index.html".to_string(), "app.js".to_string()];
+        assert!(verify_workspace_work(&dir, &tracked, 5).is_ok());
+
+        let clean_cp = WorkspaceCheckpoint::capture(&dir, &tracked, true, 0.94);
+
+        // 1. Truncation stub comment must fail deterministic verification.
+        fs::write(
+            dir.join("app.js"),
+            "// ... rest of code omitted for brevity\n",
+        )
+        .unwrap();
+        let stub_err = verify_workspace_work(&dir, &tracked, 5).unwrap_err();
+        assert!(stub_err.contains("truncation placeholder"), "got: {stub_err}");
+
+        // 2. Unresolved local module import must fail deterministic verification.
+        fs::write(
+            dir.join("module.mjs"),
+            "import { missingFn } from './nonexistent_helper.mjs';\nexport const x = missingFn;\n",
+        )
+        .unwrap();
+        let imp_err =
+            verify_workspace_work(&dir, &["module.mjs".to_string()], 5).unwrap_err();
+        assert!(imp_err.contains("unresolved local module import"), "got: {imp_err}");
+        let _ = fs::remove_file(dir.join("module.mjs"));
+
+        // 3. Top-level ReferenceError in classic script must be caught by headless DOM runtime check when node is installed.
+        fs::write(
+            dir.join("app.js"),
+            "document.addEventListener('DOMContentLoaded', () => { callUndefinedStartupHelper(); });\n",
+        )
+        .unwrap();
+        if Command::new("sh")
+            .args(["-c", "command -v node >/dev/null 2>&1"])
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            let dom_err = verify_workspace_work(&dir, &tracked, 5).unwrap_err();
+            assert!(
+                dom_err.contains("callUndefinedStartupHelper"),
+                "expected ReferenceError caught, got: {dom_err}"
+            );
+        }
+
+        // 4. Checkpoint rollback restores verified workspace state cleanly.
+        clean_cp.restore();
+        assert!(verify_workspace_work(&dir, &tracked, 5).is_ok());
 
         let _ = fs::remove_dir_all(&dir);
     }

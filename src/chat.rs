@@ -526,6 +526,160 @@ impl ChatModel {
         self.render_with_tools(messages, tools_json).len()
     }
 
+    /// Returns true if the target KV cache already holds the exact `system + tools` prefix.
+    pub fn has_hot_prefix(&self, system_prompt: &str, tools_json: &[String]) -> bool {
+        let full = render_chatml_prompt(&[Message::new("system", system_prompt)], tools_json, "");
+        let prefix_str = full.strip_suffix("assistant\n").unwrap_or(&full);
+        let tokens = self.tok.encode(prefix_str);
+        !tokens.is_empty()
+            && self.cached.len() >= tokens.len()
+            && self.cached[..tokens.len()] == tokens[..]
+    }
+
+    /// Evaluates first-token log-probabilities for `anchors` in a single forward pass (`0` decode tokens)
+    /// while preserving both target and draft KV caches. Returns `(anchor_logprobs, captured_mass)`.
+    pub fn jev_score_anchors(
+        &mut self,
+        system_hint: &str,
+        user_query: &str,
+        anchors: &[&str],
+    ) -> Option<(Vec<f32>, f32)> {
+        if anchors.len() < 2 {
+            return None;
+        }
+        let prompt_str = render_chatml_prompt(
+            &[
+                Message::new("system", system_hint),
+                Message::new("user", user_query),
+            ],
+            &[],
+            "",
+        );
+        let raw_tokens = self.tok.encode(&prompt_str);
+        if raw_tokens.is_empty() || raw_tokens.len() > 768 || raw_tokens.len() >= self.ctx {
+            return None;
+        }
+
+        let vocab_cap = if let Some(d) = self.draft.as_ref() {
+            d.draft_vocab
+        } else {
+            self.engine.cfg.vocab_size
+        };
+
+        let mut candidate_sets: Vec<Vec<usize>> = Vec::with_capacity(anchors.len());
+        for &a in anchors {
+            let trimmed = a.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            let variants = [
+                trimmed.to_string(),
+                format!(" {trimmed}"),
+                lower.clone(),
+                format!(" {lower}"),
+            ];
+            let mut ids = Vec::with_capacity(4);
+            for v in &variants {
+                let enc = self.tok.encode(v);
+                if enc.len() == 1 && enc[0] < vocab_cap && !ids.contains(&enc[0]) {
+                    ids.push(enc[0]);
+                }
+            }
+            if ids.is_empty() {
+                for v in &variants {
+                    let enc = self.tok.encode(v);
+                    if let Some(&first) = enc.first() {
+                        if first < vocab_cap && !ids.contains(&first) {
+                            ids.push(first);
+                        }
+                    }
+                }
+            }
+            candidate_sets.push(ids);
+        }
+
+        // Remove any token ID shared between two distinct anchors so anchor sets stay disjoint.
+        let mut unique_sets: Vec<Vec<usize>> = Vec::with_capacity(anchors.len());
+        for (idx, set) in candidate_sets.iter().enumerate() {
+            let filtered: Vec<usize> = set
+                .iter()
+                .copied()
+                .filter(|id| {
+                    !candidate_sets
+                        .iter()
+                        .enumerate()
+                        .any(|(other_idx, other)| other_idx != idx && other.contains(id))
+                })
+                .collect();
+            if filtered.is_empty() {
+                return None;
+            }
+            unique_sets.push(filtered);
+        }
+
+        let score_logits = |logits: &[f32]| -> (Vec<f32>, f32) {
+            let mut max_z = f32::NEG_INFINITY;
+            for &z in logits {
+                if z > max_z {
+                    max_z = z;
+                }
+            }
+            let mut sum_exp = 0.0f64;
+            for &z in logits {
+                sum_exp += ((z - max_z) as f64).exp();
+            }
+            let log_z = (max_z as f64) + sum_exp.ln();
+            let mut out = Vec::with_capacity(unique_sets.len());
+            let mut mass = 0.0f64;
+            for set in &unique_sets {
+                let mut anchor_exp = 0.0f64;
+                for &id in set {
+                    if let Some(&z) = logits.get(id) {
+                        anchor_exp += ((z as f64) - log_z).exp();
+                    }
+                }
+                let p = anchor_exp.clamp(1e-12, 1.0);
+                mass += p;
+                out.push(p.ln() as f32);
+            }
+            (out, mass.clamp(0.0, 1.0) as f32)
+        };
+
+        let metal_active = self.engine.is_metal_enabled();
+        if let Some(d) = self.draft.as_mut() {
+            let dv = d.draft_vocab;
+            let mapped: Vec<usize> = raw_tokens
+                .iter()
+                .map(|&id| if id < dv { id } else { 0 })
+                .collect();
+            let saved_total = d.cached.len();
+            let overlap = saved_total.min(mapped.len());
+            let snap = d.engine.save_kv_prefix(overlap)?;
+            d.engine.reset_context();
+            let res = {
+                let logits = d.engine.forward_prompt(&mapped);
+                score_logits(logits)
+            };
+            d.engine.restore_kv_prefix(&snap, saved_total);
+            if metal_active {
+                crate::thread_pool::SpinThreadPool::park_idle_workers();
+            }
+            return Some(res);
+        }
+
+        let saved_total = self.cached.len();
+        let overlap = saved_total.min(raw_tokens.len());
+        let snap = self.engine.save_kv_prefix(overlap)?;
+        self.engine.reset_context();
+        let res = {
+            let logits = self.engine.forward_prompt(&raw_tokens);
+            score_logits(logits)
+        };
+        self.engine.restore_kv_prefix(&snap, saved_total);
+        Some(res)
+    }
+
     /// Pre-warms the fixed system + tool-schema prefix into target and draft KV caches.
     pub fn prewarm_prefix(&mut self, system_prompt: &str, tools_json: &[String]) -> usize {
         let full = render_chatml_prompt(&[Message::new("system", system_prompt)], tools_json, "");

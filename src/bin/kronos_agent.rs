@@ -153,6 +153,19 @@ fn run_agent_goal(
             let mut printed_prose = false;
             run_agent_turn(model, history, tools_json, &turn_cfg, |ev| {
                 match ev {
+                    AgentEvent::JevDecision { plan } => {
+                        if !plan.prefetched_files.is_empty() || plan.pruned_tool_count > 0 {
+                            eprintln!(
+                                "  [jev pre-pass {:.2} ms: route={} conf={:.2} prefetched={} pruned_tools={} rubric={}]",
+                                plan.elapsed_ms,
+                                plan.route.as_str(),
+                                plan.route_choice.confidence,
+                                plan.prefetched_files.len(),
+                                plan.pruned_tool_count,
+                                plan.rubric.len()
+                            );
+                        }
+                    }
                     AgentEvent::ContextCompacted {
                         before_tokens,
                         after_tokens,
@@ -216,6 +229,17 @@ fn run_agent_goal(
                         eprintln!(
                             "  [step {step} verified in {:.1} ms: {}]",
                             report.elapsed_ms, report.summary
+                        );
+                    }
+                    AgentEvent::JevVerification {
+                        step,
+                        eval,
+                        rolled_back,
+                    } => {
+                        let rb = if rolled_back { " · rolled_back" } else { "" };
+                        eprintln!(
+                            "  [step {step} jev rubric {:.1} ms: score={:.2} passed={}{rb}]",
+                            eval.elapsed_ms, eval.score.expected, eval.passed
                         );
                     }
                     AgentEvent::Done { steps, total_secs, .. } => {

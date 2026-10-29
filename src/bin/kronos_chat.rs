@@ -258,6 +258,17 @@ fn main() {
             let mut next_workdir: Option<PathBuf> = None;
             let res = run_agent_turn(&mut model, &mut history, &tools_json, &cfg, |ev| {
                 match ev {
+                    AgentEvent::JevDecision { plan } => {
+                        if !plan.prefetched_files.is_empty() || plan.pruned_tool_count > 0 {
+                            println!(
+                                "[jev {:.2} ms · conf {:.2} · prefetched {} file(s) · pruned {} tool(s)]",
+                                plan.elapsed_ms,
+                                plan.route_choice.confidence,
+                                plan.prefetched_files.len(),
+                                plan.pruned_tool_count
+                            );
+                        }
+                    }
                     AgentEvent::ContextCompacted {
                         before_tokens,
                         after_tokens,
@@ -321,6 +332,17 @@ fn main() {
                         println!(
                             "  [step {step} verified in {:.1} ms: {}]",
                             report.elapsed_ms, report.summary
+                        );
+                    }
+                    AgentEvent::JevVerification {
+                        step,
+                        eval,
+                        rolled_back,
+                    } => {
+                        let rb = if rolled_back { " · rolled_back" } else { "" };
+                        println!(
+                            "  [step {step} jev score {:.2} ({:.1} ms, passed={}){rb}]",
+                            eval.score.expected, eval.elapsed_ms, eval.passed
                         );
                     }
                     AgentEvent::Done { steps, total_secs, .. } => {

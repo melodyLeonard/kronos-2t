@@ -2454,6 +2454,24 @@ async function runUnifiedTurn(text, attachedItems) {
           vp.className = "pill ok";
           vp.textContent = `verified · ${j.checks_run || 1} checks`;
           headRow.appendChild(vp);
+        } else if (j.type === "jev_decision") {
+          if ((j.prefetched_files || 0) > 0 || (j.pruned_tools || 0) > 0) {
+            const jp = document.createElement("span");
+            jp.className = "pill";
+            const parts = [];
+            if (j.prefetched_files > 0) parts.push(`${j.prefetched_files} ctx`);
+            if (j.pruned_tools > 0) parts.push(`-${j.pruned_tools} tools`);
+            jp.textContent = `jev · ${parts.join(" · ")}`;
+            headRow.appendChild(jp);
+          }
+        } else if (j.type === "jev_verification") {
+          if (j.passed || j.rolled_back) {
+            const jp = document.createElement("span");
+            jp.className = j.passed ? "pill ok" : "pill";
+            const pct = Math.round((j.score || 0) * 100);
+            jp.textContent = j.rolled_back ? `jev ${pct}% · restored` : `jev ${pct}%`;
+            headRow.appendChild(jp);
+          }
         } else if (j.type === "done") {
           gotDone = true;
           if (Array.isArray(j.messages)) sessionHistory = j.messages;

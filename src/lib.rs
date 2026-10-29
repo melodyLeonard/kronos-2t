@@ -34,6 +34,7 @@ pub mod demo_model;
 pub mod device;
 pub mod engine;
 pub mod hadamard;
+pub mod jev;
 pub mod json;
 pub mod k2t_format;
 pub mod lut_gemv;
