@@ -2,11 +2,15 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+#[cfg(target_os = "macos")]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(target_os = "macos")]
 use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::device::{global_device_manager, split_camel_case_parts};
 use crate::json::quote;
@@ -31,26 +35,259 @@ pub struct PreparedWav {
 static SPEECH_WARMED: AtomicBool = AtomicBool::new(false);
 static SPEECH_REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
-// SFSpeechRecognizer triggers a TCC crash when the parent host bundle lacks NSSpeechRecognitionUsageDescription;
-// SpeechAnalyzer + SpeechTranscriber runs offline on the Neural Engine without that TCC gate.
+// Packaged as a LaunchServices `.app` bundle (`KronosVoice.app`) so macOS TCC attributes microphone access
+// directly to Kronos rather than inheriting a parent terminal or IDE host process's TCC state, and so
+// WKWebView (which does not expose `navigator.mediaDevices` on macOS) and browser tabs share identical
+// low-latency native hardware microphone capture and Neural Engine SpeechAnalyzer transcription.
 #[cfg(target_os = "macos")]
 const SWIFT_SPEECH_WORKER_SRC: &str = r#"import Foundation
+import AppKit
 import Speech
 import AVFoundation
+import Darwin
+
+final class RecorderController: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorder: AVAudioRecorder? = nil
+    private var activePath: String? = nil
+    private var autoStoppedPath: String? = nil
+    private var autoStoppedElapsedMs: Int = 0
+    private var startedAt: TimeInterval = 0
+    private var lastVoiceAt: TimeInterval = 0
+    private var speechAccumMs: Double = 0
+    private var heardSpeech: Bool = false
+    private var currentLevel: Double = 0
+    private var sessionSeq: UInt64 = 0
+    private var meterTimer: DispatchSourceTimer? = nil
+
+    func startRecording() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        meterTimer?.cancel()
+        meterTimer = nil
+        if let r = recorder {
+            r.stop()
+            recorder = nil
+        }
+        if let old = activePath {
+            try? FileManager.default.removeItem(atPath: old)
+            activePath = nil
+        }
+        if let oldAuto = autoStoppedPath {
+            try? FileManager.default.removeItem(atPath: oldAuto)
+            autoStoppedPath = nil
+        }
+
+        sessionSeq &+= 1
+        let mySeq = sessionSeq
+        let wavPath = NSTemporaryDirectory() + "kronos_mic_\(Darwin.getpid())_\(mySeq).wav"
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatLinearPCM),
+            AVSampleRateKey: 16000.0,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false
+        ]
+        let rec: AVAudioRecorder
+        do {
+            rec = try AVAudioRecorder(url: URL(fileURLWithPath: wavPath), settings: settings)
+        } catch {
+            return "AVAudioRecorder init failed: \(error.localizedDescription)"
+        }
+        rec.isMeteringEnabled = true
+        guard rec.prepareToRecord(), rec.record() else {
+            try? FileManager.default.removeItem(atPath: wavPath)
+            return "Unable to start macOS microphone capture"
+        }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        recorder = rec
+        activePath = wavPath
+        autoStoppedPath = nil
+        autoStoppedElapsedMs = 0
+        startedAt = now
+        lastVoiceAt = now
+        speechAccumMs = 0
+        heardSpeech = false
+        currentLevel = 0
+
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInteractive))
+        timer.schedule(deadline: .now() + .milliseconds(60), repeating: .milliseconds(60))
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            guard self.sessionSeq == mySeq, let r = self.recorder, r.isRecording else { return }
+            r.updateMeters()
+            let avgDb = Double(r.averagePower(forChannel: 0))
+            let peakDb = Double(r.peakPower(forChannel: 0))
+            let norm = min(1.0, max(0.0, (peakDb + 50.0) / 45.0))
+            self.currentLevel = norm
+            let t = ProcessInfo.processInfo.systemUptime
+            if peakDb > -32.0 || avgDb > -37.0 {
+                self.speechAccumMs += 60.0
+                self.lastVoiceAt = t
+                if self.speechAccumMs >= 180.0 {
+                    self.heardSpeech = true
+                }
+            }
+            let elapsed = t - self.startedAt
+            if (self.heardSpeech && (t - self.lastVoiceAt) >= 1.35 && elapsed >= 0.90) || elapsed >= 45.0 {
+                r.stop()
+                self.recorder = nil
+                self.meterTimer?.cancel()
+                self.meterTimer = nil
+                self.autoStoppedPath = self.activePath
+                self.activePath = nil
+                self.autoStoppedElapsedMs = Int(elapsed * 1000.0)
+            }
+        }
+        timer.resume()
+        meterTimer = timer
+        return nil
+    }
+
+    func pollStatus() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        if let readyPath = autoStoppedPath {
+            let ms = autoStoppedElapsedMs
+            autoStoppedPath = nil
+            autoStoppedElapsedMs = 0
+            return "WAV_READY\t\(readyPath)\t\(ms)"
+        }
+        if let r = recorder, r.isRecording {
+            let elapsedMs = Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000.0)
+            let hs = heardSpeech ? 1 : 0
+            return String(format: "RECORDING\t%d\t%.3f\t%d", elapsedMs, currentLevel, hs)
+        }
+        return "IDLE"
+    }
+
+    func stopRecording(cancel: Bool) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        sessionSeq &+= 1
+        meterTimer?.cancel()
+        meterTimer = nil
+        if let r = recorder {
+            let elapsedMs = Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000.0)
+            r.stop()
+            recorder = nil
+            let path = activePath
+            activePath = nil
+            if cancel {
+                if let p = path { try? FileManager.default.removeItem(atPath: p) }
+                return "CANCELLED"
+            } else if let p = path {
+                return "WAV_READY\t\(p)\t\(elapsedMs)"
+            }
+        }
+        if let readyPath = autoStoppedPath {
+            let ms = autoStoppedElapsedMs
+            autoStoppedPath = nil
+            autoStoppedElapsedMs = 0
+            if cancel {
+                try? FileManager.default.removeItem(atPath: readyPath)
+                return "CANCELLED"
+            } else {
+                return "WAV_READY\t\(readyPath)\t\(ms)"
+            }
+        }
+        return cancel ? "CANCELLED" : "IDLE"
+    }
+}
 
 @main
 struct KronosSpeechWorker {
-    static func emit(_ line: String) {
-        if let data = (line + "\n").data(using: .utf8) {
-            FileHandle.standardOutput.write(data)
-        }
-    }
+    static let recorderCtrl = RecorderController()
 
     static func sanitize(_ s: String) -> String {
         s.replacingOccurrences(of: "\r", with: " ")
          .replacingOccurrences(of: "\n", with: " ")
          .replacingOccurrences(of: "\t", with: " ")
          .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func bundleHashTag() -> String {
+        if let url = Bundle.main.url(forResource: "src_hash", withExtension: "txt"),
+           let txt = try? String(contentsOf: url, encoding: .utf8) {
+            return sanitize(txt)
+        }
+        return "unknown"
+    }
+
+    static func defaultSocketPath() -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let dir = home + "/.kronos"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let candidate = dir + "/voice.sock"
+        if candidate.utf8.count < 96 {
+            return candidate
+        }
+        return "/tmp/kronos_voice.sock"
+    }
+
+    static func bindUnixSocket(_ path: String) -> Int32 {
+        unlink(path)
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        if fd < 0 { return -1 }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let utf8 = Array(path.utf8CString)
+        let maxLen = MemoryLayout.size(ofValue: addr.sun_path)
+        if utf8.count > maxLen {
+            Darwin.close(fd)
+            return -1
+        }
+        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+            ptr.withMemoryRebound(to: CChar.self, capacity: maxLen) { dst in
+                for i in 0..<utf8.count { dst[i] = utf8[i] }
+            }
+        }
+        let bindRes = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.bind(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        if bindRes != 0 || Darwin.listen(fd, 24) != 0 {
+            Darwin.close(fd)
+            return -1
+        }
+        _ = Darwin.chmod(path, 0o600)
+        return fd
+    }
+
+    static func readLineFromFd(_ fd: Int32) -> String? {
+        var bytes: [UInt8] = []
+        var chunk = [UInt8](repeating: 0, count: 1024)
+        while bytes.count < 65536 {
+            let n = Darwin.read(fd, &chunk, chunk.count)
+            if n <= 0 { break }
+            if let nlIdx = chunk[0..<n].firstIndex(of: 10) {
+                bytes.append(contentsOf: chunk[0..<nlIdx])
+                break
+            }
+            bytes.append(contentsOf: chunk[0..<n])
+        }
+        if bytes.isEmpty { return nil }
+        return String(bytes: bytes, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func writeLineToFd(_ fd: Int32, _ line: String) {
+        var one: Int32 = 1
+        _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+        let payload = Array((line + "\n").utf8)
+        var sent = 0
+        while sent < payload.count {
+            let n = payload.withUnsafeBytes { raw in
+                Darwin.write(fd, raw.baseAddress!.advanced(by: sent), payload.count - sent)
+            }
+            if n <= 0 { break }
+            sent += n
+        }
     }
 
     static func resolveLocale() async -> Locale {
@@ -95,82 +332,134 @@ struct KronosSpeechWorker {
         return try await collected
     }
 
-    static func main() async {
-        guard SpeechTranscriber.isAvailable else {
-            emit("ERR\tSpeechTranscriber unavailable on this Mac")
-            return
+    static func handleCommand(_ line: String, locale: Locale, sockPath: String) async -> (String, Bool) {
+        if line == "QUIT" {
+            _ = recorderCtrl.stopRecording(cancel: true)
+            unlink(sockPath)
+            return ("OK\tBYE", true)
         }
-        let locale = await resolveLocale()
-        while let rawLine = readLine(strippingNewline: true) {
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.isEmpty { continue }
-            if line == "QUIT" { break }
-            if line.hasPrefix("WARM") {
-                let t0 = ContinuousClock.now
-                let warmTranscriber = SpeechTranscriber(locale: locale, preset: .transcription)
-                if let req = try? await AssetInventory.assetInstallationRequest(supporting: [warmTranscriber]) {
-                    try? await req.downloadAndInstall()
+        if line == "PING" {
+            let auth = AVCaptureDevice.authorizationStatus(for: .audio).rawValue
+            return ("OK\tPONG\t\(bundleHashTag())\t\(auth)", false)
+        }
+        if line == "REC_STATUS" {
+            return (recorderCtrl.pollStatus(), false)
+        }
+        if line.hasPrefix("REC_STOP") {
+            let cancel = line.hasSuffix("\t1")
+            return (recorderCtrl.stopRecording(cancel: cancel), false)
+        }
+        if line == "REC_START" {
+            let status = AVCaptureDevice.authorizationStatus(for: .audio)
+            if status == .notDetermined {
+                let granted = await AVCaptureDevice.requestAccess(for: .audio)
+                if !granted {
+                    return ("DENIED\tMicrophone permission was not granted for Kronos", false)
                 }
-                let parts = line.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: true)
-                if parts.count > 1 {
-                    let warmPath = String(parts[1])
-                    _ = try? await transcribeFile(path: warmPath, hints: ["Kronos"], locale: locale)
-                } else {
-                    let opts = SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .processLifetime)
-                    let analyzer = SpeechAnalyzer(modules: [warmTranscriber], options: opts)
-                    await analyzer.cancelAndFinishNow()
-                }
-                let dur = t0.duration(to: ContinuousClock.now)
-                let ms = Double(dur.components.seconds) * 1000.0 + Double(dur.components.attoseconds) / 1e15
-                emit(String(format: "OK\t%.2f\tREADY", ms))
-                continue
+            } else if status != .authorized {
+                return ("DENIED\tEnable Kronos under macOS System Settings -> Privacy & Security -> Microphone", false)
             }
-            let parts = line.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
-            let wavPath = String(parts[0])
-            var hints: [String] = []
-            if parts.count > 1 {
-                hints = parts[1]
-                    .split(separator: "|", omittingEmptySubsequences: true)
-                    .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-                    .filter { !$0.isEmpty }
+            if let msg = recorderCtrl.startRecording() {
+                return ("ERR\t" + sanitize(msg), false)
             }
+            return ("OK\tRECORDING", false)
+        }
+        if line.hasPrefix("WARM") {
             let t0 = ContinuousClock.now
-            do {
-                let text = try await transcribeFile(path: wavPath, hints: hints, locale: locale)
-                let dur = t0.duration(to: ContinuousClock.now)
-                let ms = Double(dur.components.seconds) * 1000.0 + Double(dur.components.attoseconds) / 1e15
-                emit(String(format: "OK\t%.2f\t%@", ms, sanitize(text)))
-            } catch {
-                emit("ERR\t" + sanitize(String(describing: error)))
+            let warmTranscriber = SpeechTranscriber(locale: locale, preset: .transcription)
+            if let req = try? await AssetInventory.assetInstallationRequest(supporting: [warmTranscriber]) {
+                try? await req.downloadAndInstall()
+            }
+            let parts = line.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: true)
+            if parts.count > 1 {
+                let warmPath = String(parts[1])
+                _ = try? await transcribeFile(path: warmPath, hints: ["Kronos"], locale: locale)
+            } else {
+                let opts = SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .processLifetime)
+                let analyzer = SpeechAnalyzer(modules: [warmTranscriber], options: opts)
+                await analyzer.cancelAndFinishNow()
+            }
+            let dur = t0.duration(to: ContinuousClock.now)
+            let ms = Double(dur.components.seconds) * 1000.0 + Double(dur.components.attoseconds) / 1e15
+            return (String(format: "OK\t%.2f\tREADY", ms), false)
+        }
+
+        let body = line.hasPrefix("TRANSCRIBE\t")
+            ? String(line.dropFirst("TRANSCRIBE\t".count))
+            : line
+        let parts = body.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
+        let wavPath = String(parts[0])
+        var hints: [String] = []
+        if parts.count > 1 {
+            hints = parts[1]
+                .split(separator: "|", omittingEmptySubsequences: true)
+                .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        }
+        let t0 = ContinuousClock.now
+        do {
+            let text = try await transcribeFile(path: wavPath, hints: hints, locale: locale)
+            let dur = t0.duration(to: ContinuousClock.now)
+            let ms = Double(dur.components.seconds) * 1000.0 + Double(dur.components.attoseconds) / 1e15
+            return (String(format: "OK\t%.2f\t%@", ms, sanitize(text)), false)
+        } catch {
+            return ("ERR\t" + sanitize(String(describing: error)), false)
+        }
+    }
+
+    static func main() {
+        Darwin.signal(SIGPIPE, SIG_IGN)
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+
+        let sockPath = defaultSocketPath()
+        let serverFd = bindUnixSocket(sockPath)
+        if serverFd < 0 {
+            exit(1)
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let sem = DispatchSemaphore(value: 0)
+            var resolvedLocale = Locale(identifier: "en_US")
+            Task {
+                resolvedLocale = await resolveLocale()
+                sem.signal()
+            }
+            sem.wait()
+            let locale = resolvedLocale
+
+            while true {
+                let clientFd = Darwin.accept(serverFd, nil, nil)
+                if clientFd < 0 { continue }
+                Task {
+                    guard let reqLine = readLineFromFd(clientFd), !reqLine.isEmpty else {
+                        Darwin.close(clientFd)
+                        return
+                    }
+                    let (reply, shouldExit) = await handleCommand(reqLine, locale: locale, sockPath: sockPath)
+                    writeLineToFd(clientFd, reply)
+                    Darwin.close(clientFd)
+                    if shouldExit {
+                        Darwin.close(serverFd)
+                        exit(0)
+                    }
+                }
             }
         }
+
+        app.run()
     }
 }
 "#;
 
 #[cfg(target_os = "macos")]
-struct SpeechWorkerProcess {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-}
+static DAEMON_BOOT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+#[cfg(target_os = "macos")]
+static DAEMON_VERIFIED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
-impl Drop for SpeechWorkerProcess {
-    fn drop(&mut self) {
-        let _ = writeln!(self.stdin, "QUIT");
-        let _ = self.stdin.flush();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-#[cfg(target_os = "macos")]
-static GLOBAL_SPEECH_WORKER: OnceLock<Mutex<Option<SpeechWorkerProcess>>> = OnceLock::new();
-
-#[cfg(target_os = "macos")]
-fn worker_slot() -> &'static Mutex<Option<SpeechWorkerProcess>> {
-    GLOBAL_SPEECH_WORKER.get_or_init(|| Mutex::new(None))
+fn boot_lock() -> &'static Mutex<()> {
+    DAEMON_BOOT_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 pub fn prewarm_speech() {
@@ -285,7 +574,7 @@ pub fn transcribe_audio_bytes(audio_bytes: &[u8]) -> Result<VoiceTranscription, 
             .map(|h| h.replace(['|', '\t', '\n', '\r'], " "))
             .collect::<Vec<_>>()
             .join("|");
-        let cmd = format!("{}\t{}", tmp_path.display(), hint_field);
+        let cmd = format!("TRANSCRIBE\t{}\t{}", tmp_path.display(), hint_field);
         let worker_res = send_worker_command(&cmd);
         let _ = fs::remove_file(&tmp_path);
 
@@ -868,7 +1157,25 @@ fn fnv1a_u64(bytes: &[u8]) -> u64 {
 }
 
 #[cfg(target_os = "macos")]
-fn ensure_compiled_speech_worker_bin() -> Result<PathBuf, String> {
+fn voice_socket_path() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let dir = home.join(".kronos");
+        let _ = fs::create_dir_all(&dir);
+        let cand = dir.join("voice.sock");
+        if cand.to_string_lossy().len() < 96 {
+            return cand;
+        }
+    }
+    PathBuf::from("/tmp/kronos_voice.sock")
+}
+
+#[cfg(target_os = "macos")]
+fn expected_worker_hash_hex() -> String {
+    format!("{:016x}", fnv1a_u64(SWIFT_SPEECH_WORKER_SRC.as_bytes()))
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_compiled_voice_app_bundle() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
@@ -876,17 +1183,34 @@ fn ensure_compiled_speech_worker_bin() -> Result<PathBuf, String> {
     fs::create_dir_all(&bin_dir)
         .map_err(|e| format!("failed to create {}: {e}", bin_dir.display()))?;
 
-    let hash = fnv1a_u64(SWIFT_SPEECH_WORKER_SRC.as_bytes());
-    let bin_path = bin_dir.join(format!("kronos_speech_ane_{hash:016x}"));
-    if bin_path.exists() {
-        return Ok(bin_path);
+    let app_dir = bin_dir.join("KronosVoice.app");
+    let contents_dir = app_dir.join("Contents");
+    let macos_dir = contents_dir.join("MacOS");
+    let res_dir = contents_dir.join("Resources");
+    let exe_path = macos_dir.join("kronos_voice");
+    let stamp_path = res_dir.join("src_hash.txt");
+    let plist_path = contents_dir.join("Info.plist");
+
+    let expected_hash = expected_worker_hash_hex();
+    if exe_path.exists()
+        && plist_path.exists()
+        && fs::read_to_string(&stamp_path)
+            .map(|s| s.trim() == expected_hash)
+            .unwrap_or(false)
+    {
+        return Ok(app_dir);
     }
 
+    fs::create_dir_all(&macos_dir)
+        .map_err(|e| format!("failed to create {}: {e}", macos_dir.display()))?;
+    fs::create_dir_all(&res_dir)
+        .map_err(|e| format!("failed to create {}: {e}", res_dir.display()))?;
+
     let pid = std::process::id();
-    let src_path = bin_dir.join(format!("kronos_speech_ane_{hash:016x}_{pid}.swift"));
-    let tmp_bin = bin_dir.join(format!("kronos_speech_ane_{hash:016x}_{pid}.tmp"));
+    let src_path = bin_dir.join(format!("kronos_voice_{expected_hash}_{pid}.swift"));
+    let tmp_bin = bin_dir.join(format!("kronos_voice_{expected_hash}_{pid}.tmp"));
     fs::write(&src_path, SWIFT_SPEECH_WORKER_SRC)
-        .map_err(|e| format!("failed to write speech worker source: {e}"))?;
+        .map_err(|e| format!("failed to write voice worker source: {e}"))?;
 
     let out = Command::new("/usr/bin/swiftc")
         .args(["-O", "-parse-as-library"])
@@ -900,88 +1224,252 @@ fn ensure_compiled_speech_worker_bin() -> Result<PathBuf, String> {
     if !out.status.success() {
         let _ = fs::remove_file(&tmp_bin);
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(format!("swiftc failed compiling speech worker: {stderr}"));
+        return Err(format!("swiftc failed compiling KronosVoice.app: {stderr}"));
     }
 
-    fs::rename(&tmp_bin, &bin_path).map_err(|e| {
+    fs::rename(&tmp_bin, &exe_path).map_err(|e| {
         let _ = fs::remove_file(&tmp_bin);
-        format!("failed to install compiled speech worker: {e}")
+        format!("failed to install KronosVoice binary: {e}")
     })?;
-    Ok(bin_path)
+
+    let info_plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.melodyleonard.kronos.voice</string>
+    <key>CFBundleName</key>
+    <string>Kronos</string>
+    <key>CFBundleDisplayName</key>
+    <string>Kronos</string>
+    <key>CFBundleExecutable</key>
+    <string>kronos_voice</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Kronos uses the microphone for local on-device voice commands.</string>
+</dict>
+</plist>
+"#;
+    fs::write(&plist_path, info_plist)
+        .map_err(|e| format!("failed to write KronosVoice Info.plist: {e}"))?;
+    fs::write(&stamp_path, format!("{expected_hash}\n"))
+        .map_err(|e| format!("failed to write KronosVoice version stamp: {e}"))?;
+
+    let sign_out = Command::new("/usr/bin/codesign")
+        .args(["--force", "--deep", "--sign", "-"])
+        .arg(&app_dir)
+        .output()
+        .map_err(|e| format!("failed to invoke /usr/bin/codesign: {e}"))?;
+    if !sign_out.status.success() {
+        let stderr = String::from_utf8_lossy(&sign_out.stderr).trim().to_string();
+        return Err(format!("codesign failed for KronosVoice.app: {stderr}"));
+    }
+    Ok(app_dir)
 }
 
 #[cfg(target_os = "macos")]
-fn spawn_speech_worker() -> Result<SpeechWorkerProcess, String> {
-    let bin = ensure_compiled_speech_worker_bin()?;
-    let mut child = Command::new(&bin)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "missing speech worker stdin".to_string())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "missing speech worker stdout".to_string())?;
-    Ok(SpeechWorkerProcess {
-        child,
-        stdin,
-        stdout: BufReader::new(stdout),
-    })
+fn exchange_socket_line(sock_path: &Path, cmd_line: &str, timeout: Duration) -> Result<String, String> {
+    let mut stream = UnixStream::connect(sock_path)
+        .map_err(|e| format!("connect {}: {e}", sock_path.display()))?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    writeln!(stream, "{cmd_line}").map_err(|e| format!("socket write: {e}"))?;
+    stream.flush().map_err(|e| format!("socket flush: {e}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut resp = String::new();
+    let n = reader
+        .read_line(&mut resp)
+        .map_err(|e| format!("socket read: {e}"))?;
+    if n == 0 {
+        return Err("voice daemon closed socket without reply".to_string());
+    }
+    Ok(resp.trim_end_matches(['\r', '\n']).to_string())
 }
 
 #[cfg(target_os = "macos")]
-fn send_worker_command(cmd_line: &str) -> Result<String, String> {
-    let mut guard = worker_slot().lock().unwrap_or_else(|p| p.into_inner());
-    for attempt in 0..2 {
-        if guard.is_none() {
-            *guard = Some(spawn_speech_worker()?);
+fn ensure_voice_daemon_running() -> Result<PathBuf, String> {
+    let sock_path = voice_socket_path();
+    if DAEMON_VERIFIED.load(Ordering::Relaxed) && UnixStream::connect(&sock_path).is_ok() {
+        return Ok(sock_path);
+    }
+
+    let _guard = boot_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let expected_hash = expected_worker_hash_hex();
+    if let Ok(pong) = exchange_socket_line(&sock_path, "PING", Duration::from_secs(2)) {
+        let parts: Vec<&str> = pong.split('\t').collect();
+        if parts.len() >= 3 && parts[0] == "OK" && parts[1] == "PONG" && parts[2] == expected_hash {
+            DAEMON_VERIFIED.store(true, Ordering::Relaxed);
+            return Ok(sock_path);
         }
-        let io_res = {
-            let worker = guard.as_mut().unwrap();
-            let write_ok = writeln!(worker.stdin, "{cmd_line}")
-                .and_then(|()| worker.stdin.flush());
-            if let Err(e) = write_ok {
-                Err(format!("speech worker write error: {e}"))
-            } else {
-                let mut resp = String::new();
-                match worker.stdout.read_line(&mut resp) {
-                    Ok(0) => Err("speech worker closed stdout".to_string()),
-                    Ok(_) => Ok(resp),
-                    Err(e) => Err(format!("speech worker read error: {e}")),
-                }
-            }
-        };
+        let _ = exchange_socket_line(&sock_path, "QUIT", Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(120));
+    }
 
-        match io_res {
-            Ok(resp) => {
-                let line = resp.trim_end_matches(['\r', '\n']);
-                if let Some(rest) = line.strip_prefix("OK\t") {
-                    let transcript = rest
-                        .split_once('\t')
-                        .map_or(rest, |(_, txt)| txt)
-                        .trim()
-                        .to_string();
-                    return Ok(transcript);
-                }
-                if let Some(err) = line.strip_prefix("ERR\t") {
-                    return Err(err.trim().to_string());
-                }
-                return Err(format!("unexpected speech worker reply: {line}"));
+    let app_dir = ensure_compiled_voice_app_bundle()?;
+    let _ = fs::remove_file(&sock_path);
+    let status = Command::new("/usr/bin/open")
+        .args(["-g", "-a"])
+        .arg(&app_dir)
+        .status()
+        .map_err(|e| format!("failed to launch {}: {e}", app_dir.display()))?;
+    if !status.success() {
+        return Err(format!("LaunchServices failed starting {}", app_dir.display()));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        if let Ok(pong) = exchange_socket_line(&sock_path, "PING", Duration::from_secs(2)) {
+            if pong.starts_with("OK\tPONG") {
+                DAEMON_VERIFIED.store(true, Ordering::Relaxed);
+                return Ok(sock_path);
             }
+        }
+        thread::sleep(Duration::from_millis(45));
+    }
+    Err("timed out waiting for KronosVoice.app socket readiness".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn send_raw_daemon_command(cmd_line: &str, timeout: Duration) -> Result<String, String> {
+    for attempt in 0..2 {
+        let sock_path = ensure_voice_daemon_running()?;
+        match exchange_socket_line(&sock_path, cmd_line, timeout) {
+            Ok(resp) => return Ok(resp),
             Err(e) => {
-                *guard = None;
+                DAEMON_VERIFIED.store(false, Ordering::Relaxed);
                 if attempt == 1 {
                     return Err(e);
                 }
             }
         }
     }
-    Err("speech worker unreachable".to_string())
+    Err("KronosVoice daemon unreachable".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn send_worker_command(cmd_line: &str) -> Result<String, String> {
+    let line = send_raw_daemon_command(cmd_line, Duration::from_secs(30))?;
+    if let Some(rest) = line.strip_prefix("OK\t") {
+        let transcript = rest
+            .split_once('\t')
+            .map_or(rest, |(_, txt)| txt)
+            .trim()
+            .to_string();
+        return Ok(transcript);
+    }
+    if let Some(err) = line.strip_prefix("ERR\t") {
+        return Err(err.trim().to_string());
+    }
+    Err(format!("unexpected voice daemon reply: {line}"))
+}
+
+#[cfg(target_os = "macos")]
+fn transcribe_completed_mic_wav(wav_path_str: &str) -> Result<String, String> {
+    let wav_path = Path::new(wav_path_str);
+    let wav_bytes = fs::read(wav_path)
+        .map_err(|e| format!("failed reading recorded audio {}: {e}", wav_path.display()))?;
+    let _ = fs::remove_file(wav_path);
+    let vt = transcribe_audio_bytes(&wav_bytes)?;
+    Ok(format!(
+        r#"{{"status":"done","text":{},"raw_text":{},"audio_ms":{},"transcribe_ms":{:.2},"engine":{}}}"#,
+        quote(&vt.text),
+        quote(&vt.raw_text),
+        vt.audio_ms,
+        vt.transcribe_ms,
+        quote(vt.engine),
+    ))
+}
+
+pub fn start_mic_recording_json() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let reply = send_raw_daemon_command("REC_START", Duration::from_secs(60))?;
+        if reply.starts_with("OK\tRECORDING") {
+            return Ok(r#"{"status":"recording"}"#.to_string());
+        }
+        if let Some(msg) = reply.strip_prefix("DENIED\t") {
+            return Ok(format!(
+                r#"{{"status":"denied","message":{}}}"#,
+                quote(msg.trim())
+            ));
+        }
+        if let Some(err) = reply.strip_prefix("ERR\t") {
+            return Err(err.trim().to_string());
+        }
+        Err(format!("unexpected REC_START reply: {reply}"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("native microphone capture requires macOS".to_string())
+    }
+}
+
+pub fn poll_mic_recording_json() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let reply = send_raw_daemon_command("REC_STATUS", Duration::from_secs(5))?;
+        if let Some(rest) = reply.strip_prefix("RECORDING\t") {
+            let parts: Vec<&str> = rest.split('\t').collect();
+            let elapsed_ms: u64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let level: f32 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let heard = parts.get(2).copied() == Some("1");
+            return Ok(format!(
+                r#"{{"status":"recording","elapsed_ms":{elapsed_ms},"level":{level:.3},"heard_speech":{heard}}}"#
+            ));
+        }
+        if let Some(rest) = reply.strip_prefix("WAV_READY\t") {
+            let wav_path = rest.split('\t').next().unwrap_or("").trim();
+            return transcribe_completed_mic_wav(wav_path);
+        }
+        Ok(r#"{"status":"idle"}"#.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("native microphone capture requires macOS".to_string())
+    }
+}
+
+pub fn stop_mic_recording_json(cancel: bool) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let cmd = if cancel { "REC_STOP\t1" } else { "REC_STOP\t0" };
+        let reply = send_raw_daemon_command(cmd, Duration::from_secs(10))?;
+        if reply == "CANCELLED" {
+            return Ok(r#"{"status":"cancelled"}"#.to_string());
+        }
+        if let Some(rest) = reply.strip_prefix("WAV_READY\t") {
+            let wav_path = rest.split('\t').next().unwrap_or("").trim();
+            return transcribe_completed_mic_wav(wav_path);
+        }
+        Ok(r#"{"status":"idle"}"#.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = cancel;
+        Err("native microphone capture requires macOS".to_string())
+    }
+}
+
+pub fn open_macos_microphone_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("/usr/bin/open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("failed opening System Settings: {e}"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("System Settings requires macOS".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1043,5 +1531,14 @@ mod tests {
             normalize_voice_transcript("build a u i and call the a p i", &camels),
             "build a UI and call the API"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_kronos_voice_app_bundle_compiles_and_signs() {
+        let app_dir = ensure_compiled_voice_app_bundle().expect("compile KronosVoice.app");
+        assert!(app_dir.join("Contents/MacOS/kronos_voice").exists());
+        assert!(app_dir.join("Contents/Info.plist").exists());
+        assert!(app_dir.join("Contents/Resources/src_hash.txt").exists());
     }
 }

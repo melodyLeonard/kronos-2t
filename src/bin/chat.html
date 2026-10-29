@@ -424,11 +424,26 @@
     50% { box-shadow:0 0 0 5px rgba(217,119,87,0.08); }
   }
   #voice-status {
-    display:none; align-items:center; justify-content:space-between; gap:8px;
-    padding:5px 10px; border-radius:8px; background:var(--subtle);
-    border:1px solid var(--line); font-size:12px; color:var(--muted);
+    display:none; align-items:center; justify-content:space-between; gap:10px;
+    padding:7px 11px; border-radius:9px; background:var(--subtle);
+    border:1px solid var(--accent); font-size:12px; color:var(--text);
   }
   #voice-status.active { display:flex; }
+  #voice-status.denied {
+    background:var(--warn-bg); color:var(--warn-fg); border-color:rgba(245,158,11,0.45);
+  }
+  .v-status-left { display:flex; align-items:center; gap:9px; min-width:0; }
+  .v-eq { display:inline-flex; align-items:center; gap:2.5px; height:16px; flex-shrink:0; }
+  .v-eq span {
+    width:3px; height:4px; border-radius:99px; background:var(--accent);
+    transition:height .09s ease;
+  }
+  #voice-status.denied .v-eq span { background:var(--warn-fg); }
+  #voice-status-text { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .v-status-btns { display:flex; align-items:center; gap:6px; flex-shrink:0; }
+  #voice-done-btn {
+    background:var(--accent); color:var(--accent-ink); border-color:var(--accent); font-weight:600;
+  }
   textarea#input {
     flex:1; resize:none; min-height:42px; max-height:200px; padding:10px 12px;
     border-radius:10px; line-height:1.45;
@@ -627,8 +642,15 @@
       <form id="form">
         <div id="att-tray"></div>
         <div id="voice-status">
-          <span id="voice-status-text">Listening…</span>
-          <button id="voice-cancel-btn" class="mini-btn" type="button">Cancel</button>
+          <div class="v-status-left">
+            <div class="v-eq" id="voice-eq"><span></span><span></span><span></span><span></span><span></span></div>
+            <span id="voice-status-text">Listening…</span>
+          </div>
+          <div class="v-status-btns">
+            <button id="voice-settings-btn" class="mini-btn" type="button" style="display:none">Enable Mic ↗</button>
+            <button id="voice-done-btn" class="mini-btn" type="button">Done</button>
+            <button id="voice-cancel-btn" class="mini-btn" type="button">Cancel</button>
+          </div>
         </div>
         <div class="composer-row">
           <input id="file-input" type="file" multiple hidden>
@@ -1816,108 +1838,86 @@ chatCol.addEventListener("drop", async (e) => {
 });
 
 /* Keyboard shortcuts: Cmd+B sidebar, Cmd+N new conversation, Cmd+Shift+V voice */
-function encodeWav16kMono(chunks, totalSamples, srcRate) {
-  const dstRate = 16000;
-  const merged = new Float32Array(totalSamples);
-  let off = 0;
-  for (const c of chunks) {
-    merged.set(c, off);
-    off += c.length;
-  }
-  const ratio = Math.max(1, (srcRate || 48000) / dstRate);
-  const dstLen = Math.max(1, Math.floor(totalSamples / ratio));
-  const buf = new ArrayBuffer(44 + dstLen * 2);
-  const dv = new DataView(buf);
-  const putStr = (pos, str) => {
-    for (let i = 0; i < str.length; i++) dv.setUint8(pos + i, str.charCodeAt(i));
-  };
-  putStr(0, "RIFF");
-  dv.setUint32(4, 36 + dstLen * 2, true);
-  putStr(8, "WAVE");
-  putStr(12, "fmt ");
-  dv.setUint32(16, 16, true);
-  dv.setUint16(20, 1, true);
-  dv.setUint16(22, 1, true);
-  dv.setUint32(24, dstRate, true);
-  dv.setUint32(28, dstRate * 2, true);
-  dv.setUint16(32, 2, true);
-  dv.setUint16(34, 16, true);
-  putStr(36, "data");
-  dv.setUint32(40, dstLen * 2, true);
-  for (let i = 0; i < dstLen; i++) {
-    const start = Math.floor(i * ratio);
-    const end = Math.min(totalSamples, Math.max(start + 1, Math.floor((i + 1) * ratio)));
-    let acc = 0;
-    for (let j = start; j < end; j++) acc += merged[j];
-    const sample = Math.max(-1, Math.min(1, acc / (end - start)));
-    const s16 = sample < 0 ? Math.round(sample * 32768) : Math.round(sample * 32767);
-    dv.setInt16(44 + i * 2, s16, true);
-  }
-  return buf;
+function setVoiceEqLevel(level) {
+  const bars = $("voice-eq").querySelectorAll("span");
+  const weights = [0.45, 0.8, 1.0, 0.75, 0.5];
+  const lv = Math.max(0, Math.min(1, Number(level) || 0));
+  bars.forEach((b, i) => {
+    const h = Math.round(4 + lv * 13 * weights[i]);
+    b.style.height = `${h}px`;
+  });
 }
 
-function setVoiceStatusBanner(msg, keepVisible) {
+function showVoiceStatusBar(msg, opts = {}) {
   const bar = $("voice-status");
-  $("voice-status-text").textContent = msg;
-  bar.classList.toggle("active", Boolean(msg) && keepVisible !== false);
+  bar.classList.toggle("active", Boolean(msg));
+  bar.classList.toggle("denied", Boolean(opts.denied));
+  $("voice-status-text").textContent = msg || "";
+  $("voice-settings-btn").style.display = opts.denied ? "inline-block" : "none";
+  $("voice-done-btn").style.display = opts.showDone === false ? "none" : "inline-block";
+  if (!msg) setVoiceEqLevel(0);
+}
+
+function applyVoiceTranscript(j) {
+  const spoken = String(j.text || "").trim();
+  if (!spoken) {
+    showVoiceStatusBar("No speech detected — click Voice to speak again", { showDone: false });
+    setTimeout(() => { if (!voiceSession) showVoiceStatusBar("", {}); }, 2600);
+    input.focus();
+    return;
+  }
+  showVoiceStatusBar("", {});
+  const existing = input.value.trim();
+  input.value = existing ? (existing + " " + spoken) : spoken;
+  input.dispatchEvent(new Event("input"));
+  const ms = Math.round(j.transcribe_ms || 0);
+  pendingVoiceBadge = `voice · ${ms} ms`;
+  if (!send.disabled) {
+    $("form").requestSubmit();
+  }
 }
 
 async function stopVoiceCapture(cancelOnly) {
   const sess = voiceSession;
-  if (!sess || sess.stopping) return;
+  const btn = $("voice-btn");
+  if (!sess || sess.stopping) {
+    showVoiceStatusBar("", {});
+    return;
+  }
   sess.stopping = true;
   voiceSession = null;
-  if (sess.timer) clearInterval(sess.timer);
-  try { sess.proc.disconnect(); } catch (e) {}
-  try { sess.gain.disconnect(); } catch (e) {}
-  try { sess.source.disconnect(); } catch (e) {}
-  try { sess.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
-  try { await sess.ctx.close(); } catch (e) {}
-
-  const btn = $("voice-btn");
+  if (sess.pollTimer) clearInterval(sess.pollTimer);
   btn.classList.remove("recording");
   $("voice-btn-label").textContent = "Voice";
 
-  if (cancelOnly || sess.totalSamples < 1600) {
+  if (cancelOnly) {
     btn.classList.remove("transcribing");
-    setVoiceStatusBanner("", false);
+    showVoiceStatusBar("", {});
+    fetch("/v1/speech/record/stop", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ cancel: true }),
+    }).catch(() => {});
     input.focus();
     return;
   }
 
   btn.classList.add("transcribing");
   $("voice-btn-label").textContent = "…";
-  setVoiceStatusBanner("Transcribing speech locally on Neural Engine…", true);
+  setVoiceEqLevel(0.25);
+  showVoiceStatusBar("Transcribing speech locally on Neural Engine…", { showDone: false });
   try {
-    const wavBuf = encodeWav16kMono(sess.chunks, sess.totalSamples, sess.sampleRate);
-    const reqHeaders = { "Content-Type": "audio/wav" };
-    if ($("key").value) reqHeaders.Authorization = "Bearer " + $("key").value;
-    const r = await fetch("/v1/speech/transcribe", {
+    const r = await fetch("/v1/speech/record/stop", {
       method: "POST",
-      headers: reqHeaders,
-      body: wavBuf,
+      headers: headers(),
+      body: JSON.stringify({ cancel: false }),
     });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error?.message || r.statusText);
-    const spoken = String(j.text || "").trim();
-    if (!spoken) {
-      setVoiceStatusBanner("No speech detected — click Voice to speak again", true);
-      setTimeout(() => { if (!voiceSession) setVoiceStatusBanner("", false); }, 2600);
-      input.focus();
-      return;
-    }
-    const existing = input.value.trim();
-    input.value = existing ? (existing + " " + spoken) : spoken;
-    input.dispatchEvent(new Event("input"));
-    const ms = Math.round(j.transcribe_ms || 0);
-    pendingVoiceBadge = `voice · ${ms} ms`;
-    setVoiceStatusBanner("", false);
-    if (!send.disabled) {
-      $("form").requestSubmit();
-    }
+    applyVoiceTranscript(j);
   } catch (err) {
-    setVoiceStatusBanner("Voice transcription error: " + err.message, true);
-    setTimeout(() => { if (!voiceSession) setVoiceStatusBanner("", false); }, 3600);
+    showVoiceStatusBar("Voice transcription error: " + err.message, { showDone: false });
+    setTimeout(() => { if (!voiceSession) showVoiceStatusBar("", {}); }, 3600);
   } finally {
     btn.classList.remove("transcribing");
     $("voice-btn-label").textContent = "Voice";
@@ -1931,102 +1931,113 @@ async function startVoiceCapture() {
     await stopVoiceCapture(false);
     return;
   }
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    setVoiceStatusBanner("Microphone capture is unavailable in this browser context", true);
-    return;
-  }
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
-  } catch (err) {
-    setVoiceStatusBanner("Microphone permission denied", true);
-    setTimeout(() => { if (!voiceSession) setVoiceStatusBanner("", false); }, 3200);
-    return;
-  }
 
-  const AudioCtx = window.AudioContext || window.webkitAudioContext;
-  const ctx = new AudioCtx();
-  if (ctx.state === "suspended") {
-    try { await ctx.resume(); } catch (e) {}
-  }
-  const source = ctx.createMediaStreamSource(stream);
-  const proc = ctx.createScriptProcessor(2048, 1, 1);
-  const gain = ctx.createGain();
-  gain.gain.value = 0;
-  source.connect(proc);
-  proc.connect(gain);
-  gain.connect(ctx.destination);
-
-  const startedAt = performance.now();
   const sess = {
-    stream,
-    ctx,
-    source,
-    proc,
-    gain,
-    sampleRate: ctx.sampleRate || 48000,
-    chunks: [],
-    totalSamples: 0,
-    speechMs: 0,
-    heardSpeech: false,
-    lastVoiceAt: startedAt,
-    startedAt,
+    startedAt: performance.now(),
     stopping: false,
-    timer: null,
+    pollBusy: false,
+    pollTimer: null,
   };
   voiceSession = sess;
   btn.classList.add("recording");
   $("voice-btn-label").textContent = "Done";
-  setVoiceStatusBanner("Listening 0:00 · speak naturally (click Done or press Enter to send, Esc to cancel)", true);
+  setVoiceEqLevel(0.22);
+  showVoiceStatusBar("Starting microphone… allow access if macOS prompts", { showDone: true });
 
-  proc.onaudioprocess = (ev) => {
-    if (voiceSession !== sess || sess.stopping) return;
-    const ch = ev.inputBuffer.getChannelData(0);
-    const copy = new Float32Array(ch.length);
-    copy.set(ch);
-    sess.chunks.push(copy);
-    sess.totalSamples += copy.length;
-
-    let sumSq = 0;
-    for (let i = 0; i < ch.length; i++) sumSq += ch[i] * ch[i];
-    const rms = Math.sqrt(sumSq / Math.max(1, ch.length));
-    const now = performance.now();
-    const frameMs = (ch.length / sess.sampleRate) * 1000;
-    if (rms > 0.016) {
-      sess.speechMs += frameMs;
-      sess.lastVoiceAt = now;
-      if (sess.speechMs >= 160) sess.heardSpeech = true;
+  try {
+    const r = await fetch("/v1/speech/record/start", {
+      method: "POST",
+      headers: headers(),
+    });
+    const j = await r.json();
+    if (voiceSession !== sess || sess.stopping) {
+      fetch("/v1/speech/record/stop", {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({ cancel: true }),
+      }).catch(() => {});
+      return;
     }
-    if (sess.heardSpeech && (now - sess.lastVoiceAt) >= 1350 && (now - sess.startedAt) >= 900) {
-      stopVoiceCapture(false);
-    } else if ((now - sess.startedAt) >= 45000) {
-      stopVoiceCapture(false);
-    }
-  };
+    if (!r.ok) throw new Error(j.error?.message || r.statusText);
 
-  sess.timer = setInterval(() => {
-    if (voiceSession !== sess || sess.stopping) return;
-    const sec = Math.floor((performance.now() - sess.startedAt) / 1000);
-    const mm = Math.floor(sec / 60);
-    const ss = String(sec % 60).padStart(2, "0");
-    setVoiceStatusBanner(`Listening ${mm}:${ss} · click Done or press Enter to finish`, true);
-  }, 300);
+    if (j.status === "denied") {
+      voiceSession = null;
+      btn.classList.remove("recording");
+      $("voice-btn-label").textContent = "Voice";
+      showVoiceStatusBar(j.message || "Enable Kronos in macOS Privacy -> Microphone", {
+        denied: true,
+        showDone: false,
+      });
+      return;
+    }
+
+    sess.startedAt = performance.now();
+    showVoiceStatusBar("Listening 0:00 · speak naturally (Enter or Done to send, Esc to cancel)", {
+      showDone: true,
+    });
+
+    sess.pollTimer = setInterval(async () => {
+      if (voiceSession !== sess || sess.stopping || sess.pollBusy) return;
+      sess.pollBusy = true;
+      try {
+        const pr = await fetch("/v1/speech/record/poll", { headers: headers() });
+        if (!pr.ok || voiceSession !== sess || sess.stopping) return;
+        const pj = await pr.json();
+        if (voiceSession !== sess || sess.stopping) return;
+        if (pj.status === "recording") {
+          setVoiceEqLevel(Math.max(0.12, Number(pj.level) || 0));
+          const sec = Math.floor((pj.elapsed_ms || (performance.now() - sess.startedAt)) / 1000);
+          const mm = Math.floor(sec / 60);
+          const ss = String(sec % 60).padStart(2, "0");
+          const hint = pj.heard_speech ? "pause to auto-send or click Done" : "speak command now";
+          showVoiceStatusBar(`Listening ${mm}:${ss} · ${hint}`, { showDone: true });
+        } else if (pj.status === "done") {
+          sess.stopping = true;
+          voiceSession = null;
+          clearInterval(sess.pollTimer);
+          btn.classList.remove("recording");
+          btn.classList.remove("transcribing");
+          $("voice-btn-label").textContent = "Voice";
+          applyVoiceTranscript(pj);
+        } else if (pj.status === "idle") {
+          sess.stopping = true;
+          voiceSession = null;
+          clearInterval(sess.pollTimer);
+          btn.classList.remove("recording");
+          $("voice-btn-label").textContent = "Voice";
+          showVoiceStatusBar("", {});
+        }
+      } catch (e) {
+      } finally {
+        sess.pollBusy = false;
+      }
+    }, 115);
+  } catch (err) {
+    if (voiceSession === sess) voiceSession = null;
+    btn.classList.remove("recording");
+    $("voice-btn-label").textContent = "Voice";
+    showVoiceStatusBar("Voice startup failed: " + err.message, { denied: false, showDone: false });
+  }
 }
 
 $("voice-btn").onclick = () => startVoiceCapture();
-$("voice-cancel-btn").onclick = () => stopVoiceCapture(true);
+$("voice-done-btn").onclick = () => stopVoiceCapture(false);
+$("voice-cancel-btn").onclick = () => {
+  if (voiceSession) {
+    stopVoiceCapture(true);
+  } else {
+    showVoiceStatusBar("", {});
+  }
+};
+$("voice-settings-btn").onclick = () => {
+  fetch("/v1/speech/settings", { method: "POST", headers: headers() }).catch(() => {});
+};
 
 window.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && voiceSession) {
+  if (e.key === "Escape" && (voiceSession || $("voice-status").classList.contains("active"))) {
     e.preventDefault();
-    stopVoiceCapture(true);
+    if (voiceSession) stopVoiceCapture(true);
+    else showVoiceStatusBar("", {});
   } else if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "v") {
     e.preventDefault();
     startVoiceCapture();

@@ -486,7 +486,7 @@ mod macos {
             let _: () = msg!(st.panel, "setFrame:display:", frame => NSRect, true => bool; ());
 
             let cur_url: Id = msg!(st.webview, "URL"; Id);
-            let need_reload = if cur_url.is_null() {
+            let url_blank = if cur_url.is_null() {
                 true
             } else {
                 let abs: Id = msg!(cur_url, "absoluteString"; Id);
@@ -494,12 +494,25 @@ mod macos {
                     .map(|u| u.is_empty() || u == "about:blank")
                     .unwrap_or(true)
             };
-            if need_reload {
+            let title_ns: Id = msg!(st.webview, "title"; Id);
+            let title_ready = ns_string_to_rust(title_ns)
+                .map(|t| t.contains("Kronos"))
+                .unwrap_or(false);
+            let is_loading: bool = msg!(st.webview, "isLoading"; bool);
+            if !is_loading && (url_blank || !title_ready) {
                 let quick_url = format!("{}/quick", st.base_url.trim_end_matches('/'));
                 let ns_u = ns_string(&quick_url);
                 let url_obj: Id = msg!(class("NSURL"), "URLWithString:", ns_u => Id; Id);
                 if !url_obj.is_null() {
-                    let req: Id = msg!(class("NSURLRequest"), "requestWithURL:", url_obj => Id; Id);
+                    // NSURLRequestReloadIgnoringLocalCacheData = 1
+                    let req: Id = msg!(
+                        class("NSURLRequest"),
+                        "requestWithURL:cachePolicy:timeoutInterval:",
+                        url_obj => Id,
+                        1usize => usize,
+                        15.0f64 => f64;
+                        Id
+                    );
                     let _: Id = msg!(st.webview, "loadRequest:", req => Id; Id);
                 }
             }
@@ -1303,7 +1316,14 @@ mod macos {
             let ns_u = ns_string(&quick_url);
             let url_obj: Id = msg!(class("NSURL"), "URLWithString:", ns_u => Id; Id);
             if !url_obj.is_null() {
-                let req: Id = msg!(class("NSURLRequest"), "requestWithURL:", url_obj => Id; Id);
+                let req: Id = msg!(
+                    class("NSURLRequest"),
+                    "requestWithURL:cachePolicy:timeoutInterval:",
+                    url_obj => Id,
+                    1usize => usize,
+                    15.0f64 => f64;
+                    Id
+                );
                 let _: Id = msg!(webview, "loadRequest:", req => Id; Id);
             }
 

@@ -1538,10 +1538,22 @@ fn handle(srv: &Server, mut stream: TcpStream) {
         return respond(&mut stream, 204, "text/plain", "");
     }
     if req.method == "GET" && (req.path == "/" || req.path == "/index.html") {
-        return respond(&mut stream, 200, "text/html; charset=utf-8", CHAT_PAGE);
+        return respond_bytes(
+            &mut stream,
+            200,
+            "text/html; charset=utf-8",
+            "Cache-Control: no-store, no-cache, must-revalidate\r\n",
+            CHAT_PAGE.as_bytes(),
+        );
     }
     if req.method == "GET" && req.path == "/quick" {
-        return respond(&mut stream, 200, "text/html; charset=utf-8", QUICK_PAGE);
+        return respond_bytes(
+            &mut stream,
+            200,
+            "text/html; charset=utf-8",
+            "Cache-Control: no-store, no-cache, must-revalidate\r\n",
+            QUICK_PAGE.as_bytes(),
+        );
     }
     if req.method == "GET" && (req.path == "/preview" || req.path.starts_with("/preview/")) {
         let wd = srv.active_workdir();
@@ -1688,6 +1700,29 @@ fn handle(srv: &Server, mut stream: TcpStream) {
             &kronos_2t::speech::speech_status_json(),
         ),
         ("POST", "/v1/speech/transcribe") => handle_speech_transcribe(&mut stream, &req),
+        ("POST", "/v1/speech/record/start") => match kronos_2t::speech::start_mic_recording_json() {
+            Ok(body) => respond(&mut stream, 200, "application/json", &body),
+            Err(e) => error(&mut stream, 500, &e),
+        },
+        ("GET", "/v1/speech/record/poll") => match kronos_2t::speech::poll_mic_recording_json() {
+            Ok(body) => respond(&mut stream, 200, "application/json", &body),
+            Err(e) => error(&mut stream, 500, &e),
+        },
+        ("POST", "/v1/speech/record/stop") => {
+            let cancel = std::str::from_utf8(&req.body)
+                .ok()
+                .and_then(|s| Json::parse(s).ok())
+                .and_then(|j| j.get("cancel").and_then(Json::as_bool))
+                .unwrap_or(false);
+            match kronos_2t::speech::stop_mic_recording_json(cancel) {
+                Ok(body) => respond(&mut stream, 200, "application/json", &body),
+                Err(e) => error(&mut stream, 500, &e),
+            }
+        }
+        ("POST", "/v1/speech/settings") => match kronos_2t::speech::open_macos_microphone_settings() {
+            Ok(()) => respond(&mut stream, 200, "application/json", r#"{"status":"ok"}"#),
+            Err(e) => error(&mut stream, 500, &e),
+        },
         ("GET", "/v1/device/status") => {
             respond(
                 &mut stream,

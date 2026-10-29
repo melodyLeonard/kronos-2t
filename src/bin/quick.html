@@ -197,6 +197,58 @@
     0%, 100% { box-shadow: 0 0 0 0 rgba(217, 119, 87, 0.42); }
     50% { box-shadow: 0 0 0 5px rgba(217, 119, 87, 0.08); }
   }
+  #q-voice-bar {
+    display: none;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 0 15px 9px;
+    padding: 7px 11px;
+    border-radius: 10px;
+    background: rgba(217, 119, 87, 0.11);
+    border: 1px solid rgba(217, 119, 87, 0.34);
+    font-size: 12px;
+    color: var(--text);
+  }
+  #q-voice-bar.active {
+    display: flex;
+  }
+  #q-voice-bar.denied {
+    background: rgba(245, 158, 11, 0.12);
+    border-color: rgba(245, 158, 11, 0.4);
+  }
+  .q-voice-left {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-width: 0;
+  }
+  .q-eq {
+    display: inline-flex;
+    align-items: center;
+    gap: 2.5px;
+    height: 16px;
+    flex-shrink: 0;
+  }
+  .q-eq span {
+    width: 3px;
+    height: 4px;
+    border-radius: 99px;
+    background: var(--accent-warm);
+    transition: height 0.09s ease;
+  }
+  #q-voice-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: #e5e7eb;
+  }
+  .q-voice-btns {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
   #q-send {
     width: 32px;
     height: 32px;
@@ -408,6 +460,17 @@
       </button>
       <button id="q-send" type="submit" title="Send (Enter)">↑</button>
     </div>
+    <div id="q-voice-bar">
+      <div class="q-voice-left">
+        <div class="q-eq" id="q-eq"><span></span><span></span><span></span><span></span><span></span></div>
+        <span id="q-voice-text">Listening…</span>
+      </div>
+      <div class="q-voice-btns">
+        <button id="q-voice-settings" class="act-btn" type="button" style="display:none">Enable Mic ↗</button>
+        <button id="q-voice-done" class="act-btn dev-on" type="button">Done</button>
+        <button id="q-voice-cancel" class="act-btn" type="button">Cancel</button>
+      </div>
+    </div>
     <div id="tray"></div>
   </form>
 
@@ -475,96 +538,91 @@ function baseNamePath(p) {
   return parts[parts.length - 1] || clean || "workspace";
 }
 
-function encodeWav16kMono(chunks, totalSamples, srcRate) {
-  const dstRate = 16000;
-  const merged = new Float32Array(totalSamples);
-  let off = 0;
-  for (const c of chunks) {
-    merged.set(c, off);
-    off += c.length;
+function setQuickEqLevel(level) {
+  const bars = $("q-eq").querySelectorAll("span");
+  const weights = [0.45, 0.8, 1.0, 0.75, 0.5];
+  const lv = Math.max(0, Math.min(1, Number(level) || 0));
+  bars.forEach((b, i) => {
+    const h = Math.round(4 + lv * 13 * weights[i]);
+    b.style.height = `${h}px`;
+  });
+}
+
+function showQuickVoiceBar(msg, opts = {}) {
+  const bar = $("q-voice-bar");
+  bar.classList.toggle("active", Boolean(msg));
+  bar.classList.toggle("denied", Boolean(opts.denied));
+  $("q-voice-text").textContent = msg || "";
+  $("q-voice-settings").style.display = opts.denied ? "inline-block" : "none";
+  $("q-voice-done").style.display = opts.showDone === false ? "none" : "inline-block";
+  if (!msg) setQuickEqLevel(0);
+  syncPanelHeight();
+}
+
+function applyQuickVoiceTranscript(j) {
+  const spoken = String(j.text || "").trim();
+  if (!spoken) {
+    $("q-status").textContent = "No speech detected — click mic to speak again";
+    showQuickVoiceBar("", {});
+    qInput.focus();
+    return;
   }
-  const ratio = Math.max(1, (srcRate || 48000) / dstRate);
-  const dstLen = Math.max(1, Math.floor(totalSamples / ratio));
-  const buf = new ArrayBuffer(44 + dstLen * 2);
-  const dv = new DataView(buf);
-  const putStr = (pos, str) => {
-    for (let i = 0; i < str.length; i++) dv.setUint8(pos + i, str.charCodeAt(i));
-  };
-  putStr(0, "RIFF");
-  dv.setUint32(4, 36 + dstLen * 2, true);
-  putStr(8, "WAVE");
-  putStr(12, "fmt ");
-  dv.setUint32(16, 16, true);
-  dv.setUint16(20, 1, true);
-  dv.setUint16(22, 1, true);
-  dv.setUint32(24, dstRate, true);
-  dv.setUint32(28, dstRate * 2, true);
-  dv.setUint16(32, 2, true);
-  dv.setUint16(34, 16, true);
-  putStr(36, "data");
-  dv.setUint32(40, dstLen * 2, true);
-  for (let i = 0; i < dstLen; i++) {
-    const start = Math.floor(i * ratio);
-    const end = Math.min(totalSamples, Math.max(start + 1, Math.floor((i + 1) * ratio)));
-    let acc = 0;
-    for (let j = start; j < end; j++) acc += merged[j];
-    const sample = Math.max(-1, Math.min(1, acc / (end - start)));
-    const s16 = sample < 0 ? Math.round(sample * 32768) : Math.round(sample * 32767);
-    dv.setInt16(44 + i * 2, s16, true);
+  showQuickVoiceBar("", {});
+  const existing = qInput.value.trim();
+  qInput.value = existing ? (existing + " " + spoken) : spoken;
+  qInput.dispatchEvent(new Event("input"));
+  const ms = Math.round(j.transcribe_ms || 0);
+  pendingVoiceBadge = `voice · ${ms} ms`;
+  $("q-status").textContent = `Transcribed in ${ms} ms`;
+  if (!qSend.disabled) {
+    $("q-form").requestSubmit();
   }
-  return buf;
 }
 
 async function stopQuickVoice(cancelOnly) {
   const sess = qVoiceSession;
-  if (!sess || sess.stopping) return;
+  if (!sess || sess.stopping) {
+    showQuickVoiceBar("", {});
+    return;
+  }
   sess.stopping = true;
   qVoiceSession = null;
-  if (sess.timer) clearInterval(sess.timer);
-  try { sess.proc.disconnect(); } catch (e) {}
-  try { sess.gain.disconnect(); } catch (e) {}
-  try { sess.source.disconnect(); } catch (e) {}
-  try { sess.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
-  try { await sess.ctx.close(); } catch (e) {}
+  if (sess.pollTimer) clearInterval(sess.pollTimer);
   qVoice.classList.remove("recording");
 
-  if (cancelOnly || sess.totalSamples < 1600) {
+  if (cancelOnly) {
     qVoice.classList.remove("transcribing");
-    $("q-status").textContent = cancelOnly ? "Voice input cancelled" : "No speech captured";
+    showQuickVoiceBar("", {});
+    $("q-status").textContent = "Voice input cancelled";
+    fetch("/v1/speech/record/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cancel: true }),
+    }).catch(() => {});
+    postHost({ type: "mic_end" });
     qInput.focus();
     return;
   }
 
   qVoice.classList.add("transcribing");
+  setQuickEqLevel(0.25);
+  showQuickVoiceBar("Transcribing on Neural Engine…", { showDone: false });
   $("q-status").textContent = "Transcribing on Neural Engine…";
   try {
-    const wavBuf = encodeWav16kMono(sess.chunks, sess.totalSamples, sess.sampleRate);
-    const r = await fetch("/v1/speech/transcribe", {
+    const r = await fetch("/v1/speech/record/stop", {
       method: "POST",
-      headers: { "Content-Type": "audio/wav" },
-      body: wavBuf,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cancel: false }),
     });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error?.message || r.statusText);
-    const spoken = String(j.text || "").trim();
-    if (!spoken) {
-      $("q-status").textContent = "No speech detected — click mic to speak again";
-      qInput.focus();
-      return;
-    }
-    const existing = qInput.value.trim();
-    qInput.value = existing ? (existing + " " + spoken) : spoken;
-    qInput.dispatchEvent(new Event("input"));
-    const ms = Math.round(j.transcribe_ms || 0);
-    pendingVoiceBadge = `voice · ${ms} ms`;
-    $("q-status").textContent = `Transcribed in ${ms} ms`;
-    if (!qSend.disabled) {
-      $("q-form").requestSubmit();
-    }
+    applyQuickVoiceTranscript(j);
   } catch (err) {
+    showQuickVoiceBar("", {});
     $("q-status").textContent = "Voice error: " + err.message;
   } finally {
     qVoice.classList.remove("transcribing");
+    postHost({ type: "mic_end" });
   }
 }
 
@@ -574,97 +632,106 @@ async function startQuickVoice() {
     await stopQuickVoice(false);
     return;
   }
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    $("q-status").textContent = "Microphone API unavailable in this view";
-    return;
-  }
-  postHost({ type: "mic_begin" });
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
-  } catch (err) {
-    $("q-status").textContent = "Microphone access denied";
-    return;
-  } finally {
-    postHost({ type: "mic_end" });
-  }
 
-  const AudioCtx = window.AudioContext || window.webkitAudioContext;
-  const ctx = new AudioCtx();
-  if (ctx.state === "suspended") {
-    try { await ctx.resume(); } catch (e) {}
-  }
-  const source = ctx.createMediaStreamSource(stream);
-  const proc = ctx.createScriptProcessor(2048, 1, 1);
-  const gain = ctx.createGain();
-  gain.gain.value = 0;
-  source.connect(proc);
-  proc.connect(gain);
-  gain.connect(ctx.destination);
-
-  const startedAt = performance.now();
   const sess = {
-    stream,
-    ctx,
-    source,
-    proc,
-    gain,
-    sampleRate: ctx.sampleRate || 48000,
-    chunks: [],
-    totalSamples: 0,
-    speechMs: 0,
-    heardSpeech: false,
-    lastVoiceAt: startedAt,
-    startedAt,
+    startedAt: performance.now(),
     stopping: false,
-    timer: null,
+    pollBusy: false,
+    pollTimer: null,
   };
   qVoiceSession = sess;
+  postHost({ type: "mic_begin" });
   qVoice.classList.add("recording");
-  $("q-status").textContent = "Listening 0:00 · speak command (Enter to send, Esc to cancel)";
+  setQuickEqLevel(0.22);
+  showQuickVoiceBar("Starting microphone… allow access if macOS prompts", { showDone: true });
+  $("q-status").textContent = "Starting microphone…";
 
-  proc.onaudioprocess = (ev) => {
-    if (qVoiceSession !== sess || sess.stopping) return;
-    const ch = ev.inputBuffer.getChannelData(0);
-    const copy = new Float32Array(ch.length);
-    copy.set(ch);
-    sess.chunks.push(copy);
-    sess.totalSamples += copy.length;
-
-    let sumSq = 0;
-    for (let i = 0; i < ch.length; i++) sumSq += ch[i] * ch[i];
-    const rms = Math.sqrt(sumSq / Math.max(1, ch.length));
-    const now = performance.now();
-    const frameMs = (ch.length / sess.sampleRate) * 1000;
-    if (rms > 0.016) {
-      sess.speechMs += frameMs;
-      sess.lastVoiceAt = now;
-      if (sess.speechMs >= 160) sess.heardSpeech = true;
+  try {
+    const r = await fetch("/v1/speech/record/start", { method: "POST" });
+    const j = await r.json();
+    if (qVoiceSession !== sess || sess.stopping) {
+      fetch("/v1/speech/record/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cancel: true }),
+      }).catch(() => {});
+      return;
     }
-    if (sess.heardSpeech && (now - sess.lastVoiceAt) >= 1350 && (now - sess.startedAt) >= 900) {
-      stopQuickVoice(false);
-    } else if ((now - sess.startedAt) >= 45000) {
-      stopQuickVoice(false);
-    }
-  };
+    if (!r.ok) throw new Error(j.error?.message || r.statusText);
 
-  sess.timer = setInterval(() => {
-    if (qVoiceSession !== sess || sess.stopping) return;
-    const sec = Math.floor((performance.now() - sess.startedAt) / 1000);
-    const mm = Math.floor(sec / 60);
-    const ss = String(sec % 60).padStart(2, "0");
-    $("q-status").textContent = `Listening ${mm}:${ss} · click mic or press Enter to finish`;
-  }, 300);
+    if (j.status === "denied") {
+      qVoiceSession = null;
+      qVoice.classList.remove("recording");
+      postHost({ type: "mic_end" });
+      showQuickVoiceBar(j.message || "Enable Kronos in macOS Privacy -> Microphone", {
+        denied: true,
+        showDone: false,
+      });
+      $("q-status").textContent = "Microphone access disabled in macOS Settings";
+      return;
+    }
+
+    sess.startedAt = performance.now();
+    showQuickVoiceBar("Listening 0:00 · speak naturally (Enter or Done to send)", { showDone: true });
+    $("q-status").textContent = "Listening · auto-sends on pause";
+
+    sess.pollTimer = setInterval(async () => {
+      if (qVoiceSession !== sess || sess.stopping || sess.pollBusy) return;
+      sess.pollBusy = true;
+      try {
+        const pr = await fetch("/v1/speech/record/poll");
+        if (!pr.ok || qVoiceSession !== sess || sess.stopping) return;
+        const pj = await pr.json();
+        if (qVoiceSession !== sess || sess.stopping) return;
+        if (pj.status === "recording") {
+          setQuickEqLevel(Math.max(0.12, Number(pj.level) || 0));
+          const sec = Math.floor((pj.elapsed_ms || (performance.now() - sess.startedAt)) / 1000);
+          const mm = Math.floor(sec / 60);
+          const ss = String(sec % 60).padStart(2, "0");
+          const hint = pj.heard_speech ? "pause to auto-send or click Done" : "speak command now";
+          showQuickVoiceBar(`Listening ${mm}:${ss} · ${hint}`, { showDone: true });
+        } else if (pj.status === "done") {
+          sess.stopping = true;
+          qVoiceSession = null;
+          clearInterval(sess.pollTimer);
+          qVoice.classList.remove("recording");
+          qVoice.classList.remove("transcribing");
+          postHost({ type: "mic_end" });
+          applyQuickVoiceTranscript(pj);
+        } else if (pj.status === "idle") {
+          sess.stopping = true;
+          qVoiceSession = null;
+          clearInterval(sess.pollTimer);
+          qVoice.classList.remove("recording");
+          postHost({ type: "mic_end" });
+          showQuickVoiceBar("", {});
+        }
+      } catch (e) {
+      } finally {
+        sess.pollBusy = false;
+      }
+    }, 115);
+  } catch (err) {
+    if (qVoiceSession === sess) qVoiceSession = null;
+    qVoice.classList.remove("recording");
+    postHost({ type: "mic_end" });
+    showQuickVoiceBar("Voice startup failed: " + err.message, { denied: false, showDone: false });
+    $("q-status").textContent = "Voice error: " + err.message;
+  }
 }
 
 qVoice.onclick = () => startQuickVoice();
+$("q-voice-done").onclick = () => stopQuickVoice(false);
+$("q-voice-cancel").onclick = () => {
+  if (qVoiceSession) {
+    stopQuickVoice(true);
+  } else {
+    showQuickVoiceBar("", {});
+  }
+};
+$("q-voice-settings").onclick = () => {
+  fetch("/v1/speech/settings", { method: "POST" }).catch(() => {});
+};
 window.kronosStartVoice = () => {
   if (!qVoiceSession) startQuickVoice();
 };
@@ -910,7 +977,7 @@ let browserDragX = 0;
 let browserDragY = 0;
 
 function isInteractiveDragTarget(el) {
-  return Boolean(el && el.closest("textarea, input, select, button, a, #answer-wrap, .chip"));
+  return Boolean(el && el.closest("textarea, input, select, button, a, #answer-wrap, #q-voice-bar, .chip"));
 }
 
 shell.addEventListener("pointerdown", (e) => {
