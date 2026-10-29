@@ -327,9 +327,14 @@ impl ChatModel {
         calib: Option<(&Path, usize)>,
     ) -> Result<Self, String> {
         let mut engine = load_or_compile_engine(model_dir, cache_dir, mode_key, ctx, threads, calib)?;
-        // Hadamard INT8 KV cache by default for both `head_dim == 64` (SmolLM2) and `128` (Qwen2.5).
+        // Hadamard KV cache (`Q4` under `<= 8 GB` budget profile, `Q8` otherwise).
         if matches!(engine.cfg.head_dim(), 64 | 128) {
-            engine.enable_q8_kv_cache(true);
+            let kv_bits = if crate::memory_budget::MemoryBudgetProfile::active().prefer_q4_kv {
+                4
+            } else {
+                8
+            };
+            engine.set_kv_bits(kv_bits);
         }
         let vocab_size = engine.cfg.vocab_size;
         let mut tok = BpeTokenizer::from_model_dir(model_dir).map_err(|e| format!("tokenizer: {e}"))?;
@@ -381,17 +386,50 @@ impl ChatModel {
         self.engine.is_q8_kv_enabled()
     }
 
+    /// Sets KV cache quantization bit-width (`4`, `8`, or `32`) on target and draft engines.
+    pub fn set_kv_bits(&mut self, bits: u8) {
+        self.engine.set_kv_bits(bits);
+        self.cached.clear();
+        if let Some(d) = self.draft.as_mut() {
+            d.engine.set_kv_bits(bits);
+            d.cached.clear();
+        }
+    }
+
+    pub fn kv_bits(&self) -> u8 {
+        self.engine.kv_bits()
+    }
+
+    /// Configures a sliding-window + attention-sink KV ring buffer on target and draft engines.
+    pub fn set_kv_sliding_window(&mut self, window: Option<usize>, sink_tokens: usize) {
+        self.engine.set_kv_sliding_window(window, sink_tokens);
+        self.cached.clear();
+        if let Some(d) = self.draft.as_mut() {
+            d.engine.set_kv_sliding_window(window, sink_tokens);
+            d.cached.clear();
+        }
+    }
+
+    pub fn kv_sliding_window(&self) -> Option<usize> {
+        self.engine.kv_sliding_window().map(|(w, _)| w)
+    }
+
     /// Enables zero-copy Metal GPU inference on the target model; small draft models stay on CPU.
     pub fn enable_metal(&mut self) -> Result<(), String> {
         self.engine.enable_metal()?;
         self.cached.clear();
+        let target_bits = if self.engine.kv_bits() == 4 { 4 } else { 8 };
+        let target_win = self.engine.kv_sliding_window();
         if let Some(d) = self.draft.as_mut() {
             if d.engine.cfg.hidden_size > 1536 {
                 let _ = d.engine.enable_metal();
             } else {
                 d.engine.disable_metal();
                 if matches!(d.engine.cfg.head_dim(), 64 | 128) {
-                    d.engine.enable_q8_kv_cache(true);
+                    d.engine.set_kv_bits(target_bits);
+                    if let Some((w, s)) = target_win {
+                        d.engine.set_kv_sliding_window(Some(w), s);
+                    }
                 }
                 d.engine
                     .set_num_threads(crate::thread_pool::default_inference_threads());
@@ -495,12 +533,21 @@ impl ChatModel {
         if self.scratch.pen_logits.len() < shared_vocab {
             self.scratch.pen_logits.resize(shared_vocab, 0.0);
         }
+        let target_bits = if self.engine.kv_bits() == 4 { 4 } else { 8 };
+        let target_win = self.engine.kv_sliding_window();
         if self.engine.is_metal_enabled() && draft_eng.cfg.hidden_size > 1536 {
             let _ = draft_eng.enable_metal();
+            draft_eng.set_kv_bits(target_bits);
+            if let Some((w, s)) = target_win {
+                draft_eng.set_kv_sliding_window(Some(w), s);
+            }
         } else if (self.engine.is_q8_kv_enabled() || self.engine.is_metal_enabled())
             && matches!(draft_eng.cfg.head_dim(), 64 | 128)
         {
-            draft_eng.enable_q8_kv_cache(true);
+            draft_eng.set_kv_bits(target_bits);
+            if let Some((w, s)) = target_win {
+                draft_eng.set_kv_sliding_window(Some(w), s);
+            }
         }
         if self.engine.is_metal_enabled() {
             crate::thread_pool::SpinThreadPool::park_idle_workers();
@@ -688,9 +735,12 @@ impl ChatModel {
         if tokens.is_empty() || tokens.len() >= self.ctx {
             return 0;
         }
-        let common = self.cached.iter().zip(&tokens).take_while(|(a, b)| a == b).count();
+        let mut common = self.cached.iter().zip(&tokens).take_while(|(a, b)| a == b).count();
         if common == tokens.len() {
             return tokens.len();
+        }
+        if !self.engine.can_truncate_kv_to(common) {
+            common = 0;
         }
         self.engine.truncate_context(common);
         self.cached.truncate(common);
@@ -700,12 +750,15 @@ impl ChatModel {
             let cur_logits = &mut self.scratch.cur_logits;
             let d = self.draft.as_mut().unwrap();
             let dv = d.draft_vocab;
-            let d_common = d
+            let mut d_common = d
                 .cached
                 .iter()
                 .zip(&tokens)
                 .take_while(|(&a, &b)| a == if b < dv { b } else { 0 })
                 .count();
+            if !d.engine.can_truncate_kv_to(d_common) {
+                d_common = 0;
+            }
             d.engine.truncate_context(d_common);
             d.cached.truncate(d_common);
             let mapped: Vec<usize> = tokens[d_common..]
@@ -728,12 +781,15 @@ impl ChatModel {
             self.scratch.cur_logits.copy_from_slice(l);
             if let Some(d) = self.draft.as_mut() {
                 let dv = d.draft_vocab;
-                let d_common = d
+                let mut d_common = d
                     .cached
                     .iter()
                     .zip(&tokens)
                     .take_while(|(&a, &b)| a == if b < dv { b } else { 0 })
                     .count();
+                if !d.engine.can_truncate_kv_to(d_common) {
+                    d_common = 0;
+                }
                 d.engine.truncate_context(d_common);
                 d.cached.truncate(d_common);
                 let mapped: Vec<usize> = tokens[d_common..]
@@ -845,6 +901,9 @@ impl ChatModel {
         // Reuse the cached prefix; at least one prompt token must run to produce logits.
         let mut common = self.cached.iter().zip(&prompt).take_while(|(a, b)| a == b).count();
         common = common.min(prompt.len() - 1);
+        if !self.engine.can_truncate_kv_to(common) {
+            common = 0;
+        }
         self.engine.truncate_context(common);
         self.cached.truncate(common);
         let t0 = Instant::now();
@@ -878,12 +937,15 @@ impl ChatModel {
                     let cur_logits = &mut self.scratch.cur_logits;
                     let d = self.draft.as_mut().unwrap();
                     let dv = d.draft_vocab;
-                    let d_common = d
+                    let mut d_common = d
                         .cached
                         .iter()
                         .zip(&prompt)
                         .take_while(|(&a, &b)| a == if b < dv { b } else { 0 })
                         .count();
+                    if !d.engine.can_truncate_kv_to(d_common) {
+                        d_common = 0;
+                    }
                     d.engine.truncate_context(d_common);
                     d.cached.truncate(d_common);
                     let mapped: Vec<usize> = prompt[d_common..]
@@ -914,12 +976,15 @@ impl ChatModel {
         if !draft_synced_in_parallel {
             if let Some(d) = self.draft.as_mut() {
                 let dv = d.draft_vocab;
-                let d_common = d
+                let mut d_common = d
                     .cached
                     .iter()
                     .zip(&self.cached)
                     .take_while(|(&a, &b)| a == if b < dv { b } else { 0 })
                     .count();
+                if !d.engine.can_truncate_kv_to(d_common) {
+                    d_common = 0;
+                }
                 d.engine.truncate_context(d_common);
                 d.cached.truncate(d_common);
                 if d_common < self.cached.len() {
@@ -1038,12 +1103,15 @@ impl ChatModel {
                     let dv = d.draft_vocab;
                     let sv = d.shared_vocab;
                     let clamp_d = |id: usize| if id < dv { id } else { 0 };
-                    let d_common = d
+                    let mut d_common = d
                         .cached
                         .iter()
                         .zip(&self.cached)
                         .take_while(|(&a, &b)| a == clamp_d(b))
                         .count();
+                    if !d.engine.can_truncate_kv_to(d_common) {
+                        d_common = 0;
+                    }
                     d.engine.truncate_context(d_common);
                     d.cached.truncate(d_common);
                     let next_d = clamp_d(next);

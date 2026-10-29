@@ -353,6 +353,10 @@ fn main() {
         let calib_opt = calib.as_deref().map(|c| (Path::new(c), calib_tokens));
         let cache_dir_flag = flag("--cache-dir");
         let cache_dir_opt = cache_dir_flag.as_deref().map(Path::new);
+        if let Some(mb_str) = flag("--memory-budget-mb") {
+            let mb: usize = mb_str.parse().expect("numeric --memory-budget-mb");
+            kronos_2t::memory_budget::MemoryBudgetProfile::set_global_budget_override_mb(mb);
+        }
         let default_threads = kronos_2t::thread_pool::default_inference_threads() as f64;
         let mut model = ChatModel::load_with_cache_dir(
             model_dir,
@@ -370,6 +374,19 @@ fn main() {
         let require_metal = args.iter().any(|a| a == "--metal");
         if args.iter().any(|a| a == "--fp32-kv") {
             model.enable_q8_kv_cache(false);
+        } else if args.iter().any(|a| a == "--q8-kv") {
+            model.set_kv_bits(8);
+        } else if args.iter().any(|a| a == "--q4-kv") {
+            model.set_kv_bits(4);
+        }
+        if let Some(bits_str) = flag("--kv-bits") {
+            let bits: u8 = bits_str.parse().expect("numeric --kv-bits (4, 8, or 32)");
+            model.set_kv_bits(bits);
+        }
+        if let Some(win_str) = flag("--kv-window") {
+            let win: usize = win_str.parse().expect("numeric --kv-window");
+            let sinks = num("--kv-sinks", 4.0) as usize;
+            model.set_kv_sliding_window((win > 0).then_some(win), sinks);
         }
         if require_metal {
             model.enable_metal().unwrap_or_else(|e| {
@@ -401,12 +418,18 @@ fn main() {
                 eprintln!("built without the `ane` feature; prefilling on CPU");
             }
         }
-        let kv_tag = if model.is_metal_enabled() {
-            "Metal-Q8-KV"
-        } else if model.is_q8_kv_enabled() {
-            "Q8-KV"
-        } else {
-            "FP32-KV"
+        let kv_tag = {
+            let base = match (model.is_metal_enabled(), model.kv_bits()) {
+                (true, 4) => "Metal-Q4-KV",
+                (true, _) => "Metal-Q8-KV",
+                (false, 4) => "Q4-KV",
+                (false, 8) => "Q8-KV",
+                _ => "FP32-KV",
+            };
+            match model.kv_sliding_window() {
+                Some(w) => format!("{base}/W{w}"),
+                None => base.to_string(),
+            }
         };
         eprintln!(
             "loaded {} (weights {:.2} GiB + {} {:.2} GiB @ ctx={}) · workdir={}",

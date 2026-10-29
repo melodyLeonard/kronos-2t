@@ -18,14 +18,15 @@ use crate::hadamard::{fwht64_signed_inplace, ifwht64_signed_inplace};
 use crate::mmap_pager::sys::RawMmap;
 use crate::safetensors::{JsonCursor, SafeTensorsStore};
 use crate::simd_lut::{
-    bf16_to_f32, nf_sdot_batch_stripe_range, nf_sdot_stripe_range, nf_sdot_stripe_range_int8,
-    nf_sdot_stripe_range_raw, nibble4_sdot_batch_stripe_range, nibble4_sdot_stripe_range,
-    nibble4_sdot_stripe_range_int8, nibble4_sdot_stripe_range_raw, simd_lut_base3_gemv,
-    simd_lut_base3_stripe_range, simd_lut_bipolar_gemv, simd_lut_bipolar_stripe_range,
-    simd_lut_gemv_multiplane, vq2_lut_gemv, vq2_lut_stripe_range, vq2_lut_stripe_range_raw,
-    vq2_sdot_batch_stripe_range, BipolarActivationLut, FusedBase3LutMatrix, FusedBipolarLutMatrix,
-    GgufQ4_0Matrix, Int8ChunkActivation, MultiPlaneTernaryMatrix, NfSdotMatrix, Nibble4SdotMatrix,
-    QuantizedActivationLut, Vq2ActivationLut, Vq2LutMatrix, SIMD_ROW_STRIPE,
+    bf16_to_f32, f32_to_bf16, nf_sdot_batch_stripe_range, nf_sdot_stripe_range,
+    nf_sdot_stripe_range_int8, nf_sdot_stripe_range_raw, nibble4_sdot_batch_stripe_range,
+    nibble4_sdot_stripe_range, nibble4_sdot_stripe_range_int8, nibble4_sdot_stripe_range_raw,
+    simd_lut_base3_gemv, simd_lut_base3_stripe_range, simd_lut_bipolar_gemv,
+    simd_lut_bipolar_stripe_range, simd_lut_gemv_multiplane, vq2_lut_gemv, vq2_lut_stripe_range,
+    vq2_lut_stripe_range_raw, vq2_sdot_batch_stripe_range, BipolarActivationLut,
+    FusedBase3LutMatrix, FusedBipolarLutMatrix, GgufQ4_0Matrix, Int8ChunkActivation,
+    MultiPlaneTernaryMatrix, NfSdotMatrix, Nibble4SdotMatrix, QuantizedActivationLut,
+    Vq2ActivationLut, Vq2LutMatrix, NF4_DEFAULT_CODEBOOK_I8, SIMD_ROW_STRIPE,
 };
 use crate::thread_pool::{physical_p_cores, SpinBarrier, SpinThreadPool};
 use std::fs;
@@ -43,6 +44,9 @@ const KRONOS2_CACHE_MAGIC: &[u8] = b"K2TKRONOS2\n";
 
 /// Cache magic adding optional fused `qkv_bias` and `BF16` untied embeddings (`Qwen2` / `Qwen2.5-Coder`).
 const KRONOS3_CACHE_MAGIC: &[u8] = b"K2TKRONOS3\n";
+
+/// Cache magic adding `NF4` quantized untied embeddings (`-1.08 GiB` wired RAM on `152k`-vocab models).
+const KRONOS4_CACHE_MAGIC: &[u8] = b"K2TKRONOS4\n";
 
 /// Little-endian cursor over a [`RealLlamaEngine::save_bipolar`] cache.
 struct CacheReader<'a> {
@@ -67,11 +71,6 @@ impl<'a> CacheReader<'a> {
         let n = self.u64()?;
         Ok(self.take(n * 4)?.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
     }
-
-    fn u16s(&mut self) -> io::Result<Vec<u16>> {
-        let n = self.u64()?;
-        Ok(self.take(n * 2)?.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
-    }
 }
 
 /// Model hyperparameters parsed from HuggingFace `config.json`.
@@ -83,10 +82,18 @@ pub struct LlamaConfig {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
+    pub head_dim_override: Option<usize>,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub tie_word_embeddings: bool,
     pub max_seq_len: usize,
+    pub sliding_window: Option<usize>,
+    pub sink_tokens: usize,
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub moe_intermediate_size: usize,
+    pub shared_expert_intermediate_size: usize,
+    pub norm_topk_prob: bool,
 }
 
 impl LlamaConfig {
@@ -102,9 +109,43 @@ impl LlamaConfig {
         let mut num_hidden_layers = 30usize;
         let mut num_attention_heads = 9usize;
         let mut num_key_value_heads = 3usize;
+        let mut head_dim_override: Option<usize> = None;
         let mut rms_norm_eps = 1e-5f32;
         let mut rope_theta = 100_000.0f32;
         let mut tie_word_embeddings = true;
+        let mut raw_sliding_window: Option<usize> = None;
+        let mut use_sliding_window: Option<bool> = None;
+        let mut explicit_sinks: Option<usize> = None;
+        let mut num_experts = 0usize;
+        let mut num_experts_per_tok = 0usize;
+        let mut moe_intermediate_size = 0usize;
+        let mut shared_expert_intermediate_size = 0usize;
+        let mut norm_topk_prob = true;
+
+        let parse_opt_usize = |cur: &mut JsonCursor| -> io::Result<Option<usize>> {
+            if cur.peek() == Some(b'n') {
+                cur.consume_literal(b"null")
+                    .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                Ok(None)
+            } else {
+                let v = cur
+                    .parse_u64()
+                    .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?
+                    as usize;
+                Ok((v > 0).then_some(v))
+            }
+        };
+        let parse_bool = |cur: &mut JsonCursor| -> io::Result<bool> {
+            if cur.peek() == Some(b't') {
+                cur.consume_literal(b"true")
+                    .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                Ok(true)
+            } else {
+                cur.consume_literal(b"false")
+                    .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                Ok(false)
+            }
+        };
 
         while cur.peek() != Some(b'}') {
             let key = cur
@@ -119,17 +160,33 @@ impl LlamaConfig {
                 "num_hidden_layers" => num_hidden_layers = cur.parse_u64().unwrap() as usize,
                 "num_attention_heads" => num_attention_heads = cur.parse_u64().unwrap() as usize,
                 "num_key_value_heads" => num_key_value_heads = cur.parse_u64().unwrap() as usize,
+                "head_dim" => head_dim_override = parse_opt_usize(&mut cur)?,
                 "rms_norm_eps" => rms_norm_eps = cur.parse_f64().unwrap() as f32,
                 "rope_theta" => rope_theta = cur.parse_f64().unwrap() as f32,
-                "tie_word_embeddings" => {
-                    if cur.peek() == Some(b't') {
-                        cur.consume_literal(b"true").unwrap();
-                        tie_word_embeddings = true;
+                "tie_word_embeddings" => tie_word_embeddings = parse_bool(&mut cur)?,
+                "sliding_window" => raw_sliding_window = parse_opt_usize(&mut cur)?,
+                "use_sliding_window" => use_sliding_window = Some(parse_bool(&mut cur)?),
+                "num_sink_tokens" | "attention_sinks" => {
+                    if cur.peek() == Some(b't') || cur.peek() == Some(b'f') {
+                        let b = parse_bool(&mut cur)?;
+                        explicit_sinks = Some(if b { 4 } else { 0 });
                     } else {
-                        cur.consume_literal(b"false").unwrap();
-                        tie_word_embeddings = false;
+                        explicit_sinks = parse_opt_usize(&mut cur)?.or(Some(0));
                     }
                 }
+                "num_experts" | "num_local_experts" => {
+                    num_experts = parse_opt_usize(&mut cur)?.unwrap_or(0);
+                }
+                "num_experts_per_tok" => {
+                    num_experts_per_tok = parse_opt_usize(&mut cur)?.unwrap_or(0);
+                }
+                "moe_intermediate_size" => {
+                    moe_intermediate_size = parse_opt_usize(&mut cur)?.unwrap_or(0);
+                }
+                "shared_expert_intermediate_size" => {
+                    shared_expert_intermediate_size = parse_opt_usize(&mut cur)?.unwrap_or(0);
+                }
+                "norm_topk_prob" => norm_topk_prob = parse_bool(&mut cur)?,
                 _ => cur
                     .skip_value()
                     .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?,
@@ -141,6 +198,13 @@ impl LlamaConfig {
             }
         }
 
+        let sliding_window = if use_sliding_window == Some(false) {
+            None
+        } else {
+            raw_sliding_window.filter(|&w| w >= 8)
+        };
+        let sink_tokens = explicit_sinks.unwrap_or(if sliding_window.is_some() { 4 } else { 0 });
+
         Ok(Self {
             vocab_size,
             hidden_size,
@@ -148,21 +212,40 @@ impl LlamaConfig {
             num_hidden_layers,
             num_attention_heads,
             num_key_value_heads,
+            head_dim_override,
             rms_norm_eps,
             rope_theta,
             tie_word_embeddings,
             max_seq_len,
+            sliding_window,
+            sink_tokens,
+            num_experts,
+            num_experts_per_tok,
+            moe_intermediate_size,
+            shared_expert_intermediate_size,
+            norm_topk_prob,
         })
     }
 
     #[inline]
     pub fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_attention_heads
+        self.head_dim_override
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    #[inline]
+    pub fn q_dim(&self) -> usize {
+        self.num_attention_heads * self.head_dim()
     }
 
     #[inline]
     pub fn kv_dim(&self) -> usize {
         self.num_key_value_heads * self.head_dim()
+    }
+
+    #[inline]
+    pub fn is_moe(&self) -> bool {
+        self.num_experts > 1 && self.num_experts_per_tok > 0
     }
 }
 
@@ -731,45 +814,242 @@ impl PromptScratch {
     }
 }
 
-/// KV-head-major INT8 KV cache (`head_dim == 64` or `128`) using signed FWHT-64 + per-head FP32 scale.
+const KV_RING_BATCH_SLACK: usize = 512;
+
+#[derive(Clone, Copy)]
+struct QuantKvRawPtrs {
+    num_kv_heads: usize,
+    head_dim: usize,
+    cap_seq_len: usize,
+    bits: u8,
+    window_size: usize,
+    sink_tokens: usize,
+    ring_len: usize,
+    k_q8: usize,
+    v_q8: usize,
+    k_scales: usize,
+    v_scales: usize,
+    k_q4: usize,
+    v_q4: usize,
+    k_s16: usize,
+    v_s16: usize,
+}
+
+impl QuantKvRawPtrs {
+    #[inline(always)]
+    fn slot_of_pos(self, pos: usize) -> usize {
+        if self.ring_len == 0 || pos < self.sink_tokens {
+            pos
+        } else {
+            self.sink_tokens + ((pos - self.sink_tokens) % self.ring_len)
+        }
+    }
+
+    #[inline]
+    unsafe fn store_k(self, layer_idx: usize, kvh: usize, pos: usize, head_s: &[f32]) {
+        let slot = (layer_idx * self.num_kv_heads + kvh) * self.cap_seq_len + self.slot_of_pos(pos);
+        let hd = self.head_dim;
+        // SAFETY: `slot` is inside `cap_seq_len` for `(layer_idx, kvh)` and buffers match `self.bits`.
+        unsafe {
+            if self.bits == 8 {
+                store_hadamard_q8_head_raw(
+                    head_s,
+                    hd,
+                    (self.k_q8 as *mut i8).add(slot * hd),
+                    (self.k_scales as *mut f32).add(slot),
+                );
+            } else {
+                store_hadamard_q4_head_raw(
+                    head_s,
+                    hd,
+                    (self.k_q4 as *mut u8).add(slot * (hd / 2)),
+                    (self.k_s16 as *mut u16).add(slot * (hd / 64)),
+                );
+            }
+        }
+    }
+
+    #[inline]
+    unsafe fn store_v(self, layer_idx: usize, kvh: usize, pos: usize, head_s: &[f32]) {
+        let slot = (layer_idx * self.num_kv_heads + kvh) * self.cap_seq_len + self.slot_of_pos(pos);
+        let hd = self.head_dim;
+        // SAFETY: `slot` is inside `cap_seq_len` for `(layer_idx, kvh)` and buffers match `self.bits`.
+        unsafe {
+            if self.bits == 8 {
+                store_hadamard_q8_head_raw(
+                    head_s,
+                    hd,
+                    (self.v_q8 as *mut i8).add(slot * hd),
+                    (self.v_scales as *mut f32).add(slot),
+                );
+            } else {
+                store_hadamard_q4_head_raw(
+                    head_s,
+                    hd,
+                    (self.v_q4 as *mut u8).add(slot * (hd / 2)),
+                    (self.v_s16 as *mut u16).add(slot * (hd / 64)),
+                );
+            }
+        }
+    }
+
+    #[inline]
+    unsafe fn eval_gqa_group(
+        self,
+        layer_idx: usize,
+        kvh: usize,
+        attn_scale: f32,
+        queries: &mut [GqaQueryRef<'_>],
+    ) {
+        if queries.is_empty() {
+            return;
+        }
+        let base = (layer_idx * self.num_kv_heads + kvh) * self.cap_seq_len;
+        let hd = self.head_dim;
+        if self.bits == 8 && self.window_size == 0 {
+            let max_seq = queries.iter().map(|q| q.seq_len).max().unwrap_or(0);
+            // SAFETY: `base + max_seq <= num_layers * num_kv_heads * cap_seq_len`.
+            unsafe {
+                let k_q8_h =
+                    std::slice::from_raw_parts((self.k_q8 as *const i8).add(base * hd), max_seq * hd);
+                let ks_h =
+                    std::slice::from_raw_parts((self.k_scales as *const f32).add(base), max_seq);
+                let v_q8_h =
+                    std::slice::from_raw_parts((self.v_q8 as *const i8).add(base * hd), max_seq * hd);
+                let vs_h =
+                    std::slice::from_raw_parts((self.v_scales as *const f32).add(base), max_seq);
+                causal_gqa_group_q8(hd, k_q8_h, ks_h, v_q8_h, vs_h, attn_scale, queries);
+            }
+        } else {
+            // SAFETY: caller upholds `self` pointers and `cap_seq_len` capacity.
+            unsafe {
+                causal_gqa_group_q4_or_window(self, base, attn_scale, queries);
+            }
+        }
+    }
+}
+
+/// KV-head-major Hadamard `INT8` / `INT4` (`NF4`) KV cache with optional `O(1)` sliding-window + sink ring buffer.
 struct QuantizedKvCache {
     num_layers: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    bits: u8,
+    window_size: usize,
+    sink_tokens: usize,
+    ring_len: usize,
     max_seq_len: usize,
     cap_seq_len: usize,
     k_q8: Vec<i8>,
     v_q8: Vec<i8>,
     k_scales: Vec<f32>,
     v_scales: Vec<f32>,
+    k_q4: Vec<u8>,
+    v_q4: Vec<u8>,
+    k_s16: Vec<u16>,
+    v_s16: Vec<u16>,
 }
 
 impl QuantizedKvCache {
+    #[allow(dead_code)]
     fn new(cfg: &LlamaConfig) -> Self {
+        Self::new_with_opts(cfg, 8, cfg.sliding_window, cfg.sink_tokens)
+    }
+
+    fn new_with_opts(
+        cfg: &LlamaConfig,
+        bits: u8,
+        sliding_window: Option<usize>,
+        sink_tokens: usize,
+    ) -> Self {
+        assert!(bits == 8 || bits == 4, "KV cache bits must be 4 or 8 (got {bits})");
         let head_dim = cfg.head_dim();
         assert!(
             head_dim == 64 || head_dim == 128,
-            "Hadamard Q8 KV-cache requires head_dim == 64 or 128 (got {head_dim})"
+            "Hadamard KV-cache requires head_dim == 64 or 128 (got {head_dim})"
         );
-        // Grow capacity on demand so short/medium contexts stay L2-DTLB resident and avoid multi-GiB dirty allocations.
-        let cap_seq_len = cfg.max_seq_len.min(2048);
+        let (window_size, eff_sinks, ring_len, cap_seq_len) =
+            if let Some(w) = sliding_window.filter(|&w| w >= 8 && w + KV_RING_BATCH_SLACK < cfg.max_seq_len) {
+                let s = sink_tokens.min(w / 2);
+                let rl = (w - s) + KV_RING_BATCH_SLACK;
+                (w, s, rl, s + rl)
+            } else {
+                let init_cap = crate::memory_budget::MemoryBudgetProfile::active()
+                    .initial_kv_cap_tokens
+                    .clamp(64, 2048);
+                (0, 0, 0, cfg.max_seq_len.min(init_cap))
+            };
         let slots = cfg.num_hidden_layers * cfg.num_key_value_heads * cap_seq_len;
+        let (k_q8, v_q8, k_scales, v_scales, k_q4, v_q4, k_s16, v_s16) = if bits == 8 {
+            (
+                vec![0i8; slots * head_dim],
+                vec![0i8; slots * head_dim],
+                vec![0.0f32; slots],
+                vec![0.0f32; slots],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        } else {
+            let half_hd = head_dim / 2;
+            let gph64 = head_dim / 64;
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![0x88u8; slots * half_hd],
+                vec![0x88u8; slots * half_hd],
+                vec![0u16; slots * gph64],
+                vec![0u16; slots * gph64],
+            )
+        };
         Self {
             num_layers: cfg.num_hidden_layers,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
+            bits,
+            window_size,
+            sink_tokens: eff_sinks,
+            ring_len,
             max_seq_len: cfg.max_seq_len,
             cap_seq_len,
-            k_q8: vec![0i8; slots * head_dim],
-            v_q8: vec![0i8; slots * head_dim],
-            k_scales: vec![0.0f32; slots],
-            v_scales: vec![0.0f32; slots],
+            k_q8,
+            v_q8,
+            k_scales,
+            v_scales,
+            k_q4,
+            v_q4,
+            k_s16,
+            v_s16,
+        }
+    }
+
+    #[inline]
+    fn raw_ptrs(&self) -> QuantKvRawPtrs {
+        QuantKvRawPtrs {
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            cap_seq_len: self.cap_seq_len,
+            bits: self.bits,
+            window_size: self.window_size,
+            sink_tokens: self.sink_tokens,
+            ring_len: self.ring_len,
+            k_q8: self.k_q8.as_ptr() as usize,
+            v_q8: self.v_q8.as_ptr() as usize,
+            k_scales: self.k_scales.as_ptr() as usize,
+            v_scales: self.v_scales.as_ptr() as usize,
+            k_q4: self.k_q4.as_ptr() as usize,
+            v_q4: self.v_q4.as_ptr() as usize,
+            k_s16: self.k_s16.as_ptr() as usize,
+            v_s16: self.v_s16.as_ptr() as usize,
         }
     }
 
     fn ensure_seq_capacity(&mut self, needed_len: usize, live_len: usize) {
         assert!(needed_len <= self.max_seq_len);
-        if needed_len <= self.cap_seq_len {
+        if self.ring_len > 0 || needed_len <= self.cap_seq_len {
             return;
         }
         let mut new_cap = self.cap_seq_len.max(1);
@@ -780,26 +1060,53 @@ impl QuantizedKvCache {
         let hd = self.head_dim;
         let old_cap = self.cap_seq_len;
         let copy_len = live_len.min(old_cap);
-        let mut new_k = vec![0i8; heads * new_cap * hd];
-        let mut new_v = vec![0i8; heads * new_cap * hd];
-        let mut new_ks = vec![0.0f32; heads * new_cap];
-        let mut new_vs = vec![0.0f32; heads * new_cap];
-        if copy_len > 0 {
-            for h in 0..heads {
-                let so = h * old_cap;
-                let dn = h * new_cap;
-                new_k[dn * hd..(dn + copy_len) * hd]
-                    .copy_from_slice(&self.k_q8[so * hd..(so + copy_len) * hd]);
-                new_v[dn * hd..(dn + copy_len) * hd]
-                    .copy_from_slice(&self.v_q8[so * hd..(so + copy_len) * hd]);
-                new_ks[dn..dn + copy_len].copy_from_slice(&self.k_scales[so..so + copy_len]);
-                new_vs[dn..dn + copy_len].copy_from_slice(&self.v_scales[so..so + copy_len]);
+        if self.bits == 8 {
+            let mut new_k = vec![0i8; heads * new_cap * hd];
+            let mut new_v = vec![0i8; heads * new_cap * hd];
+            let mut new_ks = vec![0.0f32; heads * new_cap];
+            let mut new_vs = vec![0.0f32; heads * new_cap];
+            if copy_len > 0 {
+                for h in 0..heads {
+                    let so = h * old_cap;
+                    let dn = h * new_cap;
+                    new_k[dn * hd..(dn + copy_len) * hd]
+                        .copy_from_slice(&self.k_q8[so * hd..(so + copy_len) * hd]);
+                    new_v[dn * hd..(dn + copy_len) * hd]
+                        .copy_from_slice(&self.v_q8[so * hd..(so + copy_len) * hd]);
+                    new_ks[dn..dn + copy_len].copy_from_slice(&self.k_scales[so..so + copy_len]);
+                    new_vs[dn..dn + copy_len].copy_from_slice(&self.v_scales[so..so + copy_len]);
+                }
             }
+            self.k_q8 = new_k;
+            self.v_q8 = new_v;
+            self.k_scales = new_ks;
+            self.v_scales = new_vs;
+        } else {
+            let half_hd = hd / 2;
+            let gph64 = hd / 64;
+            let mut new_k = vec![0x88u8; heads * new_cap * half_hd];
+            let mut new_v = vec![0x88u8; heads * new_cap * half_hd];
+            let mut new_ks = vec![0u16; heads * new_cap * gph64];
+            let mut new_vs = vec![0u16; heads * new_cap * gph64];
+            if copy_len > 0 {
+                for h in 0..heads {
+                    let so = h * old_cap;
+                    let dn = h * new_cap;
+                    new_k[dn * half_hd..(dn + copy_len) * half_hd]
+                        .copy_from_slice(&self.k_q4[so * half_hd..(so + copy_len) * half_hd]);
+                    new_v[dn * half_hd..(dn + copy_len) * half_hd]
+                        .copy_from_slice(&self.v_q4[so * half_hd..(so + copy_len) * half_hd]);
+                    new_ks[dn * gph64..(dn + copy_len) * gph64]
+                        .copy_from_slice(&self.k_s16[so * gph64..(so + copy_len) * gph64]);
+                    new_vs[dn * gph64..(dn + copy_len) * gph64]
+                        .copy_from_slice(&self.v_s16[so * gph64..(so + copy_len) * gph64]);
+                }
+            }
+            self.k_q4 = new_k;
+            self.v_q4 = new_v;
+            self.k_s16 = new_ks;
+            self.v_s16 = new_vs;
         }
-        self.k_q8 = new_k;
-        self.v_q8 = new_v;
-        self.k_scales = new_ks;
-        self.v_scales = new_vs;
         self.cap_seq_len = new_cap;
     }
 
@@ -807,54 +1114,24 @@ impl QuantizedKvCache {
     fn physical_bytes(&self) -> usize {
         (self.k_q8.len() + self.v_q8.len()) * std::mem::size_of::<i8>()
             + (self.k_scales.len() + self.v_scales.len()) * std::mem::size_of::<f32>()
-    }
-
-    #[inline]
-    fn head_slot_base(&self, layer_idx: usize, kvh: usize) -> usize {
-        debug_assert!(layer_idx < self.num_layers && kvh < self.num_kv_heads);
-        (layer_idx * self.num_kv_heads + kvh) * self.cap_seq_len
+            + (self.k_q4.len() + self.v_q4.len()) * std::mem::size_of::<u8>()
+            + (self.k_s16.len() + self.v_s16.len()) * std::mem::size_of::<u16>()
     }
 
     #[inline]
     fn store_k_head(&mut self, layer_idx: usize, kvh: usize, pos: usize, k_head: &[f32]) {
-        let slot = self.head_slot_base(layer_idx, kvh) + pos;
-        let hd = self.head_dim;
-        // SAFETY: `slot < k_scales.len()` and `slot * hd + hd <= k_q8.len()`.
-        unsafe {
-            store_hadamard_q8_head_raw(
-                k_head,
-                hd,
-                self.k_q8.as_mut_ptr().add(slot * hd),
-                self.k_scales.as_mut_ptr().add(slot),
-            );
-        }
+        debug_assert!(layer_idx < self.num_layers && kvh < self.num_kv_heads);
+        let raw = self.raw_ptrs();
+        // SAFETY: `&mut self` guarantees exclusive access and valid slot bounds.
+        unsafe { raw.store_k(layer_idx, kvh, pos, k_head) };
     }
 
     #[inline]
     fn store_v_head(&mut self, layer_idx: usize, kvh: usize, pos: usize, v_head: &[f32]) {
-        let slot = self.head_slot_base(layer_idx, kvh) + pos;
-        let hd = self.head_dim;
-        // SAFETY: `slot < v_scales.len()` and `slot * hd + hd <= v_q8.len()`.
-        unsafe {
-            store_hadamard_q8_head_raw(
-                v_head,
-                hd,
-                self.v_q8.as_mut_ptr().add(slot * hd),
-                self.v_scales.as_mut_ptr().add(slot),
-            );
-        }
-    }
-
-    #[inline]
-    fn head_views(&self, layer_idx: usize, kvh: usize, seq_len: usize) -> (&[i8], &[f32], &[i8], &[f32]) {
-        let base = self.head_slot_base(layer_idx, kvh);
-        let hd = self.head_dim;
-        (
-            &self.k_q8[base * hd..(base + seq_len) * hd],
-            &self.k_scales[base..base + seq_len],
-            &self.v_q8[base * hd..(base + seq_len) * hd],
-            &self.v_scales[base..base + seq_len],
-        )
+        debug_assert!(layer_idx < self.num_layers && kvh < self.num_kv_heads);
+        let raw = self.raw_ptrs();
+        // SAFETY: `&mut self` guarantees exclusive access and valid slot bounds.
+        unsafe { raw.store_v(layer_idx, kvh, pos, v_head) };
     }
 }
 
@@ -943,6 +1220,10 @@ pub struct RealLlamaEngine {
     pub mean_weight_rel_error: f32,
     embed_f32_rows: Vec<f32>,
     embed_bf16_rows: Vec<u16>,
+    embed_nf4: Option<NfSdotMatrix>,
+    kv_bits_pref: u8,
+    kv_window_pref: Option<usize>,
+    kv_sinks_pref: usize,
     layers: Vec<LlamaLayer>,
     final_norm: Vec<f32>,
     lm_head: LinearBackend,
@@ -973,19 +1254,29 @@ impl RealLlamaEngine {
         self.pool.as_ref().map(|p| p.num_threads()).unwrap_or(1)
     }
 
-    /// Toggles the Hadamard INT8 KV cache (`head_dim == 64` or `128`). Frees the FP32 cache and resets `pos`.
+    /// Toggles the Hadamard quantized KV cache (`head_dim == 64` or `128`). Frees the FP32 cache and resets `pos`.
     pub fn enable_q8_kv_cache(&mut self, enable: bool) {
         self.ws.pos = 0;
         if enable {
             let hd = self.cfg.head_dim();
             assert!(
                 hd == 64 || hd == 128,
-                "Hadamard Q8 KV-cache requires head_dim == 64 or 128 (got {hd})"
+                "Hadamard KV-cache requires head_dim == 64 or 128 (got {hd})"
             );
+            let bits = if self.kv_bits_pref == 4 { 4 } else { 8 };
             self.ws.k_cache = Vec::new();
             self.ws.v_cache = Vec::new();
-            if self.ws.q8_kv.is_none() {
-                self.ws.q8_kv = Some(QuantizedKvCache::new(&self.cfg));
+            let needs_rebuild = match self.ws.q8_kv.as_ref() {
+                None => true,
+                Some(q) => q.bits != bits,
+            };
+            if needs_rebuild {
+                self.ws.q8_kv = Some(QuantizedKvCache::new_with_opts(
+                    &self.cfg,
+                    bits,
+                    self.kv_window_pref,
+                    self.kv_sinks_pref,
+                ));
             }
         } else {
             self.ws.q8_kv = None;
@@ -993,7 +1284,128 @@ impl RealLlamaEngine {
         }
     }
 
-    /// Whether the INT8 KV cache is active.
+    /// Selects 4-bit (`NF4` Hadamard) or 8-bit (`INT8` Hadamard) quantized KV cache (`bits == 4` or `8`).
+    pub fn set_kv_bits(&mut self, bits: u8) {
+        assert!(bits == 4 || bits == 8, "KV bits must be 4 or 8 (got {bits})");
+        self.kv_bits_pref = bits;
+        self.ws.pos = 0;
+        #[cfg(target_os = "macos")]
+        if let Some(gpu) = self.metal.as_mut() {
+            gpu.reconfigure_kv(&self.cfg, bits, self.kv_window_pref, self.kv_sinks_pref)
+                .expect("Metal KV reconfigure failed");
+            return;
+        }
+        if matches!(self.cfg.head_dim(), 64 | 128) {
+            self.ws.k_cache = Vec::new();
+            self.ws.v_cache = Vec::new();
+            self.ws.q8_kv = Some(QuantizedKvCache::new_with_opts(
+                &self.cfg,
+                bits,
+                self.kv_window_pref,
+                self.kv_sinks_pref,
+            ));
+        }
+    }
+
+    /// Active KV-cache bit-width (`4`, `8`, or `32`).
+    pub fn kv_bits(&self) -> u8 {
+        #[cfg(target_os = "macos")]
+        if let Some(gpu) = &self.metal {
+            return gpu.kv_bits();
+        }
+        self.ws.q8_kv.as_ref().map_or(32, |q| q.bits)
+    }
+
+    /// Configures an `O(1)` sliding-window + attention-sink KV ring buffer (`None` restores full causal window).
+    pub fn set_kv_sliding_window(&mut self, window: Option<usize>, sink_tokens: usize) {
+        self.kv_window_pref = window.filter(|&w| w >= 8);
+        self.kv_sinks_pref = if self.kv_window_pref.is_some() {
+            sink_tokens
+        } else {
+            0
+        };
+        self.ws.pos = 0;
+        #[cfg(target_os = "macos")]
+        if let Some(gpu) = self.metal.as_mut() {
+            let bits = if self.kv_bits_pref == 4 { 4 } else { 8 };
+            gpu.reconfigure_kv(&self.cfg, bits, self.kv_window_pref, self.kv_sinks_pref)
+                .expect("Metal KV window reconfigure failed");
+            return;
+        }
+        if self.ws.q8_kv.is_some() || (self.kv_window_pref.is_some() && matches!(self.cfg.head_dim(), 64 | 128)) {
+            let bits = if self.kv_bits_pref == 4 { 4 } else { 8 };
+            self.ws.k_cache = Vec::new();
+            self.ws.v_cache = Vec::new();
+            self.ws.q8_kv = Some(QuantizedKvCache::new_with_opts(
+                &self.cfg,
+                bits,
+                self.kv_window_pref,
+                self.kv_sinks_pref,
+            ));
+        }
+    }
+
+    /// Returns `(window_size, sink_tokens)` when a sliding-window ring buffer is active.
+    pub fn kv_sliding_window(&self) -> Option<(usize, usize)> {
+        #[cfg(target_os = "macos")]
+        if let Some(gpu) = &self.metal {
+            return gpu.kv_sliding_window();
+        }
+        self.ws
+            .q8_kv
+            .as_ref()
+            .and_then(|q| (q.window_size > 0).then_some((q.window_size, q.sink_tokens)))
+    }
+
+    /// Whether `truncate_context(target_len)` can roll back from `self.ws.pos` without ring-buffer aliasing.
+    #[inline]
+    pub fn can_truncate_kv_to(&self, target_len: usize) -> bool {
+        if target_len >= self.ws.pos {
+            return true;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(gpu) = &self.metal {
+            return gpu.can_truncate_kv_to(self.ws.pos, target_len);
+        }
+        if let Some(q) = &self.ws.q8_kv {
+            if q.ring_len > 0 {
+                let slack = q.ring_len.saturating_sub(q.window_size.saturating_sub(q.sink_tokens));
+                return target_len <= q.sink_tokens || (self.ws.pos - target_len) <= slack;
+            }
+        }
+        true
+    }
+
+    /// Compresses untied `BF16` embeddings into 4-bit Hadamard `NF4` (`-1.08 GiB` wired RAM on `152k` vocab)
+    /// and releases the `BF16` heap allocation.
+    pub fn compress_untied_embeddings_nf4(&mut self) {
+        if self.embed_nf4.is_some()
+            || self.embed_bf16_rows.is_empty()
+            || !self.cfg.hidden_size.is_multiple_of(64)
+        {
+            return;
+        }
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |p| p.get())
+            .clamp(1, 8);
+        let mat = NfSdotMatrix::from_bf16_u16_embeddings_nf4(
+            &self.embed_bf16_rows,
+            self.cfg.vocab_size,
+            self.cfg.hidden_size,
+            2,
+            workers,
+        );
+        self.embed_bf16_rows = Vec::new();
+        self.embed_nf4 = Some(mat);
+    }
+
+    /// Whether untied input embeddings are stored in 4-bit Hadamard `NF4`.
+    #[inline]
+    pub fn has_nf4_untied_embeddings(&self) -> bool {
+        self.embed_nf4.is_some()
+    }
+
+    /// Whether the quantized KV cache is active.
     #[inline]
     pub fn is_q8_kv_enabled(&self) -> bool {
         #[cfg(target_os = "macos")]
@@ -1033,12 +1445,16 @@ impl RealLlamaEngine {
                 });
             }
             let head_mat = as_nf4(&self.lm_head, "lm_head")?;
+            let kv_bits = if self.kv_bits_pref == 4 { 4 } else { 8 };
             let gpu = crate::metal_gpu::MetalLlamaEngine::try_new(
                 &self.cfg,
                 &self.rope_cos_sin,
                 &borrows,
                 &self.final_norm,
                 head_mat,
+                kv_bits,
+                self.kv_window_pref,
+                self.kv_sinks_pref,
             )?;
             self.ws.pos = 0;
             self.ws.q8_kv = None;
@@ -1071,7 +1487,7 @@ impl RealLlamaEngine {
         }
     }
 
-    /// Disables Metal GPU execution and restores CPU Q8-KV cache and P-core worker pool.
+    /// Disables Metal GPU execution and restores CPU quantized KV cache and P-core worker pool.
     pub fn disable_metal(&mut self) {
         #[cfg(target_os = "macos")]
         if self.metal.take().is_some() {
@@ -1194,11 +1610,15 @@ impl RealLlamaEngine {
         Ok(Self {
             #[cfg(target_os = "macos")]
             metal: None,
+            kv_bits_pref: 8,
+            kv_window_pref: cfg.sliding_window,
+            kv_sinks_pref: cfg.sink_tokens,
             cfg: cfg.clone(),
             mode: RealWeightMode::ExactFp32,
             mean_weight_rel_error: 0.0,
             embed_f32_rows,
             embed_bf16_rows: Vec::new(),
+            embed_nf4: None,
             layers,
             final_norm,
             lm_head: LinearBackend::Fp32 {
@@ -1495,11 +1915,15 @@ impl RealLlamaEngine {
         let mut eng = Self {
             #[cfg(target_os = "macos")]
             metal: None,
+            kv_bits_pref: 8,
+            kv_window_pref: self.cfg.sliding_window,
+            kv_sinks_pref: self.cfg.sink_tokens,
             cfg: self.cfg.clone(),
             mode,
             mean_weight_rel_error: (err_sum / (mat_count as f64)) as f32,
             embed_f32_rows: self.embed_f32_rows.clone(),
             embed_bf16_rows: self.embed_bf16_rows.clone(),
+            embed_nf4: self.embed_nf4.clone(),
             layers: compiled_layers,
             final_norm,
             lm_head,
@@ -1775,11 +2199,15 @@ impl RealLlamaEngine {
         Self {
             #[cfg(target_os = "macos")]
             metal: None,
+            kv_bits_pref: 8,
+            kv_window_pref: self.cfg.sliding_window,
+            kv_sinks_pref: self.cfg.sink_tokens,
             cfg: self.cfg.clone(),
             mode,
             mean_weight_rel_error: 0.0,
             embed_f32_rows: self.embed_f32_rows.clone(),
             embed_bf16_rows: self.embed_bf16_rows.clone(),
+            embed_nf4: self.embed_nf4.clone(),
             layers: compiled_layers,
             final_norm: self.final_norm.clone(),
             lm_head: LinearBackend::FusedBase3(head_mat),
@@ -2019,6 +2447,9 @@ impl RealLlamaEngine {
         let mut eng = Self {
             #[cfg(target_os = "macos")]
             metal: None,
+            kv_bits_pref: 8,
+            kv_window_pref: self.cfg.sliding_window,
+            kv_sinks_pref: self.cfg.sink_tokens,
             cfg: self.cfg.clone(),
             mode,
             mean_weight_rel_error: 0.0,
@@ -2032,6 +2463,11 @@ impl RealLlamaEngine {
                 Vec::new()
             } else {
                 self.embed_bf16_rows.clone()
+            },
+            embed_nf4: if self.cfg.tie_word_embeddings {
+                None
+            } else {
+                self.embed_nf4.clone()
             },
             layers: compiled_layers,
             final_norm: self.final_norm.clone(),
@@ -2096,7 +2532,19 @@ impl RealLlamaEngine {
                 buf
             })
             .collect();
+        let mut embed_nf4 = None;
         if cfg.tie_word_embeddings {
+            embed_bf16_rows = Vec::new();
+        } else if crate::memory_budget::MemoryBudgetProfile::active().quantize_untied_embeddings
+            && h_dim.is_multiple_of(64)
+        {
+            embed_nf4 = Some(NfSdotMatrix::from_bf16_u16_embeddings_nf4(
+                &embed_bf16_rows,
+                cfg.vocab_size,
+                h_dim,
+                2,
+                compile_threads.max(1),
+            ));
             embed_bf16_rows = Vec::new();
         }
 
@@ -2337,12 +2785,16 @@ impl RealLlamaEngine {
         let mut eng = Self {
             #[cfg(target_os = "macos")]
             metal: None,
+            kv_bits_pref: 8,
+            kv_window_pref: cfg.sliding_window,
+            kv_sinks_pref: cfg.sink_tokens,
             ws: LlamaWorkspace::new(&cfg),
             cfg,
             mode,
             mean_weight_rel_error: 0.0,
             embed_f32_rows: Vec::new(),
             embed_bf16_rows,
+            embed_nf4,
             layers: compiled_layers,
             final_norm,
             lm_head,
@@ -2482,24 +2934,25 @@ impl RealLlamaEngine {
                     w_u64(w, m.bf16_chunk_scales.len())?;
                     m.bf16_chunk_scales.iter().try_for_each(|x| w.write_all(&x.to_le_bytes()))
                 }
-                LinearBackend::NfSdot(m) => {
-                    w_u64(w, 2)?;
-                    w_u64(w, m.rows)?;
-                    w_u64(w, m.cols)?;
-                    w_u64(w, m.bits)?;
-                    w_u64(w, m.scale_group_chunks)?;
-                    let cb_bytes: [u8; 16] = std::array::from_fn(|i| m.codebook[i] as u8);
-                    w.write_all(&cb_bytes)?;
-                    w_u64(w, m.pair_stream.len())?;
-                    w.write_all(&m.pair_stream)?;
-                    w_u64(w, m.tail_stream.len())?;
-                    w.write_all(&m.tail_stream)
-                }
+                LinearBackend::NfSdot(m) => w_nf_mat(w, m),
                 _ => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "save_bipolar expects un-repacked FusedBipolar, NfSdot, or Vq2 projections",
                 )),
             }
+        }
+        fn w_nf_mat(w: &mut impl Write, m: &NfSdotMatrix) -> io::Result<()> {
+            w_u64(w, 2)?;
+            w_u64(w, m.rows)?;
+            w_u64(w, m.cols)?;
+            w_u64(w, m.bits)?;
+            w_u64(w, m.scale_group_chunks)?;
+            let cb_bytes: [u8; 16] = std::array::from_fn(|i| m.codebook[i] as u8);
+            w.write_all(&cb_bytes)?;
+            w_u64(w, m.pair_stream.len())?;
+            w.write_all(&m.pair_stream)?;
+            w_u64(w, m.tail_stream.len())?;
+            w.write_all(&m.tail_stream)
         }
 
         let (needs_v2_mats, mode_words) = match self.mode {
@@ -2550,9 +3003,12 @@ impl RealLlamaEngine {
             }
         };
 
+        let needs_v4 = self.embed_nf4.is_some();
         let needs_v3 = self.layers.iter().any(|l| l.qkv_bias.is_some())
             || !self.embed_bf16_rows.is_empty();
-        let version = if needs_v3 {
+        let version = if needs_v4 {
+            4u8
+        } else if needs_v3 {
             3u8
         } else if needs_v2_mats {
             2u8
@@ -2562,6 +3018,7 @@ impl RealLlamaEngine {
 
         let mut w = io::BufWriter::new(fs::File::create(path)?);
         w.write_all(match version {
+            4 => KRONOS4_CACHE_MAGIC,
             3 => KRONOS3_CACHE_MAGIC,
             2 => KRONOS2_CACHE_MAGIC,
             _ => BIPOLAR_CACHE_MAGIC,
@@ -2592,6 +3049,14 @@ impl RealLlamaEngine {
         if version >= 3 {
             w_u16s(&mut w, &self.embed_bf16_rows)?;
         }
+        if version >= 4 {
+            if let Some(ref em) = self.embed_nf4 {
+                w_u64(&mut w, 1)?;
+                w_nf_mat(&mut w, em)?;
+            } else {
+                w_u64(&mut w, 0)?;
+            }
+        }
         w.flush()
     }
 
@@ -2606,14 +3071,16 @@ impl RealLlamaEngine {
         let mmap = RawMmap::map_read_only(&file, len)?;
         let bytes = mmap.as_slice();
         let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
-        let (version, magic_len) = if bytes.starts_with(KRONOS3_CACHE_MAGIC) {
+        let (version, magic_len) = if bytes.starts_with(KRONOS4_CACHE_MAGIC) {
+            (4u8, KRONOS4_CACHE_MAGIC.len())
+        } else if bytes.starts_with(KRONOS3_CACHE_MAGIC) {
             (3u8, KRONOS3_CACHE_MAGIC.len())
         } else if bytes.starts_with(KRONOS2_CACHE_MAGIC) {
             (2u8, KRONOS2_CACHE_MAGIC.len())
         } else if bytes.starts_with(BIPOLAR_CACHE_MAGIC) {
             (1u8, BIPOLAR_CACHE_MAGIC.len())
         } else {
-            return Err(bad("bad bipolar/kronos2/kronos3 cache magic"));
+            return Err(bad("bad bipolar/kronos2/kronos3/kronos4 cache magic"));
         };
         let mut rd = CacheReader {
             bytes,
@@ -2773,20 +3240,56 @@ impl RealLlamaEngine {
         let final_norm = rd.f32s()?;
         let lm_head = r_mat(&mut rd)?;
         let embed_f32_rows = rd.f32s()?;
-        let embed_bf16_rows = if version >= 3 {
-            rd.u16s()?
+        let auto_q_embed = crate::memory_budget::MemoryBudgetProfile::active()
+            .quantize_untied_embeddings
+            && cfg.hidden_size.is_multiple_of(64);
+        let (mut embed_bf16_rows, mut embed_nf4) = if version >= 3 {
+            let n_u16 = rd.u64()?;
+            let raw_le = rd.take(n_u16 * 2)?;
+            if n_u16 > 0 && auto_q_embed && n_u16 == cfg.vocab_size * cfg.hidden_size {
+                let workers = std::thread::available_parallelism()
+                    .map_or(4, |p| p.get())
+                    .clamp(1, 8);
+                let mat = NfSdotMatrix::from_bf16_le_embeddings_nf4(
+                    raw_le,
+                    cfg.vocab_size,
+                    cfg.hidden_size,
+                    2,
+                    workers,
+                );
+                (Vec::new(), Some(mat))
+            } else {
+                let v: Vec<u16> = raw_le
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                (v, None)
+            }
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
+        if version >= 4 && rd.u64()? != 0 {
+            match r_mat(&mut rd)? {
+                LinearBackend::NfSdot(m) => {
+                    embed_bf16_rows = Vec::new();
+                    embed_nf4 = Some(m);
+                }
+                _ => return Err(bad("expected NfSdot untied embedding matrix in K2TKRONOS4")),
+            }
+        }
         let page_aligned = len & !16_383usize;
         if page_aligned > 0 {
             mmap.advise_dontneed(0, page_aligned);
         }
         drop(mmap);
 
+        let budget = crate::memory_budget::MemoryBudgetProfile::active();
         let mut eng = Self {
             #[cfg(target_os = "macos")]
             metal: None,
+            kv_bits_pref: if budget.prefer_q4_kv { 4 } else { 8 },
+            kv_window_pref: cfg.sliding_window,
+            kv_sinks_pref: cfg.sink_tokens,
             rope_cos_sin: build_rope_table(&cfg),
             ws: LlamaWorkspace::new(&cfg),
             cfg,
@@ -2794,6 +3297,7 @@ impl RealLlamaEngine {
             mean_weight_rel_error: 0.0,
             embed_f32_rows,
             embed_bf16_rows,
+            embed_nf4,
             layers,
             final_norm,
             lm_head,
@@ -2818,7 +3322,7 @@ impl RealLlamaEngine {
         layer_bytes + self.lm_head.physical_bytes()
     }
 
-    /// Linear weights plus biases and any untied (`FP32` or `BF16`) embedding table.
+    /// Linear weights plus biases and any untied (`FP32`, `BF16`, or `NF4`) embedding table.
     pub fn resident_weight_bytes(&self) -> usize {
         let bias_bytes: usize = self
             .layers
@@ -2829,13 +3333,14 @@ impl RealLlamaEngine {
             + bias_bytes
             + self.embed_f32_rows.len() * std::mem::size_of::<f32>()
             + self.embed_bf16_rows.len() * std::mem::size_of::<u16>()
+            + self.embed_nf4.as_ref().map_or(0, |m| m.physical_bytes())
     }
 
     /// Physical bits per weight across all transformer layers + `lm_head`.
     pub fn physical_bits_per_weight(&self) -> f64 {
-        let qkv_rows = self.cfg.hidden_size + 2 * self.cfg.kv_dim();
+        let qkv_rows = self.cfg.q_dim() + 2 * self.cfg.kv_dim();
         let layer_params = qkv_rows * self.cfg.hidden_size
-            + self.cfg.hidden_size * self.cfg.hidden_size
+            + self.cfg.hidden_size * self.cfg.q_dim()
             + 2 * self.cfg.intermediate_size * self.cfg.hidden_size
             + self.cfg.hidden_size * self.cfg.intermediate_size;
         let total_params =
@@ -2847,11 +3352,18 @@ impl RealLlamaEngine {
 /// Compact snapshot of CPU KV-cache positions `0..len` for non-destructive single-pass scoring.
 pub enum KvPrefixSnapshot {
     Q8 {
-        len: usize,
+        slots_per_head: usize,
         k_q8: Vec<i8>,
         v_q8: Vec<i8>,
         k_scales: Vec<f32>,
         v_scales: Vec<f32>,
+    },
+    Q4 {
+        slots_per_head: usize,
+        k_q4: Vec<u8>,
+        v_q4: Vec<u8>,
+        k_s16: Vec<u16>,
+        v_s16: Vec<u16>,
     },
     Fp32 {
         len: usize,
@@ -2868,32 +3380,67 @@ impl RealLlamaEngine {
             return None;
         }
         let len = n.min(self.ws.pos);
-        if let Some(q8) = self.ws.q8_kv.as_ref() {
-            let heads = q8.num_layers * q8.num_kv_heads;
-            let hd = q8.head_dim;
-            let mut k_q8 = vec![0i8; heads * len * hd];
-            let mut v_q8 = vec![0i8; heads * len * hd];
-            let mut k_scales = vec![0.0f32; heads * len];
-            let mut v_scales = vec![0.0f32; heads * len];
-            if len > 0 {
-                for h in 0..heads {
-                    let src = h * q8.cap_seq_len;
-                    let dst = h * len;
-                    k_q8[dst * hd..(dst + len) * hd]
-                        .copy_from_slice(&q8.k_q8[src * hd..(src + len) * hd]);
-                    v_q8[dst * hd..(dst + len) * hd]
-                        .copy_from_slice(&q8.v_q8[src * hd..(src + len) * hd]);
-                    k_scales[dst..dst + len].copy_from_slice(&q8.k_scales[src..src + len]);
-                    v_scales[dst..dst + len].copy_from_slice(&q8.v_scales[src..src + len]);
+        if let Some(q) = self.ws.q8_kv.as_ref() {
+            let heads = q.num_layers * q.num_kv_heads;
+            let hd = q.head_dim;
+            let slots_per_head = if q.ring_len > 0 { q.cap_seq_len } else { len };
+            if q.bits == 8 {
+                let mut k_q8 = vec![0i8; heads * slots_per_head * hd];
+                let mut v_q8 = vec![0i8; heads * slots_per_head * hd];
+                let mut k_scales = vec![0.0f32; heads * slots_per_head];
+                let mut v_scales = vec![0.0f32; heads * slots_per_head];
+                if slots_per_head > 0 {
+                    for h in 0..heads {
+                        let src = h * q.cap_seq_len;
+                        let dst = h * slots_per_head;
+                        k_q8[dst * hd..(dst + slots_per_head) * hd]
+                            .copy_from_slice(&q.k_q8[src * hd..(src + slots_per_head) * hd]);
+                        v_q8[dst * hd..(dst + slots_per_head) * hd]
+                            .copy_from_slice(&q.v_q8[src * hd..(src + slots_per_head) * hd]);
+                        k_scales[dst..dst + slots_per_head]
+                            .copy_from_slice(&q.k_scales[src..src + slots_per_head]);
+                        v_scales[dst..dst + slots_per_head]
+                            .copy_from_slice(&q.v_scales[src..src + slots_per_head]);
+                    }
                 }
+                Some(KvPrefixSnapshot::Q8 {
+                    slots_per_head,
+                    k_q8,
+                    v_q8,
+                    k_scales,
+                    v_scales,
+                })
+            } else {
+                let half_hd = hd / 2;
+                let gph64 = hd / 64;
+                let mut k_q4 = vec![0x88u8; heads * slots_per_head * half_hd];
+                let mut v_q4 = vec![0x88u8; heads * slots_per_head * half_hd];
+                let mut k_s16 = vec![0u16; heads * slots_per_head * gph64];
+                let mut v_s16 = vec![0u16; heads * slots_per_head * gph64];
+                if slots_per_head > 0 {
+                    for h in 0..heads {
+                        let src = h * q.cap_seq_len;
+                        let dst = h * slots_per_head;
+                        k_q4[dst * half_hd..(dst + slots_per_head) * half_hd].copy_from_slice(
+                            &q.k_q4[src * half_hd..(src + slots_per_head) * half_hd],
+                        );
+                        v_q4[dst * half_hd..(dst + slots_per_head) * half_hd].copy_from_slice(
+                            &q.v_q4[src * half_hd..(src + slots_per_head) * half_hd],
+                        );
+                        k_s16[dst * gph64..(dst + slots_per_head) * gph64]
+                            .copy_from_slice(&q.k_s16[src * gph64..(src + slots_per_head) * gph64]);
+                        v_s16[dst * gph64..(dst + slots_per_head) * gph64]
+                            .copy_from_slice(&q.v_s16[src * gph64..(src + slots_per_head) * gph64]);
+                    }
+                }
+                Some(KvPrefixSnapshot::Q4 {
+                    slots_per_head,
+                    k_q4,
+                    v_q4,
+                    k_s16,
+                    v_s16,
+                })
             }
-            Some(KvPrefixSnapshot::Q8 {
-                len,
-                k_q8,
-                v_q8,
-                k_scales,
-                v_scales,
-            })
         } else {
             let kvd = self.cfg.kv_dim();
             let layers = self.layers.len();
@@ -2916,29 +3463,56 @@ impl RealLlamaEngine {
     pub fn restore_kv_prefix(&mut self, snap: &KvPrefixSnapshot, total_pos: usize) {
         match snap {
             KvPrefixSnapshot::Q8 {
-                len,
+                slots_per_head,
                 k_q8,
                 v_q8,
                 k_scales,
                 v_scales,
             } => {
-                if let Some(q8) = self.ws.q8_kv.as_mut() {
-                    let len = *len;
-                    if len > 0 {
-                        q8.ensure_seq_capacity(total_pos.max(len), total_pos);
-                        let heads = q8.num_layers * q8.num_kv_heads;
-                        let hd = q8.head_dim;
+                if let Some(q) = self.ws.q8_kv.as_mut() {
+                    let sp = *slots_per_head;
+                    if sp > 0 {
+                        q.ensure_seq_capacity(total_pos.max(sp.min(q.max_seq_len)), total_pos);
+                        let heads = q.num_layers * q.num_kv_heads;
+                        let hd = q.head_dim;
                         for h in 0..heads {
-                            let src = h * len;
-                            let dst = h * q8.cap_seq_len;
-                            q8.k_q8[dst * hd..(dst + len) * hd]
-                                .copy_from_slice(&k_q8[src * hd..(src + len) * hd]);
-                            q8.v_q8[dst * hd..(dst + len) * hd]
-                                .copy_from_slice(&v_q8[src * hd..(src + len) * hd]);
-                            q8.k_scales[dst..dst + len]
-                                .copy_from_slice(&k_scales[src..src + len]);
-                            q8.v_scales[dst..dst + len]
-                                .copy_from_slice(&v_scales[src..src + len]);
+                            let src = h * sp;
+                            let dst = h * q.cap_seq_len;
+                            q.k_q8[dst * hd..(dst + sp) * hd]
+                                .copy_from_slice(&k_q8[src * hd..(src + sp) * hd]);
+                            q.v_q8[dst * hd..(dst + sp) * hd]
+                                .copy_from_slice(&v_q8[src * hd..(src + sp) * hd]);
+                            q.k_scales[dst..dst + sp].copy_from_slice(&k_scales[src..src + sp]);
+                            q.v_scales[dst..dst + sp].copy_from_slice(&v_scales[src..src + sp]);
+                        }
+                    }
+                }
+            }
+            KvPrefixSnapshot::Q4 {
+                slots_per_head,
+                k_q4,
+                v_q4,
+                k_s16,
+                v_s16,
+            } => {
+                if let Some(q) = self.ws.q8_kv.as_mut() {
+                    let sp = *slots_per_head;
+                    if sp > 0 {
+                        q.ensure_seq_capacity(total_pos.max(sp.min(q.max_seq_len)), total_pos);
+                        let heads = q.num_layers * q.num_kv_heads;
+                        let half_hd = q.head_dim / 2;
+                        let gph64 = q.head_dim / 64;
+                        for h in 0..heads {
+                            let src = h * sp;
+                            let dst = h * q.cap_seq_len;
+                            q.k_q4[dst * half_hd..(dst + sp) * half_hd]
+                                .copy_from_slice(&k_q4[src * half_hd..(src + sp) * half_hd]);
+                            q.v_q4[dst * half_hd..(dst + sp) * half_hd]
+                                .copy_from_slice(&v_q4[src * half_hd..(src + sp) * half_hd]);
+                            q.k_s16[dst * gph64..(dst + sp) * gph64]
+                                .copy_from_slice(&k_s16[src * gph64..(src + sp) * gph64]);
+                            q.v_s16[dst * gph64..(dst + sp) * gph64]
+                                .copy_from_slice(&v_s16[src * gph64..(src + sp) * gph64]);
                         }
                     }
                 }
@@ -2970,11 +3544,12 @@ impl RealLlamaEngine {
         self.ws.pos = self.ws.pos.min(n);
     }
 
-    /// Embedding row of `token` (decoded from `BF16`/`FP32` untied table, or quantized `lm_head` when tied).
+    /// Embedding row of `token` (decoded from `BF16`/`FP32`/`NF4` untied table, or quantized `lm_head` when tied).
     pub fn embed(&self, token: usize, out: &mut [f32]) {
         embed_token_into(
             &self.embed_f32_rows,
             &self.embed_bf16_rows,
+            self.embed_nf4.as_ref(),
             &self.lm_head,
             self.cfg.hidden_size,
             token,
@@ -3122,13 +3697,14 @@ impl RealLlamaEngine {
             let h_dim = self.cfg.hidden_size;
             let ef32 = &self.embed_f32_rows;
             let ebf16 = &self.embed_bf16_rows;
+            let enf4 = self.embed_nf4.as_ref();
             let lm_head = &self.lm_head;
             let tok = [token_id];
             gpu.forward_tokens(
                 &self.cfg,
                 &tok,
                 self.ws.pos,
-                |t, dst| embed_token_into(ef32, ebf16, lm_head, h_dim, t, dst),
+                |t, dst| embed_token_into(ef32, ebf16, enf4, lm_head, h_dim, t, dst),
                 None,
                 &mut self.ws.logits,
             )
@@ -3158,6 +3734,7 @@ impl RealLlamaEngine {
         embed_token_into(
             &self.embed_f32_rows,
             &self.embed_bf16_rows,
+            self.embed_nf4.as_ref(),
             &self.lm_head,
             h_dim,
             token_id,
@@ -3411,6 +3988,7 @@ impl RealLlamaEngine {
         embed_token_into(
             &self.embed_f32_rows,
             &self.embed_bf16_rows,
+            self.embed_nf4.as_ref(),
             &self.lm_head,
             h_dim,
             token_id,
@@ -3431,19 +4009,7 @@ impl RealLlamaEngine {
         let v_cache_addr = self.ws.v_cache.as_mut_ptr() as usize;
         let logits_addr = self.ws.logits.as_mut_ptr() as usize;
 
-        let (use_q8_kv, q8_cap, q8_k_addr, q8_ks_addr, q8_v_addr, q8_vs_addr) =
-            if let Some(q8) = self.ws.q8_kv.as_mut() {
-                (
-                    true,
-                    q8.cap_seq_len,
-                    q8.k_q8.as_mut_ptr() as usize,
-                    q8.k_scales.as_mut_ptr() as usize,
-                    q8.v_q8.as_mut_ptr() as usize,
-                    q8.v_scales.as_mut_ptr() as usize,
-                )
-            } else {
-                (false, 0, 0, 0, 0, 0)
-            };
+        let qkv_raw = self.ws.q8_kv.as_ref().map(|q| q.raw_ptrs());
 
         let (act_h_addr, act_hq_addr, act_hs_addr, act_hsum_addr) =
             if let Some(a) = self.ws.blut_hidden.int8.as_mut() {
@@ -3482,10 +4048,6 @@ impl RealLlamaEngine {
             let k_cache_ptr = k_cache_addr as *mut f32;
             let v_cache_ptr = v_cache_addr as *mut f32;
             let logits_ptr = logits_addr as *mut f32;
-            let q8_k_ptr = q8_k_addr as *mut i8;
-            let q8_ks_ptr = q8_ks_addr as *mut f32;
-            let q8_v_ptr = q8_v_addr as *mut i8;
-            let q8_vs_ptr = q8_vs_addr as *mut f32;
             let act_hq = act_hq_addr as *mut i8;
             let act_hs = act_hs_addr as *mut f32;
             let act_hsum = act_hsum_addr as *mut i32;
@@ -3603,14 +4165,8 @@ impl RealLlamaEngine {
                             } else if b < num_q_heads + num_kv_heads {
                                 let kvh = b - num_q_heads;
                                 apply_llama_rope_head(head_s, rope_row);
-                                if use_q8_kv {
-                                    let slot = (l_idx * num_kv_heads + kvh) * q8_cap + pos;
-                                    store_hadamard_q8_head_raw(
-                                        head_s,
-                                        head_dim,
-                                        q8_k_ptr.add(slot * head_dim),
-                                        q8_ks_ptr.add(slot),
-                                    );
+                                if let Some(raw) = qkv_raw {
+                                    raw.store_k(l_idx, kvh, pos, head_s);
                                 } else {
                                     std::ptr::copy_nonoverlapping(
                                         head_s.as_ptr(),
@@ -3620,14 +4176,8 @@ impl RealLlamaEngine {
                                 }
                             } else {
                                 let kvh = b - num_q_heads - num_kv_heads;
-                                if use_q8_kv {
-                                    let slot = (l_idx * num_kv_heads + kvh) * q8_cap + pos;
-                                    store_hadamard_q8_head_raw(
-                                        head_s,
-                                        head_dim,
-                                        q8_v_ptr.add(slot * head_dim),
-                                        q8_vs_ptr.add(slot),
-                                    );
+                                if let Some(raw) = qkv_raw {
+                                    raw.store_v(l_idx, kvh, pos, head_s);
                                 } else {
                                     std::ptr::copy_nonoverlapping(
                                         head_s.as_ptr(),
@@ -3646,18 +4196,14 @@ impl RealLlamaEngine {
                 while let Some((qh0, qh1)) = barrier.claim_work(qh_grain, num_q_heads) {
                     // SAFETY: inputs are read-only; head `qh` owns its `scores` slice and Hadamard chunks `[qh*cph, (qh+1)*cph)`.
                     unsafe {
-                        if use_q8_kv {
+                        if let Some(raw) = qkv_raw {
                             let mut out_group = [[0.0f32; 128]; 8];
+                            let sc_len = active_kv_len(seq_len, raw.window_size);
                             let mut s0 = qh0;
                             while s0 < qh1 {
                                 let kvh = s0 / kv_group;
                                 let s1 = ((kvh + 1) * kv_group).min(qh1).min(s0 + 8);
                                 let m = s1 - s0;
-                                let base = (l_idx * num_kv_heads + kvh) * q8_cap;
-                                let k_q8_h = std::slice::from_raw_parts(q8_k_ptr.add(base * head_dim), seq_len * head_dim);
-                                let ks_h = std::slice::from_raw_parts(q8_ks_ptr.add(base), seq_len);
-                                let v_q8_h = std::slice::from_raw_parts(q8_v_ptr.add(base * head_dim), seq_len * head_dim);
-                                let vs_h = std::slice::from_raw_parts(q8_vs_ptr.add(base), seq_len);
                                 let mut out_iter = out_group[..m].iter_mut();
                                 let mut queries: [GqaQueryRef<'_>; 8] = std::array::from_fn(|j| {
                                     if j < m {
@@ -3666,7 +4212,7 @@ impl RealLlamaEngine {
                                         GqaQueryRef {
                                             q_head: std::slice::from_raw_parts(qkv_ptr.add(qh * head_dim), head_dim),
                                             seq_len,
-                                            sc: std::slice::from_raw_parts_mut(scores_ptr.add(qh * seq_len), seq_len),
+                                            sc: std::slice::from_raw_parts_mut(scores_ptr.add(qh * sc_len), sc_len),
                                             out: &mut ob[..head_dim],
                                         }
                                     } else {
@@ -3678,15 +4224,7 @@ impl RealLlamaEngine {
                                         }
                                     }
                                 });
-                                causal_gqa_group_q8(
-                                    head_dim,
-                                    k_q8_h,
-                                    ks_h,
-                                    v_q8_h,
-                                    vs_h,
-                                    attn_scale,
-                                    &mut queries[..m],
-                                );
+                                raw.eval_gqa_group(l_idx, kvh, attn_scale, &mut queries[..m]);
                                 for (j, og) in out_group[..m].iter().enumerate() {
                                     let qh = s0 + j;
                                     for sub in 0..chunks_per_head {
@@ -4041,12 +4579,13 @@ impl RealLlamaEngine {
             let h_dim = self.cfg.hidden_size;
             let ef32 = &self.embed_f32_rows;
             let ebf16 = &self.embed_bf16_rows;
+            let enf4 = self.embed_nf4.as_ref();
             let lm_head = &self.lm_head;
             gpu.forward_tokens(
                 &self.cfg,
                 tokens,
                 self.ws.pos,
-                |t, dst| embed_token_into(ef32, ebf16, lm_head, h_dim, t, dst),
+                |t, dst| embed_token_into(ef32, ebf16, enf4, lm_head, h_dim, t, dst),
                 None,
                 &mut self.ws.logits,
             )
@@ -4083,12 +4622,13 @@ impl RealLlamaEngine {
             let h_dim = self.cfg.hidden_size;
             let ef32 = &self.embed_f32_rows;
             let ebf16 = &self.embed_bf16_rows;
+            let enf4 = self.embed_nf4.as_ref();
             let lm_head = &self.lm_head;
             gpu.forward_tokens(
                 &self.cfg,
                 tokens,
                 self.ws.pos,
-                |t, dst| embed_token_into(ef32, ebf16, lm_head, h_dim, t, dst),
+                |t, dst| embed_token_into(ef32, ebf16, enf4, lm_head, h_dim, t, dst),
                 Some(&mut out_logits[..tokens.len() * vocab]),
                 &mut self.ws.logits,
             )
@@ -4147,6 +4687,7 @@ impl RealLlamaEngine {
             embed_token_into(
                 &self.embed_f32_rows,
                 &self.embed_bf16_rows,
+                self.embed_nf4.as_ref(),
                 &self.lm_head,
                 h,
                 tok,
@@ -4181,15 +4722,11 @@ impl RealLlamaEngine {
             let rope = &self.rope_cos_sin;
             let cfg = &self.cfg;
             if let Some(q8) = self.ws.q8_kv.as_mut() {
-                let q8_cap = q8.cap_seq_len;
-                let q8_k_addr = q8.k_q8.as_mut_ptr() as usize;
-                let q8_ks_addr = q8.k_scales.as_mut_ptr() as usize;
-                let q8_v_addr = q8.v_q8.as_mut_ptr() as usize;
-                let q8_vs_addr = q8.v_scales.as_mut_ptr() as usize;
+                let raw = q8.raw_ptrs();
                 par_range(pool, n, |a, b| {
                     for t in a..b {
                         let pos = pos0 + t;
-                        // SAFETY: token `t` owns row `t` of `qkv` and cache slot `pos` across all KV heads.
+                        // SAFETY: token `t` owns row `t` of `qkv` and distinct ring/linear cache slot `slot_of_pos(pos)`.
                         unsafe {
                             let row = std::slice::from_raw_parts_mut(
                                 (qkv_ptr as *mut f32).add(t * qkv_rows),
@@ -4204,25 +4741,13 @@ impl RealLlamaEngine {
                             apply_llama_rope_precomp(q, cfg.num_attention_heads, head_dim, half_dim, rope_row);
                             apply_llama_rope_precomp(k, num_kv_heads, head_dim, half_dim, rope_row);
                             for kvh in 0..num_kv_heads {
-                                let slot = (l_idx * num_kv_heads + kvh) * q8_cap + pos;
-                                store_hadamard_q8_head_raw(
-                                    &k[kvh * head_dim..(kvh + 1) * head_dim],
-                                    head_dim,
-                                    (q8_k_addr as *mut i8).add(slot * head_dim),
-                                    (q8_ks_addr as *mut f32).add(slot),
-                                );
-                                store_hadamard_q8_head_raw(
-                                    &v[kvh * head_dim..(kvh + 1) * head_dim],
-                                    head_dim,
-                                    (q8_v_addr as *mut i8).add(slot * head_dim),
-                                    (q8_vs_addr as *mut f32).add(slot),
-                                );
+                                raw.store_k(l_idx, kvh, pos, &k[kvh * head_dim..(kvh + 1) * head_dim]);
+                                raw.store_v(l_idx, kvh, pos, &v[kvh * head_dim..(kvh + 1) * head_dim]);
                             }
                         }
                     }
                 });
 
-                let q8_ro = &*q8;
                 let attn_ptr = attn.as_mut_ptr() as usize;
                 let qkv_ref = &*qkv;
                 let t_step = if n >= 16 { 4 } else if n >= 4 { 2 } else { 1 };
@@ -4230,10 +4755,10 @@ impl RealLlamaEngine {
                 let g_blocks = kv_group.div_ceil(g_sub);
                 let t_blocks = n.div_ceil(t_step);
                 let total_items = num_kv_heads * g_blocks * t_blocks;
-                let max_seq = pos0 + n;
+                let sc_cap = active_kv_len(pos0 + n, raw.window_size);
                 let m_cap = t_step * g_sub;
                 par_range(pool, total_items, |a, b| {
-                    let needed = m_cap * max_seq;
+                    let needed = m_cap * sc_cap;
                     let mut sc_stack = [0.0f32; 16_384];
                     let mut sc_heap = Vec::new();
                     let sc_buf: &mut [f32] = if needed <= sc_stack.len() {
@@ -4253,15 +4778,14 @@ impl RealLlamaEngine {
                         let t0 = tb * t_step;
                         let t1 = (t0 + t_step).min(n);
                         let m = (t1 - t0) * g_len;
-                        let group_max_seq = pos0 + t1;
-                        let (k_q8_h, ks_h, v_q8_h, vs_h) = q8_ro.head_views(l_idx, kvh, group_max_seq);
-                        let mut sc_rest = &mut sc_buf[..m * max_seq];
+                        let mut sc_rest = &mut sc_buf[..m * sc_cap];
                         let mut queries: [GqaQueryRef<'_>; MAX_GQA_GROUP_BATCH] = std::array::from_fn(|j| {
                             if j < m {
                                 let t = t0 + j / g_len;
                                 let qh = kvh * kv_group + g0 + (j % g_len);
                                 let seq_len = pos0 + t + 1;
-                                let (sc_head, next) = std::mem::take(&mut sc_rest).split_at_mut(max_seq);
+                                let sc_len = active_kv_len(seq_len, raw.window_size);
+                                let (sc_head, next) = std::mem::take(&mut sc_rest).split_at_mut(sc_cap);
                                 sc_rest = next;
                                 // SAFETY: each `(t, qh)` owns disjoint `attn[t * h + qh * head_dim .. + head_dim]`.
                                 let dst = unsafe {
@@ -4273,7 +4797,7 @@ impl RealLlamaEngine {
                                 GqaQueryRef {
                                     q_head: &qkv_ref[t * qkv_rows + qh * head_dim..t * qkv_rows + (qh + 1) * head_dim],
                                     seq_len,
-                                    sc: &mut sc_head[..seq_len],
+                                    sc: &mut sc_head[..sc_len],
                                     out: dst,
                                 }
                             } else {
@@ -4285,15 +4809,10 @@ impl RealLlamaEngine {
                                 }
                             }
                         });
-                        causal_gqa_group_q8(
-                            head_dim,
-                            k_q8_h,
-                            ks_h,
-                            v_q8_h,
-                            vs_h,
-                            attn_scale,
-                            &mut queries[..m],
-                        );
+                        // SAFETY: KV stores completed across `par_range` above; `raw` buffers are read-only here.
+                        unsafe {
+                            raw.eval_gqa_group(l_idx, kvh, attn_scale, &mut queries[..m]);
+                        }
                     }
                 });
             } else {
@@ -4610,6 +5129,7 @@ fn eval_proj_rot(
 fn embed_token_into(
     embed_f32_rows: &[f32],
     embed_bf16_rows: &[u16],
+    embed_nf4: Option<&NfSdotMatrix>,
     lm_head: &LinearBackend,
     h_dim: usize,
     token: usize,
@@ -4625,6 +5145,11 @@ fn embed_token_into(
         for (dst, &b16) in out.iter_mut().zip(src.iter()) {
             *dst = bf16_to_f32(b16);
         }
+        return;
+    }
+    if let Some(m) = embed_nf4 {
+        m.dequantize_row_rotated(token, out);
+        ifwht64_signed_inplace(out);
         return;
     }
     match lm_head {
@@ -5062,6 +5587,346 @@ fn causal_gqa_group_q8(
     }
 }
 
+#[inline(always)]
+fn active_kv_len(seq_len: usize, window_size: usize) -> usize {
+    if window_size > 0 && seq_len > window_size {
+        window_size
+    } else {
+        seq_len
+    }
+}
+
+#[inline(always)]
+fn active_kv_pos(idx: usize, seq_len: usize, window_size: usize, sink_tokens: usize) -> usize {
+    if window_size > 0 && seq_len > window_size && idx >= sink_tokens {
+        (seq_len - (window_size - sink_tokens)) + (idx - sink_tokens)
+    } else {
+        idx
+    }
+}
+
+#[inline(always)]
+fn nf4_nearest_idx(y: f32) -> u8 {
+    let a = y.abs();
+    let p = if a < 37.5 {
+        if a < 12.0 {
+            0
+        } else if a < 24.5 {
+            1
+        } else {
+            2
+        }
+    } else if a < 85.5 {
+        if a < 51.0 {
+            3
+        } else if a < 66.5 {
+            4
+        } else {
+            5
+        }
+    } else if a < 111.5 {
+        6
+    } else {
+        7
+    };
+    if y >= 0.0 {
+        8 + p
+    } else {
+        7 - p
+    }
+}
+
+#[inline]
+unsafe fn store_hadamard_q4_head_raw(
+    head_s: &[f32],
+    head_dim: usize,
+    dst_q4: *mut u8,
+    dst_s16: *mut u16,
+) {
+    debug_assert!(head_dim == 64 || head_dim == 128);
+    let mut rot = [0.0f32; 128];
+    rot[..head_dim].copy_from_slice(&head_s[..head_dim]);
+    fwht64_signed_inplace(&mut rot[..head_dim]);
+    let gph = head_dim / 64;
+    for g in 0..gph {
+        let blk = &rot[g * 64..(g + 1) * 64];
+        let mut max_abs = 0.0f32;
+        for &v in blk {
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        // SAFETY: caller guarantees `dst_q4` holds `head_dim / 2` bytes and `dst_s16` holds `gph` `u16`s.
+        unsafe {
+            if max_abs < 1e-30 {
+                *dst_s16.add(g) = 0;
+                std::ptr::write_bytes(dst_q4.add(g * 32), 0x88, 32);
+                continue;
+            }
+            let inv0 = 127.0 / max_abs;
+            let mut num = 0.0f32;
+            let mut den = 0.0f32;
+            for &v in blk {
+                let c = NF4_DEFAULT_CODEBOOK_I8[nf4_nearest_idx(v * inv0) as usize] as f32;
+                num += v * c;
+                den += c * c;
+            }
+            let s_refined = if den > 1e-12 && num > 0.0 {
+                num / den
+            } else {
+                max_abs / 127.0
+            };
+            let s_bf16 = f32_to_bf16(s_refined);
+            let s_final = bf16_to_f32(s_bf16);
+            let inv_final = if s_final > 1e-30 { 1.0 / s_final } else { 0.0 };
+            *dst_s16.add(g) = s_bf16;
+            for h in 0..2 {
+                let base = h * 32;
+                let out_p = dst_q4.add(g * 32 + h * 16);
+                for i in 0..16 {
+                    let lo = nf4_nearest_idx(blk[base + i] * inv_final);
+                    let hi = nf4_nearest_idx(blk[base + 16 + i] * inv_final);
+                    *out_p.add(i) = lo | (hi << 4);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot64_q8_nf4_neon(q_i8: &[i8; 64], k_packed32: *const u8) -> i32 {
+    use std::arch::aarch64::*;
+    // SAFETY: `q_i8` has 64 bytes, `k_packed32` has 32 bytes, `NF4_DEFAULT_CODEBOOK_I8` has 16 bytes.
+    unsafe {
+        let cb = vld1q_s8(NF4_DEFAULT_CODEBOOK_I8.as_ptr());
+        let mask = vdupq_n_u8(0x0F);
+        let qp = q_i8.as_ptr();
+        let p0 = vld1q_u8(k_packed32);
+        let p1 = vld1q_u8(k_packed32.add(16));
+        let k0 = vqtbl1q_s8(cb, vandq_u8(p0, mask));
+        let k1 = vqtbl1q_s8(cb, vshrq_n_u8::<4>(p0));
+        let k2 = vqtbl1q_s8(cb, vandq_u8(p1, mask));
+        let k3 = vqtbl1q_s8(cb, vshrq_n_u8::<4>(p1));
+        let mut acc = vdupq_n_s32(0);
+        acc = sdot_v16_i8(acc, k0, vld1q_s8(qp));
+        acc = sdot_v16_i8(acc, k1, vld1q_s8(qp.add(16)));
+        acc = sdot_v16_i8(acc, k2, vld1q_s8(qp.add(32)));
+        acc = sdot_v16_i8(acc, k3, vld1q_s8(qp.add(48)));
+        vaddvq_s32(acc)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot64_q8_q8_neon(q_i8: &[i8; 64], k_q8: *const i8) -> i32 {
+    use std::arch::aarch64::*;
+    // SAFETY: `q_i8` and `k_q8` each hold 64 `i8` bytes.
+    unsafe {
+        let qp = q_i8.as_ptr();
+        let mut acc = vdupq_n_s32(0);
+        acc = sdot_v16_i8(acc, vld1q_s8(k_q8), vld1q_s8(qp));
+        acc = sdot_v16_i8(acc, vld1q_s8(k_q8.add(16)), vld1q_s8(qp.add(16)));
+        acc = sdot_v16_i8(acc, vld1q_s8(k_q8.add(32)), vld1q_s8(qp.add(32)));
+        acc = sdot_v16_i8(acc, vld1q_s8(k_q8.add(48)), vld1q_s8(qp.add(48)));
+        vaddvq_s32(acc)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn accum64_nf4_neon(v_packed32: *const u8, w: f32, out: &mut [f32; 64]) {
+    use std::arch::aarch64::*;
+    // SAFETY: `v_packed32` holds 32 bytes and `out` holds 64 `f32` values.
+    unsafe {
+        let cb = vld1q_s8(NF4_DEFAULT_CODEBOOK_I8.as_ptr());
+        let mask = vdupq_n_u8(0x0F);
+        let vw = vdupq_n_f32(w);
+        let op = out.as_mut_ptr();
+        let p0 = vld1q_u8(v_packed32);
+        let p1 = vld1q_u8(v_packed32.add(16));
+        let vecs = [
+            vqtbl1q_s8(cb, vandq_u8(p0, mask)),
+            vqtbl1q_s8(cb, vshrq_n_u8::<4>(p0)),
+            vqtbl1q_s8(cb, vandq_u8(p1, mask)),
+            vqtbl1q_s8(cb, vshrq_n_u8::<4>(p1)),
+        ];
+        for (g, &vb) in vecs.iter().enumerate() {
+            let lo16 = vmovl_s8(vget_low_s8(vb));
+            let hi16 = vmovl_high_s8(vb);
+            let b = g * 16;
+            vst1q_f32(op.add(b), vfmaq_f32(vld1q_f32(op.add(b)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16))), vw));
+            vst1q_f32(op.add(b + 4), vfmaq_f32(vld1q_f32(op.add(b + 4)), vcvtq_f32_s32(vmovl_high_s16(lo16)), vw));
+            vst1q_f32(op.add(b + 8), vfmaq_f32(vld1q_f32(op.add(b + 8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16))), vw));
+            vst1q_f32(op.add(b + 12), vfmaq_f32(vld1q_f32(op.add(b + 12)), vcvtq_f32_s32(vmovl_high_s16(hi16)), vw));
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn accum64_q8_neon(v_q8: *const i8, w: f32, out: &mut [f32; 64]) {
+    use std::arch::aarch64::*;
+    // SAFETY: `v_q8` holds 64 `i8` bytes and `out` holds 64 `f32` values.
+    unsafe {
+        let vw = vdupq_n_f32(w);
+        let op = out.as_mut_ptr();
+        for g in 0..4 {
+            let vb = vld1q_s8(v_q8.add(g * 16));
+            let lo16 = vmovl_s8(vget_low_s8(vb));
+            let hi16 = vmovl_high_s8(vb);
+            let b = g * 16;
+            vst1q_f32(op.add(b), vfmaq_f32(vld1q_f32(op.add(b)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16))), vw));
+            vst1q_f32(op.add(b + 4), vfmaq_f32(vld1q_f32(op.add(b + 4)), vcvtq_f32_s32(vmovl_high_s16(lo16)), vw));
+            vst1q_f32(op.add(b + 8), vfmaq_f32(vld1q_f32(op.add(b + 8)), vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16))), vw));
+            vst1q_f32(op.add(b + 12), vfmaq_f32(vld1q_f32(op.add(b + 12)), vcvtq_f32_s32(vmovl_high_s16(hi16)), vw));
+        }
+    }
+}
+
+unsafe fn causal_gqa_group_q4_or_window(
+    raw: QuantKvRawPtrs,
+    base_slot: usize,
+    attn_scale: f32,
+    queries: &mut [GqaQueryRef<'_>],
+) {
+    let hd = raw.head_dim;
+    let gph = hd / 64;
+    let half_hd = hd / 2;
+    debug_assert!(hd == 64 || hd == 128);
+    for q in queries.iter_mut() {
+        let act_len = active_kv_len(q.seq_len, raw.window_size);
+        debug_assert!(q.q_head.len() == hd && q.out.len() == hd && q.sc.len() >= act_len);
+        let mut q_i8_flat = [0i8; 128];
+        let mut q_scale = 0.0f32;
+        // SAFETY: `q.q_head.len() == hd` (`64` or `128`) and `q_i8_flat` holds 128 `i8`s.
+        unsafe {
+            if hd == 64 {
+                store_hadamard_q8_head64_raw(q.q_head, q_i8_flat.as_mut_ptr(), &mut q_scale);
+            } else {
+                store_hadamard_q8_head128_raw(q.q_head, q_i8_flat.as_mut_ptr(), &mut q_scale);
+            }
+        }
+        let q_i8: [[i8; 64]; 2] = [
+            q_i8_flat[..64].try_into().unwrap(),
+            q_i8_flat[64..128].try_into().unwrap(),
+        ];
+        let q_s = [q_scale * attn_scale; 2];
+        let sc = &mut q.sc[..act_len];
+        for (idx, dst_s) in sc.iter_mut().enumerate() {
+            let pos = active_kv_pos(idx, q.seq_len, raw.window_size, raw.sink_tokens);
+            let slot = base_slot + raw.slot_of_pos(pos);
+            let mut total = 0.0f32;
+            if raw.bits == 4 {
+                for g in 0..gph {
+                    // SAFETY: `slot < (num_layers * num_kv_heads) * cap_seq_len`.
+                    let ks = unsafe { bf16_to_f32(*(raw.k_s16 as *const u16).add(slot * gph + g)) };
+                    let kp = unsafe { (raw.k_q4 as *const u8).add(slot * half_hd + g * 32) };
+                    #[cfg(target_arch = "aarch64")]
+                    let dot = unsafe { dot64_q8_nf4_neon(&q_i8[g], kp) };
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let dot = unsafe {
+                        let mut acc = 0i32;
+                        for h in 0..2 {
+                            for i in 0..16 {
+                                let b = *kp.add(h * 16 + i);
+                                let c0 = NF4_DEFAULT_CODEBOOK_I8[(b & 0x0F) as usize] as i32;
+                                let c1 = NF4_DEFAULT_CODEBOOK_I8[(b >> 4) as usize] as i32;
+                                acc += c0 * (q_i8[g][h * 32 + i] as i32)
+                                    + c1 * (q_i8[g][h * 32 + 16 + i] as i32);
+                            }
+                        }
+                        acc
+                    };
+                    total += (dot as f32) * ks * q_s[g];
+                }
+            } else {
+                // SAFETY: `slot` in bounds for `k_q8` and `k_scales`.
+                let ks = unsafe { *(raw.k_scales as *const f32).add(slot) };
+                for g in 0..gph {
+                    let kp = unsafe { (raw.k_q8 as *const i8).add(slot * hd + g * 64) };
+                    #[cfg(target_arch = "aarch64")]
+                    let dot = unsafe { dot64_q8_q8_neon(&q_i8[g], kp) };
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let dot = unsafe {
+                        let mut acc = 0i32;
+                        for i in 0..64 {
+                            acc += (*kp.add(i) as i32) * (q_i8[g][i] as i32);
+                        }
+                        acc
+                    };
+                    total += (dot as f32) * ks * q_s[g];
+                }
+            }
+            *dst_s = total;
+        }
+
+        let max_score = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let inv_sum = 1.0 / softmax_unnorm_inplace(sc, max_score);
+        let mut out_blks = [[0.0f32; 64]; 2];
+        for (idx, &p_raw) in sc.iter().enumerate() {
+            let p_norm = p_raw * inv_sum;
+            if p_norm == 0.0 {
+                continue;
+            }
+            let pos = active_kv_pos(idx, q.seq_len, raw.window_size, raw.sink_tokens);
+            let slot = base_slot + raw.slot_of_pos(pos);
+            if raw.bits == 4 {
+                for (g, out_blk) in out_blks.iter_mut().enumerate().take(gph) {
+                    // SAFETY: `slot` in bounds for `v_q4` and `v_s16`.
+                    let vs = unsafe { bf16_to_f32(*(raw.v_s16 as *const u16).add(slot * gph + g)) };
+                    let w = p_norm * vs;
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let vp = unsafe { (raw.v_q4 as *const u8).add(slot * half_hd + g * 32) };
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        accum64_nf4_neon(vp, w, out_blk);
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    unsafe {
+                        for h in 0..2 {
+                            for i in 0..16 {
+                                let b = *vp.add(h * 16 + i);
+                                out_blk[h * 32 + i] +=
+                                    w * (NF4_DEFAULT_CODEBOOK_I8[(b & 0x0F) as usize] as f32);
+                                out_blk[h * 32 + 16 + i] +=
+                                    w * (NF4_DEFAULT_CODEBOOK_I8[(b >> 4) as usize] as f32);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // SAFETY: `slot` in bounds for `v_q8` and `v_scales`.
+                let vs = unsafe { *(raw.v_scales as *const f32).add(slot) };
+                let w = p_norm * vs;
+                if w == 0.0 {
+                    continue;
+                }
+                for (g, out_blk) in out_blks.iter_mut().enumerate().take(gph) {
+                    let vp = unsafe { (raw.v_q8 as *const i8).add(slot * hd + g * 64) };
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        accum64_q8_neon(vp, w, out_blk);
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    unsafe {
+                        for (dst, i) in out_blk.iter_mut().zip(0..64) {
+                            *dst += w * (*vp.add(i) as f32);
+                        }
+                    }
+                }
+            }
+        }
+        for (g, blk) in out_blks.iter().enumerate().take(gph) {
+            q.out[g * 64..(g + 1) * 64].copy_from_slice(blk);
+        }
+        ifwht64_signed_inplace(&mut q.out[..hd]);
+    }
+}
+
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn causal_gqa_attention_q8(
@@ -5077,18 +5942,19 @@ fn causal_gqa_attention_q8(
 ) {
     let seq_len = pos + 1;
     let hd = q8_kv.head_dim;
+    let raw = q8_kv.raw_ptrs();
+    let sc_len = active_kv_len(seq_len, raw.window_size);
     let mut qh0 = 0usize;
     while qh0 < num_q_heads {
         let kvh = qh0 / kv_group;
         let qh1 = ((kvh + 1) * kv_group).min(num_q_heads).min(qh0 + MAX_GQA_GROUP_BATCH);
         let m = qh1 - qh0;
-        let (k_q8_h, ks_h, v_q8_h, vs_h) = q8_kv.head_views(layer_idx, kvh, seq_len);
-        let mut sc_rest = &mut scores[..m * seq_len];
+        let mut sc_rest = &mut scores[..m * sc_len];
         let mut out_rest = &mut attn_out[qh0 * hd..qh1 * hd];
         let mut queries: [GqaQueryRef<'_>; MAX_GQA_GROUP_BATCH] = std::array::from_fn(|j| {
             if j < m {
                 let qh = qh0 + j;
-                let (sc_head, sc_next) = std::mem::take(&mut sc_rest).split_at_mut(seq_len);
+                let (sc_head, sc_next) = std::mem::take(&mut sc_rest).split_at_mut(sc_len);
                 let (out_head, out_next) = std::mem::take(&mut out_rest).split_at_mut(hd);
                 sc_rest = sc_next;
                 out_rest = out_next;
@@ -5107,7 +5973,10 @@ fn causal_gqa_attention_q8(
                 }
             }
         });
-        causal_gqa_group_q8(hd, k_q8_h, ks_h, v_q8_h, vs_h, attn_scale, &mut queries[..m]);
+        // SAFETY: `q8_kv` owns valid buffers for `(layer_idx, kvh)` up to `pos`.
+        unsafe {
+            raw.eval_gqa_group(layer_idx, kvh, attn_scale, &mut queries[..m]);
+        }
         qh0 = qh1;
     }
 }
@@ -6225,10 +7094,18 @@ mod tests {
                 num_hidden_layers: 2,
                 num_attention_heads: heads,
                 num_key_value_heads: kv_heads,
+                head_dim_override: None,
                 rms_norm_eps: 1e-5,
                 rope_theta: 10_000.0,
                 tie_word_embeddings: true,
                 max_seq_len: 64,
+                sliding_window: None,
+                sink_tokens: 0,
+                num_experts: 0,
+                num_experts_per_tok: 0,
+                moe_intermediate_size: 0,
+                shared_expert_intermediate_size: 0,
+                norm_topk_prob: true,
             };
             let kv_dim = kv_heads * hd;
             let attn_scale = 1.0 / (hd as f32).sqrt();
@@ -6486,6 +7363,166 @@ mod tests {
         );
 
         loaded.set_num_threads(1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_phase2_nf4_untied_embeddings_k2tkronos4_and_q4_sliding_kv_parity() {
+        let dir = std::env::temp_dir().join(format!("kronos_phase2_cpu_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let vocab = 192usize;
+        let h = 256usize;
+        let inter = 512usize;
+        let nl = 2usize;
+        let nh = 2usize;
+        let nkv = 1usize;
+        let kvd = 128usize;
+
+        fs::write(
+            dir.join("config.json"),
+            format!(
+                r#"{{"vocab_size":{vocab},"hidden_size":{h},"intermediate_size":{inter},"num_hidden_layers":{nl},"num_attention_heads":{nh},"num_key_value_heads":{nkv},"rms_norm_eps":1e-6,"rope_theta":1000000.0,"tie_word_embeddings":false}}"#
+            ),
+        )
+        .unwrap();
+
+        let mk_bf16 = |n: usize, seed: usize, scale: f32| -> Vec<u8> {
+            let mut out = Vec::with_capacity(n * 2);
+            for i in 0..n {
+                let mut z = (i as u64).wrapping_add((seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                let u = ((z >> 40) as f32) / ((1u32 << 24) as f32);
+                let v = (2.0 * u - 1.0) * scale;
+                out.extend_from_slice(&f32_to_bf16(v).to_le_bytes());
+            }
+            out
+        };
+        let mut data = Vec::new();
+        let mut hdr_items = Vec::new();
+        let mut push_t = |name: &str, shape: &[usize], raw: Vec<u8>| {
+            let s = data.len();
+            data.extend_from_slice(&raw);
+            let e = data.len();
+            let sh_str: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+            hdr_items.push(format!(
+                r#""{name}":{{"dtype":"BF16","shape":[{}],"data_offsets":[{s},{e}]}}"#,
+                sh_str.join(",")
+            ));
+        };
+        push_t("model.embed_tokens.weight", &[vocab, h], mk_bf16(vocab * h, 31, 0.4));
+        for l in 0..nl {
+            let p = format!("model.layers.{l}");
+            push_t(&format!("{p}.input_layernorm.weight"), &[h], mk_bf16(h, 7 + l, 1.0));
+            push_t(&format!("{p}.post_attention_layernorm.weight"), &[h], mk_bf16(h, 11 + l, 1.0));
+            push_t(&format!("{p}.self_attn.q_proj.weight"), &[h, h], mk_bf16(h * h, 13 + l, 0.08));
+            push_t(&format!("{p}.self_attn.k_proj.weight"), &[kvd, h], mk_bf16(kvd * h, 17 + l, 0.08));
+            push_t(&format!("{p}.self_attn.v_proj.weight"), &[kvd, h], mk_bf16(kvd * h, 19 + l, 0.08));
+            push_t(&format!("{p}.self_attn.o_proj.weight"), &[h, h], mk_bf16(h * h, 41 + l, 0.08));
+            push_t(&format!("{p}.mlp.gate_proj.weight"), &[inter, h], mk_bf16(inter * h, 43 + l, 0.08));
+            push_t(&format!("{p}.mlp.up_proj.weight"), &[inter, h], mk_bf16(inter * h, 47 + l, 0.08));
+            push_t(&format!("{p}.mlp.down_proj.weight"), &[h, inter], mk_bf16(h * inter, 53 + l, 0.055));
+        }
+        push_t("model.norm.weight", &[h], mk_bf16(h, 59, 1.0));
+        push_t("lm_head.weight", &[vocab, h], mk_bf16(vocab * h, 61, 0.3));
+        let hdr = format!("{{{}}}", hdr_items.join(","));
+        let mut st_bytes = (hdr.len() as u64).to_le_bytes().to_vec();
+        st_bytes.extend_from_slice(hdr.as_bytes());
+        st_bytes.extend_from_slice(&data);
+        fs::write(dir.join("model.safetensors"), st_bytes).unwrap();
+
+        let mode = RealWeightMode::KronosNfGptq {
+            bits: 4,
+            scale_group_chunks: 2,
+        };
+        let calib = vec![(0..16).map(|i| (i * 5 + 1) % vocab).collect::<Vec<_>>()];
+        let mut eng = RealLlamaEngine::compile_streaming_gptq_from_dir(&dir, mode, &calib, 2).unwrap();
+        let mut bf16_row = vec![0.0f32; h];
+        eng.embed(17, &mut bf16_row);
+        let before_bytes = eng.resident_weight_bytes();
+        eng.compress_untied_embeddings_nf4();
+        let after_bytes = eng.resident_weight_bytes();
+        let saved_emb_bytes = before_bytes.saturating_sub(after_bytes);
+        assert!(eng.has_nf4_untied_embeddings());
+        assert!(
+            saved_emb_bytes > (vocab * h * 2 * 7) / 10 && after_bytes < before_bytes,
+            "expected >70% untied embedding RAM reduction, saved={saved_emb_bytes}"
+        );
+        let mut nf4_row = vec![0.0f32; h];
+        eng.embed(17, &mut nf4_row);
+        assert!(
+            logit_cosine_f64(&bf16_row, &nf4_row) > 0.992,
+            "NF4 untied embedding row cosine too low"
+        );
+
+        let v4_path = dir.join("kronos-v4.k2tb");
+        eng.save_bipolar(&v4_path).unwrap();
+        let mut q8_eng = RealLlamaEngine::load_bipolar(&dir, &v4_path, 1024).unwrap();
+        assert!(q8_eng.has_nf4_untied_embeddings());
+        q8_eng.repack_sdot();
+        q8_eng.set_kv_bits(8);
+        q8_eng.set_num_threads(2);
+
+        let mut q4_eng = RealLlamaEngine::load_bipolar(&dir, &v4_path, 1024).unwrap();
+        q4_eng.repack_sdot();
+        q4_eng.set_kv_bits(4);
+        q4_eng.set_num_threads(2);
+
+        let prompt: Vec<usize> = (0..24).map(|i| (i * 11 + 3) % vocab).collect();
+        let l_q8 = q8_eng.forward_prompt(&prompt).to_vec();
+        let l_q4 = q4_eng.forward_prompt(&prompt).to_vec();
+        assert!(
+            q4_eng.kv_cache_bytes() * 100 < q8_eng.kv_cache_bytes() * 55,
+            "Q4-KV bytes ({}) should be <55% of Q8-KV bytes ({})",
+            q4_eng.kv_cache_bytes(),
+            q8_eng.kv_cache_bytes()
+        );
+        assert!(
+            logit_cosine_f64(&l_q8, &l_q4) > 0.998,
+            "CPU Q4-KV vs Q8-KV prefill cosine too low"
+        );
+
+        let snap = q4_eng.save_kv_prefix(12).unwrap();
+        let _ = q4_eng.forward_token(7);
+        q4_eng.restore_kv_prefix(&snap, 12);
+        let l_restored = q4_eng.forward_prompt(&prompt[12..]).to_vec();
+        assert!(
+            logit_cosine_f64(&l_q4, &l_restored) > 0.99999,
+            "Q4-KV snapshot restore mismatch"
+        );
+
+        // Sliding-window + sink ring wraparound (`640 > 528` ring capacity): batch prefill must match decode.
+        let mut win_batch = RealLlamaEngine::load_bipolar(&dir, &v4_path, 1024).unwrap();
+        win_batch.repack_sdot();
+        win_batch.set_kv_bits(4);
+        win_batch.set_kv_sliding_window(Some(16), 4);
+        win_batch.set_num_threads(2);
+
+        let mut win_step = RealLlamaEngine::load_bipolar(&dir, &v4_path, 1024).unwrap();
+        win_step.repack_sdot();
+        win_step.set_kv_bits(4);
+        win_step.set_kv_sliding_window(Some(16), 4);
+        win_step.set_num_threads(2);
+
+        let long_seq: Vec<usize> = (0..640).map(|i| (i * 13 + 5) % vocab).collect();
+        let lb = win_batch.forward_prompt(&long_seq).to_vec();
+        let mut ls = Vec::new();
+        for &t in &long_seq {
+            ls = win_step.forward_token(t).to_vec();
+        }
+        let cos_win = logit_cosine_f64(&lb, &ls);
+        assert!(
+            cos_win > 0.9999,
+            "CPU Q4 sliding-window ring wraparound batch vs step mismatch: {cos_win}"
+        );
+        assert!(win_batch.can_truncate_kv_to(0));
+        assert!(!win_batch.can_truncate_kv_to(8));
+        assert!(win_batch.can_truncate_kv_to(638));
+
+        q8_eng.set_num_threads(1);
         let _ = fs::remove_dir_all(&dir);
     }
 }

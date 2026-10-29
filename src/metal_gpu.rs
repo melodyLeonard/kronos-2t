@@ -1,8 +1,11 @@
 //! Zero-crate Metal.framework GPU inference backend for NF4 models on Apple Silicon.
 
 use crate::hadamard::rademacher_sign_masks_64;
+use crate::memory_budget::MemoryBudgetProfile;
 use crate::real_llm::LlamaConfig;
-use crate::simd_lut::{NfSdotMatrix, PageAlignedBytes};
+use crate::simd_lut::{
+    bf16_to_f32, f32_to_bf16, NfSdotMatrix, PageAlignedBytes, NF4_DEFAULT_CODEBOOK_I8,
+};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::OnceLock;
 
@@ -28,7 +31,7 @@ unsafe extern "C" {
 
 const MTL_RESOURCE_STORAGE_MODE_SHARED: usize = 0;
 const MTL_CMD_STATUS_COMPLETED: usize = 4;
-const PROMPT_CHUNK_GPU: usize = 1536;
+const MAX_PROMPT_CHUNK_GPU: usize = 1536;
 const GEMV_MAX_TOKENS: usize = 8;
 
 #[repr(C)]
@@ -76,6 +79,7 @@ struct Selectors {
     wait_done: Sel,
     cmd_status: Sel,
     cmd_error: Sel,
+    rec_max_ws: Sel,
 }
 
 // SAFETY: Objective-C `SEL` values are immutable process-wide interned pointers.
@@ -116,6 +120,7 @@ fn sels() -> &'static Selectors {
             wait_done: reg(c"waitUntilCompleted"),
             cmd_status: reg(c"status"),
             cmd_error: reg(c"error"),
+            rec_max_ws: reg(c"recommendedMaxWorkingSetSize"),
         }
     })
 }
@@ -260,6 +265,10 @@ struct RopeKvParams {
     n_tok: u32,
     layer_idx: u32,
     kv_cap: u32,
+    kv_bits: u32,
+    window_size: u32,
+    sink_tokens: u32,
+    ring_len: u32,
 }
 
 #[repr(C)]
@@ -276,6 +285,10 @@ struct GqaFlashParams {
     layer_idx: u32,
     kv_cap: u32,
     attn_scale: f32,
+    kv_bits: u32,
+    window_size: u32,
+    sink_tokens: u32,
+    ring_len: u32,
     _pad: u32,
 }
 
@@ -320,56 +333,95 @@ struct GpuKvCache {
     num_kv_heads: usize,
     head_dim: usize,
     groups_per_head: usize,
+    bits: u8,
+    window_size: usize,
+    sink_tokens: usize,
+    ring_len: usize,
     max_seq_len: usize,
     cap_seq_len: usize,
-    k_q8: MtlObj,
-    v_q8: MtlObj,
+    k_data: MtlObj,
+    v_data: MtlObj,
     k_scales: MtlObj,
     v_scales: MtlObj,
 }
 
 impl GpuKvCache {
-    fn new(device: Id, cfg: &LlamaConfig) -> Result<Self, String> {
+    fn new(
+        device: Id,
+        cfg: &LlamaConfig,
+        bits: u8,
+        sliding_window: Option<usize>,
+        sink_tokens: usize,
+        prompt_chunk_gpu: usize,
+        init_cap_tokens: usize,
+    ) -> Result<Self, String> {
+        if bits != 4 && bits != 8 {
+            return Err(format!("Metal KV cache bits must be 4 or 8 (got {bits})"));
+        }
         let head_dim = cfg.head_dim();
         if head_dim != 64 && head_dim != 128 {
-            return Err(format!("Metal Q8_0 KV cache requires head_dim 64 or 128 (got {head_dim})"));
+            return Err(format!("Metal KV cache requires head_dim 64 or 128 (got {head_dim})"));
         }
         let groups_per_head = head_dim / 32;
-        let cap_seq_len = cfg.max_seq_len.clamp(1, 2048);
+        let slack = prompt_chunk_gpu.max(512);
+        let (window_size, eff_sinks, ring_len, cap_seq_len) =
+            if let Some(w) = sliding_window.filter(|&w| w >= 8 && w + slack < cfg.max_seq_len) {
+                let s = sink_tokens.min(w / 2);
+                let rl = (w - s) + slack;
+                (w, s, rl, s + rl)
+            } else {
+                let init_cap = init_cap_tokens.clamp(64, 2048);
+                (0, 0, 0, cfg.max_seq_len.clamp(1, init_cap))
+            };
         let slots = cfg.num_hidden_layers * cfg.num_key_value_heads * cap_seq_len;
-        let k_q8 = alloc_shared_buffer(device, slots * head_dim, "kv.k_q8")?;
-        let v_q8 = alloc_shared_buffer(device, slots * head_dim, "kv.v_q8")?;
-        let k_scales = alloc_shared_buffer(
-            device,
-            slots * groups_per_head * std::mem::size_of::<f32>(),
-            "kv.k_scales",
-        )?;
-        let v_scales = alloc_shared_buffer(
-            device,
-            slots * groups_per_head * std::mem::size_of::<f32>(),
-            "kv.v_scales",
-        )?;
+        let slot_data_bytes = if bits == 4 { head_dim / 2 } else { head_dim };
+        let slot_scale_bytes = groups_per_head
+            * if bits == 4 {
+                std::mem::size_of::<u16>()
+            } else {
+                std::mem::size_of::<f32>()
+            };
+        let k_data = alloc_shared_buffer(device, slots * slot_data_bytes, "kv.k_data")?;
+        let v_data = alloc_shared_buffer(device, slots * slot_data_bytes, "kv.v_data")?;
+        let k_scales = alloc_shared_buffer(device, slots * slot_scale_bytes, "kv.k_scales")?;
+        let v_scales = alloc_shared_buffer(device, slots * slot_scale_bytes, "kv.v_scales")?;
         Ok(Self {
             num_layers: cfg.num_hidden_layers,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim,
             groups_per_head,
+            bits,
+            window_size,
+            sink_tokens: eff_sinks,
+            ring_len,
             max_seq_len: cfg.max_seq_len,
             cap_seq_len,
-            k_q8,
-            v_q8,
+            k_data,
+            v_data,
             k_scales,
             v_scales,
         })
     }
 
+    #[inline]
+    fn slot_of_pos(&self, pos: usize) -> usize {
+        if self.ring_len == 0 || pos < self.sink_tokens {
+            pos
+        } else {
+            self.sink_tokens + ((pos - self.sink_tokens) % self.ring_len)
+        }
+    }
+
     fn physical_bytes(&self) -> usize {
-        self.k_q8.byte_len() + self.v_q8.byte_len() + self.k_scales.byte_len() + self.v_scales.byte_len()
+        self.k_data.byte_len()
+            + self.v_data.byte_len()
+            + self.k_scales.byte_len()
+            + self.v_scales.byte_len()
     }
 
     fn ensure_seq_capacity(&mut self, device: Id, needed_len: usize, live_len: usize) -> Result<(), String> {
         assert!(needed_len <= self.max_seq_len, "sequence exceeds max_seq_len");
-        if needed_len <= self.cap_seq_len {
+        if self.ring_len > 0 || needed_len <= self.cap_seq_len {
             return Ok(());
         }
         let mut new_cap = self.cap_seq_len.max(1);
@@ -377,13 +429,21 @@ impl GpuKvCache {
             new_cap = (new_cap * 2).min(self.max_seq_len);
         }
         let heads = self.num_layers * self.num_kv_heads;
-        let hd = self.head_dim;
-        let gph = self.groups_per_head;
-        let sc_bytes = gph * std::mem::size_of::<f32>();
+        let data_bytes = if self.bits == 4 {
+            self.head_dim / 2
+        } else {
+            self.head_dim
+        };
+        let sc_bytes = self.groups_per_head
+            * if self.bits == 4 {
+                std::mem::size_of::<u16>()
+            } else {
+                std::mem::size_of::<f32>()
+            };
         let slots = heads * new_cap;
 
-        let new_k = alloc_shared_buffer(device, slots * hd, "kv.k_q8_grow")?;
-        let new_v = alloc_shared_buffer(device, slots * hd, "kv.v_q8_grow")?;
+        let new_k = alloc_shared_buffer(device, slots * data_bytes, "kv.k_data_grow")?;
+        let new_v = alloc_shared_buffer(device, slots * data_bytes, "kv.v_data_grow")?;
         let new_ks = alloc_shared_buffer(device, slots * sc_bytes, "kv.k_scales_grow")?;
         let new_vs = alloc_shared_buffer(device, slots * sc_bytes, "kv.v_scales_grow")?;
 
@@ -396,14 +456,14 @@ impl GpuKvCache {
                 // SAFETY: Shared unified-memory buffers are idle between synchronous command buffers.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        self.k_q8.contents_ptr().add(so * hd),
-                        new_k.contents_ptr().add(dn * hd),
-                        copy_len * hd,
+                        self.k_data.contents_ptr().add(so * data_bytes),
+                        new_k.contents_ptr().add(dn * data_bytes),
+                        copy_len * data_bytes,
                     );
                     std::ptr::copy_nonoverlapping(
-                        self.v_q8.contents_ptr().add(so * hd),
-                        new_v.contents_ptr().add(dn * hd),
-                        copy_len * hd,
+                        self.v_data.contents_ptr().add(so * data_bytes),
+                        new_v.contents_ptr().add(dn * data_bytes),
+                        copy_len * data_bytes,
                     );
                     std::ptr::copy_nonoverlapping(
                         self.k_scales.contents_ptr().add(so * sc_bytes),
@@ -418,8 +478,8 @@ impl GpuKvCache {
                 }
             }
         }
-        self.k_q8 = new_k;
-        self.v_q8 = new_v;
+        self.k_data = new_k;
+        self.v_data = new_v;
         self.k_scales = new_ks;
         self.v_scales = new_vs;
         self.cap_seq_len = new_cap;
@@ -433,31 +493,142 @@ impl GpuKvCache {
         let nkvh = self.num_kv_heads;
         let kvd = nkvh * hd;
         let cap = self.cap_seq_len;
-        let kp = self.k_q8.contents_ptr().cast::<i8>();
-        let vp = self.v_q8.contents_ptr().cast::<i8>();
-        let ksp = self.k_scales.contents_ptr().cast::<f32>();
-        let vsp = self.v_scales.contents_ptr().cast::<f32>();
-        for l in 0..self.num_layers {
-            let src_l = l * rows * kvd;
-            for pos in 0..n {
-                for kvh in 0..nkvh {
-                    let slot = (l * nkvh + kvh) * cap + pos;
-                    let off = src_l + pos * kvd + kvh * hd;
-                    let kh = &keys[off..off + hd];
-                    let vh = &values[off..off + hd];
-                    for g in 0..gph {
-                        let kg = &kh[g * 32..(g + 1) * 32];
-                        let vg = &vh[g * 32..(g + 1) * 32];
-                        // SAFETY: `slot < num_layers * nkvh * cap`.
-                        unsafe {
-                            quantize_q8_group32(kg, kp.add(slot * hd + g * 32), ksp.add(slot * gph + g));
-                            quantize_q8_group32(vg, vp.add(slot * hd + g * 32), vsp.add(slot * gph + g));
+        if self.bits == 8 {
+            let kp = self.k_data.contents_ptr().cast::<i8>();
+            let vp = self.v_data.contents_ptr().cast::<i8>();
+            let ksp = self.k_scales.contents_ptr().cast::<f32>();
+            let vsp = self.v_scales.contents_ptr().cast::<f32>();
+            for l in 0..self.num_layers {
+                let src_l = l * rows * kvd;
+                for pos in 0..n {
+                    let s_pos = self.slot_of_pos(pos);
+                    for kvh in 0..nkvh {
+                        let slot = (l * nkvh + kvh) * cap + s_pos;
+                        let off = src_l + pos * kvd + kvh * hd;
+                        let kh = &keys[off..off + hd];
+                        let vh = &values[off..off + hd];
+                        for g in 0..gph {
+                            let kg = &kh[g * 32..(g + 1) * 32];
+                            let vg = &vh[g * 32..(g + 1) * 32];
+                            // SAFETY: `slot < num_layers * nkvh * cap`.
+                            unsafe {
+                                quantize_q8_group32(kg, kp.add(slot * hd + g * 32), ksp.add(slot * gph + g));
+                                quantize_q8_group32(vg, vp.add(slot * hd + g * 32), vsp.add(slot * gph + g));
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            let half_hd = hd / 2;
+            let kp = self.k_data.contents_ptr();
+            let vp = self.v_data.contents_ptr();
+            let ksp = self.k_scales.contents_ptr().cast::<u16>();
+            let vsp = self.v_scales.contents_ptr().cast::<u16>();
+            for l in 0..self.num_layers {
+                let src_l = l * rows * kvd;
+                for pos in 0..n {
+                    let s_pos = self.slot_of_pos(pos);
+                    for kvh in 0..nkvh {
+                        let slot = (l * nkvh + kvh) * cap + s_pos;
+                        let off = src_l + pos * kvd + kvh * hd;
+                        let kh = &keys[off..off + hd];
+                        let vh = &values[off..off + hd];
+                        for g in 0..gph {
+                            let kg = &kh[g * 32..(g + 1) * 32];
+                            let vg = &vh[g * 32..(g + 1) * 32];
+                            // SAFETY: `slot < num_layers * nkvh * cap`.
+                            unsafe {
+                                quantize_q4_hadamard_group32(
+                                    kg,
+                                    kp.add(slot * half_hd + g * 16),
+                                    ksp.add(slot * gph + g),
+                                );
+                                quantize_q4_hadamard_group32(
+                                    vg,
+                                    vp.add(slot * half_hd + g * 16),
+                                    vsp.add(slot * gph + g),
+                                );
+                            }
                         }
                     }
                 }
             }
         }
         Ok(())
+    }
+}
+
+const KV_RAD32_MASK_CPU: u32 = 0xA5C3_9669;
+
+#[inline]
+fn kv_nf4_nearest_cpu(y: f32) -> u8 {
+    let mut best = 0u8;
+    let mut best_d = f32::INFINITY;
+    for (idx, &c) in NF4_DEFAULT_CODEBOOK_I8.iter().enumerate() {
+        let d = (y - (c as f32)).abs();
+        if d < best_d {
+            best_d = d;
+            best = idx as u8;
+        }
+    }
+    best
+}
+
+#[inline]
+unsafe fn quantize_q4_hadamard_group32(src: &[f32], dst_q4: *mut u8, dst_s_bf16: *mut u16) {
+    debug_assert_eq!(src.len(), 32);
+    let inv_sqrt32 = 1.0f32 / (32.0f32).sqrt();
+    let mut rot = [0.0f32; 32];
+    for (i, &v) in src.iter().enumerate() {
+        let sign = if ((KV_RAD32_MASK_CPU >> i) & 1) != 0 { -1.0 } else { 1.0 };
+        rot[i] = v * sign * inv_sqrt32;
+    }
+    let mut d = 1usize;
+    while d <= 16 {
+        for base in (0..32).step_by(d * 2) {
+            for j in 0..d {
+                let a = rot[base + j];
+                let b = rot[base + j + d];
+                rot[base + j] = a + b;
+                rot[base + j + d] = a - b;
+            }
+        }
+        d <<= 1;
+    }
+    let mut m = 0.0f32;
+    for &v in &rot {
+        m = m.max(v.abs());
+    }
+    // SAFETY: Caller provides 16 `u8` slots and 1 `u16` slot.
+    unsafe {
+        if m <= 1e-12 {
+            std::ptr::write_bytes(dst_q4, 0x88, 16);
+            *dst_s_bf16 = 0;
+            return;
+        }
+        let inv0 = 127.0 / m;
+        let mut num = 0.0f32;
+        let mut den = 0.0f32;
+        for &v in &rot {
+            let c = NF4_DEFAULT_CODEBOOK_I8[kv_nf4_nearest_cpu(v * inv0) as usize] as f32;
+            num += v * c;
+            den += c * c;
+        }
+        let s_ref = if den > 1e-12 && num > 0.0 {
+            num / den
+        } else {
+            m / 127.0
+        };
+        let sb = f32_to_bf16(s_ref);
+        let sf = bf16_to_f32(sb);
+        let inv = if sf > 1e-20 { 1.0 / sf } else { 0.0 };
+        *dst_s_bf16 = sb;
+        for i in 0..16 {
+            let lo = kv_nf4_nearest_cpu(rot[i] * inv);
+            let hi = kv_nf4_nearest_cpu(rot[i + 16] * inv);
+            *dst_q4.add(i) = lo | (hi << 4);
+        }
     }
 }
 
@@ -522,11 +693,18 @@ impl GpuScratch {
         })
     }
 
-    fn ensure_capacity(&mut self, device: Id, cfg: &LlamaConfig, n_tok: usize, logits_tokens: usize) -> Result<(), String> {
+    fn ensure_capacity(
+        &mut self,
+        device: Id,
+        cfg: &LlamaConfig,
+        n_tok: usize,
+        logits_tokens: usize,
+        max_chunk_tokens: usize,
+    ) -> Result<(), String> {
         let f32_b = std::mem::size_of::<f32>();
         let f16_b = std::mem::size_of::<u16>();
         if n_tok > self.cap_tokens {
-            let n = n_tok.next_power_of_two().min(PROMPT_CHUNK_GPU).max(n_tok);
+            let n = n_tok.next_power_of_two().min(max_chunk_tokens).max(n_tok);
             let n_f16 = n.div_ceil(128) * 128;
             let max_rot = cfg.hidden_size.max(cfg.intermediate_size);
             let qkv_rows = cfg.hidden_size + 2 * cfg.kv_dim();
@@ -551,6 +729,8 @@ impl GpuScratch {
 pub struct MetalLlamaEngine {
     device: MtlObj,
     queue: MtlObj,
+    prompt_chunk_gpu: usize,
+    init_kv_cap_tokens: usize,
     pso_norm_fwht: MtlObj,
     pso_transpose_f16: MtlObj,
     pso_gemv_decode1: MtlObj,
@@ -689,12 +869,16 @@ fn build_pipeline(device: Id, library: Id, fn_name: &str) -> Result<MtlObj, Stri
 }
 
 impl MetalLlamaEngine {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         cfg: &LlamaConfig,
         rope_cos_sin: &[f32],
         layers_in: &[LayerBorrow<'_>],
         final_norm_in: &[f32],
         lm_head_in: &NfSdotMatrix,
+        kv_bits: u8,
+        kv_window: Option<usize>,
+        kv_sinks: usize,
     ) -> Result<Self, String> {
         if !cfg.hidden_size.is_multiple_of(64) || !cfg.intermediate_size.is_multiple_of(64) {
             return Err("Metal backend requires hidden_size and intermediate_size divisible by 64".to_string());
@@ -710,6 +894,13 @@ impl MetalLlamaEngine {
                 let raw_dev = MTLCreateSystemDefaultDevice();
                 let device = MtlObj::from_retained(raw_dev, "MTLCreateSystemDefaultDevice")?;
                 let st = sels();
+                let rec_ws: u64 = msg_sel!(device.id(), st.rec_max_ws; u64);
+                let budget = MemoryBudgetProfile::active_with_metal_working_set(
+                    (rec_ws > 0).then_some(rec_ws as usize),
+                );
+                let prompt_chunk_gpu = budget.prompt_chunk_gpu.clamp(128, MAX_PROMPT_CHUNK_GPU);
+                let init_kv_cap_tokens = budget.initial_kv_cap_tokens.clamp(64, 2048);
+
                 let raw_q: Id = msg_sel!(device.id(), st.new_cmd_queue; Id);
                 let queue = MtlObj::from_retained(raw_q, "newCommandQueue")?;
 
@@ -773,13 +964,23 @@ impl MetalLlamaEngine {
                 }
                 let final_norm = upload_slice_buffer(device.id(), final_norm_in, "final_norm")?;
                 let lm_head = wrap_nf4_matrix(device.id(), lm_head_in, dummy_buf.id(), "lm_head")?;
-                let kv = GpuKvCache::new(device.id(), cfg)?;
-                let init_scratch_toks = cfg.max_seq_len.clamp(16, PROMPT_CHUNK_GPU);
+                let kv = GpuKvCache::new(
+                    device.id(),
+                    cfg,
+                    kv_bits,
+                    kv_window,
+                    kv_sinks,
+                    prompt_chunk_gpu,
+                    init_kv_cap_tokens,
+                )?;
+                let init_scratch_toks = cfg.max_seq_len.clamp(16, prompt_chunk_gpu.min(256));
                 let scratch = GpuScratch::new(device.id(), cfg, init_scratch_toks, 8)?;
 
                 Ok(Self {
                     device,
                     queue,
+                    prompt_chunk_gpu,
+                    init_kv_cap_tokens,
                     pso_norm_fwht,
                     pso_transpose_f16,
                     pso_gemv_decode1,
@@ -801,6 +1002,52 @@ impl MetalLlamaEngine {
             objc_autoreleasePoolPop(pool);
             res
         }
+    }
+
+    #[inline]
+    pub fn prompt_chunk_gpu(&self) -> usize {
+        self.prompt_chunk_gpu
+    }
+
+    #[inline]
+    pub fn kv_bits(&self) -> u8 {
+        self.kv.bits
+    }
+
+    #[inline]
+    pub fn kv_sliding_window(&self) -> Option<(usize, usize)> {
+        (self.kv.window_size > 0).then_some((self.kv.window_size, self.kv.sink_tokens))
+    }
+
+    #[inline]
+    pub fn can_truncate_kv_to(&self, cur_pos: usize, target_len: usize) -> bool {
+        if target_len >= cur_pos || self.kv.ring_len == 0 {
+            return true;
+        }
+        let slack = self
+            .kv
+            .ring_len
+            .saturating_sub(self.kv.window_size.saturating_sub(self.kv.sink_tokens));
+        target_len <= self.kv.sink_tokens || (cur_pos - target_len) <= slack
+    }
+
+    pub fn reconfigure_kv(
+        &mut self,
+        cfg: &LlamaConfig,
+        bits: u8,
+        window: Option<usize>,
+        sinks: usize,
+    ) -> Result<(), String> {
+        self.kv = GpuKvCache::new(
+            self.device.id(),
+            cfg,
+            bits,
+            window,
+            sinks,
+            self.prompt_chunk_gpu,
+            self.init_kv_cap_tokens,
+        )?;
+        Ok(())
     }
 
     #[inline]
@@ -833,9 +1080,10 @@ impl MetalLlamaEngine {
         }
 
         let want_all = all_logits_out.is_some();
+        let max_chunk = self.prompt_chunk_gpu;
         let mut offset = 0usize;
         while offset < tokens.len() {
-            let chunk_len = (tokens.len() - offset).min(PROMPT_CHUNK_GPU);
+            let chunk_len = (tokens.len() - offset).min(max_chunk);
             let is_last_chunk = offset + chunk_len == tokens.len();
             let chunk = &tokens[offset..offset + chunk_len];
             let chunk_pos0 = pos_start + offset;
@@ -881,8 +1129,13 @@ impl MetalLlamaEngine {
     {
         let n_tok = tokens.len();
         self.kv.ensure_seq_capacity(self.device.id(), pos0 + n_tok, pos0)?;
-        self.scratch
-            .ensure_capacity(self.device.id(), cfg, n_tok, logits_tokens.max(1))?;
+        self.scratch.ensure_capacity(
+            self.device.id(),
+            cfg,
+            n_tok,
+            logits_tokens.max(1),
+            self.prompt_chunk_gpu,
+        )?;
 
         let h_dim = cfg.hidden_size;
         let inter_dim = cfg.intermediate_size;
@@ -945,14 +1198,14 @@ impl MetalLlamaEngine {
                         n_tok,
                     );
 
-                    // 3. NeoX RoPE on Q/K + Q8_0 group-32 KV cache write.
+                    // 3. NeoX RoPE on Q/K + Q8_0 / Hadamard-NF4 group-32 KV cache write.
                     {
                         msg_sel!(enc, st.set_cps, self.pso_rope_kv.id() => Id; ());
                         msg_sel!(enc, st.set_buf, self.scratch.qkv.id() => Id, 0usize => usize, 0usize => usize; ());
                         msg_sel!(enc, st.set_buf, self.rope_buf.id() => Id, 0usize => usize, 1usize => usize; ());
-                        msg_sel!(enc, st.set_buf, self.kv.k_q8.id() => Id, 0usize => usize, 2usize => usize; ());
+                        msg_sel!(enc, st.set_buf, self.kv.k_data.id() => Id, 0usize => usize, 2usize => usize; ());
                         msg_sel!(enc, st.set_buf, self.kv.k_scales.id() => Id, 0usize => usize, 3usize => usize; ());
-                        msg_sel!(enc, st.set_buf, self.kv.v_q8.id() => Id, 0usize => usize, 4usize => usize; ());
+                        msg_sel!(enc, st.set_buf, self.kv.v_data.id() => Id, 0usize => usize, 4usize => usize; ());
                         msg_sel!(enc, st.set_buf, self.kv.v_scales.id() => Id, 0usize => usize, 5usize => usize; ());
                         let rp = RopeKvParams {
                             num_q_heads: num_q_heads as u32,
@@ -963,6 +1216,10 @@ impl MetalLlamaEngine {
                             n_tok: n_tok as u32,
                             layer_idx: l_idx as u32,
                             kv_cap,
+                            kv_bits: self.kv.bits as u32,
+                            window_size: self.kv.window_size as u32,
+                            sink_tokens: self.kv.sink_tokens as u32,
+                            ring_len: self.kv.ring_len as u32,
                         };
                         msg_sel!(
                             enc,
@@ -982,7 +1239,7 @@ impl MetalLlamaEngine {
                         );
                     }
 
-                    // 4. Causal GQA online-softmax FlashAttention / FlashDecoding over Q8_0 KV cache.
+                    // 4. Causal GQA online-softmax FlashAttention / FlashDecoding over Q8_0 / Q4 KV cache.
                     {
                         let pso = if n_tok <= GEMV_MAX_TOKENS {
                             self.pso_gqa_decode.id()
@@ -991,9 +1248,9 @@ impl MetalLlamaEngine {
                         };
                         msg_sel!(enc, st.set_cps, pso => Id; ());
                         msg_sel!(enc, st.set_buf, self.scratch.qkv.id() => Id, 0usize => usize, 0usize => usize; ());
-                        msg_sel!(enc, st.set_buf, self.kv.k_q8.id() => Id, 0usize => usize, 1usize => usize; ());
+                        msg_sel!(enc, st.set_buf, self.kv.k_data.id() => Id, 0usize => usize, 1usize => usize; ());
                         msg_sel!(enc, st.set_buf, self.kv.k_scales.id() => Id, 0usize => usize, 2usize => usize; ());
-                        msg_sel!(enc, st.set_buf, self.kv.v_q8.id() => Id, 0usize => usize, 3usize => usize; ());
+                        msg_sel!(enc, st.set_buf, self.kv.v_data.id() => Id, 0usize => usize, 3usize => usize; ());
                         msg_sel!(enc, st.set_buf, self.kv.v_scales.id() => Id, 0usize => usize, 4usize => usize; ());
                         msg_sel!(enc, st.set_buf, self.scratch.attn_out.id() => Id, 0usize => usize, 5usize => usize; ());
                         let gp = GqaFlashParams {
@@ -1008,6 +1265,10 @@ impl MetalLlamaEngine {
                             layer_idx: l_idx as u32,
                             kv_cap,
                             attn_scale,
+                            kv_bits: self.kv.bits as u32,
+                            window_size: self.kv.window_size as u32,
+                            sink_tokens: self.kv.sink_tokens as u32,
+                            ring_len: self.kv.ring_len as u32,
                             _pad: 0,
                         };
                         msg_sel!(
@@ -1377,6 +1638,10 @@ struct RopeKvParams {
     uint n_tok;
     uint layer_idx;
     uint kv_cap;
+    uint kv_bits;
+    uint window_size;
+    uint sink_tokens;
+    uint ring_len;
 };
 
 struct GqaFlashParams {
@@ -1391,8 +1656,101 @@ struct GqaFlashParams {
     uint layer_idx;
     uint kv_cap;
     float attn_scale;
+    uint kv_bits;
+    uint window_size;
+    uint sink_tokens;
+    uint ring_len;
     uint _pad;
 };
+
+constant float KV_INV_SQRT32 = 0.17677669529663689f;
+constant uint  KV_RAD32_MASK = 0xA5C39669u;
+constant float KV_NF4_CB[16] = {
+    -127.0f, -96.0f, -75.0f, -58.0f, -44.0f, -31.0f, -18.0f, -6.0f,
+       6.0f,  18.0f,  31.0f,  44.0f,  58.0f,  75.0f,  96.0f, 127.0f
+};
+
+inline float bf16_u16_to_f32(ushort b) {
+    return as_type<float>(uint(b) << 16u);
+}
+
+inline ushort f32_to_bf16_u16(float v) {
+    uint bits = as_type<uint>(v);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u) {
+        return ushort((bits >> 16u) | 0x0040u);
+    }
+    uint bias = 0x00007FFFu + ((bits >> 16u) & 1u);
+    return ushort((bits + bias) >> 16u);
+}
+
+inline uint kv_slot_of_pos(uint pos, uint sink_tokens, uint ring_len) {
+    return (ring_len == 0u || pos < sink_tokens)
+        ? pos
+        : (sink_tokens + ((pos - sink_tokens) % ring_len));
+}
+
+inline uint kv_nf4_idx(float y) {
+    float a = fabs(y);
+    uint p;
+    if (a < 37.5f) {
+        p = (a < 12.0f) ? 0u : ((a < 24.5f) ? 1u : 2u);
+    } else if (a < 85.5f) {
+        p = (a < 51.0f) ? 3u : ((a < 66.5f) ? 4u : 5u);
+    } else {
+        p = (a < 111.5f) ? 6u : 7u;
+    }
+    return (y >= 0.0f) ? (8u + p) : (7u - p);
+}
+
+inline float simd_fwht32(float v, uint lane) {
+    float sign = (((KV_RAD32_MASK >> lane) & 1u) != 0u) ? -KV_INV_SQRT32 : KV_INV_SQRT32;
+    v *= sign;
+    for (uint d = 1u; d <= 16u; d <<= 1u) {
+        float p = simd_shuffle_xor(v, ushort(d));
+        v = ((lane & d) == 0u) ? (v + p) : (p - v);
+    }
+    return v;
+}
+
+inline float simd_ifwht32(float v, uint lane) {
+    for (uint d = 1u; d <= 16u; d <<= 1u) {
+        float p = simd_shuffle_xor(v, ushort(d));
+        v = ((lane & d) == 0u) ? (v + p) : (p - v);
+    }
+    float sign = (((KV_RAD32_MASK >> lane) & 1u) != 0u) ? -KV_INV_SQRT32 : KV_INV_SQRT32;
+    return v * sign;
+}
+
+inline void ifwht32_pair4(thread float4& v0, thread float4& v1, uint qc) {
+    v0 = float4(v0.x + v0.y, v0.x - v0.y, v0.z + v0.w, v0.z - v0.w);
+    v1 = float4(v1.x + v1.y, v1.x - v1.y, v1.z + v1.w, v1.z - v1.w);
+    v0 = float4(v0.x + v0.z, v0.y + v0.w, v0.x - v0.z, v0.y - v0.w);
+    v1 = float4(v1.x + v1.z, v1.y + v1.w, v1.x - v1.z, v1.y - v1.w);
+    float4 p0 = simd_shuffle_xor(v0, ushort(1));
+    float4 p1 = simd_shuffle_xor(v1, ushort(1));
+    bool low4 = ((qc & 1u) == 0u);
+    v0 = low4 ? (v0 + p0) : (p0 - v0);
+    v1 = low4 ? (v1 + p1) : (p1 - v1);
+    float4 q0 = simd_shuffle_xor(v0, ushort(2));
+    float4 q1 = simd_shuffle_xor(v1, ushort(2));
+    bool low8 = ((qc & 2u) == 0u);
+    v0 = low8 ? (v0 + q0) : (q0 - v0);
+    v1 = low8 ? (v1 + q1) : (q1 - v1);
+    float4 s0 = v0 + v1;
+    float4 s1 = v0 - v1;
+    uint m0 = KV_RAD32_MASK >> (qc * 4u);
+    uint m1 = KV_RAD32_MASK >> (16u + qc * 4u);
+    v0 = s0 * float4(
+        ((m0 & 1u) != 0u) ? -KV_INV_SQRT32 : KV_INV_SQRT32,
+        ((m0 & 2u) != 0u) ? -KV_INV_SQRT32 : KV_INV_SQRT32,
+        ((m0 & 4u) != 0u) ? -KV_INV_SQRT32 : KV_INV_SQRT32,
+        ((m0 & 8u) != 0u) ? -KV_INV_SQRT32 : KV_INV_SQRT32);
+    v1 = s1 * float4(
+        ((m1 & 1u) != 0u) ? -KV_INV_SQRT32 : KV_INV_SQRT32,
+        ((m1 & 2u) != 0u) ? -KV_INV_SQRT32 : KV_INV_SQRT32,
+        ((m1 & 4u) != 0u) ? -KV_INV_SQRT32 : KV_INV_SQRT32,
+        ((m1 & 8u) != 0u) ? -KV_INV_SQRT32 : KV_INV_SQRT32);
+}
 
 inline float bf16_bytes_to_f32(device const uchar* p) {
     uint u = uint(p[0]) | (uint(p[1]) << 8);
@@ -2056,13 +2414,44 @@ inline void store_q8_group32(
     if (lane == 0u) *dst_scale = sc;
 }
 
+inline void store_q4_group32(
+    float val,
+    uint lane,
+    device uchar* dst_q4,
+    device ushort* dst_scale_bf16)
+{
+    float r = simd_fwht32(val, lane);
+    float m = simd_max(fabs(r));
+    if (m <= 1e-12f) {
+        if (lane < 16u) dst_q4[lane] = uchar(0x88u);
+        if (lane == 0u) *dst_scale_bf16 = ushort(0u);
+        return;
+    }
+    float inv0 = 127.0f / m;
+    float c0 = KV_NF4_CB[kv_nf4_idx(r * inv0)];
+    float num = simd_sum(r * c0);
+    float den = simd_sum(c0 * c0);
+    float s_ref = (den > 1e-12f && num > 0.0f) ? (num / den) : (m * (1.0f / 127.0f));
+    ushort sb = f32_to_bf16_u16(s_ref);
+    float sf = bf16_u16_to_f32(sb);
+    float inv = (sf > 1e-20f) ? (1.0f / sf) : 0.0f;
+    uint q_lo = kv_nf4_idx(r * inv);
+    uint q_hi = simd_shuffle_xor(q_lo, ushort(16));
+    if (lane < 16u) {
+        dst_q4[lane] = uchar(q_lo | (q_hi << 4u));
+    }
+    if (lane == 0u) {
+        *dst_scale_bf16 = sb;
+    }
+}
+
 kernel void qkv_rope_kv_store(
     device float*       qkv      [[buffer(0)]],
     device const float* rope_tab [[buffer(1)]],
-    device char*        k_q8     [[buffer(2)]],
-    device float*       k_scales [[buffer(3)]],
-    device char*        v_q8     [[buffer(4)]],
-    device float*       v_scales [[buffer(5)]],
+    device uchar*       k_raw    [[buffer(2)]],
+    device uchar*       ks_raw   [[buffer(3)]],
+    device uchar*       v_raw    [[buffer(4)]],
+    device uchar*       vs_raw   [[buffer(5)]],
     constant RopeKvParams& p     [[buffer(6)]],
     uint2 tg_pos [[threadgroup_position_in_grid]],
     uint sg_id   [[simdgroup_index_in_threadgroup]],
@@ -2087,46 +2476,81 @@ kernel void qkv_rope_kv_store(
             float x1 = head[half_d + i];
             float c = rope[i];
             float s = rope[half_d + i];
-            head[i] = x0 * c - x1 * s;
-            head[half_d + i] = x1 * c + x0 * s;
+            float rx0 = x0 * c - x1 * s;
+            float rx1 = x1 * c + x0 * s;
+            if (p.kv_bits == 4u) {
+                rx0 = simd_fwht32(rx0, lane);
+                rx1 = simd_fwht32(rx1, lane);
+            }
+            head[i] = rx0;
+            head[half_d + i] = rx1;
         }
     } else if (b < p.num_q_heads + p.num_kv_heads) {
         uint kvh = b - p.num_q_heads;
-        ulong slot = (ulong(p.layer_idx * p.num_kv_heads + kvh) * ulong(p.kv_cap)) + ulong(pos);
-        device char* kq = k_q8 + slot * ulong(hd);
-        device float* ks = k_scales + slot * ulong(gph);
+        uint s_pos = kv_slot_of_pos(pos, p.sink_tokens, p.ring_len);
+        ulong slot = (ulong(p.layer_idx * p.num_kv_heads + kvh) * ulong(p.kv_cap)) + ulong(s_pos);
         uint half_groups = half_d >> 5u;
-        for (uint e = 0u; e < half_groups; ++e) {
-            uint i = e * 32u + lane;
-            float x0 = head[i];
-            float x1 = head[half_d + i];
-            float c = rope[i];
-            float s = rope[half_d + i];
-            float rx0 = x0 * c - x1 * s;
-            float rx1 = x1 * c + x0 * s;
-            head[i] = rx0;
-            head[half_d + i] = rx1;
-            store_q8_group32(rx0, lane, kq + e * 32u, ks + e);
-            store_q8_group32(rx1, lane, kq + half_d + e * 32u, ks + half_groups + e);
+        if (p.kv_bits == 4u) {
+            device uchar* kq = k_raw + slot * ulong(half_d);
+            device ushort* ks = ((device ushort*)ks_raw) + slot * ulong(gph);
+            for (uint e = 0u; e < half_groups; ++e) {
+                uint i = e * 32u + lane;
+                float x0 = head[i];
+                float x1 = head[half_d + i];
+                float c = rope[i];
+                float s = rope[half_d + i];
+                float rx0 = x0 * c - x1 * s;
+                float rx1 = x1 * c + x0 * s;
+                head[i] = rx0;
+                head[half_d + i] = rx1;
+                store_q4_group32(rx0, lane, kq + e * 16u, ks + e);
+                store_q4_group32(rx1, lane, kq + (half_groups + e) * 16u, ks + half_groups + e);
+            }
+        } else {
+            device char* kq = ((device char*)k_raw) + slot * ulong(hd);
+            device float* ks = ((device float*)ks_raw) + slot * ulong(gph);
+            for (uint e = 0u; e < half_groups; ++e) {
+                uint i = e * 32u + lane;
+                float x0 = head[i];
+                float x1 = head[half_d + i];
+                float c = rope[i];
+                float s = rope[half_d + i];
+                float rx0 = x0 * c - x1 * s;
+                float rx1 = x1 * c + x0 * s;
+                head[i] = rx0;
+                head[half_d + i] = rx1;
+                store_q8_group32(rx0, lane, kq + e * 32u, ks + e);
+                store_q8_group32(rx1, lane, kq + half_d + e * 32u, ks + half_groups + e);
+            }
         }
     } else {
         uint kvh = b - p.num_q_heads - p.num_kv_heads;
-        ulong slot = (ulong(p.layer_idx * p.num_kv_heads + kvh) * ulong(p.kv_cap)) + ulong(pos);
-        device char* vq = v_q8 + slot * ulong(hd);
-        device float* vs = v_scales + slot * ulong(gph);
-        for (uint g = 0u; g < gph; ++g) {
-            float v = head[g * 32u + lane];
-            store_q8_group32(v, lane, vq + g * 32u, vs + g);
+        uint s_pos = kv_slot_of_pos(pos, p.sink_tokens, p.ring_len);
+        ulong slot = (ulong(p.layer_idx * p.num_kv_heads + kvh) * ulong(p.kv_cap)) + ulong(s_pos);
+        if (p.kv_bits == 4u) {
+            device uchar* vq = v_raw + slot * ulong(half_d);
+            device ushort* vs = ((device ushort*)vs_raw) + slot * ulong(gph);
+            for (uint g = 0u; g < gph; ++g) {
+                float v = head[g * 32u + lane];
+                store_q4_group32(v, lane, vq + g * 16u, vs + g);
+            }
+        } else {
+            device char* vq = ((device char*)v_raw) + slot * ulong(hd);
+            device float* vs = ((device float*)vs_raw) + slot * ulong(gph);
+            for (uint g = 0u; g < gph; ++g) {
+                float v = head[g * 32u + lane];
+                store_q8_group32(v, lane, vq + g * 32u, vs + g);
+            }
         }
     }
 }
 
 kernel void causal_gqa_flash_q8_decode(
     device const float* qkv      [[buffer(0)]],
-    device const char*  k_q8     [[buffer(1)]],
-    device const float* k_scales [[buffer(2)]],
-    device const char*  v_q8     [[buffer(3)]],
-    device const float* v_scales [[buffer(4)]],
+    device const uchar* k_raw    [[buffer(1)]],
+    device const uchar* ks_raw   [[buffer(2)]],
+    device const uchar* v_raw    [[buffer(3)]],
+    device const uchar* vs_raw   [[buffer(4)]],
     device float*       attn_out [[buffer(5)]],
     constant GqaFlashParams& p   [[buffer(6)]],
     uint2 tg_pos [[threadgroup_position_in_grid]],
@@ -2140,6 +2564,10 @@ kernel void causal_gqa_flash_q8_decode(
     const uint hd = p.head_dim;
     const uint kvh = qh / p.kv_group;
     const uint seq_len = p.pos0 + t + 1u;
+    const uint act_len = (p.window_size > 0u && seq_len > p.window_size) ? p.window_size : seq_len;
+    const uint tail_start = (p.window_size > 0u && seq_len > p.window_size)
+        ? (seq_len - (p.window_size - p.sink_tokens))
+        : p.sink_tokens;
     const ulong head_base_slot = ulong(p.layer_idx * p.num_kv_heads + kvh) * ulong(p.kv_cap);
     device const float* q_ptr = qkv + ulong(t) * ulong(p.qkv_rows) + ulong(qh * hd);
 
@@ -2152,47 +2580,122 @@ kernel void causal_gqa_flash_q8_decode(
     float l_val = 0.0f;
     float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
 
-    if (hd == 128u) {
-        for (uint s = sg_id; s < seq_len; s += 4u) {
-            ulong slot = head_base_slot + ulong(s);
-            device const char* kp = k_q8 + slot * 128ul;
-            float4 ks = *(device const float4*)(k_scales + slot * 4ul);
-            float dot_p = q0 * (float(kp[lane]) * ks.x)
-                        + q1 * (float(kp[32u + lane]) * ks.y)
-                        + q2 * (float(kp[64u + lane]) * ks.z)
-                        + q3 * (float(kp[96u + lane]) * ks.w);
-            float score = simd_sum(dot_p);
-            float m_new = (l_val == 0.0f) ? score : max(m_val, score);
-            float alpha = (l_val == 0.0f) ? 0.0f : exp(m_val - m_new);
-            float pw = exp(score - m_new);
-            l_val = l_val * alpha + pw;
-            m_val = m_new;
+    if (p.kv_bits == 4u) {
+        const uint b_idx = lane & 15u;
+        const uint shift = (lane >> 4u) << 2u;
+        device const ushort* ksp = (device const ushort*)ks_raw;
+        device const ushort* vsp = (device const ushort*)vs_raw;
+        if (hd == 128u) {
+            for (uint idx = sg_id; idx < act_len; idx += 4u) {
+                uint pos = (idx < p.sink_tokens) ? idx : (tail_start + idx - p.sink_tokens);
+                uint s_pos = kv_slot_of_pos(pos, p.sink_tokens, p.ring_len);
+                ulong slot = head_base_slot + ulong(s_pos);
+                device const uchar* kp = k_raw + slot * 64ul;
+                ushort4 ksb = *(device const ushort4*)(ksp + slot * 4ul);
+                float4 ks = float4(
+                    bf16_u16_to_f32(ksb.x),
+                    bf16_u16_to_f32(ksb.y),
+                    bf16_u16_to_f32(ksb.z),
+                    bf16_u16_to_f32(ksb.w));
+                float k0 = KV_NF4_CB[(uint(kp[b_idx]) >> shift) & 0xFu];
+                float k1 = KV_NF4_CB[(uint(kp[16u + b_idx]) >> shift) & 0xFu];
+                float k2 = KV_NF4_CB[(uint(kp[32u + b_idx]) >> shift) & 0xFu];
+                float k3 = KV_NF4_CB[(uint(kp[48u + b_idx]) >> shift) & 0xFu];
+                float dot_p = q0 * (k0 * ks.x) + q1 * (k1 * ks.y) + q2 * (k2 * ks.z) + q3 * (k3 * ks.w);
+                float score = simd_sum(dot_p);
+                float m_new = (l_val == 0.0f) ? score : max(m_val, score);
+                float alpha = (l_val == 0.0f) ? 0.0f : exp(m_val - m_new);
+                float pw = exp(score - m_new);
+                l_val = l_val * alpha + pw;
+                m_val = m_new;
 
-            device const char* vp = v_q8 + slot * 128ul;
-            float4 vs = *(device const float4*)(v_scales + slot * 4ul);
-            o0 = o0 * alpha + (pw * vs.x) * float(vp[lane]);
-            o1 = o1 * alpha + (pw * vs.y) * float(vp[32u + lane]);
-            o2 = o2 * alpha + (pw * vs.z) * float(vp[64u + lane]);
-            o3 = o3 * alpha + (pw * vs.w) * float(vp[96u + lane]);
+                device const uchar* vp = v_raw + slot * 64ul;
+                ushort4 vsb = *(device const ushort4*)(vsp + slot * 4ul);
+                float4 vs = float4(
+                    bf16_u16_to_f32(vsb.x),
+                    bf16_u16_to_f32(vsb.y),
+                    bf16_u16_to_f32(vsb.z),
+                    bf16_u16_to_f32(vsb.w));
+                o0 = o0 * alpha + (pw * vs.x) * KV_NF4_CB[(uint(vp[b_idx]) >> shift) & 0xFu];
+                o1 = o1 * alpha + (pw * vs.y) * KV_NF4_CB[(uint(vp[16u + b_idx]) >> shift) & 0xFu];
+                o2 = o2 * alpha + (pw * vs.z) * KV_NF4_CB[(uint(vp[32u + b_idx]) >> shift) & 0xFu];
+                o3 = o3 * alpha + (pw * vs.w) * KV_NF4_CB[(uint(vp[48u + b_idx]) >> shift) & 0xFu];
+            }
+        } else {
+            for (uint idx = sg_id; idx < act_len; idx += 4u) {
+                uint pos = (idx < p.sink_tokens) ? idx : (tail_start + idx - p.sink_tokens);
+                uint s_pos = kv_slot_of_pos(pos, p.sink_tokens, p.ring_len);
+                ulong slot = head_base_slot + ulong(s_pos);
+                device const uchar* kp = k_raw + slot * 32ul;
+                ushort2 ksb = *(device const ushort2*)(ksp + slot * 2ul);
+                float2 ks = float2(bf16_u16_to_f32(ksb.x), bf16_u16_to_f32(ksb.y));
+                float k0 = KV_NF4_CB[(uint(kp[b_idx]) >> shift) & 0xFu];
+                float k1 = KV_NF4_CB[(uint(kp[16u + b_idx]) >> shift) & 0xFu];
+                float score = simd_sum(q0 * (k0 * ks.x) + q1 * (k1 * ks.y));
+                float m_new = (l_val == 0.0f) ? score : max(m_val, score);
+                float alpha = (l_val == 0.0f) ? 0.0f : exp(m_val - m_new);
+                float pw = exp(score - m_new);
+                l_val = l_val * alpha + pw;
+                m_val = m_new;
+
+                device const uchar* vp = v_raw + slot * 32ul;
+                ushort2 vsb = *(device const ushort2*)(vsp + slot * 2ul);
+                float2 vs = float2(bf16_u16_to_f32(vsb.x), bf16_u16_to_f32(vsb.y));
+                o0 = o0 * alpha + (pw * vs.x) * KV_NF4_CB[(uint(vp[b_idx]) >> shift) & 0xFu];
+                o1 = o1 * alpha + (pw * vs.y) * KV_NF4_CB[(uint(vp[16u + b_idx]) >> shift) & 0xFu];
+            }
         }
     } else {
-        for (uint s = sg_id; s < seq_len; s += 4u) {
-            ulong slot = head_base_slot + ulong(s);
-            device const char* kp = k_q8 + slot * 64ul;
-            float2 ks = *(device const float2*)(k_scales + slot * 2ul);
-            float dot_p = q0 * (float(kp[lane]) * ks.x)
-                        + q1 * (float(kp[32u + lane]) * ks.y);
-            float score = simd_sum(dot_p);
-            float m_new = (l_val == 0.0f) ? score : max(m_val, score);
-            float alpha = (l_val == 0.0f) ? 0.0f : exp(m_val - m_new);
-            float pw = exp(score - m_new);
-            l_val = l_val * alpha + pw;
-            m_val = m_new;
+        device const char* k_q8 = (device const char*)k_raw;
+        device const float* k_scales = (device const float*)ks_raw;
+        device const char* v_q8 = (device const char*)v_raw;
+        device const float* v_scales = (device const float*)vs_raw;
+        if (hd == 128u) {
+            for (uint idx = sg_id; idx < act_len; idx += 4u) {
+                uint pos = (idx < p.sink_tokens) ? idx : (tail_start + idx - p.sink_tokens);
+                uint s_pos = kv_slot_of_pos(pos, p.sink_tokens, p.ring_len);
+                ulong slot = head_base_slot + ulong(s_pos);
+                device const char* kp = k_q8 + slot * 128ul;
+                float4 ks = *(device const float4*)(k_scales + slot * 4ul);
+                float dot_p = q0 * (float(kp[lane]) * ks.x)
+                            + q1 * (float(kp[32u + lane]) * ks.y)
+                            + q2 * (float(kp[64u + lane]) * ks.z)
+                            + q3 * (float(kp[96u + lane]) * ks.w);
+                float score = simd_sum(dot_p);
+                float m_new = (l_val == 0.0f) ? score : max(m_val, score);
+                float alpha = (l_val == 0.0f) ? 0.0f : exp(m_val - m_new);
+                float pw = exp(score - m_new);
+                l_val = l_val * alpha + pw;
+                m_val = m_new;
 
-            device const char* vp = v_q8 + slot * 64ul;
-            float2 vs = *(device const float2*)(v_scales + slot * 2ul);
-            o0 = o0 * alpha + (pw * vs.x) * float(vp[lane]);
-            o1 = o1 * alpha + (pw * vs.y) * float(vp[32u + lane]);
+                device const char* vp = v_q8 + slot * 128ul;
+                float4 vs = *(device const float4*)(v_scales + slot * 4ul);
+                o0 = o0 * alpha + (pw * vs.x) * float(vp[lane]);
+                o1 = o1 * alpha + (pw * vs.y) * float(vp[32u + lane]);
+                o2 = o2 * alpha + (pw * vs.z) * float(vp[64u + lane]);
+                o3 = o3 * alpha + (pw * vs.w) * float(vp[96u + lane]);
+            }
+        } else {
+            for (uint idx = sg_id; idx < act_len; idx += 4u) {
+                uint pos = (idx < p.sink_tokens) ? idx : (tail_start + idx - p.sink_tokens);
+                uint s_pos = kv_slot_of_pos(pos, p.sink_tokens, p.ring_len);
+                ulong slot = head_base_slot + ulong(s_pos);
+                device const char* kp = k_q8 + slot * 64ul;
+                float2 ks = *(device const float2*)(k_scales + slot * 2ul);
+                float dot_p = q0 * (float(kp[lane]) * ks.x)
+                            + q1 * (float(kp[32u + lane]) * ks.y);
+                float score = simd_sum(dot_p);
+                float m_new = (l_val == 0.0f) ? score : max(m_val, score);
+                float alpha = (l_val == 0.0f) ? 0.0f : exp(m_val - m_new);
+                float pw = exp(score - m_new);
+                l_val = l_val * alpha + pw;
+                m_val = m_new;
+
+                device const char* vp = v_q8 + slot * 64ul;
+                float2 vs = *(device const float2*)(v_scales + slot * 2ul);
+                o0 = o0 * alpha + (pw * vs.x) * float(vp[lane]);
+                o1 = o1 * alpha + (pw * vs.y) * float(vp[32u + lane]);
+            }
         }
     }
 
@@ -2223,24 +2726,36 @@ kernel void causal_gqa_flash_q8_decode(
         float inv_l = 1.0f / (tg_l[0] * w0 + tg_l[1] * w1 + tg_l[2] * w2 + tg_l[3] * w3);
 
         device float* dst = attn_out + ulong(t) * ulong(p.h_dim) + ulong(qh * hd);
-        dst[lane] = (tg_o[0][lane] * w0 + tg_o[1][lane] * w1 + tg_o[2][lane] * w2 + tg_o[3][lane] * w3) * inv_l;
+        float r0 = (tg_o[0][lane] * w0 + tg_o[1][lane] * w1 + tg_o[2][lane] * w2 + tg_o[3][lane] * w3) * inv_l;
         uint i1 = 32u + lane;
-        dst[i1] = (tg_o[0][i1] * w0 + tg_o[1][i1] * w1 + tg_o[2][i1] * w2 + tg_o[3][i1] * w3) * inv_l;
+        float r1 = (tg_o[0][i1] * w0 + tg_o[1][i1] * w1 + tg_o[2][i1] * w2 + tg_o[3][i1] * w3) * inv_l;
+        if (p.kv_bits == 4u) {
+            r0 = simd_ifwht32(r0, lane);
+            r1 = simd_ifwht32(r1, lane);
+        }
+        dst[lane] = r0;
+        dst[i1] = r1;
         if (hd == 128u) {
             uint i2 = 64u + lane;
             uint i3 = 96u + lane;
-            dst[i2] = (tg_o[0][i2] * w0 + tg_o[1][i2] * w1 + tg_o[2][i2] * w2 + tg_o[3][i2] * w3) * inv_l;
-            dst[i3] = (tg_o[0][i3] * w0 + tg_o[1][i3] * w1 + tg_o[2][i3] * w2 + tg_o[3][i3] * w3) * inv_l;
+            float r2 = (tg_o[0][i2] * w0 + tg_o[1][i2] * w1 + tg_o[2][i2] * w2 + tg_o[3][i2] * w3) * inv_l;
+            float r3 = (tg_o[0][i3] * w0 + tg_o[1][i3] * w1 + tg_o[2][i3] * w2 + tg_o[3][i3] * w3) * inv_l;
+            if (p.kv_bits == 4u) {
+                r2 = simd_ifwht32(r2, lane);
+                r3 = simd_ifwht32(r3, lane);
+            }
+            dst[i2] = r2;
+            dst[i3] = r3;
         }
     }
 }
 
 kernel void causal_gqa_flash_q8_prefill(
     device const float* qkv      [[buffer(0)]],
-    device const char*  k_q8     [[buffer(1)]],
-    device const float* k_scales [[buffer(2)]],
-    device const char*  v_q8     [[buffer(3)]],
-    device const float* v_scales [[buffer(4)]],
+    device const uchar* k_raw    [[buffer(1)]],
+    device const uchar* ks_raw   [[buffer(2)]],
+    device const uchar* v_raw    [[buffer(3)]],
+    device const uchar* vs_raw   [[buffer(4)]],
     device float*       attn_out [[buffer(5)]],
     constant GqaFlashParams& p   [[buffer(6)]],
     uint2 tg_pos [[threadgroup_position_in_grid]],
@@ -2257,6 +2772,12 @@ kernel void causal_gqa_flash_q8_prefill(
     const uint n_dp = hd >> 4u;
     const uint kvh = qh / p.kv_group;
     const uint max_seq_len = p.pos0 + min(p.n_tok, tg_t0 + 32u);
+    const uint min_row_seq = p.pos0 + tg_t0 + 1u;
+    const uint gap_end = (p.window_size > 0u && min_row_seq > p.window_size)
+        ? max(p.sink_tokens, min_row_seq - (p.window_size - p.sink_tokens))
+        : p.sink_tokens;
+    const uint gap_len = gap_end - p.sink_tokens;
+    const uint total_union = max_seq_len - gap_len;
     const ulong head_base_slot = ulong(p.layer_idx * p.num_kv_heads + kvh) * ulong(p.kv_cap);
 
     const uint qr = lane >> 2u;
@@ -2305,34 +2826,62 @@ kernel void causal_gqa_flash_q8_prefill(
 
     const uint q_tok = tg_t0 + sg_id * 8u + qr;
     const uint row_seq_len = (q_tok < p.n_tok) ? (p.pos0 + q_tok + 1u) : 0u;
+    const uint row_win_start = (p.window_size > 0u && row_seq_len > p.window_size)
+        ? (row_seq_len - (p.window_size - p.sink_tokens))
+        : p.sink_tokens;
     const uint kb = tid_tg >> 3u;
     const uint sub = tid_tg & 7u;
 
-    for (uint s0 = 0u; s0 < max_seq_len; s0 += 16u) {
-        uint s_kv = s0 + kb;
+    for (uint u0 = 0u; u0 < total_union; u0 += 16u) {
+        uint u_kv = u0 + kb;
+        uint pos_kv = (u_kv < p.sink_tokens) ? u_kv : (u_kv + gap_len);
+        uint s_pos = kv_slot_of_pos(pos_kv, p.sink_tokens, p.ring_len);
         if (hd == 128u) {
             uint d0 = sub * 16u;
-            if (s_kv < max_seq_len) {
-                ulong slot = head_base_slot + ulong(s_kv);
+            if (u_kv < total_union) {
+                ulong slot = head_base_slot + ulong(s_pos);
                 uint g32 = sub >> 1u;
-                float ks = k_scales[slot * 4ul + ulong(g32)];
-                float vs = v_scales[slot * 4ul + ulong(g32)];
-                device const char4* kp4 = (device const char4*)(k_q8 + slot * 128ul + ulong(d0));
-                device const char4* vp4 = (device const char4*)(v_q8 + slot * 128ul + ulong(d0));
-                #pragma clang loop unroll(full)
-                for (uint j = 0u; j < 4u; ++j) {
-                    char4 kq = kp4[j];
-                    char4 vq = vp4[j];
-                    uint dj = d0 + j * 4u;
-                    Ks[dj + 0u][kb] = half(float(kq.x) * ks);
-                    Ks[dj + 1u][kb] = half(float(kq.y) * ks);
-                    Ks[dj + 2u][kb] = half(float(kq.z) * ks);
-                    Ks[dj + 3u][kb] = half(float(kq.w) * ks);
-                    *(threadgroup half4*)(&Vs[kb][dj]) = half4(
-                        half(float(vq.x) * vs),
-                        half(float(vq.y) * vs),
-                        half(float(vq.z) * vs),
-                        half(float(vq.w) * vs));
+                if (p.kv_bits == 4u) {
+                    uint shift = (sub & 1u) * 4u;
+                    float ks = bf16_u16_to_f32(((device const ushort*)ks_raw)[slot * 4ul + ulong(g32)]);
+                    float vs = bf16_u16_to_f32(((device const ushort*)vs_raw)[slot * 4ul + ulong(g32)]);
+                    device const uchar4* kp4 = (device const uchar4*)(k_raw + slot * 64ul + ulong(g32 * 16u));
+                    device const uchar4* vp4 = (device const uchar4*)(v_raw + slot * 64ul + ulong(g32 * 16u));
+                    #pragma clang loop unroll(full)
+                    for (uint j = 0u; j < 4u; ++j) {
+                        uchar4 kb4 = kp4[j];
+                        uchar4 vb4 = vp4[j];
+                        uint dj = d0 + j * 4u;
+                        Ks[dj + 0u][kb] = half(KV_NF4_CB[(uint(kb4.x) >> shift) & 0xFu] * ks);
+                        Ks[dj + 1u][kb] = half(KV_NF4_CB[(uint(kb4.y) >> shift) & 0xFu] * ks);
+                        Ks[dj + 2u][kb] = half(KV_NF4_CB[(uint(kb4.z) >> shift) & 0xFu] * ks);
+                        Ks[dj + 3u][kb] = half(KV_NF4_CB[(uint(kb4.w) >> shift) & 0xFu] * ks);
+                        *(threadgroup half4*)(&Vs[kb][dj]) = half4(
+                            half(KV_NF4_CB[(uint(vb4.x) >> shift) & 0xFu] * vs),
+                            half(KV_NF4_CB[(uint(vb4.y) >> shift) & 0xFu] * vs),
+                            half(KV_NF4_CB[(uint(vb4.z) >> shift) & 0xFu] * vs),
+                            half(KV_NF4_CB[(uint(vb4.w) >> shift) & 0xFu] * vs));
+                    }
+                } else {
+                    float ks = ((device const float*)ks_raw)[slot * 4ul + ulong(g32)];
+                    float vs = ((device const float*)vs_raw)[slot * 4ul + ulong(g32)];
+                    device const char4* kp4 = (device const char4*)(((device const char*)k_raw) + slot * 128ul + ulong(d0));
+                    device const char4* vp4 = (device const char4*)(((device const char*)v_raw) + slot * 128ul + ulong(d0));
+                    #pragma clang loop unroll(full)
+                    for (uint j = 0u; j < 4u; ++j) {
+                        char4 kq = kp4[j];
+                        char4 vq = vp4[j];
+                        uint dj = d0 + j * 4u;
+                        Ks[dj + 0u][kb] = half(float(kq.x) * ks);
+                        Ks[dj + 1u][kb] = half(float(kq.y) * ks);
+                        Ks[dj + 2u][kb] = half(float(kq.z) * ks);
+                        Ks[dj + 3u][kb] = half(float(kq.w) * ks);
+                        *(threadgroup half4*)(&Vs[kb][dj]) = half4(
+                            half(float(vq.x) * vs),
+                            half(float(vq.y) * vs),
+                            half(float(vq.z) * vs),
+                            half(float(vq.w) * vs));
+                    }
                 }
             } else {
                 #pragma clang loop unroll(full)
@@ -2347,27 +2896,51 @@ kernel void causal_gqa_flash_q8_prefill(
             }
         } else {
             uint d0 = sub * 8u;
-            if (s_kv < max_seq_len) {
-                ulong slot = head_base_slot + ulong(s_kv);
+            if (u_kv < total_union) {
+                ulong slot = head_base_slot + ulong(s_pos);
                 uint g32 = sub >> 2u;
-                float ks = k_scales[slot * 2ul + ulong(g32)];
-                float vs = v_scales[slot * 2ul + ulong(g32)];
-                device const char4* kp4 = (device const char4*)(k_q8 + slot * 64ul + ulong(d0));
-                device const char4* vp4 = (device const char4*)(v_q8 + slot * 64ul + ulong(d0));
-                #pragma clang loop unroll(full)
-                for (uint j = 0u; j < 2u; ++j) {
-                    char4 kq = kp4[j];
-                    char4 vq = vp4[j];
-                    uint dj = d0 + j * 4u;
-                    Ks[dj + 0u][kb] = half(float(kq.x) * ks);
-                    Ks[dj + 1u][kb] = half(float(kq.y) * ks);
-                    Ks[dj + 2u][kb] = half(float(kq.z) * ks);
-                    Ks[dj + 3u][kb] = half(float(kq.w) * ks);
-                    *(threadgroup half4*)(&Vs[kb][dj]) = half4(
-                        half(float(vq.x) * vs),
-                        half(float(vq.y) * vs),
-                        half(float(vq.z) * vs),
-                        half(float(vq.w) * vs));
+                if (p.kv_bits == 4u) {
+                    uint byte_off = (sub & 1u) * 8u;
+                    uint shift = ((sub >> 1u) & 1u) * 4u;
+                    float ks = bf16_u16_to_f32(((device const ushort*)ks_raw)[slot * 2ul + ulong(g32)]);
+                    float vs = bf16_u16_to_f32(((device const ushort*)vs_raw)[slot * 2ul + ulong(g32)]);
+                    device const uchar4* kp4 = (device const uchar4*)(k_raw + slot * 32ul + ulong(g32 * 16u + byte_off));
+                    device const uchar4* vp4 = (device const uchar4*)(v_raw + slot * 32ul + ulong(g32 * 16u + byte_off));
+                    #pragma clang loop unroll(full)
+                    for (uint j = 0u; j < 2u; ++j) {
+                        uchar4 kb4 = kp4[j];
+                        uchar4 vb4 = vp4[j];
+                        uint dj = d0 + j * 4u;
+                        Ks[dj + 0u][kb] = half(KV_NF4_CB[(uint(kb4.x) >> shift) & 0xFu] * ks);
+                        Ks[dj + 1u][kb] = half(KV_NF4_CB[(uint(kb4.y) >> shift) & 0xFu] * ks);
+                        Ks[dj + 2u][kb] = half(KV_NF4_CB[(uint(kb4.z) >> shift) & 0xFu] * ks);
+                        Ks[dj + 3u][kb] = half(KV_NF4_CB[(uint(kb4.w) >> shift) & 0xFu] * ks);
+                        *(threadgroup half4*)(&Vs[kb][dj]) = half4(
+                            half(KV_NF4_CB[(uint(vb4.x) >> shift) & 0xFu] * vs),
+                            half(KV_NF4_CB[(uint(vb4.y) >> shift) & 0xFu] * vs),
+                            half(KV_NF4_CB[(uint(vb4.z) >> shift) & 0xFu] * vs),
+                            half(KV_NF4_CB[(uint(vb4.w) >> shift) & 0xFu] * vs));
+                    }
+                } else {
+                    float ks = ((device const float*)ks_raw)[slot * 2ul + ulong(g32)];
+                    float vs = ((device const float*)vs_raw)[slot * 2ul + ulong(g32)];
+                    device const char4* kp4 = (device const char4*)(((device const char*)k_raw) + slot * 64ul + ulong(d0));
+                    device const char4* vp4 = (device const char4*)(((device const char*)v_raw) + slot * 64ul + ulong(d0));
+                    #pragma clang loop unroll(full)
+                    for (uint j = 0u; j < 2u; ++j) {
+                        char4 kq = kp4[j];
+                        char4 vq = vp4[j];
+                        uint dj = d0 + j * 4u;
+                        Ks[dj + 0u][kb] = half(float(kq.x) * ks);
+                        Ks[dj + 1u][kb] = half(float(kq.y) * ks);
+                        Ks[dj + 2u][kb] = half(float(kq.z) * ks);
+                        Ks[dj + 3u][kb] = half(float(kq.w) * ks);
+                        *(threadgroup half4*)(&Vs[kb][dj]) = half4(
+                            half(float(vq.x) * vs),
+                            half(float(vq.y) * vs),
+                            half(float(vq.z) * vs),
+                            half(float(vq.w) * vs));
+                    }
                 }
             } else {
                 #pragma clang loop unroll(full)
@@ -2400,11 +2973,24 @@ kernel void causal_gqa_flash_q8_prefill(
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
         float4 sc = *(threadgroup const float4*)(&Sc[sg_id][qr][c0]);
-        uint k0 = s0 + c0;
-        if (k0 + 0u >= row_seq_len) sc.x = -1e30f;
-        if (k0 + 1u >= row_seq_len) sc.y = -1e30f;
-        if (k0 + 2u >= row_seq_len) sc.z = -1e30f;
-        if (k0 + 3u >= row_seq_len) sc.w = -1e30f;
+        uint u0c = u0 + c0;
+        uint kp0 = (u0c + 0u < p.sink_tokens) ? (u0c + 0u) : (u0c + 0u + gap_len);
+        uint kp1 = (u0c + 1u < p.sink_tokens) ? (u0c + 1u) : (u0c + 1u + gap_len);
+        uint kp2 = (u0c + 2u < p.sink_tokens) ? (u0c + 2u) : (u0c + 2u + gap_len);
+        uint kp3 = (u0c + 3u < p.sink_tokens) ? (u0c + 3u) : (u0c + 3u + gap_len);
+        bool4 valid = bool4(
+            (u0c + 0u < total_union) && (kp0 < row_seq_len) && (kp0 < p.sink_tokens || kp0 >= row_win_start),
+            (u0c + 1u < total_union) && (kp1 < row_seq_len) && (kp1 < p.sink_tokens || kp1 >= row_win_start),
+            (u0c + 2u < total_union) && (kp2 < row_seq_len) && (kp2 < p.sink_tokens || kp2 >= row_win_start),
+            (u0c + 3u < total_union) && (kp3 < row_seq_len) && (kp3 < p.sink_tokens || kp3 >= row_win_start));
+        if (!valid.x) sc.x = -1e30f;
+        if (!valid.y) sc.y = -1e30f;
+        if (!valid.z) sc.z = -1e30f;
+        if (!valid.w) sc.w = -1e30f;
+
+        uint any_v = uint(valid.x || valid.y || valid.z || valid.w);
+        any_v |= simd_shuffle_xor(any_v, ushort(1));
+        any_v |= simd_shuffle_xor(any_v, ushort(2));
 
         float rmax = max(max(sc.x, sc.y), max(sc.z, sc.w));
         rmax = max(rmax, simd_shuffle_xor(rmax, ushort(1)));
@@ -2412,14 +2998,14 @@ kernel void causal_gqa_flash_q8_prefill(
 
         float alpha = 1.0f;
         float4 pw = float4(0.0f);
-        if (s0 < row_seq_len) {
+        if (any_v != 0u) {
             float m_new = (l_row == 0.0f) ? rmax : max(m_row, rmax);
             alpha = (l_row == 0.0f) ? 0.0f : exp(m_row - m_new);
             pw = float4(
-                (k0 + 0u < row_seq_len) ? exp(sc.x - m_new) : 0.0f,
-                (k0 + 1u < row_seq_len) ? exp(sc.y - m_new) : 0.0f,
-                (k0 + 2u < row_seq_len) ? exp(sc.z - m_new) : 0.0f,
-                (k0 + 3u < row_seq_len) ? exp(sc.w - m_new) : 0.0f);
+                valid.x ? exp(sc.x - m_new) : 0.0f,
+                valid.y ? exp(sc.y - m_new) : 0.0f,
+                valid.z ? exp(sc.z - m_new) : 0.0f,
+                valid.w ? exp(sc.w - m_new) : 0.0f);
             float psum = pw.x + pw.y + pw.z + pw.w;
             psum += simd_shuffle_xor(psum, ushort(1));
             psum += simd_shuffle_xor(psum, ushort(2));
@@ -2457,6 +3043,13 @@ kernel void causal_gqa_flash_q8_prefill(
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (p.kv_bits == 4u) {
+        const uint n_g32 = hd >> 5u;
+        for (uint g = 0u; g < n_g32; ++g) {
+            ifwht32_pair4(o_acc[2u * g], o_acc[2u * g + 1u], qc);
+        }
     }
 
     if (q_tok < p.n_tok && l_row > 0.0f) {
@@ -2683,6 +3276,221 @@ mod tests {
             );
 
             cpu_eng.set_num_threads(1);
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn test_metal_q4_kv_and_sliding_window_sink_parity() {
+        for (hd, nh, nkv, vocab) in [(64usize, 4usize, 2usize, 136usize), (128usize, 4usize, 2usize, 152usize)] {
+            let h = nh * hd;
+            let inter = h * 2;
+            let nl = 2usize;
+            let kvd = nkv * hd;
+            let dir = std::env::temp_dir().join(format!(
+                "kronos_metal_q4win_hd{hd}_{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+
+            fs::write(
+                dir.join("config.json"),
+                format!(
+                    r#"{{"vocab_size":{vocab},"hidden_size":{h},"intermediate_size":{inter},"num_hidden_layers":{nl},"num_attention_heads":{nh},"num_key_value_heads":{nkv},"rms_norm_eps":1e-6,"rope_theta":1000000.0,"tie_word_embeddings":false}}"#
+                ),
+            )
+            .unwrap();
+
+            let mk_bf16 = |n: usize, seed: usize, scale: f32| -> Vec<u8> {
+                let mut out = Vec::with_capacity(n * 2);
+                for i in 0..n {
+                    let mut z = (i as u64)
+                        .wrapping_add((seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                    z ^= z >> 31;
+                    let u = ((z >> 40) as f32) / ((1u32 << 24) as f32);
+                    let v = (2.0 * u - 1.0) * scale;
+                    out.extend_from_slice(&f32_to_bf16(v).to_le_bytes());
+                }
+                out
+            };
+            let write_safetensors = |path: &Path, entries: Vec<(String, Vec<usize>, Vec<u8>)>| {
+                let mut data = Vec::new();
+                let mut hdr_items = Vec::new();
+                for (name, shape, raw) in entries {
+                    let s = data.len();
+                    data.extend_from_slice(&raw);
+                    let e = data.len();
+                    let sh_str: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+                    hdr_items.push(format!(
+                        r#""{name}":{{"dtype":"BF16","shape":[{}],"data_offsets":[{s},{e}]}}"#,
+                        sh_str.join(",")
+                    ));
+                }
+                let hdr = format!("{{{}}}", hdr_items.join(","));
+                let mut file_bytes = (hdr.len() as u64).to_le_bytes().to_vec();
+                file_bytes.extend_from_slice(hdr.as_bytes());
+                file_bytes.extend_from_slice(&data);
+                fs::write(path, file_bytes).unwrap();
+            };
+
+            let mut tensors = vec![(
+                "model.embed_tokens.weight".to_string(),
+                vec![vocab, h],
+                mk_bf16(vocab * h, 31, 0.4),
+            )];
+            for l in 0..nl {
+                let p = format!("model.layers.{l}");
+                tensors.extend([
+                    (format!("{p}.input_layernorm.weight"), vec![h], mk_bf16(h, 7 + l, 1.0)),
+                    (format!("{p}.post_attention_layernorm.weight"), vec![h], mk_bf16(h, 11 + l, 1.0)),
+                    (format!("{p}.self_attn.q_proj.weight"), vec![h, h], mk_bf16(h * h, 13 + l, 0.08)),
+                    (format!("{p}.self_attn.k_proj.weight"), vec![kvd, h], mk_bf16(kvd * h, 17 + l, 0.08)),
+                    (format!("{p}.self_attn.v_proj.weight"), vec![kvd, h], mk_bf16(kvd * h, 19 + l, 0.08)),
+                    (format!("{p}.self_attn.o_proj.weight"), vec![h, h], mk_bf16(h * h, 41 + l, 0.08)),
+                    (format!("{p}.mlp.gate_proj.weight"), vec![inter, h], mk_bf16(inter * h, 43 + l, 0.08)),
+                    (format!("{p}.mlp.up_proj.weight"), vec![inter, h], mk_bf16(inter * h, 47 + l, 0.08)),
+                    (format!("{p}.mlp.down_proj.weight"), vec![h, inter], mk_bf16(h * inter, 53 + l, 0.055)),
+                ]);
+            }
+            tensors.push(("model.norm.weight".to_string(), vec![h], mk_bf16(h, 59, 1.0)));
+            tensors.push(("lm_head.weight".to_string(), vec![vocab, h], mk_bf16(vocab * h, 61, 0.3)));
+            write_safetensors(&dir.join("model.safetensors"), tensors);
+
+            let mode = RealWeightMode::KronosNfGptq {
+                bits: 4,
+                scale_group_chunks: 2,
+            };
+            let calib = vec![(0..16).map(|i| (i * 5 + 1) % vocab).collect::<Vec<_>>()];
+            let mut compiled = RealLlamaEngine::compile_streaming_gptq_from_dir(&dir, mode, &calib, 2).unwrap();
+            compiled.compress_untied_embeddings_nf4();
+            let cache_path = dir.join("kronos-nf4g128.k2tb");
+            compiled.save_bipolar(&cache_path).unwrap();
+
+            let mut cpu_q8 = RealLlamaEngine::load_bipolar(&dir, &cache_path, 4096).unwrap();
+            cpu_q8.repack_sdot();
+            cpu_q8.set_kv_bits(8);
+            cpu_q8.set_num_threads(2);
+
+            let mut gpu_eng = RealLlamaEngine::load_bipolar(&dir, &cache_path, 4096).unwrap();
+            gpu_eng.repack_sdot();
+            gpu_eng.enable_metal().unwrap();
+            gpu_eng.set_kv_bits(8);
+            let q8_bytes = gpu_eng.kv_cache_bytes();
+            gpu_eng.set_kv_bits(4);
+            let q4_bytes = gpu_eng.kv_cache_bytes();
+            assert_eq!(q4_bytes * 2, q8_bytes, "Metal Q4-KV must be exact 2.0x smaller than Q8-KV");
+
+            let mut gpu_step = RealLlamaEngine::load_bipolar(&dir, &cache_path, 4096).unwrap();
+            gpu_step.repack_sdot();
+            gpu_step.enable_metal().unwrap();
+            gpu_step.set_kv_bits(4);
+
+            // 1. Q4-KV MMA prefill (`n_tok = 68`) vs Metal decode1 (`cos > 0.9998`) and CPU Q8 reference (`cos > 0.998`).
+            let prefill_toks: Vec<usize> = (0..68).map(|i| (i * 11 + 2) % vocab).collect();
+            let cp = cpu_q8.forward_prompt(&prefill_toks).to_vec();
+            let gp = gpu_eng.forward_prompt(&prefill_toks).to_vec();
+            let mut gs_last = Vec::new();
+            for &t in &prefill_toks {
+                gs_last = gpu_step.forward_token(t).to_vec();
+            }
+            let cos_self = cosine_sim(&gp, &gs_last);
+            assert!(
+                cos_self > 0.9997,
+                "Metal Q4-KV MMA prefill vs decode1 mismatch (hd={hd}): cos={cos_self:.6}"
+            );
+            let cos_p = cosine_sim(&cp, &gp);
+            let kl_p = kl_divergence_nats(&cp, &gp);
+            assert!(
+                cos_p > 0.998 && kl_p < 0.015,
+                "Metal Q4-KV MMA prefill vs CPU Q8-KV mismatch (hd={hd}): cos={cos_p:.6}, kl={kl_p:.6}"
+            );
+
+            let batch_toks: Vec<usize> = (0..5).map(|i| (i * 13 + 7) % vocab).collect();
+            let mut cb = vec![0.0f32; 5 * vocab];
+            let mut gb = vec![0.0f32; 5 * vocab];
+            cpu_q8.forward_batch_logits(&batch_toks, &mut cb);
+            gpu_eng.forward_batch_logits(&batch_toks, &mut gb);
+            for (t, &bt) in batch_toks.iter().enumerate() {
+                let cs = &cb[t * vocab..(t + 1) * vocab];
+                let gs = &gb[t * vocab..(t + 1) * vocab];
+                let gs_step = gpu_step.forward_token(bt);
+                let cos_self_b = cosine_sim(gs, gs_step);
+                assert!(
+                    cos_self_b > 0.9997,
+                    "Metal Q4-KV batch vs decode1 token {t} mismatch (hd={hd}): cos={cos_self_b:.6}"
+                );
+                let cos_b = cosine_sim(cs, gs);
+                let kl_b = kl_divergence_nats(cs, gs);
+                assert!(
+                    cos_b > 0.997 && kl_b < 0.015,
+                    "Metal Q4-KV batch verify token {t} mismatch (hd={hd}): cos={cos_b:.6}, kl={kl_b:.6}"
+                );
+            }
+
+            for step in 0..3 {
+                let tok = (step * 17 + 9) % vocab;
+                let cl = cpu_q8.forward_token(tok).to_vec();
+                let gl = gpu_eng.forward_token(tok).to_vec();
+                let gs_step = gpu_step.forward_token(tok);
+                assert!(
+                    cosine_sim(&gl, gs_step) > 0.9999,
+                    "Metal Q4-KV decode1 determinism mismatch (hd={hd})"
+                );
+                let cos_d = cosine_sim(&cl, &gl);
+                assert!(
+                    cos_d > 0.997,
+                    "Metal Q4-KV decode1 step {step} mismatch (hd={hd}): cos={cos_d:.6}"
+                );
+            }
+
+            // 2. Sliding-window (`W=24`, `sinks=4`) + Q4-KV across ring wraparound (`1650` tokens).
+            cpu_q8.set_kv_sliding_window(Some(24), 4);
+            gpu_eng.set_kv_sliding_window(Some(24), 4);
+            gpu_step.set_kv_sliding_window(Some(24), 4);
+            let ring_toks: Vec<usize> = (0..1650).map(|i| (i * 19 + 3) % vocab).collect();
+            let cw = cpu_q8.forward_prompt(&ring_toks).to_vec();
+            let gw = gpu_eng.forward_prompt(&ring_toks).to_vec();
+            let mut gsw_last = Vec::new();
+            for &t in &ring_toks {
+                gsw_last = gpu_step.forward_token(t).to_vec();
+            }
+            let cos_self_w = cosine_sim(&gw, &gsw_last);
+            assert!(
+                cos_self_w > 0.9997,
+                "Metal Q4-KV sliding-window MMA prefill vs decode1 mismatch (hd={hd}): cos={cos_self_w:.6}"
+            );
+            let cos_w = cosine_sim(&cw, &gw);
+            let kl_w = kl_divergence_nats(&cw, &gw);
+            assert!(
+                cos_w > 0.996 && kl_w < 0.015,
+                "Metal Q4-KV sliding-window wraparound prefill mismatch (hd={hd}): cos={cos_w:.6}, kl={kl_w:.6}"
+            );
+            assert!(gpu_eng.can_truncate_kv_to(0));
+            assert!(!gpu_eng.can_truncate_kv_to(8));
+            assert!(gpu_eng.can_truncate_kv_to(1648));
+
+            for step in 0..3 {
+                let tok = (step * 23 + 1) % vocab;
+                let cl = cpu_q8.forward_token(tok).to_vec();
+                let gl = gpu_eng.forward_token(tok).to_vec();
+                let gs = gpu_step.forward_token(tok);
+                let cos_self_dw = cosine_sim(&gl, gs);
+                assert!(
+                    cos_self_dw > 0.9997,
+                    "Metal Q4-KV sliding-window decode1 self-consistency mismatch (hd={hd}): cos={cos_self_dw:.6}"
+                );
+                let cos_dw = cosine_sim(&cl, &gl);
+                let kl_dw = kl_divergence_nats(&cl, &gl);
+                assert!(
+                    cos_dw > 0.996 && kl_dw < 0.015,
+                    "Metal Q4-KV sliding-window decode1 step {step} mismatch (hd={hd}): cos={cos_dw:.6}, kl={kl_dw:.6}"
+                );
+            }
+
+            cpu_q8.set_num_threads(1);
             let _ = fs::remove_dir_all(&dir);
         }
     }

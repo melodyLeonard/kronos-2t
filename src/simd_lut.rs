@@ -4708,6 +4708,277 @@ impl NfSdotMatrix {
         }
     }
 
+    /// Stream-quantizes a `[rows, cols]` little-endian `BF16` embedding table into 4-bit Hadamard `NF4`
+    /// using bounded 32-row thread-local scratch (`< 6 MiB` total temporary RAM on `152k x 5120`).
+    pub fn from_bf16_le_embeddings_nf4(
+        bf16_le_bytes: &[u8],
+        rows: usize,
+        cols: usize,
+        scale_group_chunks: usize,
+        num_threads: usize,
+    ) -> Self {
+        assert_eq!(bf16_le_bytes.len(), rows * cols * 2);
+        Self::build_nf4_from_bf16_getter(rows, cols, scale_group_chunks, num_threads, |r, c| {
+            let off = (r * cols + c) * 2;
+            u16::from_le_bytes([bf16_le_bytes[off], bf16_le_bytes[off + 1]])
+        })
+    }
+
+    /// Stream-quantizes a `[rows, cols]` `BF16` (`u16`) embedding table into 4-bit Hadamard `NF4`.
+    pub fn from_bf16_u16_embeddings_nf4(
+        bf16_words: &[u16],
+        rows: usize,
+        cols: usize,
+        scale_group_chunks: usize,
+        num_threads: usize,
+    ) -> Self {
+        assert_eq!(bf16_words.len(), rows * cols);
+        Self::build_nf4_from_bf16_getter(rows, cols, scale_group_chunks, num_threads, |r, c| {
+            bf16_words[r * cols + c]
+        })
+    }
+
+    fn build_nf4_from_bf16_getter<F>(
+        rows: usize,
+        cols: usize,
+        scale_group_chunks: usize,
+        num_threads: usize,
+        get_bf16: F,
+    ) -> Self
+    where
+        F: Fn(usize, usize) -> u16 + Sync,
+    {
+        assert!(rows > 0 && cols > 0 && cols.is_multiple_of(64));
+        let sgc = scale_group_chunks.max(1);
+        let codebook = NF4_DEFAULT_CODEBOOK_I8;
+        let cb32 = nf_expand_codebook32(4, &codebook);
+        let mut pos_th = [0.0f32; 7];
+        for m in 0..7 {
+            pos_th[m] = 0.5 * ((cb32[8 + m] as f32) + (cb32[9 + m] as f32));
+        }
+        let cb_top = (cb32[15] as f32).max(1.0);
+
+        let quant4 = |w: f32, inv_delta: f32| -> u8 {
+            let aw = w.abs() * inv_delta;
+            let mag = if aw < pos_th[3] {
+                if aw < pos_th[1] {
+                    usize::from(aw >= pos_th[0])
+                } else {
+                    2 + usize::from(aw >= pos_th[2])
+                }
+            } else if aw < pos_th[5] {
+                4 + usize::from(aw >= pos_th[4])
+            } else {
+                6 + usize::from(aw >= pos_th[6])
+            };
+            if w >= 0.0 {
+                (8 + mag) as u8
+            } else {
+                (7 - mag) as u8
+            }
+        };
+
+        let num_stripes = rows.div_ceil(SIMD_ROW_STRIPE);
+        let num_pairs = num_stripes / 2;
+        let has_tail = (num_stripes & 1) != 0;
+        let num_chunks = cols / 64;
+        let num_scale_groups = num_chunks.div_ceil(sgc);
+        let chunk_b = Self::stripe_chunk_bytes(4);
+        let pair_tot = num_scale_groups * 64 + num_chunks * 2 * chunk_b;
+        let tail_tot = num_scale_groups * 32 + num_chunks * chunk_b;
+        let mut pair_stream = PageAlignedBytes::zeroed(num_pairs * pair_tot);
+        let mut tail_stream = PageAlignedBytes::zeroed(usize::from(has_tail) * tail_tot);
+
+        let quantize_one_row = |global_r: usize,
+                                row_buf: &mut [f32],
+                                idx_dst: &mut [u8],
+                                sc_dst: &mut [u16],
+                                lane: usize| {
+            if global_r >= rows {
+                idx_dst.fill(8);
+                for sg in 0..num_scale_groups {
+                    sc_dst[sg * SIMD_ROW_STRIPE + lane] = 0;
+                }
+                return;
+            }
+            for (c, dst) in row_buf.iter_mut().enumerate() {
+                *dst = bf16_to_f32(get_bf16(global_r, c));
+            }
+            crate::hadamard::fwht64_signed_inplace(row_buf);
+            for sg in 0..num_scale_groups {
+                let col0 = sg * sgc * 64;
+                let col1 = (col0 + sgc * 64).min(cols);
+                let grp = &row_buf[col0..col1];
+                let mut max_abs = 0.0f32;
+                for &v in grp {
+                    if v.abs() > max_abs {
+                        max_abs = v.abs();
+                    }
+                }
+                if max_abs <= 1e-12 {
+                    idx_dst[col0..col1].fill(8);
+                    sc_dst[sg * SIMD_ROW_STRIPE + lane] = 0;
+                    continue;
+                }
+                let inv0 = cb_top / max_abs;
+                let mut dot_wq = 0.0f32;
+                let mut dot_qq = 0.0f32;
+                for &v in grp {
+                    let q = quant4(v, inv0) as usize;
+                    let qf = cb32[q] as f32;
+                    dot_wq += v * qf;
+                    dot_qq += qf * qf;
+                }
+                let delta_bf16 = f32_to_bf16(if dot_qq > 0.0 {
+                    (dot_wq / dot_qq).max(0.0)
+                } else {
+                    max_abs / cb_top
+                });
+                let delta = bf16_to_f32(delta_bf16);
+                let inv = if delta > 1e-12 { 1.0 / delta } else { 0.0 };
+                for (sub, &v) in grp.iter().enumerate() {
+                    idx_dst[col0 + sub] = quant4(v, inv);
+                }
+                sc_dst[sg * SIMD_ROW_STRIPE + lane] = delta_bf16;
+            }
+        };
+
+        let pack_nibble_chunk = |idx_stripe: &[u8], c: usize, dst: &mut [u8]| {
+            let c_col = c * 64;
+            for k in 0..4 {
+                for g in 0..4 {
+                    for j in 0..4 {
+                        let lane = g * 4 + j;
+                        let row_off = lane * cols + c_col;
+                        for t in 0..4 {
+                            let lo0 = idx_stripe[row_off + k * 16 + t] & 0x0F;
+                            let hi0 = idx_stripe[row_off + k * 16 + 4 + t] & 0x0F;
+                            dst[k * 128 + g * 32 + j * 4 + t] = lo0 | (hi0 << 4);
+                            let lo1 = idx_stripe[row_off + k * 16 + 8 + t] & 0x0F;
+                            let hi1 = idx_stripe[row_off + k * 16 + 12 + t] & 0x0F;
+                            dst[k * 128 + g * 32 + 16 + j * 4 + t] = lo1 | (hi1 << 4);
+                        }
+                    }
+                }
+            }
+        };
+
+        if num_pairs > 0 {
+            let workers = num_threads.max(1).min(num_pairs);
+            let pairs_per_worker = num_pairs.div_ceil(workers);
+            std::thread::scope(|s| {
+                let mut rem = &mut pair_stream[..];
+                let mut p_start = 0usize;
+                while p_start < num_pairs && !rem.is_empty() {
+                    let take = pairs_per_worker.min(num_pairs - p_start);
+                    let (chunk_bytes, next) = rem.split_at_mut(take * pair_tot);
+                    rem = next;
+                    let p0 = p_start;
+                    p_start += take;
+                    let q_row = &quantize_one_row;
+                    let p_chunk = &pack_nibble_chunk;
+                    s.spawn(move || {
+                        let mut row_buf = vec![0.0f32; cols];
+                        let mut idx_a = vec![8u8; SIMD_ROW_STRIPE * cols];
+                        let mut idx_b = vec![8u8; SIMD_ROW_STRIPE * cols];
+                        let mut sc_a = vec![0u16; num_scale_groups * SIMD_ROW_STRIPE];
+                        let mut sc_b = vec![0u16; num_scale_groups * SIMD_ROW_STRIPE];
+                        for local_p in 0..take {
+                            let p = p0 + local_p;
+                            let r_a = p * 2 * SIMD_ROW_STRIPE;
+                            let r_b = r_a + SIMD_ROW_STRIPE;
+                            for lane in 0..SIMD_ROW_STRIPE {
+                                q_row(
+                                    r_a + lane,
+                                    &mut row_buf,
+                                    &mut idx_a[lane * cols..(lane + 1) * cols],
+                                    &mut sc_a,
+                                    lane,
+                                );
+                                q_row(
+                                    r_b + lane,
+                                    &mut row_buf,
+                                    &mut idx_b[lane * cols..(lane + 1) * cols],
+                                    &mut sc_b,
+                                    lane,
+                                );
+                            }
+                            let dst_pair = &mut chunk_bytes[local_p * pair_tot..(local_p + 1) * pair_tot];
+                            let mut cur = 0usize;
+                            for sg in 0..num_scale_groups {
+                                for lane in 0..SIMD_ROW_STRIPE {
+                                    let ua = sc_a[sg * SIMD_ROW_STRIPE + lane];
+                                    let ub = sc_b[sg * SIMD_ROW_STRIPE + lane];
+                                    dst_pair[cur + lane * 2..cur + lane * 2 + 2]
+                                        .copy_from_slice(&ua.to_le_bytes());
+                                    dst_pair[cur + 32 + lane * 2..cur + 32 + lane * 2 + 2]
+                                        .copy_from_slice(&ub.to_le_bytes());
+                                }
+                                cur += 64;
+                                let c_start = sg * sgc;
+                                let c_end = (c_start + sgc).min(num_chunks);
+                                for c in c_start..c_end {
+                                    p_chunk(&idx_a, c, &mut dst_pair[cur..cur + chunk_b]);
+                                    p_chunk(
+                                        &idx_b,
+                                        c,
+                                        &mut dst_pair[cur + chunk_b..cur + 2 * chunk_b],
+                                    );
+                                    cur += 2 * chunk_b;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        if has_tail {
+            let r_t = num_pairs * 2 * SIMD_ROW_STRIPE;
+            let mut row_buf = vec![0.0f32; cols];
+            let mut idx_t = vec![8u8; SIMD_ROW_STRIPE * cols];
+            let mut sc_t = vec![0u16; num_scale_groups * SIMD_ROW_STRIPE];
+            for lane in 0..SIMD_ROW_STRIPE {
+                quantize_one_row(
+                    r_t + lane,
+                    &mut row_buf,
+                    &mut idx_t[lane * cols..(lane + 1) * cols],
+                    &mut sc_t,
+                    lane,
+                );
+            }
+            let mut cur = 0usize;
+            for sg in 0..num_scale_groups {
+                for lane in 0..SIMD_ROW_STRIPE {
+                    let ut = sc_t[sg * SIMD_ROW_STRIPE + lane];
+                    tail_stream[cur + lane * 2..cur + lane * 2 + 2]
+                        .copy_from_slice(&ut.to_le_bytes());
+                }
+                cur += 32;
+                let c_start = sg * sgc;
+                let c_end = (c_start + sgc).min(num_chunks);
+                for c in c_start..c_end {
+                    pack_nibble_chunk(&idx_t, c, &mut tail_stream[cur..cur + chunk_b]);
+                    cur += chunk_b;
+                }
+            }
+        }
+
+        Self {
+            rows,
+            cols,
+            bits: 4,
+            scale_group_chunks: sgc,
+            num_stripes,
+            num_pairs,
+            num_chunks,
+            num_scale_groups,
+            codebook,
+            pair_stream,
+            tail_stream,
+        }
+    }
+
     /// Reorders `gate_up_proj` rows from `[gate; up]` into 64-row `[gate_64(ic), up_64(ic)]` blocks.
     pub fn to_gate_up_interleaved(&self) -> Self {
         assert!(

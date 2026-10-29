@@ -38,6 +38,7 @@ pub mod jev;
 pub mod json;
 pub mod k2t_format;
 pub mod lut_gemv;
+pub mod memory_budget;
 #[cfg(target_os = "macos")]
 pub mod metal_gpu;
 pub mod mmap_pager;
