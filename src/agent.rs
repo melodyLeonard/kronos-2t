@@ -14,7 +14,8 @@ pub const MAX_CMD_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_SEARCH_MATCHES: usize = 60;
 
 pub const AGENT_SYSTEM_PROMPT: &str = concat!(
-    "You are Kronos Agent, a local software engineering runner on Apple Silicon. ",
+    "Your name is Kronos. You were created and built by Melody Leonard as a local software engineering runner on Apple Silicon. ",
+    "When asked your name or who built or created you, answer directly that your name is Kronos and that you were built by Melody Leonard; never say you lack a name and never claim to be built by OpenAI, Alibaba, Qwen, Hugging Face, Anthropic, or any other third-party organization. ",
     "Use the workspace tools (write_file, edit_file, read_file, list_dir, search_files, run_command) ",
     "to build, edit, and verify complete working files directly on disk. ",
     "Do not paste file drafts or completion claims in prose before calling tools; emit <tool_call> invocations immediately, then summarize after tool calls succeed. ",
@@ -63,6 +64,7 @@ pub struct ToolExecOutcome {
 pub enum TurnRoute {
     Chat,
     Agent,
+    Computer,
 }
 
 impl TurnRoute {
@@ -70,6 +72,7 @@ impl TurnRoute {
         match self {
             TurnRoute::Chat => "chat",
             TurnRoute::Agent => "agent",
+            TurnRoute::Computer => "computer",
         }
     }
 }
@@ -175,6 +178,14 @@ pub fn classify_turn_intent(
     let stripped = lower.trim_end_matches(['?', '.', ',']);
     if greetings.contains(&stripped) {
         return TurnRoute::Chat;
+    }
+
+    if crate::device::is_computer_control_prompt(&lower)
+        && crate::device::global_device_manager()
+            .current_config()
+            .allow_computer_control
+    {
+        return TurnRoute::Computer;
     }
 
     let mut score = 0i32;
@@ -1278,6 +1289,22 @@ pub fn execute_tool(
                 diff: None,
             }
         }
+        "use_computer" => match crate::device::global_device_manager().execute_computer_action(&args) {
+            Ok(msg) => ToolExecOutcome {
+                ok: true,
+                validation_ok: true,
+                validation_msg: "ok".to_string(),
+                output: msg,
+                diff: None,
+            },
+            Err(err) => ToolExecOutcome {
+                ok: false,
+                validation_ok: true,
+                validation_msg: "ok".to_string(),
+                output: format!("error: {err}"),
+                diff: None,
+            },
+        },
         other => ToolExecOutcome {
             ok: false,
             validation_ok: true,
@@ -2336,8 +2363,10 @@ fn extract_partial_json_str(haystack: &str, key: &str) -> Option<String> {
 }
 
 pub const UNIFIED_SYSTEM_PROMPT: &str = concat!(
-    "You are Kronos, a local multimodal software engineering and reasoning engine on Apple Silicon. ",
+    "Your name is Kronos. You were created and built by Melody Leonard as a local multimodal software engineering and reasoning engine on Apple Silicon. ",
+    "When asked your name or who built or created you, answer directly that your name is Kronos and that you were built by Melody Leonard; never say you lack a name and never claim to be built by OpenAI, Alibaba, Qwen, Hugging Face, Anthropic, or any other third-party organization. ",
     "For general questions, explanations, or analysis of attached PDFs, documents, CSVs, code snippets, or images that do not modify workspace files, reply directly and concisely from the inline context without calling tools. ",
+    "When a [Device Context] block is provided, answer using its exact local paths and watch history, and when `use_computer` is available and the user asks to open or control an application, file, folder, or URL on their Mac, call `use_computer` directly. ",
     "When asked to build, edit, style, fix, inspect, or run files in the workspace, use the workspace tools (write_file, edit_file, read_file, list_dir, search_files, run_command) directly on disk. ",
     "Do not paste file drafts or completion claims in prose before calling tools; emit <tool_call> invocations immediately, then summarize briefly after tool calls succeed. ",
     "Check the Existing workspace files list below before calling edit_file: only call edit_file on files that exist on disk using exact existing lines, and use write_file for new files or full rewrites. ",
@@ -3096,7 +3125,7 @@ pub fn run_agent_turn(
                 repair_attempts += 1;
                 history.push(Message::new(
                     "user",
-                    "No workspace tool call was emitted yet, so no files on disk were modified or inspected. Emit a <tool_call> now (such as `write_file`, `edit_file`, `read_file`, `list_dir`, or `run_command`) to perform the requested workspace action directly on disk before replying.",
+                    "No tool call was emitted yet, so the requested action has not run. Emit a <tool_call> now (using `use_computer` for macOS app or file actions, or `write_file`/`edit_file`/`read_file`/`list_dir`/`run_command` for workspace actions) before replying.",
                 ));
                 continue;
             }

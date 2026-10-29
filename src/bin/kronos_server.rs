@@ -30,6 +30,7 @@ use kronos_2t::agent::{
 };
 use kronos_2t::attachments::{ingest_attachment, AttachmentIngestion};
 use kronos_2t::chat::{ChatModel, Completion, GenParams, Message, ToolCall};
+use kronos_2t::device::{global_device_manager, use_computer_tool_definition_json};
 use kronos_2t::json::{quote, Json};
 use kronos_2t::vision::analyze_image_payload;
 use std::fs;
@@ -680,21 +681,69 @@ fn stream_agent_loop_sse(srv: &Server, stream: &mut TcpStream, spec: StreamTurnS
         history.insert(0, Message::new("system", &sys));
     } else if history[0].content.starts_with(UNIFIED_SYSTEM_PROMPT)
         || history[0].content.starts_with(AGENT_SYSTEM_PROMPT)
+        || history[0].content.starts_with("You are Kronos")
+        || history[0].content.starts_with("Your name is Kronos")
     {
         history[0].content = build_unified_system_prompt(&workdir);
     }
 
-    let tools_json = if initial_route == TurnRoute::Chat {
-        Vec::new()
-    } else {
-        tool_definitions_json()
+    let mut effective_route = initial_route;
+    let last_user_text = history
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    if !last_user_text.contains("[Device Context") {
+        if let Some(dev_ctx) = global_device_manager().query_for_turn(&last_user_text) {
+            if dev_ctx.wants_computer_action && effective_route == TurnRoute::Chat {
+                effective_route = TurnRoute::Computer;
+                active_route = TurnRoute::Computer;
+                let _ = write_sse(r#"{"type":"route","mode":"computer"}"#);
+            }
+            let items_json: Vec<String> = dev_ctx
+                .hits
+                .iter()
+                .take(6)
+                .map(|h| {
+                    format!(
+                        r#"{{"kind":{},"name":{},"path":{},"exists_on_disk":{}}}"#,
+                        quote(h.kind.label()),
+                        quote(&h.name),
+                        quote(&h.path),
+                        h.exists_on_disk
+                    )
+                })
+                .collect();
+            let _ = write_sse(&format!(
+                r#"{{"type":"device_context","hits":{},"elapsed_ms":{:.2},"items":[{}]}}"#,
+                dev_ctx.hits.len(),
+                dev_ctx.elapsed_ms,
+                items_json.join(",")
+            ));
+            if let Some(last_u) = history.iter_mut().rev().find(|m| m.role == "user") {
+                last_u.content = format!("{}\n\n{}", dev_ctx.prompt_block, last_u.content);
+            }
+        }
+    }
+
+    let tools_json = match effective_route {
+        TurnRoute::Chat => Vec::new(),
+        TurnRoute::Computer => vec![use_computer_tool_definition_json()],
+        TurnRoute::Agent => {
+            let mut t = tool_definitions_json();
+            if global_device_manager().current_config().allow_computer_control {
+                t.push(use_computer_tool_definition_json());
+            }
+            t
+        }
     };
     let cfg = AgentTurnConfig {
         workdir,
         params,
         max_steps,
         cmd_timeout_secs: cmd_timeout,
-        expect_tool_call: initial_route == TurnRoute::Agent,
+        expect_tool_call: matches!(effective_route, TurnRoute::Agent | TurnRoute::Computer),
     };
 
     let mut model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
@@ -722,9 +771,14 @@ fn stream_agent_loop_sse(srv: &Server, stream: &mut TcpStream, spec: StreamTurnS
             target,
             bytes,
         } => {
-            if active_route != TurnRoute::Agent {
-                active_route = TurnRoute::Agent;
-                let _ = write_sse(r#"{"type":"route","mode":"agent"}"#);
+            let next_r = if name == "use_computer" {
+                TurnRoute::Computer
+            } else {
+                TurnRoute::Agent
+            };
+            if active_route == TurnRoute::Chat {
+                active_route = next_r;
+                let _ = write_sse(&format!(r#"{{"type":"route","mode":{}}}"#, quote(active_route.as_str())));
             }
             write_sse(&format!(
                 r#"{{"type":"tool_progress","step":{step},"name":{},"target":{},"bytes":{bytes}}}"#,
@@ -737,9 +791,14 @@ fn stream_agent_loop_sse(srv: &Server, stream: &mut TcpStream, spec: StreamTurnS
             usage(completion)
         )),
         AgentEvent::ToolStart { step, call } => {
-            if active_route != TurnRoute::Agent {
-                active_route = TurnRoute::Agent;
-                let _ = write_sse(r#"{"type":"route","mode":"agent"}"#);
+            let next_r = if call.name == "use_computer" {
+                TurnRoute::Computer
+            } else {
+                TurnRoute::Agent
+            };
+            if active_route == TurnRoute::Chat {
+                active_route = next_r;
+                let _ = write_sse(&format!(r#"{{"type":"route","mode":{}}}"#, quote(active_route.as_str())));
             }
             write_sse(&format!(
                 r#"{{"type":"tool_start","step":{step},"id":{},"name":{},"arguments":{}}}"#,
@@ -874,6 +933,7 @@ fn unified_turn_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
     let route = match body.get("route").and_then(Json::as_str).unwrap_or("auto") {
         "chat" => TurnRoute::Chat,
         "agent" => TurnRoute::Agent,
+        "computer" => TurnRoute::Computer,
         _ => classify_turn_intent(
             &raw_user_text,
             has_images,
@@ -890,6 +950,14 @@ fn unified_turn_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
             max_tokens: 1536,
             seed: 0,
         },
+        TurnRoute::Computer => GenParams {
+            temperature: 0.0,
+            top_k: 40,
+            top_p: 0.9,
+            repeat_penalty: 1.05,
+            max_tokens: 1024,
+            seed: 0,
+        },
         TurnRoute::Agent => GenParams {
             temperature: 0.0,
             top_k: 40,
@@ -900,7 +968,11 @@ fn unified_turn_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
         },
     };
     let params = parse_gen_params(&body, &defaults);
-    let default_steps = if route == TurnRoute::Chat { 4 } else { 10 };
+    let default_steps = match route {
+        TurnRoute::Chat => 4,
+        TurnRoute::Computer => 4,
+        TurnRoute::Agent => 10,
+    };
     let max_steps = body
         .get("max_steps")
         .and_then(Json::as_f64)
@@ -1537,6 +1609,55 @@ fn handle(srv: &Server, mut stream: TcpStream) {
             }
         }
         ("POST", "/v1/screencapture") => handle_screencapture(&mut stream, &req),
+        ("GET", "/v1/device/status") => {
+            respond(
+                &mut stream,
+                200,
+                "application/json",
+                &global_device_manager().status_json(),
+            );
+        }
+        ("POST", "/v1/device/config") => {
+            let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
+                Ok(b) => b,
+                Err(e) => return error(&mut stream, 400, &format!("invalid JSON: {e}")),
+            };
+            let en = body.get("enabled").and_then(Json::as_bool);
+            let cc = body.get("allow_computer_control").and_then(Json::as_bool);
+            let rebuild = body.get("rebuild").and_then(Json::as_bool).unwrap_or(false);
+            let _ = global_device_manager().update_config(en, cc, rebuild);
+            respond(
+                &mut stream,
+                200,
+                "application/json",
+                &global_device_manager().status_json(),
+            );
+        }
+        ("GET", "/v1/device/profile") => {
+            let mgr = global_device_manager();
+            let md = mgr.profile_markdown();
+            let body = format!(
+                r#"{{"markdown":{},"status":{}}}"#,
+                quote(&md),
+                mgr.status_json()
+            );
+            respond(&mut stream, 200, "application/json", &body);
+        }
+        ("POST", "/v1/device/open") => {
+            let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
+                Ok(b) => b,
+                Err(e) => return error(&mut stream, 400, &format!("invalid JSON: {e}")),
+            };
+            match global_device_manager().execute_computer_action(&body) {
+                Ok(msg) => respond(
+                    &mut stream,
+                    200,
+                    "application/json",
+                    &format!(r#"{{"status":"ok","message":{}}}"#, quote(&msg)),
+                ),
+                Err(e) => error(&mut stream, 400, &e),
+            }
+        }
         ("GET", "/v1/agent/files") => {
             let wd = srv.active_workdir();
             respond(
@@ -1672,14 +1793,22 @@ fn main() {
     });
     let ui_index = load_ui_state_index(&state_dir, &workdir);
 
+    let enable_dev_ctx = args.iter().any(|a| a == "--device-context");
     let t_warm = Instant::now();
     let warm_sys = build_unified_system_prompt(&workdir);
     let warm_tools = tool_definitions_json();
     let mut prewarmed_tokens = 0usize;
     std::thread::scope(|s| {
         let vj = s.spawn(kronos_2t::vision::prewarm_vision);
+        let dj = s.spawn(move || {
+            let mgr = global_device_manager();
+            if enable_dev_ctx {
+                mgr.update_config(Some(true), None, false);
+            }
+        });
         prewarmed_tokens = model.prewarm_prefix(&warm_sys, &warm_tools);
         let _ = vj.join();
+        let _ = dj.join();
     });
     eprintln!(
         "pre-warmed {prewarmed_tokens} system+tool KV tokens and Apple Vision pipeline in {:.2}s",

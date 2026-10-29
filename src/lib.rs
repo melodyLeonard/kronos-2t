@@ -31,6 +31,7 @@ pub mod compiler;
 #[cfg(all(feature = "ane", target_os = "macos"))]
 pub mod coreml;
 pub mod demo_model;
+pub mod device;
 pub mod engine;
 pub mod hadamard;
 pub mod json;

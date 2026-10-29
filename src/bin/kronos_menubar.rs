@@ -84,6 +84,9 @@ mod macos {
     #[link(name = "WebKit", kind = "framework")]
     unsafe extern "C" {}
 
+    #[link(name = "QuartzCore", kind = "framework")]
+    unsafe extern "C" {}
+
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
         fn CGMainDisplayID() -> u32;
@@ -139,7 +142,7 @@ mod macos {
     }
 
     const PANEL_WIDTH: f64 = 680.0;
-    const PANEL_INIT_HEIGHT: f64 = 122.0;
+    const PANEL_INIT_HEIGHT: f64 = 142.0;
 
     struct BarState {
         base_url: String,
@@ -150,6 +153,11 @@ mod macos {
         panel_x: f64,
         panel_top_y: f64,
         panel_height: f64,
+        has_custom_pos: bool,
+        dragging: bool,
+        suppress_auto_hide: bool,
+        drag_mouse_start: (f64, f64),
+        drag_panel_start: (f64, f64),
         visible: bool,
     }
 
@@ -295,6 +303,85 @@ mod macos {
         (x.round(), top_y.round())
     }
 
+    unsafe fn is_anchor_visible_on_any_screen(x: f64, top_y: f64) -> bool {
+        let screens: Id = msg!(class("NSScreen"), "screens"; Id);
+        if screens.is_null() {
+            return true;
+        }
+        let count: usize = msg!(screens, "count"; usize);
+        if count == 0 {
+            return true;
+        }
+        let probe_left = x + 60.0;
+        let probe_right = x + PANEL_WIDTH - 60.0;
+        let probe_y = top_y - 14.0;
+        for i in 0..count {
+            let scr: Id = msg!(screens, "objectAtIndex:", i => usize; Id);
+            if !scr.is_null() {
+                let vf: NSRect = msg!(scr, "visibleFrame"; NSRect);
+                let sx0 = vf.origin.x;
+                let sx1 = vf.origin.x + vf.size.width;
+                let sy0 = vf.origin.y;
+                let sy1 = vf.origin.y + vf.size.height;
+                if probe_right > sx0 && probe_left < sx1 && probe_y >= sy0 && probe_y <= sy1 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    unsafe fn clamp_top_below_menubar(x: f64, mut top_y: f64) -> f64 {
+        let screens: Id = msg!(class("NSScreen"), "screens"; Id);
+        if screens.is_null() {
+            return top_y;
+        }
+        let count: usize = msg!(screens, "count"; usize);
+        let mid_x = x + PANEL_WIDTH * 0.5;
+        for i in 0..count {
+            let scr: Id = msg!(screens, "objectAtIndex:", i => usize; Id);
+            if !scr.is_null() {
+                let full: NSRect = msg!(scr, "frame"; NSRect);
+                if mid_x >= full.origin.x
+                    && mid_x <= full.origin.x + full.size.width
+                    && top_y >= full.origin.y
+                    && top_y <= full.origin.y + full.size.height + 120.0
+                {
+                    let vf: NSRect = msg!(scr, "visibleFrame"; NSRect);
+                    let max_top = vf.origin.y + vf.size.height;
+                    if top_y > max_top {
+                        top_y = max_top;
+                    }
+                    break;
+                }
+            }
+        }
+        top_y
+    }
+
+    unsafe fn reset_panel_position() {
+        STATE.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            let Some(st) = borrow.as_mut() else { return };
+            let (ax, top_y) = compute_default_anchor();
+            st.panel_x = ax;
+            st.panel_top_y = top_y;
+            st.has_custom_pos = false;
+            st.dragging = false;
+            let frame = NSRect {
+                origin: NSPoint {
+                    x: st.panel_x,
+                    y: st.panel_top_y - st.panel_height,
+                },
+                size: NSSize {
+                    width: PANEL_WIDTH,
+                    height: st.panel_height,
+                },
+            };
+            let _: () = msg!(st.panel, "setFrame:display:", frame => NSRect, true => bool; ());
+        });
+    }
+
     unsafe fn eval_js(webview: Id, script: &str) {
         if webview.is_null() {
             return;
@@ -337,9 +424,13 @@ mod macos {
         STATE.with(|cell| {
             let mut borrow = cell.borrow_mut();
             let Some(st) = borrow.as_mut() else { return };
-            let (ax, top_y) = compute_default_anchor();
-            st.panel_x = ax;
-            st.panel_top_y = top_y;
+            if !st.has_custom_pos || !is_anchor_visible_on_any_screen(st.panel_x, st.panel_top_y) {
+                let (ax, top_y) = compute_default_anchor();
+                st.panel_x = ax;
+                st.panel_top_y = top_y;
+                st.has_custom_pos = false;
+            }
+            st.dragging = false;
             let frame = NSRect {
                 origin: NSPoint {
                     x: st.panel_x,
@@ -396,6 +487,7 @@ mod macos {
             let mut borrow = cell.borrow_mut();
             let Some(st) = borrow.as_mut() else { return };
             let _: () = msg!(st.panel, "orderOut:", ptr::null_mut() => Id; ());
+            st.dragging = false;
             st.visible = false;
         });
     }
@@ -406,8 +498,7 @@ mod macos {
                 .as_ref()
                 .map(|st| {
                     let is_vis: bool = unsafe { msg!(st.panel, "isVisible"; bool) };
-                    let is_key: bool = unsafe { msg!(st.panel, "isKeyWindow"; bool) };
-                    st.visible && is_vis && is_key
+                    st.visible && is_vis
                 })
                 .unwrap_or(false)
         });
@@ -419,7 +510,7 @@ mod macos {
     }
 
     unsafe fn resize_panel(new_height: f64) {
-        let clamped = new_height.clamp(108.0, 540.0);
+        let clamped = new_height.clamp(124.0, 560.0);
         STATE.with(|cell| {
             let mut borrow = cell.borrow_mut();
             let Some(st) = borrow.as_mut() else { return };
@@ -438,6 +529,7 @@ mod macos {
                 },
             };
             let _: () = msg!(st.panel, "setFrame:display:", frame => NSRect, true => bool; ());
+            let _: () = msg!(st.panel, "invalidateShadow"; ());
         });
     }
 
@@ -447,16 +539,24 @@ mod macos {
 
     unsafe fn pick_files_with_open_panel() {
         let webview = STATE.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .map(|s| s.webview)
-                .unwrap_or(ptr::null_mut())
+            let mut borrow = cell.borrow_mut();
+            if let Some(s) = borrow.as_mut() {
+                s.suppress_auto_hide = true;
+                s.webview
+            } else {
+                ptr::null_mut()
+            }
         });
         if webview.is_null() {
             return;
         }
         let open_panel: Id = msg!(class("NSOpenPanel"), "openPanel"; Id);
         if open_panel.is_null() {
+            STATE.with(|cell| {
+                if let Some(s) = cell.borrow_mut().as_mut() {
+                    s.suppress_auto_hide = false;
+                }
+            });
             return;
         }
         let _: () = msg!(open_panel, "setCanChooseFiles:", true => bool; ());
@@ -479,7 +579,36 @@ mod macos {
                 }
             }
         }
+        STATE.with(|cell| {
+            if let Some(s) = cell.borrow_mut().as_mut() {
+                s.suppress_auto_hide = false;
+            }
+        });
         show_panel(false);
+    }
+
+    unsafe extern "C" fn on_window_resign_key(_this: Id, _cmd: Sel, _notif: Id) {
+        let should_hide = STATE.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map(|st| st.visible && !st.suppress_auto_hide && !st.dragging)
+                .unwrap_or(false)
+        });
+        if should_hide {
+            hide_panel();
+        }
+    }
+
+    unsafe extern "C" fn on_app_resign_active(_this: Id, _cmd: Sel, _notif: Id) {
+        let should_hide = STATE.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map(|st| st.visible && !st.suppress_auto_hide && !st.dragging)
+                .unwrap_or(false)
+        });
+        if should_hide {
+            hide_panel();
+        }
     }
 
     unsafe extern "C" fn panel_can_become_key(_this: Id, _cmd: Sel) -> bool {
@@ -541,6 +670,11 @@ mod macos {
         });
         hide_panel();
         open_external_url(&url);
+    }
+
+    unsafe extern "C" fn on_menu_reset_pos(_this: Id, _cmd: Sel, _sender: Id) {
+        reset_panel_position();
+        show_panel(false);
     }
 
     unsafe extern "C" fn on_menu_quit(_this: Id, _cmd: Sel, _sender: Id) {
@@ -633,6 +767,76 @@ mod macos {
             "pick_file" => {
                 pick_files_with_open_panel();
             }
+            "drag_start" => {
+                let mouse: NSPoint = msg!(class("NSEvent"), "mouseLocation"; NSPoint);
+                STATE.with(|cell| {
+                    let mut borrow = cell.borrow_mut();
+                    let Some(st) = borrow.as_mut() else { return };
+                    let frame: NSRect = msg!(st.panel, "frame"; NSRect);
+                    st.panel_x = frame.origin.x;
+                    st.panel_top_y = frame.origin.y + frame.size.height;
+                    st.dragging = true;
+                    st.drag_mouse_start = (mouse.x, mouse.y);
+                    st.drag_panel_start = (st.panel_x, st.panel_top_y);
+                });
+            }
+            "drag_move" => {
+                let mouse: NSPoint = msg!(class("NSEvent"), "mouseLocation"; NSPoint);
+                STATE.with(|cell| {
+                    let mut borrow = cell.borrow_mut();
+                    let Some(st) = borrow.as_mut() else { return };
+                    if !st.dragging {
+                        return;
+                    }
+                    let next_x = (st.drag_panel_start.0 + (mouse.x - st.drag_mouse_start.0)).round();
+                    let raw_top_y = (st.drag_panel_start.1 + (mouse.y - st.drag_mouse_start.1)).round();
+                    let next_top_y = clamp_top_below_menubar(next_x, raw_top_y);
+                    if (next_x - st.panel_x).abs() < 0.5 && (next_top_y - st.panel_top_y).abs() < 0.5 {
+                        return;
+                    }
+                    st.panel_x = next_x;
+                    st.panel_top_y = next_top_y;
+                    st.has_custom_pos = true;
+                    let frame = NSRect {
+                        origin: NSPoint {
+                            x: st.panel_x,
+                            y: st.panel_top_y - st.panel_height,
+                        },
+                        size: NSSize {
+                            width: PANEL_WIDTH,
+                            height: st.panel_height,
+                        },
+                    };
+                    let _: () = msg!(st.panel, "setFrame:display:", frame => NSRect, true => bool; ());
+                });
+            }
+            "drag_end" => {
+                STATE.with(|cell| {
+                    if let Some(st) = cell.borrow_mut().as_mut() {
+                        st.dragging = false;
+                    }
+                });
+            }
+            "reset_pos" => {
+                reset_panel_position();
+            }
+            "capture_begin" => {
+                STATE.with(|cell| {
+                    let mut borrow = cell.borrow_mut();
+                    if let Some(st) = borrow.as_mut() {
+                        st.suppress_auto_hide = true;
+                        let _: () = msg!(st.panel, "orderOut:", ptr::null_mut() => Id; ());
+                    }
+                });
+            }
+            "capture_end" => {
+                STATE.with(|cell| {
+                    if let Some(st) = cell.borrow_mut().as_mut() {
+                        st.suppress_auto_hide = false;
+                    }
+                });
+                show_panel(false);
+            }
             _ => {}
         }
     }
@@ -701,6 +905,12 @@ mod macos {
             );
             class_addMethod(
                 ctrl_cls,
+                sel("resetHudPosition:"),
+                on_menu_reset_pos as *const c_void,
+                action_sig.as_ptr(),
+            );
+            class_addMethod(
+                ctrl_cls,
                 sel("quitBar:"),
                 on_menu_quit as *const c_void,
                 action_sig.as_ptr(),
@@ -709,6 +919,18 @@ mod macos {
                 ctrl_cls,
                 sel("smartPaste:"),
                 on_edit_paste as *const c_void,
+                action_sig.as_ptr(),
+            );
+            class_addMethod(
+                ctrl_cls,
+                sel("windowDidResignKey:"),
+                on_window_resign_key as *const c_void,
+                action_sig.as_ptr(),
+            );
+            class_addMethod(
+                ctrl_cls,
+                sel("applicationDidResignActive:"),
+                on_app_resign_active as *const c_void,
                 action_sig.as_ptr(),
             );
             class_addMethod(
@@ -780,6 +1002,7 @@ mod macos {
 
         add_item("Quick Prompt (⌥Space)", "toggleQuickPrompt:", "");
         add_item("New Quick Chat", "newQuickChat:", "n");
+        add_item("Reset HUD Position", "resetHudPosition:", "");
         add_item("Open Kronos Workspace", "openWorkspace:", "o");
         let sep: Id = msg!(class("NSMenuItem"), "separatorItem"; Id);
         let _: () = msg!(menu, "addItem:", sep => Id; ());
@@ -866,6 +1089,7 @@ mod macos {
             let _: bool = msg!(app, "setActivationPolicy:", 1isize => isize; bool);
 
             let controller: Id = msg!(ctrl_cls, "new"; Id);
+            let _: () = msg!(app, "setDelegate:", controller => Id; ());
             install_edit_main_menu(app, controller);
             let status_menu = build_status_dropdown_menu(controller);
 
@@ -920,8 +1144,9 @@ mod macos {
             let _: () = msg!(panel, "setLevel:", 3isize => isize; ()); // NSFloatingWindowLevel
             // CanJoinAllSpaces (1<<0) | FullScreenAuxiliary (1<<8)
             let _: () = msg!(panel, "setCollectionBehavior:", (1usize << 0) | (1usize << 8) => usize; ());
-            let _: () = msg!(panel, "setMovableByWindowBackground:", true => bool; ());
+            let _: () = msg!(panel, "setMovableByWindowBackground:", false => bool; ());
             let _: () = msg!(panel, "setHidesOnDeactivate:", false => bool; ());
+            let _: () = msg!(panel, "setDelegate:", controller => Id; ());
 
             let wk_cfg: Id = msg!(class("WKWebViewConfiguration"), "new"; Id);
             let ucc: Id = msg!(wk_cfg, "userContentController"; Id);
@@ -963,7 +1188,18 @@ mod macos {
                 let _: Id = msg!(webview, "loadRequest:", req => Id; Id);
             }
 
-            let _: () = msg!(panel, "setContentView:", webview => Id; ());
+            // Rounded CALayer container eliminates rectangular borderless window corner rim on macOS 14+.
+            let container_alloc: Id = msg!(class("NSView"), "alloc"; Id);
+            let container: Id = msg!(container_alloc, "initWithFrame:", view_rect => NSRect; Id);
+            let _: () = msg!(container, "setAutoresizingMask:", 18usize => usize; ());
+            let _: () = msg!(container, "setWantsLayer:", true => bool; ());
+            let layer: Id = msg!(container, "layer"; Id);
+            if !layer.is_null() {
+                let _: () = msg!(layer, "setCornerRadius:", 18.0f64 => f64; ());
+                let _: () = msg!(layer, "setMasksToBounds:", true => bool; ());
+            }
+            let _: () = msg!(container, "addSubview:", webview => Id; ());
+            let _: () = msg!(panel, "setContentView:", container => Id; ());
 
             STATE.with(|cell| {
                 *cell.borrow_mut() = Some(BarState {
@@ -975,6 +1211,11 @@ mod macos {
                     panel_x: ax,
                     panel_top_y: top_y,
                     panel_height: PANEL_INIT_HEIGHT,
+                    has_custom_pos: false,
+                    dragging: false,
+                    suppress_auto_hide: false,
+                    drag_mouse_start: (0.0, 0.0),
+                    drag_panel_start: (ax, top_y),
                     visible: false,
                 });
             });
@@ -1007,6 +1248,18 @@ mod macos {
                 let (p_cls, c_cls) = register_objc_classes();
                 assert!(!p_cls.is_null());
                 assert!(!c_cls.is_null());
+            }
+        }
+
+        #[test]
+        fn test_anchor_visibility_and_menubar_clamp() {
+            let (ax, top_y) = compute_default_anchor();
+            assert!(top_y > 180.0);
+            unsafe {
+                assert!(is_anchor_visible_on_any_screen(ax, top_y));
+                assert!(!is_anchor_visible_on_any_screen(-99_999.0, -99_999.0));
+                let clamped = clamp_top_below_menubar(ax, top_y + 10_000.0);
+                assert!(clamped <= top_y + 10_000.0);
             }
         }
     }

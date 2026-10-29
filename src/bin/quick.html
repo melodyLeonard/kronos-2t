@@ -25,6 +25,14 @@
     overflow: hidden;
     user-select: none;
   }
+  body.standalone {
+    min-height: 100vh;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 11vh 20px 20px;
+    background: #0f1014;
+  }
   #shell {
     display: flex;
     flex-direction: column;
@@ -33,16 +41,84 @@
     border: 1px solid var(--line);
     border-radius: 18px;
     overflow: hidden;
+  }
+  body.standalone #shell {
+    max-width: 680px;
     box-shadow: 0 22px 54px rgba(0, 0, 0, 0.52);
   }
   #shell.drag-over {
     border-color: var(--accent);
   }
+  #shell.is-dragging,
+  #shell.is-dragging * {
+    cursor: grabbing;
+  }
+  #drag-bar {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 24px;
+    padding: 4px 12px 0;
+    cursor: grab;
+  }
+  .drag-brand {
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    color: #7c828f;
+  }
+  .drag-pill {
+    position: absolute;
+    left: 50%;
+    top: 9px;
+    transform: translateX(-50%);
+    width: 40px;
+    height: 4px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.2);
+    transition: background 0.14s ease;
+    pointer-events: none;
+  }
+  #drag-bar:hover .drag-pill,
+  #shell.is-dragging .drag-pill {
+    background: rgba(255, 255, 255, 0.42);
+  }
+  .hud-win-btns {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .hud-icon-btn {
+    width: 22px;
+    height: 20px;
+    border: none;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.05);
+    color: #c5cad3;
+    font: inherit;
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+  }
+  .hud-icon-btn:hover {
+    background: var(--panel);
+    color: #fff;
+  }
+  #q-close:hover {
+    background: rgba(217, 119, 87, 0.28);
+    color: #fff;
+  }
   .top-row {
     display: flex;
     align-items: center;
     gap: 11px;
-    padding: 13px 15px 10px;
+    padding: 6px 15px 10px;
+    cursor: grab;
   }
   .brand-mark {
     width: 24px;
@@ -52,6 +128,7 @@
     align-items: center;
     justify-content: center;
     color: var(--accent-warm);
+    cursor: grab;
   }
   #q-input {
     flex: 1;
@@ -212,6 +289,7 @@
     padding: 8px 15px 10px;
     border-top: 1px solid var(--line);
     background: rgba(255, 255, 255, 0.02);
+    cursor: grab;
   }
   .meta-left {
     display: flex;
@@ -244,13 +322,39 @@
     background: var(--panel);
     border-color: rgba(255, 255, 255, 0.24);
   }
+  .act-btn.dev-on {
+    border-color: rgba(94, 234, 212, 0.42);
+    color: #5eead4;
+    background: rgba(13, 148, 136, 0.14);
+  }
+  .q-open-chip {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 7px;
+    border: 1px solid var(--line);
+    background: var(--panel);
+    color: var(--text);
+    cursor: pointer;
+  }
+  .q-open-chip:hover {
+    border-color: var(--accent);
+    color: #5eead4;
+  }
 </style>
 </head>
 <body>
 <div id="shell">
+  <div id="drag-bar" title="Drag to move Quick Prompt · Double-click to re-center">
+    <span class="drag-brand">Kronos</span>
+    <span class="drag-pill"></span>
+    <div class="hud-win-btns">
+      <button id="q-new" class="hud-icon-btn" type="button" title="New Quick Chat (Cmd+N)">+</button>
+      <button id="q-close" class="hud-icon-btn" type="button" title="Hide Quick Prompt (Esc)">×</button>
+    </div>
+  </div>
   <form id="q-form">
     <div class="top-row">
-      <div class="brand-mark" title="Kronos Quick Prompt">
+      <div class="brand-mark" title="Drag to move Quick Prompt">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round">
           <path d="M12 2v20M4.9 4.9l14.2 14.2M2 12h20M4.9 19.1L19.1 4.9"/>
         </svg>
@@ -272,6 +376,7 @@
     </div>
     <div class="actions-right">
       <input id="q-file" type="file" multiple hidden>
+      <button id="btn-device" class="act-btn" type="button" title="Toggle Develop Context for Device">Device: OFF</button>
       <button id="btn-shot" class="act-btn" type="button" title="Drag to capture a screen region">Capture screen</button>
       <button id="btn-attach" class="act-btn" type="button" title="Attach PDF, image, or code file">Attach file</button>
       <button id="btn-copy" class="act-btn" type="button" style="display:none">Copy</button>
@@ -292,6 +397,11 @@ let pendingAttachments = [];
 let lastReplyText = "";
 let activeWorkdir = "";
 
+const isNativeHost = Boolean(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.kronos);
+if (!isNativeHost) {
+  document.body.classList.add("standalone");
+}
+
 function postHost(msg) {
   try {
     if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.kronos) {
@@ -304,7 +414,8 @@ function postHost(msg) {
 
 function syncPanelHeight() {
   requestAnimationFrame(() => {
-    const h = Math.min(Math.max($("shell").offsetHeight + 4, 108), 520);
+    const rawH = Math.ceil($("shell").getBoundingClientRect().height);
+    const h = Math.min(Math.max(rawH, 124), 560);
     postHost({ type: "resize", height: h });
   });
 }
@@ -359,6 +470,7 @@ function resetQuickChat() {
 
 window.kronosFocusInput = () => {
   loadSessionsList();
+  syncQuickDeviceStatus();
   syncPanelHeight();
   qInput.focus();
 };
@@ -499,6 +611,7 @@ $("q-file").onchange = async (e) => {
 
 $("btn-shot").onclick = async () => {
   $("q-status").textContent = "Select a screen region…";
+  postHost({ type: "capture_begin" });
   try {
     const r = await fetch("/v1/screencapture", {
       method: "POST",
@@ -521,6 +634,8 @@ $("btn-shot").onclick = async () => {
     }
   } catch (e) {
     $("q-status").textContent = "Screen capture unavailable";
+  } finally {
+    postHost({ type: "capture_end" });
   }
   qInput.focus();
 };
@@ -545,6 +660,76 @@ window.addEventListener("paste", async (e) => {
 });
 
 const shell = $("shell");
+let dragState = null;
+let browserDragX = 0;
+let browserDragY = 0;
+
+function isInteractiveDragTarget(el) {
+  return Boolean(el && el.closest("textarea, input, select, button, a, #answer-wrap, .chip"));
+}
+
+shell.addEventListener("pointerdown", (e) => {
+  if (e.button !== 0 || isInteractiveDragTarget(e.target)) return;
+  e.preventDefault();
+  try { shell.setPointerCapture(e.pointerId); } catch (err) {}
+  shell.classList.add("is-dragging");
+  const native = postHost({ type: "drag_start", sx: e.screenX, sy: e.screenY });
+  dragState = {
+    id: e.pointerId,
+    startSx: e.screenX,
+    startSy: e.screenY,
+    baseX: browserDragX,
+    baseY: browserDragY,
+    native,
+  };
+});
+
+shell.addEventListener("pointermove", (e) => {
+  if (!dragState || e.pointerId !== dragState.id) return;
+  const dx = e.screenX - dragState.startSx;
+  const dy = e.screenY - dragState.startSy;
+  if (dragState.native) {
+    postHost({ type: "drag_move", sx: e.screenX, sy: e.screenY, dx, dy });
+  } else {
+    browserDragX = dragState.baseX + dx;
+    browserDragY = dragState.baseY + dy;
+    shell.style.transform = `translate(${browserDragX}px, ${browserDragY}px)`;
+  }
+});
+
+function finishShellDrag(e) {
+  if (!dragState || (e && e.pointerId !== dragState.id)) return;
+  if (dragState.native) {
+    postHost({ type: "drag_end" });
+  }
+  try { if (e) shell.releasePointerCapture(e.pointerId); } catch (err) {}
+  dragState = null;
+  shell.classList.remove("is-dragging");
+  qInput.focus();
+}
+
+shell.addEventListener("pointerup", finishShellDrag);
+shell.addEventListener("pointercancel", finishShellDrag);
+
+$("drag-bar").addEventListener("dblclick", (e) => {
+  if (isInteractiveDragTarget(e.target)) return;
+  if (!postHost({ type: "reset_pos" })) {
+    browserDragX = 0;
+    browserDragY = 0;
+    shell.style.transform = "";
+  }
+});
+
+$("q-new").onclick = () => resetQuickChat();
+$("q-close").onclick = () => {
+  if (!postHost({ type: "hide" })) resetQuickChat();
+};
+document.body.addEventListener("pointerdown", (e) => {
+  if (e.target === document.body) {
+    if (!postHost({ type: "hide" })) resetQuickChat();
+  }
+});
+
 shell.addEventListener("dragover", (e) => { e.preventDefault(); shell.classList.add("drag-over"); });
 shell.addEventListener("dragleave", () => shell.classList.remove("drag-over"));
 shell.addEventListener("drop", async (e) => {
@@ -696,8 +881,31 @@ $("q-form").onsubmit = async (e) => {
           routeMode = j.mode || "chat";
           const p = document.createElement("span");
           p.className = "q-pill";
-          p.textContent = routeMode === "agent" ? "agent · workspace" : "chat";
+          p.textContent = routeMode === "agent"
+            ? "agent · workspace"
+            : (routeMode === "computer" ? "computer · macOS" : "chat");
           badgeRow.appendChild(p);
+        } else if (j.type === "device_context") {
+          const b = `device · ${j.hits || 0} matches · ${(j.elapsed_ms || 0).toFixed(2)} ms`;
+          badges.push(b);
+          const p = document.createElement("span");
+          p.className = "q-pill";
+          p.textContent = b;
+          badgeRow.appendChild(p);
+          for (const it of (j.items || []).filter(x => x.exists_on_disk && x.path).slice(0, 2)) {
+            const c = document.createElement("button");
+            c.type = "button";
+            c.className = "q-open-chip";
+            c.textContent = `Open ${it.name.slice(0, 26)} ↗`;
+            c.title = it.path;
+            c.onclick = () => fetch("/v1/device/open", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ action: it.kind === "app" ? "open_app" : "open_file", target: it.path }),
+            }).catch(() => {});
+            badgeRow.appendChild(c);
+          }
+          syncPanelHeight();
         } else if (j.type === "attachments") {
           for (const item of (j.items || [])) {
             badges.push(item.badge);
@@ -765,7 +973,41 @@ $("q-form").onsubmit = async (e) => {
   }
 };
 
+let qDeviceEnabled = false;
+async function syncQuickDeviceStatus() {
+  try {
+    const r = await fetch("/v1/device/status");
+    if (!r.ok) return;
+    const st = await r.json();
+    qDeviceEnabled = !!st.enabled;
+    const btn = $("btn-device");
+    btn.classList.toggle("dev-on", qDeviceEnabled);
+    btn.textContent = qDeviceEnabled ? `Device: ON (${st.indexed_entries || 0})` : "Device: OFF";
+  } catch (e) {}
+}
+$("btn-device").onclick = async () => {
+  try {
+    const r = await fetch("/v1/device/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: !qDeviceEnabled }),
+    });
+    if (r.ok) {
+      const st = await r.json();
+      qDeviceEnabled = !!st.enabled;
+      const btn = $("btn-device");
+      btn.classList.toggle("dev-on", qDeviceEnabled);
+      btn.textContent = qDeviceEnabled ? `Device: ON (${st.indexed_entries || 0})` : "Device: OFF";
+      $("q-status").textContent = qDeviceEnabled
+        ? `Device Context active · ${st.indexed_entries || 0} items (${(st.build_ms || 0).toFixed(1)} ms)`
+        : "Device Context paused";
+    }
+  } catch (e) {}
+  qInput.focus();
+};
+
 loadSessionsList();
+syncQuickDeviceStatus();
 syncPanelHeight();
 </script>
 </body>

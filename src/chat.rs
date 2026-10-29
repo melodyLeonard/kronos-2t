@@ -12,8 +12,8 @@ use std::time::Instant;
 #[cfg(all(feature = "ane", target_os = "macos"))]
 const ANE_MIN_NEW_TOKENS: usize = 32;
 
-pub const DEFAULT_SYSTEM: &str = "You are a helpful AI assistant named SmolLM, trained by Hugging Face";
-pub const DEFAULT_SYSTEM_QWEN: &str = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+pub const DEFAULT_SYSTEM: &str = "Your name is Kronos. You were created and built by Melody Leonard, running locally on the Kronos engine on Apple Silicon. When asked your name or who built or created you, answer directly that your name is Kronos and that you were built by Melody Leonard; never say you lack a name and never claim to be built by OpenAI, Alibaba, Qwen, Hugging Face, Anthropic, or any other third-party organization.";
+pub const DEFAULT_SYSTEM_QWEN: &str = "Your name is Kronos. You were created and built by Melody Leonard, running locally on the Kronos engine on Apple Silicon. When asked your name or who built or created you, answer directly that your name is Kronos and that you were built by Melody Leonard; never say you lack a name and never claim to be built by OpenAI, Alibaba, Qwen, Hugging Face, Anthropic, or any other third-party organization.";
 
 /// Maximum draft tokens verified in one single-pass target batch (`1 + 7 = 8` tokens).
 const SPEC_DRAFT_K_GREEDY: usize = 7;
@@ -1949,22 +1949,25 @@ mod tests {
         ];
 
         let rendered = render_chatml_prompt(&msgs, &tools, DEFAULT_SYSTEM_QWEN);
-        let expected = concat!(
-            "<|im_start|>system\n",
-            "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
-            "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n",
-            "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
-            r#"{"type":"function","function":{"name":"write_file","parameters":{"type":"object"}}}"#,
-            "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n",
-            "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n",
-            "<|im_start|>user\nBuild index.html<|im_end|>\n",
-            "<|im_start|>assistant\n<tool_call>\n",
-            r#"{"name": "write_file", "arguments": {"path":"index.html","content":"<h1>Hi</h1>"}}"#,
-            "\n</tool_call>\n<tool_call>\n",
-            r#"{"name": "list_dir", "arguments": {"path":"."}}"#,
-            "\n</tool_call><|im_end|>\n",
-            "<|im_start|>user\n<tool_response>\nwrote 11 bytes\n</tool_response>\n<tool_response>\nindex.html\n</tool_response><|im_end|>\n",
-            "<|im_start|>assistant\n",
+        let expected = format!(
+            concat!(
+                "<|im_start|>system\n",
+                "{}",
+                "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n",
+                "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
+                r#"{{"type":"function","function":{{"name":"write_file","parameters":{{"type":"object"}}}}}}"#,
+                "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n",
+                "<tool_call>\n{{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n</tool_call><|im_end|>\n",
+                "<|im_start|>user\nBuild index.html<|im_end|>\n",
+                "<|im_start|>assistant\n<tool_call>\n",
+                r#"{{"name": "write_file", "arguments": {{"path":"index.html","content":"<h1>Hi</h1>"}}}}"#,
+                "\n</tool_call>\n<tool_call>\n",
+                r#"{{"name": "list_dir", "arguments": {{"path":"."}}}}"#,
+                "\n</tool_call><|im_end|>\n",
+                "<|im_start|>user\n<tool_response>\nwrote 11 bytes\n</tool_response>\n<tool_response>\nindex.html\n</tool_response><|im_end|>\n",
+                "<|im_start|>assistant\n",
+            ),
+            DEFAULT_SYSTEM_QWEN
         );
         assert_eq!(rendered, expected);
     }

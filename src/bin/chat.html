@@ -175,6 +175,45 @@
   #settings-popover input, #settings-popover select {
     width:142px; font-size:12px; padding:4px 7px;
   }
+  #settings-popover input[type="checkbox"] {
+    width:auto; padding:0; accent-color:var(--accent); cursor:pointer;
+  }
+  .dev-ctx-box {
+    margin:6px 0 10px; padding:9px 10px; border:1px solid var(--line);
+    border-radius:10px; background:var(--subtle);
+  }
+  .dev-ctx-stats {
+    font-size:11px; color:var(--muted); margin:4px 0 7px; line-height:1.4;
+  }
+  .dev-ctx-actions { display:flex; gap:6px; flex-wrap:wrap; }
+  #device-hdr-btn.active { border-color:var(--accent); color:var(--accent); }
+  .dev-hit-bar {
+    display:flex; flex-wrap:wrap; gap:6px; margin:2px 0 4px;
+  }
+  .dev-open-chip {
+    font-size:11px; padding:2px 8px; border-radius:7px; border:1px solid var(--line);
+    background:var(--subtle); color:var(--text); cursor:pointer;
+  }
+  .dev-open-chip:hover { border-color:var(--accent); color:var(--accent); }
+  #dev-profile-modal {
+    position:fixed; inset:0; background:rgba(0,0,0,0.52); display:none;
+    align-items:center; justify-content:center; z-index:40; padding:24px;
+  }
+  #dev-profile-modal.open { display:flex; }
+  .dev-modal-card {
+    width:min(760px, 94vw); max-height:82vh; background:var(--panel);
+    border:1px solid var(--line); border-radius:14px; display:flex;
+    flex-direction:column; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,0.35);
+  }
+  .dev-modal-hdr {
+    display:flex; align-items:center; justify-content:space-between;
+    padding:11px 15px; border-bottom:1px solid var(--line); font-weight:600; font-size:13px;
+  }
+  #dev-profile-pre {
+    margin:0; padding:14px 16px; overflow:auto; flex:1;
+    font:12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space:pre-wrap; word-break:break-word; color:var(--text);
+  }
   .settings-note {
     margin-top:8px; padding-top:8px; border-top:1px solid var(--line);
     font-size:11.5px; color:var(--muted); line-height:1.45;
@@ -516,11 +555,27 @@
     <span>Kronos Engine Settings</span>
     <button id="settings-close" class="mini-btn" type="button">Close</button>
   </div>
+  <div class="dev-ctx-box">
+    <label title="Build a sub-millisecond memory-mapped index of local documents, certificates, apps, projects, and watched media">
+      <span>Develop context for device</span>
+      <input id="dev-ctx-enabled" type="checkbox">
+    </label>
+    <label title="Allow Kronos to launch macOS applications and open or reveal local files">
+      <span>Allow computer control</span>
+      <input id="dev-cc-enabled" type="checkbox" checked>
+    </label>
+    <div id="dev-ctx-stats" class="dev-ctx-stats">Device index idle</div>
+    <div class="dev-ctx-actions">
+      <button id="dev-ctx-rebuild" class="mini-btn" type="button">Refresh Index</button>
+      <button id="dev-ctx-inspect" class="mini-btn" type="button">Memory Artifact</button>
+    </div>
+  </div>
   <label>Routing
     <select id="route-mode">
-      <option value="auto" selected>Auto (Chat + Agent)</option>
+      <option value="auto" selected>Auto (Chat + Agent + Computer)</option>
       <option value="chat">Force Chat</option>
       <option value="agent">Force Agent</option>
+      <option value="computer">Force Computer Use</option>
     </select>
   </label>
   <label>Temperature <input id="temp" type="number" step="0.05" min="0" max="2" placeholder="auto"></label>
@@ -544,6 +599,7 @@
       <span class="model" id="model">connecting…</span>
     </div>
     <span class="ctx-pill" id="ctx-meter" title="Active prompt tokens / context capacity">ctx 0 / 16.4k</span>
+    <button id="device-hdr-btn" type="button" title="Configure Device Context memory artifact and macOS Computer Use">Device: OFF</button>
     <button id="compact-btn" type="button" title="Compact older history while preserving workspace state">Compact</button>
     <button id="ws-toggle" type="button" title="Open or close workspace preview and diff inspector">Workspace (<span id="ws-count">0</span>)</button>
   </header>
@@ -596,6 +652,16 @@
         <div id="changes-wrap"></div>
       </div>
     </aside>
+  </div>
+</div>
+
+<div id="dev-profile-modal">
+  <div class="dev-modal-card">
+    <div class="dev-modal-hdr">
+      <span id="dev-modal-title">Kronos Device Context Artifact (~/.kronos/device_context/device_profile.md)</span>
+      <button id="dev-modal-close" class="mini-btn" type="button">Close</button>
+    </div>
+    <pre id="dev-profile-pre">Loading device memory artifact…</pre>
   </div>
 </div>
 
@@ -742,13 +808,87 @@ $("sb-settings-btn").onclick = (e) => {
   e.stopPropagation();
   $("settings-popover").classList.toggle("open");
 };
+$("device-hdr-btn").onclick = (e) => {
+  e.stopPropagation();
+  $("settings-popover").classList.toggle("open");
+};
 $("settings-close").onclick = () => $("settings-popover").classList.remove("open");
 window.addEventListener("click", (e) => {
   const pop = $("settings-popover");
-  if (pop.classList.contains("open") && !pop.contains(e.target) && e.target !== $("sb-settings-btn")) {
+  if (pop.classList.contains("open") && !pop.contains(e.target) && e.target !== $("sb-settings-btn") && e.target !== $("device-hdr-btn")) {
     pop.classList.remove("open");
   }
 });
+
+function renderDeviceStatus(st) {
+  if (!st) return;
+  $("dev-ctx-enabled").checked = !!st.enabled;
+  $("dev-cc-enabled").checked = st.allow_computer_control !== false;
+  const btn = $("device-hdr-btn");
+  btn.classList.toggle("active", !!st.enabled);
+  if (st.enabled) {
+    btn.textContent = `Device · ${st.indexed_entries || 0} items`;
+    $("dev-ctx-stats").textContent = `${st.indexed_entries || 0} items (${st.apps_count || 0} apps, ${st.docs_count || 0} docs, ${st.media_count || 0} media) · built in ${(st.build_ms || 0).toFixed(1)} ms · ${st.learned_facts_count || 0} learned facts`;
+  } else {
+    btn.textContent = "Device: OFF";
+    $("dev-ctx-stats").textContent = st.indexed_entries > 0
+      ? `Paused (${st.indexed_entries} cached items on disk)`
+      : "Turn on to index local documents, certificates, apps, and watched media";
+  }
+}
+
+async function refreshDeviceStatus() {
+  try {
+    const r = await fetch("/v1/device/status", { headers: headers() });
+    if (r.ok) renderDeviceStatus(await r.json());
+  } catch (e) {}
+}
+
+async function updateDeviceConfig(patch) {
+  try {
+    const r = await fetch("/v1/device/config", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify(patch),
+    });
+    if (r.ok) renderDeviceStatus(await r.json());
+  } catch (e) {}
+}
+
+$("dev-ctx-enabled").onchange = () => updateDeviceConfig({ enabled: $("dev-ctx-enabled").checked });
+$("dev-cc-enabled").onchange = () => updateDeviceConfig({ allow_computer_control: $("dev-cc-enabled").checked });
+$("dev-ctx-rebuild").onclick = async () => {
+  $("dev-ctx-stats").textContent = "Rebuilding binary k2di index…";
+  await updateDeviceConfig({ enabled: $("dev-ctx-enabled").checked, rebuild: true });
+};
+$("dev-ctx-inspect").onclick = async () => {
+  $("dev-profile-modal").classList.add("open");
+  $("dev-profile-pre").textContent = "Loading device memory artifact…";
+  try {
+    const r = await fetch("/v1/device/profile", { headers: headers() });
+    if (r.ok) {
+      const j = await r.json();
+      $("dev-profile-pre").textContent = j.markdown || "Empty artifact";
+      if (j.status) renderDeviceStatus(j.status);
+    }
+  } catch (e) {
+    $("dev-profile-pre").textContent = "Failed to load device profile: " + e.message;
+  }
+};
+$("dev-modal-close").onclick = () => $("dev-profile-modal").classList.remove("open");
+$("dev-profile-modal").onclick = (e) => {
+  if (e.target === $("dev-profile-modal")) $("dev-profile-modal").classList.remove("open");
+};
+
+async function triggerDirectDeviceOpen(action, target) {
+  try {
+    await fetch("/v1/device/open", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ action, target }),
+    });
+  } catch (e) {}
+}
 
 $("nav-history").onclick = () => {
   const w = $("sb-search-wrap");
@@ -1727,6 +1867,9 @@ function userBubble(text, attachments) {
 function summarizeArgs(name, rawArgs) {
   try {
     const a = JSON.parse(rawArgs);
+    if (name === "use_computer") {
+      return `${a.action || "action"} · ${a.target || ""}`;
+    }
     if (name === "edit_file" && a.path) {
       const o = String(a.old_text || "").replace(/\s+/g, " ").trim().slice(0, 22);
       const n = String(a.new_text || "").replace(/\s+/g, " ").trim().slice(0, 22);
@@ -1850,9 +1993,45 @@ async function runUnifiedTurn(text, attachedItems) {
             routePill.className = "pill info";
             routePill.textContent = "agent · workspace";
             stepsBox.style.display = "flex";
+          } else if (activeRoute === "computer") {
+            routePill.className = "pill info";
+            routePill.textContent = "computer · macOS";
+            stepsBox.style.display = "flex";
           } else {
             routePill.className = "pill run";
             routePill.textContent = "chat";
+          }
+        } else if (j.type === "device_context") {
+          const badge = `device · ${j.hits || 0} matches · ${(j.elapsed_ms || 0).toFixed(2)} ms`;
+          turnBadges.push(badge);
+          const dp = document.createElement("span");
+          dp.className = "pill info";
+          dp.textContent = badge;
+          headRow.appendChild(dp);
+          const actionable = (j.items || []).filter(it => it.exists_on_disk && it.path).slice(0, 3);
+          if (actionable.length > 0) {
+            const bar = document.createElement("div");
+            bar.className = "dev-hit-bar";
+            for (const it of actionable) {
+              const btn = document.createElement("button");
+              btn.type = "button";
+              btn.className = "dev-open-chip";
+              const act = it.kind === "app" ? "open_app" : "open_file";
+              btn.textContent = `Open ${it.name.slice(0, 32)} ↗`;
+              btn.title = it.path;
+              btn.onclick = () => triggerDirectDeviceOpen(act, it.path);
+              bar.appendChild(btn);
+              if (it.kind !== "app") {
+                const rev = document.createElement("button");
+                rev.type = "button";
+                rev.className = "dev-open-chip";
+                rev.textContent = "Finder";
+                rev.title = `Reveal ${it.path} in Finder`;
+                rev.onclick = () => triggerDirectDeviceOpen("reveal_in_finder", it.path);
+                bar.appendChild(rev);
+              }
+            }
+            card.insertBefore(bar, proseBox);
           }
         } else if (j.type === "attachments") {
           for (const item of (j.items || [])) {
@@ -2099,6 +2278,7 @@ window.addEventListener("hashchange", () => {
 
   await refreshWorkspace(true);
   await fetchSessionsIndex();
+  refreshDeviceStatus();
 
   const hashMatch = location.hash.match(/^#session=([A-Za-z0-9_-]+)/);
   const savedSess = hashMatch ? hashMatch[1] : store("kronos-active-session");
