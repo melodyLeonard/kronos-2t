@@ -252,6 +252,8 @@ struct Nf4MatParams {
     has_bias: u32,
     has_residual: u32,
     n_offset: u32,
+    bits: u32,
+    chunk_bytes: u32,
 }
 
 #[repr(C)]
@@ -304,6 +306,8 @@ pub(crate) struct GpuNf4Matrix {
     scale_group_chunks: u32,
     num_scale_groups: u32,
     pair_total_bytes: u32,
+    bits: u32,
+    chunk_bytes: u32,
 }
 
 pub(crate) struct GpuLayerWeights {
@@ -821,8 +825,11 @@ fn wrap_page_aligned_nocopy(device: Id, bytes: &PageAlignedBytes, dummy: Id, wha
 }
 
 fn wrap_nf4_matrix(device: Id, mat: &NfSdotMatrix, dummy: Id, label: &str) -> Result<GpuNf4Matrix, String> {
-    if mat.bits != 4 {
-        return Err(format!("{label}: Metal GPU backend currently supports 4-bit NF4 (got {}-bit)", mat.bits));
+    if !(2..=5).contains(&mat.bits) {
+        return Err(format!(
+            "{label}: Metal GPU backend supports 2..=5-bit NfSdot (got {}-bit)",
+            mat.bits
+        ));
     }
     let pair_buf = wrap_page_aligned_nocopy(device, &mat.pair_stream, dummy, label)?;
     let tail_buf = wrap_page_aligned_nocopy(device, &mat.tail_stream, dummy, label)?;
@@ -845,6 +852,8 @@ fn wrap_nf4_matrix(device: Id, mat: &NfSdotMatrix, dummy: Id, label: &str) -> Re
         scale_group_chunks: mat.scale_group_chunks as u32,
         num_scale_groups: mat.num_scale_groups as u32,
         pair_total_bytes: mat.pair_total_bytes() as u32,
+        bits: mat.bits as u32,
+        chunk_bytes: NfSdotMatrix::stripe_chunk_bytes(mat.bits) as u32,
     })
 }
 
@@ -1509,6 +1518,8 @@ impl MetalLlamaEngine {
             has_bias: u32::from(bias.is_some()),
             has_residual: u32::from(residual.is_some()),
             n_offset: 0,
+            bits: mat.bits,
+            chunk_bytes: mat.chunk_bytes,
         };
         let bias_id = bias.unwrap_or_else(|| self.dummy_buf.id());
         let res_id = residual.unwrap_or_else(|| self.dummy_buf.id());
@@ -1627,6 +1638,8 @@ struct Nf4MatParams {
     uint has_bias;
     uint has_residual;
     uint n_offset;
+    uint bits;
+    uint chunk_bytes;
 };
 
 struct RopeKvParams {
@@ -1933,6 +1946,154 @@ inline half2 make_nf4_pair(uint cb0, uint cb1, uint cb2, uint cb3, uint byte_idx
     return half2(half(lo), half(hi));
 }
 
+constant char4 E8Q2_EVEN_TPL[28] = {
+    char4(0, 0, 0, 0),
+    char4(32, 32, 0, 0),
+    char4(32, 0, 32, 0),
+    char4(32, 0, 0, 32),
+    char4(0, 32, 32, 0),
+    char4(0, 32, 0, 32),
+    char4(0, 0, 32, 32),
+    char4(64, 0, 0, 0),
+    char4(0, 64, 0, 0),
+    char4(0, 0, 64, 0),
+    char4(0, 0, 0, 64),
+    char4(32, 32, 32, 32),
+    char4(32, 0, 0, 0),
+    char4(0, 32, 0, 0),
+    char4(0, 0, 32, 0),
+    char4(0, 0, 0, 32),
+    char4(32, 32, 32, 0),
+    char4(32, 32, 0, 32),
+    char4(32, 0, 32, 32),
+    char4(0, 32, 32, 32),
+    char4(96, 0, 0, 0),
+    char4(0, 96, 0, 0),
+    char4(0, 0, 96, 0),
+    char4(0, 0, 0, 96),
+    char4(64, 32, 32, 32),
+    char4(32, 64, 32, 32),
+    char4(32, 32, 64, 32),
+    char4(32, 32, 32, 64)
+};
+
+inline void init_nf_tables(
+    constant Nf4MatParams& p,
+    uint tid_tg,
+    threadgroup half2* l_pair,
+    threadgroup float* cb32_s)
+{
+    if (p.bits == 4u) {
+        l_pair[tid_tg] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg);
+        l_pair[tid_tg + 128u] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg + 128u);
+    } else if (tid_tg < 16u) {
+        float c = nf4_byte_lut(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg);
+        if (p.bits == 5u) {
+            cb32_s[15u - tid_tg] = -c;
+            cb32_s[16u + tid_tg] = c;
+        } else {
+            cb32_s[tid_tg] = c;
+            cb32_s[16u + tid_tg] = 0.0f;
+        }
+    }
+}
+
+inline void unpack_nf_8cols(
+    device const uchar* d_ptr,
+    uint bits,
+    uint k,
+    uint tid,
+    threadgroup const half2* l_pair,
+    threadgroup const float* cb32_s,
+    thread float4& w_lo,
+    thread float4& w_hi)
+{
+    if (bits == 4u) {
+        uchar4 b = ((device const uchar4*)d_ptr)[k * 32u + tid];
+        half2 p0 = l_pair[b.x], p1 = l_pair[b.y], p2 = l_pair[b.z], p3 = l_pair[b.w];
+        w_lo = float4(p0.x, p1.x, p2.x, p3.x);
+        w_hi = float4(p0.y, p1.y, p2.y, p3.y);
+    } else if (bits == 2u) {
+        uint g = tid >> 3u;
+        uint half16 = (tid >> 2u) & 1u;
+        uint j = tid & 3u;
+        uint eb = ((k & 1u) << 1u) | half16;
+        uint off = (k >> 1u) * 128u + g * 32u + eb * 4u + j;
+        uint tpl = uint(d_ptr[off]);
+        uint sgn = uint(d_ptr[off + 16u]);
+        float4 mu, mv;
+        if ((popcount(tpl ^ sgn) & 1u) != 0u) {
+            uint tpl_u = tpl & 0xFu;
+            uint tpl_v = tpl >> 4u;
+            uint u_idx = (tpl_u < 12u && tpl_v >= 12u) ? (16u + tpl_u) : tpl_u;
+            uint v_idx = (tpl_v < 12u && tpl_u >= 12u) ? (16u + tpl_v) : tpl_v;
+            mu = float4(E8Q2_EVEN_TPL[u_idx]);
+            mv = float4(E8Q2_EVEN_TPL[v_idx]);
+        } else {
+            mu = float4(
+                ((tpl & 1u) != 0u) ? 48.0f : 16.0f,
+                ((tpl & 2u) != 0u) ? 48.0f : 16.0f,
+                ((tpl & 4u) != 0u) ? 48.0f : 16.0f,
+                ((tpl & 8u) != 0u) ? 48.0f : 16.0f);
+            mv = float4(
+                ((tpl & 16u) != 0u) ? 48.0f : 16.0f,
+                ((tpl & 32u) != 0u) ? 48.0f : 16.0f,
+                ((tpl & 64u) != 0u) ? 48.0f : 16.0f,
+                ((tpl & 128u) != 0u) ? 48.0f : 16.0f);
+        }
+        w_lo = float4(
+            ((sgn & 1u) != 0u) ? -mu.x : mu.x,
+            ((sgn & 2u) != 0u) ? -mu.y : mu.y,
+            ((sgn & 4u) != 0u) ? -mu.z : mu.z,
+            ((sgn & 8u) != 0u) ? -mu.w : mu.w);
+        w_hi = float4(
+            ((sgn & 16u) != 0u) ? -mv.x : mv.x,
+            ((sgn & 32u) != 0u) ? -mv.y : mv.y,
+            ((sgn & 64u) != 0u) ? -mv.z : mv.z,
+            ((sgn & 128u) != 0u) ? -mv.w : mv.w);
+    } else if (bits == 3u) {
+        uint g = tid >> 3u;
+        uint half16 = (tid >> 2u) & 1u;
+        uint j = tid & 3u;
+        device const uchar4* blk4 = (device const uchar4*)(d_ptr + (k >> 1u) * 192u + g * 48u);
+        uint sub_pair = ((k & 1u) << 1u) | half16;
+        uint4 idx_lo, idx_hi;
+        if (sub_pair == 0u) {
+            uint4 v0 = uint4(blk4[j]);
+            idx_lo = v0 & 7u;
+            idx_hi = (v0 >> 3u) & 7u;
+        } else if (sub_pair == 1u) {
+            uint4 v0 = uint4(blk4[j]);
+            uint4 v1 = uint4(blk4[4u + j]);
+            uint4 v2 = uint4(blk4[8u + j]);
+            idx_lo = ((v0 >> 6u) & 3u) | (((v2 >> 6u) & 1u) << 2u);
+            idx_hi = v1 & 7u;
+        } else if (sub_pair == 2u) {
+            uint4 v1 = uint4(blk4[4u + j]);
+            uint4 v2 = uint4(blk4[8u + j]);
+            idx_lo = (v1 >> 3u) & 7u;
+            idx_hi = ((v1 >> 6u) & 3u) | (((v2 >> 7u) & 1u) << 2u);
+        } else {
+            uint4 v2 = uint4(blk4[8u + j]);
+            idx_lo = v2 & 7u;
+            idx_hi = (v2 >> 3u) & 7u;
+        }
+        w_lo = float4(cb32_s[idx_lo.x], cb32_s[idx_lo.y], cb32_s[idx_lo.z], cb32_s[idx_lo.w]);
+        w_hi = float4(cb32_s[idx_hi.x], cb32_s[idx_hi.y], cb32_s[idx_hi.z], cb32_s[idx_hi.w]);
+    } else {
+        uint g = tid >> 3u;
+        uint half16 = (tid >> 2u) & 1u;
+        uint j = tid & 3u;
+        uint4 b = uint4(((device const uchar4*)d_ptr)[k * 32u + tid]);
+        uint4 hb = uint4(((device const uchar4*)(d_ptr + 512u))[g * 8u + (k >> 1u) * 4u + j]);
+        uint sh0 = (((k & 1u) == 0u) ? 4u : 0u) + half16 * 2u;
+        uint4 idx_lo = (b & 0xFu) | (((hb >> sh0) & 1u) << 4u);
+        uint4 idx_hi = (b >> 4u) | (((hb >> (sh0 + 1u)) & 1u) << 4u);
+        w_lo = float4(cb32_s[idx_lo.x], cb32_s[idx_lo.y], cb32_s[idx_lo.z], cb32_s[idx_lo.w]);
+        w_hi = float4(cb32_s[idx_hi.x], cb32_s[idx_hi.y], cb32_s[idx_hi.z], cb32_s[idx_hi.w]);
+    }
+}
+
 kernel void nf4_gemv_decode1(
     device const uchar* pair_stream [[buffer(0)]],
     device const uchar* tail_stream [[buffer(1)]],
@@ -1952,21 +2113,23 @@ kernel void nf4_gemv_decode1(
     const bool has_b = (!is_tail) && ((sa + 1u) < p.num_stripes);
 
     threadgroup half2 l_pair[256];
-    l_pair[tid_tg] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg);
-    l_pair[tid_tg + 128u] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg + 128u);
+    threadgroup float cb32_s[32];
+    init_nf_tables(p, tid_tg, l_pair, cb32_s);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint g = tid >> 3u;
     const uint half16 = (tid >> 2u) & 1u;
     const uint j = tid & 3u;
     const uint lane = (g << 2u) | j;
+    const uint chunk_b = p.chunk_bytes;
+    const uint pair_chunk_b = 2u * chunk_b;
 
     float acc_a = 0.0f;
     float acc_b = 0.0f;
 
     if (!is_tail) {
         device const uchar* p_base = pair_stream + ulong(pair_idx) * ulong(p.pair_total_bytes);
-        const uint sg_stride = 64u + p.scale_group_chunks * 1024u;
+        const uint sg_stride = 64u + p.scale_group_chunks * pair_chunk_b;
         for (uint sg = sg_id; sg < p.num_scale_groups; sg += 4u) {
             device const uchar* sg_ptr = p_base + ulong(sg) * ulong(sg_stride);
             float wsa = bf16_bytes_to_f32(sg_ptr + lane * 2u);
@@ -1977,30 +2140,27 @@ kernel void nf4_gemv_decode1(
             float sgb = 0.0f;
             for (uint c = c0; c < c1; ++c) {
                 uint sub_c = c - c0;
-                device const uint* da = (device const uint*)(sg_ptr + 64u + sub_c * 1024u);
-                device const uint* db = da + 128u;
+                device const uchar* da = sg_ptr + 64u + sub_c * pair_chunk_b;
+                device const uchar* db = da + chunk_b;
                 for (uint k = 0u; k < 4u; ++k) {
                     uint col = c * 64u + k * 16u + half16 * 8u;
                     device const float4* xp = (device const float4*)(x_rot + col);
                     float4 x0 = xp[0];
                     float4 x1 = xp[1];
 
-                    uchar4 ba = as_type<uchar4>(da[k * 32u + tid]);
-                    half2 pa0 = l_pair[ba.x], pa1 = l_pair[ba.y], pa2 = l_pair[ba.z], pa3 = l_pair[ba.w];
-                    sga += dot(float4(pa0.x, pa1.x, pa2.x, pa3.x), x0)
-                         + dot(float4(pa0.y, pa1.y, pa2.y, pa3.y), x1);
+                    float4 wa0, wa1, wb0, wb1;
+                    unpack_nf_8cols(da, p.bits, k, tid, l_pair, cb32_s, wa0, wa1);
+                    sga += dot(wa0, x0) + dot(wa1, x1);
 
-                    uchar4 bb = as_type<uchar4>(db[k * 32u + tid]);
-                    half2 pb0 = l_pair[bb.x], pb1 = l_pair[bb.y], pb2 = l_pair[bb.z], pb3 = l_pair[bb.w];
-                    sgb += dot(float4(pb0.x, pb1.x, pb2.x, pb3.x), x0)
-                         + dot(float4(pb0.y, pb1.y, pb2.y, pb3.y), x1);
+                    unpack_nf_8cols(db, p.bits, k, tid, l_pair, cb32_s, wb0, wb1);
+                    sgb += dot(wb0, x0) + dot(wb1, x1);
                 }
             }
             acc_a += sga * wsa;
             acc_b += sgb * wsb;
         }
     } else {
-        const uint sg_stride = 32u + p.scale_group_chunks * 512u;
+        const uint sg_stride = 32u + p.scale_group_chunks * chunk_b;
         for (uint sg = sg_id; sg < p.num_scale_groups; sg += 4u) {
             device const uchar* sg_ptr = tail_stream + ulong(sg) * ulong(sg_stride);
             float wsa = bf16_bytes_to_f32(sg_ptr + lane * 2u);
@@ -2009,14 +2169,13 @@ kernel void nf4_gemv_decode1(
             float sga = 0.0f;
             for (uint c = c0; c < c1; ++c) {
                 uint sub_c = c - c0;
-                device const uint* da = (device const uint*)(sg_ptr + 32u + sub_c * 512u);
+                device const uchar* da = sg_ptr + 32u + sub_c * chunk_b;
                 for (uint k = 0u; k < 4u; ++k) {
                     uint col = c * 64u + k * 16u + half16 * 8u;
                     device const float4* xp = (device const float4*)(x_rot + col);
-                    uchar4 ba = as_type<uchar4>(da[k * 32u + tid]);
-                    half2 pa0 = l_pair[ba.x], pa1 = l_pair[ba.y], pa2 = l_pair[ba.z], pa3 = l_pair[ba.w];
-                    sga += dot(float4(pa0.x, pa1.x, pa2.x, pa3.x), xp[0])
-                         + dot(float4(pa0.y, pa1.y, pa2.y, pa3.y), xp[1]);
+                    float4 wa0, wa1;
+                    unpack_nf_8cols(da, p.bits, k, tid, l_pair, cb32_s, wa0, wa1);
+                    sga += dot(wa0, xp[0]) + dot(wa1, xp[1]);
                 }
             }
             acc_a += sga * wsa;
@@ -2066,9 +2225,9 @@ kernel void nf4_gemv_batch(
     const bool has_b = (!is_tail) && ((sa + 1u) < p.num_stripes);
 
     threadgroup half2 l_pair[256];
+    threadgroup float cb32_s[32];
     threadgroup float tg_buf[4][256];
-    l_pair[tid_tg] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg);
-    l_pair[tid_tg + 128u] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg + 128u);
+    init_nf_tables(p, tid_tg, l_pair, cb32_s);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint g = tid >> 3u;
@@ -2076,6 +2235,8 @@ kernel void nf4_gemv_batch(
     const uint j = tid & 3u;
     const uint lane = (g << 2u) | j;
     const uint wc = half16 * 8u;
+    const uint chunk_b = p.chunk_bytes;
+    const uint pair_chunk_b = 2u * chunk_b;
     threadgroup half* ws_sg = (threadgroup half*)(&tg_buf[sg_id][0]);
 
     simdgroup_float8x8 acc_a0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
@@ -2085,7 +2246,7 @@ kernel void nf4_gemv_batch(
 
     if (!is_tail) {
         device const uchar* p_base = pair_stream + ulong(pair_idx) * ulong(p.pair_total_bytes);
-        const uint sg_stride = 64u + p.scale_group_chunks * 1024u;
+        const uint sg_stride = 64u + p.scale_group_chunks * pair_chunk_b;
         for (uint sg = sg_id; sg < p.num_scale_groups; sg += 4u) {
             device const uchar* sg_ptr = p_base + ulong(sg) * ulong(sg_stride);
             float wsa = bf16_bytes_to_f32(sg_ptr + lane * 2u);
@@ -2094,27 +2255,18 @@ kernel void nf4_gemv_batch(
             uint c1 = min(c0 + p.scale_group_chunks, p.num_chunks);
             for (uint c = c0; c < c1; ++c) {
                 uint sub_c = c - c0;
-                device const uint* da = (device const uint*)(sg_ptr + 64u + sub_c * 1024u);
-                device const uint* db = da + 128u;
-                #pragma clang loop unroll(full)
+                device const uchar* da = sg_ptr + 64u + sub_c * pair_chunk_b;
+                device const uchar* db = da + chunk_b;
                 for (uint k = 0u; k < 4u; ++k) {
                     uint col = c * 64u + k * 16u;
                     simdgroup_half8x8 x_f0, x_f1;
                     simdgroup_load(x_f0, x_rot_f16 + ulong(col) * 128ul, 128);
                     simdgroup_load(x_f1, x_rot_f16 + ulong(col + 8u) * 128ul, 128);
 
-                    uchar4 ba = as_type<uchar4>(da[k * 32u + tid]);
-                    half2 pa0 = l_pair[ba.x], pa1 = l_pair[ba.y], pa2 = l_pair[ba.z], pa3 = l_pair[ba.w];
-                    *(threadgroup half4*)(ws_sg + lane * 20u + wc) = half4(
-                        half(float(pa0.x) * wsa),
-                        half(float(pa1.x) * wsa),
-                        half(float(pa2.x) * wsa),
-                        half(float(pa3.x) * wsa));
-                    *(threadgroup half4*)(ws_sg + lane * 20u + wc + 4u) = half4(
-                        half(float(pa0.y) * wsa),
-                        half(float(pa1.y) * wsa),
-                        half(float(pa2.y) * wsa),
-                        half(float(pa3.y) * wsa));
+                    float4 wa0, wa1;
+                    unpack_nf_8cols(da, p.bits, k, tid, l_pair, cb32_s, wa0, wa1);
+                    *(threadgroup half4*)(ws_sg + lane * 20u + wc) = half4(wa0 * wsa);
+                    *(threadgroup half4*)(ws_sg + lane * 20u + wc + 4u) = half4(wa1 * wsa);
                     simdgroup_barrier(mem_flags::mem_threadgroup);
                     simdgroup_half8x8 wa00, wa01, wa10, wa11;
                     simdgroup_load(wa00, ws_sg + 0u, 20);
@@ -2127,18 +2279,10 @@ kernel void nf4_gemv_batch(
                     simdgroup_multiply_accumulate(acc_a1, wa11, x_f1, acc_a1);
                     simdgroup_barrier(mem_flags::mem_threadgroup);
 
-                    uchar4 bb = as_type<uchar4>(db[k * 32u + tid]);
-                    half2 pb0 = l_pair[bb.x], pb1 = l_pair[bb.y], pb2 = l_pair[bb.z], pb3 = l_pair[bb.w];
-                    *(threadgroup half4*)(ws_sg + lane * 20u + wc) = half4(
-                        half(float(pb0.x) * wsb),
-                        half(float(pb1.x) * wsb),
-                        half(float(pb2.x) * wsb),
-                        half(float(pb3.x) * wsb));
-                    *(threadgroup half4*)(ws_sg + lane * 20u + wc + 4u) = half4(
-                        half(float(pb0.y) * wsb),
-                        half(float(pb1.y) * wsb),
-                        half(float(pb2.y) * wsb),
-                        half(float(pb3.y) * wsb));
+                    float4 wb0, wb1;
+                    unpack_nf_8cols(db, p.bits, k, tid, l_pair, cb32_s, wb0, wb1);
+                    *(threadgroup half4*)(ws_sg + lane * 20u + wc) = half4(wb0 * wsb);
+                    *(threadgroup half4*)(ws_sg + lane * 20u + wc + 4u) = half4(wb1 * wsb);
                     simdgroup_barrier(mem_flags::mem_threadgroup);
                     simdgroup_half8x8 wb00, wb01, wb10, wb11;
                     simdgroup_load(wb00, ws_sg + 0u, 20);
@@ -2154,7 +2298,7 @@ kernel void nf4_gemv_batch(
             }
         }
     } else {
-        const uint sg_stride = 32u + p.scale_group_chunks * 512u;
+        const uint sg_stride = 32u + p.scale_group_chunks * chunk_b;
         for (uint sg = sg_id; sg < p.num_scale_groups; sg += 4u) {
             device const uchar* sg_ptr = tail_stream + ulong(sg) * ulong(sg_stride);
             float wsa = bf16_bytes_to_f32(sg_ptr + lane * 2u);
@@ -2162,26 +2306,17 @@ kernel void nf4_gemv_batch(
             uint c1 = min(c0 + p.scale_group_chunks, p.num_chunks);
             for (uint c = c0; c < c1; ++c) {
                 uint sub_c = c - c0;
-                device const uint* da = (device const uint*)(sg_ptr + 32u + sub_c * 512u);
-                #pragma clang loop unroll(full)
+                device const uchar* da = sg_ptr + 32u + sub_c * chunk_b;
                 for (uint k = 0u; k < 4u; ++k) {
                     uint col = c * 64u + k * 16u;
                     simdgroup_half8x8 x_f0, x_f1;
                     simdgroup_load(x_f0, x_rot_f16 + ulong(col) * 128ul, 128);
                     simdgroup_load(x_f1, x_rot_f16 + ulong(col + 8u) * 128ul, 128);
 
-                    uchar4 ba = as_type<uchar4>(da[k * 32u + tid]);
-                    half2 pa0 = l_pair[ba.x], pa1 = l_pair[ba.y], pa2 = l_pair[ba.z], pa3 = l_pair[ba.w];
-                    *(threadgroup half4*)(ws_sg + lane * 20u + wc) = half4(
-                        half(float(pa0.x) * wsa),
-                        half(float(pa1.x) * wsa),
-                        half(float(pa2.x) * wsa),
-                        half(float(pa3.x) * wsa));
-                    *(threadgroup half4*)(ws_sg + lane * 20u + wc + 4u) = half4(
-                        half(float(pa0.y) * wsa),
-                        half(float(pa1.y) * wsa),
-                        half(float(pa2.y) * wsa),
-                        half(float(pa3.y) * wsa));
+                    float4 wa0, wa1;
+                    unpack_nf_8cols(da, p.bits, k, tid, l_pair, cb32_s, wa0, wa1);
+                    *(threadgroup half4*)(ws_sg + lane * 20u + wc) = half4(wa0 * wsa);
+                    *(threadgroup half4*)(ws_sg + lane * 20u + wc + 4u) = half4(wa1 * wsa);
                     simdgroup_barrier(mem_flags::mem_threadgroup);
                     simdgroup_half8x8 wa00, wa01, wa10, wa11;
                     simdgroup_load(wa00, ws_sg + 0u, 20);
@@ -2244,8 +2379,8 @@ kernel void nf4_gemm_mma(
 
     threadgroup half Ws[32][68];
     threadgroup half2 l_pair[256];
-    l_pair[tid_tg] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg);
-    l_pair[tid_tg + 128u] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg + 128u);
+    threadgroup float cb32_s[32];
+    init_nf_tables(p, tid_tg, l_pair, cb32_s);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     simdgroup_float8x8 acc[4][4];
@@ -2269,9 +2404,11 @@ kernel void nf4_gemm_mma(
     const uint w_col = k_sub * 16u + half16 * 8u;
     const uint sg_n = sg_id * 8u;
     const uint n_ni = min(4u, (p.n_tok - n_base + 31u) >> 5u);
+    const uint chunk_b = p.chunk_bytes;
+    const uint pair_chunk_b = 2u * chunk_b;
 
-    const uint pair_sg_stride = 64u + p.scale_group_chunks * 1024u;
-    const uint tail_sg_stride = 32u + p.scale_group_chunks * 512u;
+    const uint pair_sg_stride = 64u + p.scale_group_chunks * pair_chunk_b;
+    const uint tail_sg_stride = 32u + p.scale_group_chunks * chunk_b;
     const device uchar* pair_base = pair_stream + ulong(pair_idx) * ulong(p.pair_total_bytes);
 
     uint sg = 0u;
@@ -2290,23 +2427,15 @@ kernel void nf4_gemm_mma(
             }
         }
         if (st_valid) {
-            device const uint* d_u32 = (!st_tail)
-                ? (device const uint*)(sg_ptr + 64u + sub_c * 1024u + side * 512u)
-                : (device const uint*)(sg_ptr + 32u + sub_c * 512u);
+            device const uchar* d_ptr = (!st_tail)
+                ? (sg_ptr + 64u + sub_c * pair_chunk_b + side * chunk_b)
+                : (sg_ptr + 32u + sub_c * chunk_b);
             for (uint hc = 0u; hc < 2u; ++hc) {
-                uchar4 b = as_type<uchar4>(d_u32[(hc * 2u + k_sub) * 32u + tid]);
-                half2 p0 = l_pair[b.x], p1 = l_pair[b.y], p2 = l_pair[b.z], p3 = l_pair[b.w];
+                float4 w0, w1;
+                unpack_nf_8cols(d_ptr, p.bits, hc * 2u + k_sub, tid, l_pair, cb32_s, w0, w1);
                 uint wc = hc * 32u + w_col;
-                *(threadgroup half4*)(&Ws[m_row][wc]) = half4(
-                    half(float(p0.x) * w_scale),
-                    half(float(p1.x) * w_scale),
-                    half(float(p2.x) * w_scale),
-                    half(float(p3.x) * w_scale));
-                *(threadgroup half4*)(&Ws[m_row][wc + 4u]) = half4(
-                    half(float(p0.y) * w_scale),
-                    half(float(p1.y) * w_scale),
-                    half(float(p2.y) * w_scale),
-                    half(float(p3.y) * w_scale));
+                *(threadgroup half4*)(&Ws[m_row][wc]) = half4(w0 * w_scale);
+                *(threadgroup half4*)(&Ws[m_row][wc + 4u]) = half4(w1 * w_scale);
             }
         } else {
             for (uint hc = 0u; hc < 2u; ++hc) {
@@ -3493,5 +3622,198 @@ mod tests {
             cpu_q8.set_num_threads(1);
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn test_metal_e8q2_nf3_nf5_and_mixed_parity() {
+        let hd = 64usize;
+        let nh = 4usize;
+        let nkv = 2usize;
+        let vocab = 136usize; // 9 stripes (4 pairs + 1 odd tail stripe)
+        let h = nh * hd;
+        let inter = h * 2;
+        let nl = 2usize;
+        let kvd = nkv * hd;
+        let dir = std::env::temp_dir().join(format!(
+            "kronos_metal_lowbit_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(
+            dir.join("config.json"),
+            format!(
+                r#"{{"vocab_size":{vocab},"hidden_size":{h},"intermediate_size":{inter},"num_hidden_layers":{nl},"num_attention_heads":{nh},"num_key_value_heads":{nkv},"rms_norm_eps":1e-6,"rope_theta":1000000.0,"tie_word_embeddings":false}}"#
+            ),
+        )
+        .unwrap();
+
+        let mk_bf16 = |n: usize, seed: usize, scale: f32| -> Vec<u8> {
+            let mut out = Vec::with_capacity(n * 2);
+            for i in 0..n {
+                let mut z = (i as u64)
+                    .wrapping_add((seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                let u = ((z >> 40) as f32) / ((1u32 << 24) as f32);
+                let v = (2.0 * u - 1.0) * scale;
+                out.extend_from_slice(&f32_to_bf16(v).to_le_bytes());
+            }
+            out
+        };
+        let write_safetensors = |path: &Path, entries: Vec<(String, Vec<usize>, Vec<u8>)>| {
+            let mut data = Vec::new();
+            let mut hdr_items = Vec::new();
+            for (name, shape, raw) in entries {
+                let s = data.len();
+                data.extend_from_slice(&raw);
+                let e = data.len();
+                let sh_str: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+                hdr_items.push(format!(
+                    r#""{name}":{{"dtype":"BF16","shape":[{}],"data_offsets":[{s},{e}]}}"#,
+                    sh_str.join(",")
+                ));
+            }
+            let hdr = format!("{{{}}}", hdr_items.join(","));
+            let mut file_bytes = (hdr.len() as u64).to_le_bytes().to_vec();
+            file_bytes.extend_from_slice(hdr.as_bytes());
+            file_bytes.extend_from_slice(&data);
+            fs::write(path, file_bytes).unwrap();
+        };
+
+        let mut tensors = vec![(
+            "model.embed_tokens.weight".to_string(),
+            vec![vocab, h],
+            mk_bf16(vocab * h, 31, 0.4),
+        )];
+        for l in 0..nl {
+            let p = format!("model.layers.{l}");
+            tensors.extend([
+                (format!("{p}.input_layernorm.weight"), vec![h], mk_bf16(h, 7 + l, 1.0)),
+                (format!("{p}.post_attention_layernorm.weight"), vec![h], mk_bf16(h, 11 + l, 1.0)),
+                (format!("{p}.self_attn.q_proj.weight"), vec![h, h], mk_bf16(h * h, 13 + l, 0.08)),
+                (format!("{p}.self_attn.k_proj.weight"), vec![kvd, h], mk_bf16(kvd * h, 17 + l, 0.08)),
+                (format!("{p}.self_attn.v_proj.weight"), vec![kvd, h], mk_bf16(kvd * h, 19 + l, 0.08)),
+                (format!("{p}.self_attn.o_proj.weight"), vec![h, h], mk_bf16(h * h, 41 + l, 0.08)),
+                (format!("{p}.mlp.gate_proj.weight"), vec![inter, h], mk_bf16(inter * h, 43 + l, 0.08)),
+                (format!("{p}.mlp.up_proj.weight"), vec![inter, h], mk_bf16(inter * h, 47 + l, 0.08)),
+                (format!("{p}.mlp.down_proj.weight"), vec![h, inter], mk_bf16(h * inter, 53 + l, 0.055)),
+            ]);
+        }
+        tensors.push(("model.norm.weight".to_string(), vec![h], mk_bf16(h, 59, 1.0)));
+        tensors.push(("lm_head.weight".to_string(), vec![vocab, h], mk_bf16(vocab * h, 61, 0.3)));
+        write_safetensors(&dir.join("model.safetensors"), tensors);
+
+        let calib = vec![(0..16).map(|i| (i * 5 + 1) % vocab).collect::<Vec<_>>()];
+        let modes = [
+            (
+                "e8q2g128",
+                RealWeightMode::KronosNfGptq {
+                    bits: 2,
+                    scale_group_chunks: 2,
+                },
+            ),
+            (
+                "nf3g128",
+                RealWeightMode::KronosNfGptq {
+                    bits: 3,
+                    scale_group_chunks: 2,
+                },
+            ),
+            (
+                "e8q2nf4g128",
+                RealWeightMode::KronosNfMixedGptq {
+                    attn_head_bits: 4,
+                    ffn_bits: 2,
+                    scale_group_chunks: 2,
+                },
+            ),
+            (
+                "nfg54324",
+                RealWeightMode::KronosNfPlanesGptq {
+                    qkv: 5,
+                    o: 4,
+                    gate_up: 3,
+                    down: 2,
+                    head: 4,
+                    scale_group_chunks: 2,
+                },
+            ),
+        ];
+
+        let prefill_toks: Vec<usize> = (0..68).map(|i| (i * 11 + 2) % vocab).collect();
+        let batch_toks: Vec<usize> = (0..5).map(|i| (i * 13 + 7) % vocab).collect();
+
+        for (tag, mode) in modes {
+            let mut compiled =
+                RealLlamaEngine::compile_streaming_gptq_from_dir(&dir, mode, &calib, 2).unwrap();
+            compiled.compress_untied_embeddings_nf4();
+            let cache_path = dir.join(format!("kronos-{tag}.k2tb"));
+            compiled.save_bipolar(&cache_path).unwrap();
+
+            let mut cpu = RealLlamaEngine::load_bipolar(&dir, &cache_path, 512).unwrap();
+            cpu.repack_sdot();
+            cpu.set_kv_bits(8);
+            cpu.set_num_threads(2);
+
+            let mut gpu = RealLlamaEngine::load_bipolar(&dir, &cache_path, 512).unwrap();
+            gpu.repack_sdot();
+            gpu.enable_metal().unwrap();
+            gpu.set_kv_bits(8);
+
+            let mut gpu_step = RealLlamaEngine::load_bipolar(&dir, &cache_path, 512).unwrap();
+            gpu_step.repack_sdot();
+            gpu_step.enable_metal().unwrap();
+            gpu_step.set_kv_bits(8);
+
+            let cp = cpu.forward_prompt(&prefill_toks).to_vec();
+            let gp = gpu.forward_prompt(&prefill_toks).to_vec();
+            let mut gs_last = Vec::new();
+            for &t in &prefill_toks {
+                gs_last = gpu_step.forward_token(t).to_vec();
+            }
+            let cos_self_p = cosine_sim(&gp, &gs_last);
+            let cos_cpu_p = cosine_sim(&cp, &gp);
+            let kl_p = kl_divergence_nats(&cp, &gp);
+            assert!(
+                cos_self_p > 0.9997 && cos_cpu_p > 0.999 && kl_p < 0.005,
+                "Metal {tag} MMA prefill mismatch: self_cos={cos_self_p:.6}, cpu_cos={cos_cpu_p:.6}, kl={kl_p:.6}"
+            );
+
+            let mut cb = vec![0.0f32; 5 * vocab];
+            let mut gb = vec![0.0f32; 5 * vocab];
+            cpu.forward_batch_logits(&batch_toks, &mut cb);
+            gpu.forward_batch_logits(&batch_toks, &mut gb);
+            for (t, &bt) in batch_toks.iter().enumerate() {
+                let cs = &cb[t * vocab..(t + 1) * vocab];
+                let gs = &gb[t * vocab..(t + 1) * vocab];
+                let gs_step = gpu_step.forward_token(bt);
+                let cos_self_b = cosine_sim(gs, gs_step);
+                let cos_cpu_b = cosine_sim(cs, gs);
+                assert!(
+                    cos_self_b > 0.9997 && cos_cpu_b > 0.999,
+                    "Metal {tag} batch tok {t} mismatch: self_cos={cos_self_b:.6}, cpu_cos={cos_cpu_b:.6}"
+                );
+            }
+
+            for step in 0..3 {
+                let tok = (step * 17 + 9) % vocab;
+                let cl = cpu.forward_token(tok).to_vec();
+                let gl = gpu.forward_token(tok).to_vec();
+                let gs_s = gpu_step.forward_token(tok);
+                let cos_self_d = cosine_sim(&gl, gs_s);
+                let cos_cpu_d = cosine_sim(&cl, &gl);
+                assert!(
+                    cos_self_d > 0.9999 && cos_cpu_d > 0.999,
+                    "Metal {tag} decode1 step {step} mismatch: self_cos={cos_self_d:.6}, cpu_cos={cos_cpu_d:.6}"
+                );
+            }
+
+            cpu.set_num_threads(1);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -123,8 +123,8 @@ impl Completion {
     }
 }
 
-/// Parses a mode key: `nf5`, `nf4`, `nf3`, `nf3nf4` (optional `g128`), `nfpQOGDH` (`G=64`),
-/// `nfgQOGDH` (`G=128`), `vq2`, `vq2g128`, `v2b4`, `v2b5`, `b4`, `b5`, `b6`, or `pQOGDH`.
+/// Parses a mode key: `nf5`, `nf4`, `nf3`, `e8q2`, `nf3nf4`, `e8q2nf4` (optional `g128`),
+/// `nfpQOGDH` (`G=64`), `nfgQOGDH` (`G=128`), `vq2`, `vq2g128`, `v2b4`, `v2b5`, `b4`, `b5`, `b6`, or `pQOGDH`.
 pub fn parse_mode(m: &str) -> Result<RealWeightMode, String> {
     Ok(match m {
         "nf5" => RealWeightMode::KronosNfGptq {
@@ -161,6 +161,24 @@ pub fn parse_mode(m: &str) -> Result<RealWeightMode, String> {
             bits: 3,
             scale_group_chunks: 2,
         },
+        "e8q2" => RealWeightMode::KronosNfGptq {
+            bits: 2,
+            scale_group_chunks: 1,
+        },
+        "e8q2g128" => RealWeightMode::KronosNfGptq {
+            bits: 2,
+            scale_group_chunks: 2,
+        },
+        "e8q2nf4" => RealWeightMode::KronosNfMixedGptq {
+            attn_head_bits: 4,
+            ffn_bits: 2,
+            scale_group_chunks: 1,
+        },
+        "e8q2nf4g128" => RealWeightMode::KronosNfMixedGptq {
+            attn_head_bits: 4,
+            ffn_bits: 2,
+            scale_group_chunks: 2,
+        },
         "vq2" => RealWeightMode::KronosVq2Gptq { scale_group_chunks: 1 },
         "vq2g128" => RealWeightMode::KronosVq2Gptq { scale_group_chunks: 2 },
         "v2b4" => RealWeightMode::KronosVq2MixedGptq {
@@ -176,7 +194,7 @@ pub fn parse_mode(m: &str) -> Result<RealWeightMode, String> {
         "b6" => RealWeightMode::KronosBipolarGptq { num_planes: 6 },
         p if p.len() == 8
             && (p.starts_with("nfp") || p.starts_with("nfg"))
-            && p[3..].bytes().all(|b| (b'3'..=b'5').contains(&b)) =>
+            && p[3..].bytes().all(|b| (b'2'..=b'5').contains(&b)) =>
         {
             let d: Vec<usize> = p[3..].bytes().map(|b| (b - b'0') as usize).collect();
             let sgc = if p.starts_with("nfg") { 2 } else { 1 };
@@ -195,7 +213,7 @@ pub fn parse_mode(m: &str) -> Result<RealWeightMode, String> {
         }
         other => {
             return Err(format!(
-                "unknown mode {other}; use nf5, nf5g128, nf4, nf4g128, nf3nf4, nf3nf4g128, nf3, nf3g128, nfpQOGDH, nfgQOGDH (digits 3-5), vq2, vq2g128, v2b4, v2b5, b4, b5, b6 or pQOGDH (digits 4-6)"
+                "unknown mode {other}; use nf5, nf5g128, nf4, nf4g128, nf3nf4, nf3nf4g128, nf3, nf3g128, e8q2, e8q2g128, e8q2nf4, e8q2nf4g128, nfpQOGDH, nfgQOGDH (digits 2-5), vq2, vq2g128, v2b4, v2b5, b4, b5, b6 or pQOGDH (digits 4-6)"
             ));
         }
     })

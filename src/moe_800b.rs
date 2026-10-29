@@ -290,10 +290,10 @@ impl Kronos800bConfig {
         c
     }
 
-    /// Byte layout of one NF3/NF4 expert in a `.k2tm` shard.
+    /// Byte layout of one E8Q2/NF3/NF4/NF5 expert in a `.k2tm` shard.
     /// `gu_rows` and `dn_rows` must be multiples of 32.
     pub fn nf_expert_layout(&self, bits: usize) -> NfExpertByteLayout {
-        assert!(bits == 3 || bits == 4);
+        assert!((2..=5).contains(&bits));
         assert!(self.d_model.is_multiple_of(64) && self.d_ff_expert.is_multiple_of(64));
         let gu_rows = 2 * self.d_ff_expert;
         let dn_rows = self.d_model;

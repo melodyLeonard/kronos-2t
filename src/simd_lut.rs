@@ -4349,6 +4349,270 @@ pub const NF3_DEFAULT_CODEBOOK_I8: [i8; 16] = [
     -127, -79, -45, -14, 14, 45, 79, 127, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
+/// Even-coset 4D magnitude templates (`16 * 2 D_8`) for 2-bit Gosset `E8Q2` lattice quantization:
+/// `0..12` have `(sum / 32)` even, `12..16` and `16..28` have `(sum / 32)` odd.
+pub const E8Q2_EVEN_TEMPLATES_I8: [[i8; 4]; 28] = [
+    [0, 0, 0, 0],
+    [32, 32, 0, 0],
+    [32, 0, 32, 0],
+    [32, 0, 0, 32],
+    [0, 32, 32, 0],
+    [0, 32, 0, 32],
+    [0, 0, 32, 32],
+    [64, 0, 0, 0],
+    [0, 64, 0, 0],
+    [0, 0, 64, 0],
+    [0, 0, 0, 64],
+    [32, 32, 32, 32],
+    [32, 0, 0, 0],
+    [0, 32, 0, 0],
+    [0, 0, 32, 0],
+    [0, 0, 0, 32],
+    [32, 32, 32, 0],
+    [32, 32, 0, 32],
+    [32, 0, 32, 32],
+    [0, 32, 32, 32],
+    [96, 0, 0, 0],
+    [0, 96, 0, 0],
+    [0, 0, 96, 0],
+    [0, 0, 0, 96],
+    [64, 32, 32, 32],
+    [32, 64, 32, 32],
+    [32, 32, 64, 32],
+    [32, 32, 32, 64],
+];
+
+/// Squared Euclidean norms of [`E8Q2_EVEN_TEMPLATES_I8`].
+pub const E8Q2_EVEN_NORM2: [f32; 28] = {
+    let mut out = [0.0f32; 28];
+    let mut i = 0;
+    while i < 28 {
+        let t = E8Q2_EVEN_TEMPLATES_I8[i];
+        let s = (t[0] as i32) * (t[0] as i32)
+            + (t[1] as i32) * (t[1] as i32)
+            + (t[2] as i32) * (t[2] as i32)
+            + (t[3] as i32) * (t[3] as i32);
+        out[i] = s as f32;
+        i += 1;
+    }
+    out
+};
+
+/// Transposed 32-byte `vqtbl2q_s8` lookup tables for coordinates `0..4` of [`E8Q2_EVEN_TEMPLATES_I8`].
+pub const E8Q2_EVEN_COL_TABLES_I8: [[i8; 32]; 4] = {
+    let mut cols = [[0i8; 32]; 4];
+    let mut c = 0;
+    while c < 4 {
+        let mut idx = 0;
+        while idx < 28 {
+            cols[c][idx] = E8Q2_EVEN_TEMPLATES_I8[idx][c];
+            idx += 1;
+        }
+        c += 1;
+    }
+    cols
+};
+
+/// Decodes a 16-bit `(tpl_byte, sgn_byte)` Gosset `E8Q2` codeword into 8 signed `INT8` coordinates
+/// on `16 * 2 E_8` (`[-96, +96]`). `(0, 1)` decodes to `[0; 8]`.
+#[inline]
+pub fn e8q2_decode_8d(tpl_byte: u8, sgn_byte: u8) -> [i8; 8] {
+    let is_even = ((tpl_byte ^ sgn_byte).count_ones() & 1) != 0;
+    let mut out = [0i8; 8];
+    if is_even {
+        let tpl_u = (tpl_byte & 0x0F) as usize;
+        let tpl_v = (tpl_byte >> 4) as usize;
+        let u_idx = if tpl_u < 12 && tpl_v >= 12 { 16 + tpl_u } else { tpl_u };
+        let v_idx = if tpl_v < 12 && tpl_u >= 12 { 16 + tpl_v } else { tpl_v };
+        let u = E8Q2_EVEN_TEMPLATES_I8[u_idx];
+        let v = E8Q2_EVEN_TEMPLATES_I8[v_idx];
+        for i in 0..4 {
+            let mu = u[i];
+            out[i] = if ((sgn_byte >> i) & 1) != 0 { -mu } else { mu };
+            let mv = v[i];
+            out[4 + i] = if ((sgn_byte >> (4 + i)) & 1) != 0 { -mv } else { mv };
+        }
+    } else {
+        for (i, dst) in out.iter_mut().enumerate() {
+            let mag = if ((tpl_byte >> i) & 1) != 0 { 48i8 } else { 16i8 };
+            *dst = if ((sgn_byte >> i) & 1) != 0 { -mag } else { mag };
+        }
+    }
+    out
+}
+
+/// Finds the exact global `L2`-nearest 16-bit Gosset `E8Q2` codeword to pre-scaled `y` (`w / delta`).
+/// Returns `(tpl_byte, sgn_byte, decoded_i8, squared_l2_error)`.
+#[inline]
+pub fn e8q2_quantize_8d(y: &[f32; 8]) -> (u8, u8, [i8; 8], f32) {
+    // 1. Exact Wagner decoder over all 32,768 odd-coset points (`popcount(tpl ^ sgn)` even).
+    let mut tpl_odd = 0u8;
+    let mut sgn_odd = 0u8;
+    let mut alt_b = [0u8; 8];
+    let mut alt_s = [0u8; 8];
+    let mut parity = 0u8;
+    let mut min_pen = f32::INFINITY;
+    let mut flip_i = 0usize;
+    for (i, &yi) in y.iter().enumerate() {
+        let (bp, sp, dp) = if yi >= -16.0 {
+            let d = yi - 16.0;
+            (0u8, 0u8, d * d)
+        } else {
+            let d = yi + 48.0;
+            (1u8, 1u8, d * d)
+        };
+        let (bm, sm, dm) = if yi >= 16.0 {
+            let d = yi - 48.0;
+            (1u8, 0u8, d * d)
+        } else {
+            let d = yi + 16.0;
+            (0u8, 1u8, d * d)
+        };
+        let pen = (dp - dm).abs();
+        if pen < min_pen {
+            min_pen = pen;
+            flip_i = i;
+        }
+        if dp <= dm {
+            tpl_odd |= bp << i;
+            sgn_odd |= sp << i;
+            alt_b[i] = bm;
+            alt_s[i] = sm;
+        } else {
+            tpl_odd |= bm << i;
+            sgn_odd |= sm << i;
+            alt_b[i] = bp;
+            alt_s[i] = sp;
+            parity ^= 1;
+        }
+    }
+    if parity != 0 {
+        tpl_odd = (tpl_odd & !(1u8 << flip_i)) | (alt_b[flip_i] << flip_i);
+        sgn_odd = (sgn_odd & !(1u8 << flip_i)) | (alt_s[flip_i] << flip_i);
+    }
+    let q_odd = e8q2_decode_8d(tpl_odd, sgn_odd);
+    let mut odd_loss = 0.0f32;
+    for i in 0..8 {
+        let d = y[i] - (q_odd[i] as f32);
+        odd_loss += d * d;
+    }
+
+    // 2. Factored exact search over all 32,768 even-coset points (`popcount(tpl ^ sgn)` odd).
+    let mut ay = [0.0f32; 8];
+    let mut sgn_nat = 0u8;
+    let mut min_ay = f32::INFINITY;
+    let mut min_ay_i = 0usize;
+    for i in 0..8 {
+        let a = y[i].abs();
+        ay[i] = a;
+        if y[i] < 0.0 {
+            sgn_nat |= 1u8 << i;
+        }
+        if a < min_ay {
+            min_ay = a;
+            min_ay_i = i;
+        }
+    }
+
+    let mut eu = [0.0f32; 28];
+    let mut ev = [0.0f32; 28];
+    for t in 0..28 {
+        let tp = E8Q2_EVEN_TEMPLATES_I8[t];
+        let n2 = E8Q2_EVEN_NORM2[t];
+        let du = ay[0] * (tp[0] as f32)
+            + ay[1] * (tp[1] as f32)
+            + ay[2] * (tp[2] as f32)
+            + ay[3] * (tp[3] as f32);
+        let dv = ay[4] * (tp[0] as f32)
+            + ay[5] * (tp[1] as f32)
+            + ay[6] * (tp[2] as f32)
+            + ay[7] * (tp[3] as f32);
+        eu[t] = n2 - 2.0 * du;
+        ev[t] = n2 - 2.0 * dv;
+    }
+
+    let argmin_range = |arr: &[f32; 28], start: usize, end: usize| -> usize {
+        let mut best_i = start;
+        let mut best_v = arr[start];
+        for (i, &val) in arr.iter().enumerate().take(end).skip(start + 1) {
+            if val < best_v {
+                best_v = val;
+                best_i = i;
+            }
+        }
+        best_i
+    };
+
+    let u0 = argmin_range(&eu, 0, 11);
+    let v0 = argmin_range(&ev, 0, 11);
+    let u_p2 = argmin_range(&eu, 12, 16);
+    let v_p2 = argmin_range(&ev, 12, 16);
+    let u_alt = argmin_range(&eu, 16, 28) - 16;
+    let v_alt = argmin_range(&ev, 16, 28) - 16;
+
+    let pen_11 = if (sgn_nat.count_ones() & 1) == 0 {
+        128.0 * min_ay
+    } else {
+        0.0
+    };
+    let cands: [(usize, usize, f32); 7] = [
+        (u0, v0, eu[u0] + ev[v0]),
+        (11, v0, eu[11] + ev[v0]),
+        (u0, 11, eu[u0] + ev[11]),
+        (11, 11, eu[11] + ev[11] + pen_11),
+        (u_p2, v_p2, eu[u_p2] + ev[v_p2]),
+        (u_alt, v_p2, eu[16 + u_alt] + ev[v_p2]),
+        (u_p2, v_alt, eu[u_p2] + ev[16 + v_alt]),
+    ];
+    let mut best_tu = cands[0].0;
+    let mut best_tv = cands[0].1;
+    let mut best_e = cands[0].2;
+    for &(tu, tv, cost) in &cands[1..] {
+        if cost < best_e {
+            best_e = cost;
+            best_tu = tu;
+            best_tv = tv;
+        }
+    }
+
+    let tpl_even = (best_tu as u8) | ((best_tv as u8) << 4);
+    let mut sgn_even = sgn_nat;
+    if ((tpl_even ^ sgn_even).count_ones() & 1) == 0 {
+        if tpl_even == 0xBB {
+            sgn_even ^= 1u8 << min_ay_i;
+        } else {
+            let u_idx = if best_tu < 12 && best_tv >= 12 { 16 + best_tu } else { best_tu };
+            let v_idx = if best_tv < 12 && best_tu >= 12 { 16 + best_tv } else { best_tv };
+            let tu_arr = E8Q2_EVEN_TEMPLATES_I8[u_idx];
+            let tv_arr = E8Q2_EVEN_TEMPLATES_I8[v_idx];
+            let mut zero_i = 0usize;
+            for i in 0..4 {
+                if tu_arr[i] == 0 {
+                    zero_i = i;
+                    break;
+                }
+                if tv_arr[i] == 0 {
+                    zero_i = 4 + i;
+                    break;
+                }
+            }
+            sgn_even ^= 1u8 << zero_i;
+        }
+    }
+    let q_even = e8q2_decode_8d(tpl_even, sgn_even);
+    let mut even_loss = 0.0f32;
+    for i in 0..8 {
+        let d = y[i] - (q_even[i] as f32);
+        even_loss += d * d;
+    }
+
+    if even_loss < odd_loss {
+        (tpl_even, sgn_even, q_even, even_loss)
+    } else {
+        (tpl_odd, sgn_odd, q_odd, odd_loss)
+    }
+}
+
 /// Expands the 16-byte serialized codebook into up to 32 signed INT8 centroids (`NF5` stores the 16
 /// positive centroids `q_0..q_15` in `codebook[0..16]`, mirrored to `[-q_15..-q_0, q_0..q_15]`).
 #[inline]
@@ -4501,13 +4765,15 @@ pub struct NfSdotMatrix {
 }
 
 impl NfSdotMatrix {
-    /// Weight bytes per stripe and chunk: 640 for NF5, 512 for NF4, 384 for NF3.
+    /// Weight bytes per stripe and chunk: 640 for NF5, 512 for NF4, 384 for NF3, 256 for E8Q2.
     #[inline]
     pub const fn stripe_chunk_bytes(bits: usize) -> usize {
         match bits {
             5 => 640,
             4 => 512,
-            _ => 384,
+            3 => 384,
+            2 => 256,
+            _ => panic!("unsupported NfSdotMatrix bits"),
         }
     }
 
@@ -4703,6 +4969,118 @@ impl NfSdotMatrix {
             num_chunks,
             num_scale_groups,
             codebook,
+            pair_stream,
+            tail_stream,
+        }
+    }
+
+    /// Packs row-major 8D Gosset `E8Q2` `(tpl_codes, sgn_codes)` (`[rows, cols / 8]` each) and
+    /// stripe-major `bf16_scales` (`[num_stripes, num_scale_groups, SIMD_ROW_STRIPE]`) into `bits = 2`.
+    pub fn from_e8q2_codes(
+        tpl_codes: &[u8],
+        sgn_codes: &[u8],
+        bf16_scales: &[u16],
+        rows: usize,
+        cols: usize,
+        scale_group_chunks: usize,
+    ) -> Self {
+        assert!(rows > 0 && cols > 0 && cols.is_multiple_of(64));
+        assert!(scale_group_chunks >= 1);
+        let blocks_per_row = cols / 8;
+        assert_eq!(tpl_codes.len(), rows * blocks_per_row);
+        assert_eq!(sgn_codes.len(), rows * blocks_per_row);
+        let num_stripes = rows.div_ceil(SIMD_ROW_STRIPE);
+        let num_pairs = num_stripes / 2;
+        let has_tail = (num_stripes & 1) != 0;
+        let num_chunks = cols / 64;
+        let num_scale_groups = num_chunks.div_ceil(scale_group_chunks);
+        assert_eq!(bf16_scales.len(), num_stripes * num_scale_groups * SIMD_ROW_STRIPE);
+
+        let chunk_b = Self::stripe_chunk_bytes(2);
+        let pair_tot = num_scale_groups * 64 + num_chunks * 2 * chunk_b;
+        let tail_tot = num_scale_groups * 32 + num_chunks * chunk_b;
+        let mut pair_stream = PageAlignedBytes::zeroed(num_pairs * pair_tot);
+        let mut tail_stream = PageAlignedBytes::zeroed(usize::from(has_tail) * tail_tot);
+
+        let pack_one_chunk = |stripe: usize, c: usize, dst: &mut [u8]| {
+            debug_assert_eq!(dst.len(), chunk_b);
+            let r_base = stripe * SIMD_ROW_STRIPE;
+            let eb_base = c * 8;
+            for kp in 0..2 {
+                for g in 0..4 {
+                    let blk = &mut dst[kp * 128 + g * 32..kp * 128 + (g + 1) * 32];
+                    for eb in 0..4 {
+                        let eb_col = eb_base + kp * 4 + eb;
+                        for j in 0..4 {
+                            let lane = g * 4 + j;
+                            let r = r_base + lane;
+                            let (tpl, sgn) = if r < rows {
+                                let idx = r * blocks_per_row + eb_col;
+                                (tpl_codes[idx], sgn_codes[idx])
+                            } else {
+                                (0u8, 1u8)
+                            };
+                            blk[eb * 4 + j] = tpl;
+                            blk[16 + eb * 4 + j] = sgn;
+                        }
+                    }
+                }
+            }
+        };
+
+        for p in 0..num_pairs {
+            let sa = 2 * p;
+            let sb = sa + 1;
+            let mut cursor = p * pair_tot;
+            for sg in 0..num_scale_groups {
+                let sca = &bf16_scales[(sa * num_scale_groups + sg) * SIMD_ROW_STRIPE..][..SIMD_ROW_STRIPE];
+                let scb = &bf16_scales[(sb * num_scale_groups + sg) * SIMD_ROW_STRIPE..][..SIMD_ROW_STRIPE];
+                for (lane, (&ua, &ub)) in sca.iter().zip(scb.iter()).enumerate() {
+                    pair_stream[cursor + lane * 2..cursor + lane * 2 + 2].copy_from_slice(&ua.to_le_bytes());
+                    pair_stream[cursor + 32 + lane * 2..cursor + 32 + lane * 2 + 2]
+                        .copy_from_slice(&ub.to_le_bytes());
+                }
+                cursor += 64;
+                let c_start = sg * scale_group_chunks;
+                let c_end = (c_start + scale_group_chunks).min(num_chunks);
+                for c in c_start..c_end {
+                    pack_one_chunk(sa, c, &mut pair_stream[cursor..cursor + chunk_b]);
+                    pack_one_chunk(sb, c, &mut pair_stream[cursor + chunk_b..cursor + 2 * chunk_b]);
+                    cursor += 2 * chunk_b;
+                }
+            }
+            debug_assert_eq!(cursor, (p + 1) * pair_tot);
+        }
+
+        if has_tail {
+            let st = num_pairs * 2;
+            let mut cursor = 0usize;
+            for sg in 0..num_scale_groups {
+                let sct = &bf16_scales[(st * num_scale_groups + sg) * SIMD_ROW_STRIPE..][..SIMD_ROW_STRIPE];
+                for (lane, &ut) in sct.iter().enumerate() {
+                    tail_stream[cursor + lane * 2..cursor + lane * 2 + 2].copy_from_slice(&ut.to_le_bytes());
+                }
+                cursor += 32;
+                let c_start = sg * scale_group_chunks;
+                let c_end = (c_start + scale_group_chunks).min(num_chunks);
+                for c in c_start..c_end {
+                    pack_one_chunk(st, c, &mut tail_stream[cursor..cursor + chunk_b]);
+                    cursor += chunk_b;
+                }
+            }
+            debug_assert_eq!(cursor, tail_tot);
+        }
+
+        Self {
+            rows,
+            cols,
+            bits: 2,
+            scale_group_chunks,
+            num_stripes,
+            num_pairs,
+            num_chunks,
+            num_scale_groups,
+            codebook: [0i8; 16],
             pair_stream,
             tail_stream,
         }
@@ -5070,7 +5448,7 @@ impl NfSdotMatrix {
                     };
                     *dst = (cb32[idx] as f32) * delta;
                 }
-            } else {
+            } else if self.bits == 3 {
                 for kp in 0..2 {
                     let k0 = kp * 2;
                     let k1 = k0 + 1;
@@ -5098,6 +5476,18 @@ impl NfSdotMatrix {
                         dst_c[k1 * 16 + 4 + t] = (cb32[idxs[5]] as f32) * delta;
                         dst_c[k1 * 16 + 8 + t] = (cb32[idxs[6]] as f32) * delta;
                         dst_c[k1 * 16 + 12 + t] = (cb32[idxs[7]] as f32) * delta;
+                    }
+                }
+            } else {
+                for kp in 0..2 {
+                    for eb in 0..4 {
+                        let off = kp * 128 + g * 32 + eb * 4 + j;
+                        let (tpl, sgn) = unsafe { (*d_ptr.add(off), *d_ptr.add(off + 16)) };
+                        let q8 = e8q2_decode_8d(tpl, sgn);
+                        let col0 = kp * 32 + eb * 8;
+                        for (sub, &qv) in q8.iter().enumerate() {
+                            dst_c[col0 + sub] = (qv as f32) * delta;
+                        }
                     }
                 }
             }
@@ -5171,7 +5561,8 @@ pub unsafe fn nf_sdot_stripe_range_raw(
             match matrix.bits {
                 5 => nf_sdot_decode_neon::<5>(matrix, xq, xscales, stripe_start, stripe_end, out_base),
                 4 => nf_sdot_decode_neon::<4>(matrix, xq, xscales, stripe_start, stripe_end, out_base),
-                _ => nf_sdot_decode_neon::<3>(matrix, xq, xscales, stripe_start, stripe_end, out_base),
+                3 => nf_sdot_decode_neon::<3>(matrix, xq, xscales, stripe_start, stripe_end, out_base),
+                _ => nf_sdot_decode_neon::<2>(matrix, xq, xscales, stripe_start, stripe_end, out_base),
             }
         }
     }
@@ -5392,6 +5783,105 @@ unsafe fn nf3_accum_32cols(
 }
 
 #[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn e8q2_load_tables() -> [std::arch::aarch64::int8x16x2_t; 4] {
+    use std::arch::aarch64::*;
+    // SAFETY: `E8Q2_EVEN_COL_TABLES_I8` holds four 32-byte static arrays.
+    unsafe {
+        std::array::from_fn(|c| {
+            let p = E8Q2_EVEN_COL_TABLES_I8[c].as_ptr();
+            int8x16x2_t(vld1q_s8(p), vld1q_s8(p.add(16)))
+        })
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn e8q2_unpack_quad_transpose<const IS_V: bool>(
+    vtpl: std::arch::aarch64::uint8x16_t,
+    vsgn: std::arch::aarch64::uint8x16_t,
+    is_even: std::arch::aarch64::uint8x16_t,
+    ev_idx: std::arch::aarch64::uint8x16_t,
+    tbl: &[std::arch::aarch64::int8x16x2_t; 4],
+) -> (
+    std::arch::aarch64::int8x16_t,
+    std::arch::aarch64::int8x16_t,
+    std::arch::aarch64::int8x16_t,
+    std::arch::aarch64::int8x16_t,
+) {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON intrinsics are baseline on `aarch64`.
+    let (v48, v16) = unsafe { (vdupq_n_u8(48), vdupq_n_u8(16)) };
+    let coord = |t: usize| -> int8x16_t {
+        let bit = if IS_V { 1u8 << (4 + t) } else { 1u8 << t };
+        // SAFETY: NEON intrinsics are baseline on `aarch64`.
+        unsafe {
+            let bmask = vdupq_n_u8(bit);
+            let even_mag = vqtbl2q_s8(tbl[t], ev_idx);
+            let odd_mag = vreinterpretq_s8_u8(vbslq_u8(vtstq_u8(vtpl, bmask), v48, v16));
+            let mag = vbslq_s8(is_even, even_mag, odd_mag);
+            vbslq_s8(vtstq_u8(vsgn, bmask), vnegq_s8(mag), mag)
+        }
+    };
+    let c0 = coord(0);
+    let c1 = coord(1);
+    let c2 = coord(2);
+    let c3 = coord(3);
+    // SAFETY: NEON zip intrinsics transpose `[eb * 4 + j, t]` into `[eb, j * 4 + t]`.
+    unsafe {
+        let z01_lo = vreinterpretq_s16_s8(vzip1q_s8(c0, c1));
+        let z23_lo = vreinterpretq_s16_s8(vzip1q_s8(c2, c3));
+        let z01_hi = vreinterpretq_s16_s8(vzip2q_s8(c0, c1));
+        let z23_hi = vreinterpretq_s16_s8(vzip2q_s8(c2, c3));
+        (
+            vreinterpretq_s8_s16(vzip1q_s16(z01_lo, z23_lo)),
+            vreinterpretq_s8_s16(vzip2q_s16(z01_lo, z23_lo)),
+            vreinterpretq_s8_s16(vzip1q_s16(z01_hi, z23_hi)),
+            vreinterpretq_s8_s16(vzip2q_s16(z01_hi, z23_hi)),
+        )
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn e8q2_accum_32cols(
+    mut acc: std::arch::aarch64::int32x4_t,
+    blk: *const u8,
+    x0: std::arch::aarch64::int8x16_t,
+    x1: std::arch::aarch64::int8x16_t,
+    tbl: &[std::arch::aarch64::int8x16x2_t; 4],
+) -> std::arch::aarch64::int32x4_t {
+    use std::arch::aarch64::*;
+    // SAFETY: `blk` holds 32 B (`16` tpl + `16` sgn); NEON + `sdot` are available on Apple Silicon.
+    unsafe {
+        let vtpl = vld1q_u8(blk);
+        let vsgn = vld1q_u8(blk.add(16));
+        let is_even = vtstq_u8(vcntq_u8(veorq_u8(vtpl, vsgn)), vdupq_n_u8(1));
+        let tpl_u = vandq_u8(vtpl, vdupq_n_u8(0x0F));
+        let tpl_v = vshrq_n_u8::<4>(vtpl);
+        let v12 = vdupq_n_u8(12);
+        let m16 = vdupq_n_u8(16);
+        let u_lt12 = vcltq_u8(tpl_u, v12);
+        let v_lt12 = vcltq_u8(tpl_v, v12);
+        let u_idx = vorrq_u8(tpl_u, vandq_u8(vbicq_u8(u_lt12, v_lt12), m16));
+        let v_idx = vorrq_u8(tpl_v, vandq_u8(vbicq_u8(v_lt12, u_lt12), m16));
+
+        let (u0, u1, u2, u3) = e8q2_unpack_quad_transpose::<false>(vtpl, vsgn, is_even, u_idx, tbl);
+        acc = sdot_s8_lane::<0>(acc, u0, x0);
+        acc = sdot_s8_lane::<2>(acc, u1, x0);
+        acc = sdot_s8_lane::<0>(acc, u2, x1);
+        acc = sdot_s8_lane::<2>(acc, u3, x1);
+
+        let (v0, v1, v2, v3) = e8q2_unpack_quad_transpose::<true>(vtpl, vsgn, is_even, v_idx, tbl);
+        acc = sdot_s8_lane::<1>(acc, v0, x0);
+        acc = sdot_s8_lane::<3>(acc, v1, x0);
+        acc = sdot_s8_lane::<1>(acc, v2, x1);
+        acc = sdot_s8_lane::<3>(acc, v3, x1);
+    }
+    acc
+}
+
+#[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
 unsafe fn nf_sdot_one_stripe_neon<const BITS: usize>(
@@ -5406,6 +5896,7 @@ unsafe fn nf_sdot_one_stripe_neon<const BITS: usize>(
     let cb32 = matrix.codebook32();
     let cb = unsafe { vld1q_s8(cb32.as_ptr()) };
     let cb2 = unsafe { int8x16x2_t(cb, vld1q_s8(cb32.as_ptr().add(16))) };
+    let e8_tbl = unsafe { e8q2_load_tables() };
     let mask_0f = vdupq_n_u8(0x0F);
     let m10 = vdupq_n_u8(0x10);
     let m07 = vdupq_n_u8(0x07);
@@ -5442,12 +5933,17 @@ unsafe fn nf_sdot_one_stripe_neon<const BITS: usize>(
                     *ag = nf4_accum_16cols(*ag, vld1q_u8(d_ptr.add(256 + g * 32)), vld1q_u8(d_ptr.add(256 + g * 32 + 16)), x2, cb, mask_0f);
                     *ag = nf4_accum_16cols(*ag, vld1q_u8(d_ptr.add(384 + g * 32)), vld1q_u8(d_ptr.add(384 + g * 32 + 16)), x3, cb, mask_0f);
                 }
-            } else {
+            } else if BITS == 3 {
                 for (g, ag) in a.iter_mut().enumerate() {
                     let b0 = d_ptr.add(g * 48);
                     *ag = nf3_accum_32cols(*ag, vld1q_u8(b0), vld1q_u8(b0.add(16)), vld1q_u8(b0.add(32)), x0, x1, cb, m07, m04);
                     let b1 = d_ptr.add(192 + g * 48);
                     *ag = nf3_accum_32cols(*ag, vld1q_u8(b1), vld1q_u8(b1.add(16)), vld1q_u8(b1.add(32)), x2, x3, cb, m07, m04);
+                }
+            } else {
+                for (g, ag) in a.iter_mut().enumerate() {
+                    *ag = e8q2_accum_32cols(*ag, d_ptr.add(g * 32), x0, x1, &e8_tbl);
+                    *ag = e8q2_accum_32cols(*ag, d_ptr.add(128 + g * 32), x2, x3, &e8_tbl);
                 }
             }
             let vsx = vdupq_n_f32(sx);
@@ -5516,6 +6012,7 @@ unsafe fn nf_sdot_decode_neon<const BITS: usize>(
     let cb32 = matrix.codebook32();
     let cb = unsafe { vld1q_s8(cb32.as_ptr()) };
     let cb2 = unsafe { int8x16x2_t(cb, vld1q_s8(cb32.as_ptr().add(16))) };
+    let e8_tbl = unsafe { e8q2_load_tables() };
     let mask_0f = vdupq_n_u8(0x0F);
     let m10 = vdupq_n_u8(0x10);
     let m07 = vdupq_n_u8(0x07);
@@ -5594,7 +6091,7 @@ unsafe fn nf_sdot_decode_neon<const BITS: usize>(
                             fa[g] = vfmaq_f32(fa[g], vmulq_f32(vcvtq_f32_s32(aag), vsx), wsa_g);
                             fb[g] = vfmaq_f32(fb[g], vmulq_f32(vcvtq_f32_s32(abg), vsx), wsb_g);
                         }
-                    } else {
+                    } else if BITS == 3 {
                         for g in 0..4 {
                             let a0 = da.add(g * 48);
                             let b0 = db.add(g * 48);
@@ -5604,6 +6101,17 @@ unsafe fn nf_sdot_decode_neon<const BITS: usize>(
                             let b1 = db.add(192 + g * 48);
                             aag = nf3_accum_32cols(aag, vld1q_u8(a1), vld1q_u8(a1.add(16)), vld1q_u8(a1.add(32)), x2, x3, cb, m07, m04);
                             abg = nf3_accum_32cols(abg, vld1q_u8(b1), vld1q_u8(b1.add(16)), vld1q_u8(b1.add(32)), x2, x3, cb, m07, m04);
+                            let wsa_g = load_bf16x4_as_f32(sc_ptr.add(g * 8));
+                            let wsb_g = load_bf16x4_as_f32(sc_ptr.add(32 + g * 8));
+                            fa[g] = vfmaq_f32(fa[g], vmulq_f32(vcvtq_f32_s32(aag), vsx), wsa_g);
+                            fb[g] = vfmaq_f32(fb[g], vmulq_f32(vcvtq_f32_s32(abg), vsx), wsb_g);
+                        }
+                    } else {
+                        for g in 0..4 {
+                            let mut aag = e8q2_accum_32cols(vdupq_n_s32(0), da.add(g * 32), x0, x1, &e8_tbl);
+                            aag = e8q2_accum_32cols(aag, da.add(128 + g * 32), x2, x3, &e8_tbl);
+                            let mut abg = e8q2_accum_32cols(vdupq_n_s32(0), db.add(g * 32), x0, x1, &e8_tbl);
+                            abg = e8q2_accum_32cols(abg, db.add(128 + g * 32), x2, x3, &e8_tbl);
                             let wsa_g = load_bf16x4_as_f32(sc_ptr.add(g * 8));
                             let wsb_g = load_bf16x4_as_f32(sc_ptr.add(32 + g * 8));
                             fa[g] = vfmaq_f32(fa[g], vmulq_f32(vcvtq_f32_s32(aag), vsx), wsa_g);
@@ -5708,7 +6216,20 @@ pub unsafe fn nf_sdot_pair_stream_range_slices(
                     pair_end,
                     out_base,
                 ),
-                _ => nf_sdot_pairs_slice_neon::<3>(
+                3 => nf_sdot_pairs_slice_neon::<3>(
+                    pair_stream.as_ptr(),
+                    codebook,
+                    nc,
+                    nsg,
+                    sgc,
+                    pair_tot,
+                    xq,
+                    xscales,
+                    pair_start,
+                    pair_end,
+                    out_base,
+                ),
+                _ => nf_sdot_pairs_slice_neon::<2>(
                     pair_stream.as_ptr(),
                     codebook,
                     nc,
@@ -5748,41 +6269,54 @@ pub unsafe fn nf_sdot_pair_stream_range_slices(
                             let d_off = sg_off + 64 + (ci * 2 + sub) * chunk_b;
                             let d = &pair_stream[d_off..d_off + chunk_b];
                             let mut dot = 0i32;
-                            for k in 0..64 {
-                                let idx = if bits == 4 || bits == 5 {
-                                    let (kb, w) = (k / 16, k % 16);
-                                    let sub4 = w / 4;
-                                    let t = w % 4;
-                                    let b = r_in_g * 4 + t;
-                                    let byte = d[kb * 128 + g * 32 + (sub4 / 2) * 16 + b];
-                                    let lo4 = if (sub4 & 1) == 0 { byte & 0x0F } else { byte >> 4 };
-                                    if bits == 5 {
-                                        let hi_byte = d[512 + g * 32 + (kb / 2) * 16 + b];
-                                        let shift = if (kb & 1) == 0 { 4 + sub4 } else { sub4 };
-                                        (lo4 | (((hi_byte >> shift) & 1) << 4)) as usize
-                                    } else {
-                                        lo4 as usize
+                            if bits == 2 {
+                                for kp in 0..2 {
+                                    for eb in 0..4 {
+                                        let off = kp * 128 + g * 32 + eb * 4 + r_in_g;
+                                        let q8 = e8q2_decode_8d(d[off], d[off + 16]);
+                                        let col0 = c * 64 + kp * 32 + eb * 8;
+                                        for (sub_k, &qv) in q8.iter().enumerate() {
+                                            dot += (qv as i32) * (q_s[col0 + sub_k] as i32);
+                                        }
                                     }
-                                } else {
-                                    let half = k / 32;
-                                    let k32 = k % 32;
-                                    let sub8 = k32 / 4;
-                                    let k_in_q = k32 % 4;
-                                    let b = half * 192 + g * 48;
-                                    let j = r_in_g * 4 + k_in_q;
-                                    let (v0, v1, v2) = (d[b + j], d[b + 16 + j], d[b + 32 + j]);
-                                    (match sub8 {
-                                        0 => v0 & 0x07,
-                                        1 => (v0 >> 3) & 0x07,
-                                        2 => (v0 >> 6) | ((v2 >> 4) & 0x04),
-                                        3 => v1 & 0x07,
-                                        4 => (v1 >> 3) & 0x07,
-                                        5 => (v1 >> 6) | ((v2 >> 5) & 0x04),
-                                        6 => v2 & 0x07,
-                                        _ => (v2 >> 3) & 0x07,
-                                    }) as usize
-                                };
-                                dot += (cb32[idx] as i32) * (q_s[c * 64 + k] as i32);
+                                }
+                            } else {
+                                for k in 0..64 {
+                                    let idx = if bits == 4 || bits == 5 {
+                                        let (kb, w) = (k / 16, k % 16);
+                                        let sub4 = w / 4;
+                                        let t = w % 4;
+                                        let b = r_in_g * 4 + t;
+                                        let byte = d[kb * 128 + g * 32 + (sub4 / 2) * 16 + b];
+                                        let lo4 = if (sub4 & 1) == 0 { byte & 0x0F } else { byte >> 4 };
+                                        if bits == 5 {
+                                            let hi_byte = d[512 + g * 32 + (kb / 2) * 16 + b];
+                                            let shift = if (kb & 1) == 0 { 4 + sub4 } else { sub4 };
+                                            (lo4 | (((hi_byte >> shift) & 1) << 4)) as usize
+                                        } else {
+                                            lo4 as usize
+                                        }
+                                    } else {
+                                        let half = k / 32;
+                                        let k32 = k % 32;
+                                        let sub8 = k32 / 4;
+                                        let k_in_q = k32 % 4;
+                                        let b = half * 192 + g * 48;
+                                        let j = r_in_g * 4 + k_in_q;
+                                        let (v0, v1, v2) = (d[b + j], d[b + 16 + j], d[b + 32 + j]);
+                                        (match sub8 {
+                                            0 => v0 & 0x07,
+                                            1 => (v0 >> 3) & 0x07,
+                                            2 => (v0 >> 6) | ((v2 >> 4) & 0x04),
+                                            3 => v1 & 0x07,
+                                            4 => (v1 >> 3) & 0x07,
+                                            5 => (v1 >> 6) | ((v2 >> 5) & 0x04),
+                                            6 => v2 & 0x07,
+                                            _ => (v2 >> 3) & 0x07,
+                                        }) as usize
+                                    };
+                                    dot += (cb32[idx] as i32) * (q_s[c * 64 + k] as i32);
+                                }
                             }
                             acc += (dot as f32) * sc_s[c] * w_scale;
                         }
@@ -5815,6 +6349,7 @@ unsafe fn nf_sdot_pairs_slice_neon<const BITS: usize>(
     let cb32 = nf_expand_codebook32(BITS, codebook);
     let cb = unsafe { vld1q_s8(cb32.as_ptr()) };
     let cb2 = unsafe { int8x16x2_t(cb, vld1q_s8(cb32.as_ptr().add(16))) };
+    let e8_tbl = unsafe { e8q2_load_tables() };
     let mask_0f = vdupq_n_u8(0x0F);
     let m10 = vdupq_n_u8(0x10);
     let m07 = vdupq_n_u8(0x07);
@@ -5878,7 +6413,7 @@ unsafe fn nf_sdot_pairs_slice_neon<const BITS: usize>(
                             fa[g] = vfmaq_f32(fa[g], vmulq_f32(vcvtq_f32_s32(aag), vsx), wsa_g);
                             fb[g] = vfmaq_f32(fb[g], vmulq_f32(vcvtq_f32_s32(abg), vsx), wsb_g);
                         }
-                    } else {
+                    } else if BITS == 3 {
                         for g in 0..4 {
                             let ga0 = da.add(g * 48);
                             let gb0 = db.add(g * 48);
@@ -5888,6 +6423,17 @@ unsafe fn nf_sdot_pairs_slice_neon<const BITS: usize>(
                             let gb1 = db.add(192 + g * 48);
                             aag = nf3_accum_32cols(aag, vld1q_u8(ga1), vld1q_u8(ga1.add(16)), vld1q_u8(ga1.add(32)), x2, x3, cb, m07, m04);
                             abg = nf3_accum_32cols(abg, vld1q_u8(gb1), vld1q_u8(gb1.add(16)), vld1q_u8(gb1.add(32)), x2, x3, cb, m07, m04);
+                            let wsa_g = load_bf16x4_as_f32(sc_ptr.add(g * 8));
+                            let wsb_g = load_bf16x4_as_f32(sc_ptr.add(32 + g * 8));
+                            fa[g] = vfmaq_f32(fa[g], vmulq_f32(vcvtq_f32_s32(aag), vsx), wsa_g);
+                            fb[g] = vfmaq_f32(fb[g], vmulq_f32(vcvtq_f32_s32(abg), vsx), wsb_g);
+                        }
+                    } else {
+                        for g in 0..4 {
+                            let mut aag = e8q2_accum_32cols(vdupq_n_s32(0), da.add(g * 32), x0, x1, &e8_tbl);
+                            aag = e8q2_accum_32cols(aag, da.add(128 + g * 32), x2, x3, &e8_tbl);
+                            let mut abg = e8q2_accum_32cols(vdupq_n_s32(0), db.add(g * 32), x0, x1, &e8_tbl);
+                            abg = e8q2_accum_32cols(abg, db.add(128 + g * 32), x2, x3, &e8_tbl);
                             let wsa_g = load_bf16x4_as_f32(sc_ptr.add(g * 8));
                             let wsb_g = load_bf16x4_as_f32(sc_ptr.add(32 + g * 8));
                             fa[g] = vfmaq_f32(fa[g], vmulq_f32(vcvtq_f32_s32(aag), vsx), wsa_g);
@@ -5935,7 +6481,8 @@ pub unsafe fn nf_sdot_batch_stripe_range(
             match matrix.bits {
                 5 => nf_sdot_batch_outer_neon::<5>(matrix, acts, stripe_start, stripe_end, out_base, out_stride),
                 4 => nf_sdot_batch_outer_neon::<4>(matrix, acts, stripe_start, stripe_end, out_base, out_stride),
-                _ => nf_sdot_batch_outer_neon::<3>(matrix, acts, stripe_start, stripe_end, out_base, out_stride),
+                3 => nf_sdot_batch_outer_neon::<3>(matrix, acts, stripe_start, stripe_end, out_base, out_stride),
+                _ => nf_sdot_batch_outer_neon::<2>(matrix, acts, stripe_start, stripe_end, out_base, out_stride),
             }
         }
     }
@@ -6053,6 +6600,7 @@ unsafe fn nf_sdot_batch_tile_neon<const BITS: usize, const NT: usize>(
     let cb32 = matrix.codebook32();
     let cb = unsafe { vld1q_s8(cb32.as_ptr()) };
     let cb2 = unsafe { int8x16x2_t(cb, vld1q_s8(cb32.as_ptr().add(16))) };
+    let e8_tbl = unsafe { e8q2_load_tables() };
     let mask_0f = vdupq_n_u8(0x0F);
     let m10 = vdupq_n_u8(0x10);
     let m07 = vdupq_n_u8(0x07);
@@ -6136,7 +6684,7 @@ unsafe fn nf_sdot_batch_tile_neon<const BITS: usize, const NT: usize>(
                         }
                     }
                 }
-            } else {
+            } else if BITS == 3 {
                 for kp in 0..2 {
                     let k0 = kp * 2;
                     let k1 = k0 + 1;
@@ -6168,6 +6716,45 @@ unsafe fn nf_sdot_batch_tile_neon<const BITS: usize, const NT: usize>(
                             a = sdot_s8_lane::<1>(a, w5, x1);
                             a = sdot_s8_lane::<2>(a, w6, x1);
                             a = sdot_s8_lane::<3>(a, w7, x1);
+                            acc[t] = a;
+                        }
+                    }
+                }
+            } else {
+                for kp in 0..2 {
+                    let k0 = kp * 2;
+                    let k1 = k0 + 1;
+                    // SAFETY: `c * 64 + 64 <= cols`; `d_ptr` holds `256` B.
+                    unsafe {
+                        let blk = d_ptr.add(kp * 128 + g * 32);
+                        let vtpl = vld1q_u8(blk);
+                        let vsgn = vld1q_u8(blk.add(16));
+                        let is_even = vtstq_u8(vcntq_u8(veorq_u8(vtpl, vsgn)), vdupq_n_u8(1));
+                        let tpl_u = vandq_u8(vtpl, mask_0f);
+                        let tpl_v = vshrq_n_u8::<4>(vtpl);
+                        let v12 = vdupq_n_u8(12);
+                        let u_lt12 = vcltq_u8(tpl_u, v12);
+                        let v_lt12 = vcltq_u8(tpl_v, v12);
+                        let u_idx = vorrq_u8(tpl_u, vandq_u8(vbicq_u8(u_lt12, v_lt12), m10));
+                        let v_idx = vorrq_u8(tpl_v, vandq_u8(vbicq_u8(v_lt12, u_lt12), m10));
+                        let (u0, u1, u2, u3) =
+                            e8q2_unpack_quad_transpose::<false>(vtpl, vsgn, is_even, u_idx, &e8_tbl);
+                        let (v0, v1, v2, v3) =
+                            e8q2_unpack_quad_transpose::<true>(vtpl, vsgn, is_even, v_idx, &e8_tbl);
+                        let off0 = c * 64 + k0 * 16;
+                        let off1 = c * 64 + k1 * 16;
+                        for t in 0..NT {
+                            let x0 = vld1q_s8(i8a[t].q.as_ptr().add(off0));
+                            let x1 = vld1q_s8(i8a[t].q.as_ptr().add(off1));
+                            let mut a = acc[t];
+                            a = sdot_s8_lane::<0>(a, u0, x0);
+                            a = sdot_s8_lane::<1>(a, v0, x0);
+                            a = sdot_s8_lane::<2>(a, u1, x0);
+                            a = sdot_s8_lane::<3>(a, v1, x0);
+                            a = sdot_s8_lane::<0>(a, u2, x1);
+                            a = sdot_s8_lane::<1>(a, v2, x1);
+                            a = sdot_s8_lane::<2>(a, u3, x1);
+                            a = sdot_s8_lane::<3>(a, v3, x1);
                             acc[t] = a;
                         }
                     }
@@ -8347,7 +8934,7 @@ mod tests {
                 })
                 .collect();
 
-            for bits in [3usize, 4usize, 5usize] {
+            for bits in [2usize, 3usize, 4usize, 5usize] {
                 for sgc in [1usize, 2usize] {
                     let nf = compile_hadamard_gptq_nf(&weights, rows, cols, bits, sgc, Some(&hess), 4);
                     let mut x = sample_x(4242 + (bits * 10 + sgc) as u64);
@@ -8488,5 +9075,188 @@ mod tests {
             assert_eq!(&yi_f[ic * 128..ic * 128 + 64], &yp_f[ic * 64..(ic + 1) * 64]);
             assert_eq!(&yi_f[ic * 128 + 64..ic * 128 + 128], &yp_f[128 + ic * 64..128 + (ic + 1) * 64]);
         }
+    }
+
+    #[test]
+    fn test_e8q2_gosset_lattice_optimality_and_vq2_comparison() {
+        use crate::compiler::{
+            compile_hadamard_gptq_e8q2, compile_hadamard_gptq_vq2, FullRowGptqHessian,
+        };
+        use crate::hadamard::fwht64_signed_inplace;
+        use std::collections::HashSet;
+
+        // 1. Exhaustive check over all 65,536 16-bit `(tpl, sgn)` Gosset `E8Q2` codewords.
+        assert_eq!(e8q2_decode_8d(0, 1), [0i8; 8]);
+        let mut all_codewords = Vec::with_capacity(65_536);
+        let mut distinct = HashSet::with_capacity(40_000);
+        let mut shell1 = HashSet::new();
+        let mut shell2 = HashSet::new();
+        for code in 0..65_536u32 {
+            let tpl = (code & 0xFF) as u8;
+            let sgn = (code >> 8) as u8;
+            let q = e8q2_decode_8d(tpl, sgn);
+            all_codewords.push(q);
+
+            let mut sum16 = 0i32;
+            let mut norm2 = 0i32;
+            let mut all_even32 = true;
+            let mut all_odd16 = true;
+            for &c in &q {
+                let ci = c as i32;
+                assert!((-96..=96).contains(&ci) && ci % 16 == 0);
+                let u = ci / 16;
+                if u.rem_euclid(2) != 0 {
+                    all_even32 = false;
+                } else {
+                    all_odd16 = false;
+                }
+                sum16 += u;
+                norm2 += ci * ci;
+            }
+            assert!(
+                all_even32 || all_odd16,
+                "code=({tpl},{sgn}) mixed coset parity: {q:?}"
+            );
+            assert_eq!(
+                sum16.rem_euclid(4),
+                0,
+                "code=({tpl},{sgn}) violates Gosset 2*E_8 sum congruence: {q:?}"
+            );
+            distinct.insert(q);
+            if norm2 == 2048 {
+                shell1.insert(q);
+            } else if norm2 == 4096 {
+                shell2.insert(q);
+            }
+        }
+        assert_eq!(distinct.len(), 36_769);
+        assert_eq!(shell1.len(), 240, "must cover all 240 Gosset E_8 kissing roots");
+        assert_eq!(shell2.len(), 2160, "must cover all 2,160 Gosset E_8 shell-2 vectors");
+
+        // 2. `e8q2_quantize_8d` must match 65,536-point brute-force minimum L2 error.
+        let mut rng = 0xD1B5_4A32_D192_ED03u64;
+        for case_idx in 0..320usize {
+            let mut y = [0.0f32; 8];
+            let scale = match case_idx % 4 {
+                0 => 14.0,
+                1 => 28.0,
+                2 => 52.0,
+                _ => 88.0,
+            };
+            for slot in &mut y {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let u = ((rng >> 40) as f32) / ((1u32 << 24) as f32) - 0.5;
+                *slot = u * 2.0 * scale;
+            }
+            if case_idx == 0 {
+                y = [0.0; 8];
+            }
+            let (tpl, sgn, q, sq_err) = e8q2_quantize_8d(&y);
+            assert_eq!(e8q2_decode_8d(tpl, sgn), q);
+            let mut brute_best = f32::INFINITY;
+            for cand in &all_codewords {
+                let mut d2 = 0.0f32;
+                for i in 0..8 {
+                    let d = y[i] - (cand[i] as f32);
+                    d2 += d * d;
+                }
+                if d2 < brute_best {
+                    brute_best = d2;
+                }
+            }
+            assert!(
+                (sq_err - brute_best).abs() <= 1e-3 * brute_best.max(1.0),
+                "case {case_idx}: e8q2_quantize_8d sq_err={sq_err} > brute_best={brute_best} for y={y:?}"
+            );
+        }
+
+        // 3. `E8Q2` (`2.125 bpw` @ G=128) must strictly outperform `VQ2` (`2.125 bpw` @ G=128).
+        let rows = 96usize;
+        let cols = 256usize;
+        let weights: Vec<f32> = (0..rows * cols)
+            .map(|idx| {
+                let z = (idx as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let h = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                let base = (((h >> 40) as f32) / ((1u32 << 24) as f32)) - 0.5;
+                if idx % 256 == 23 || idx % 256 == 141 {
+                    base * 12.0
+                } else {
+                    base * 0.35
+                }
+            })
+            .collect();
+        let sample_x = |s: u64| -> Vec<f32> {
+            (0..cols)
+                .map(|c| {
+                    let z = (s + 1)
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add((c as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+                    let h = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    let v = (((h >> 40) as f32) / ((1u32 << 24) as f32)) - 0.5;
+                    if c == 23 { v * 8.0 } else { v }
+                })
+                .collect()
+        };
+        let mut hess = FullRowGptqHessian::new(cols);
+        for s in 0..256u64 {
+            hess.observe_activation(&sample_x(s));
+        }
+        hess.finalize(0.015);
+
+        let e8 = compile_hadamard_gptq_e8q2(&weights, rows, cols, 2, Some(&hess), 4);
+        let vq = compile_hadamard_gptq_vq2(&weights, rows, cols, 2, Some(&hess), 4);
+        assert_eq!(e8.bits, 2);
+
+        let mut mse_e8 = 0.0f64;
+        let mut mse_vq = 0.0f64;
+        let mut row_e8 = vec![0.0f32; cols];
+        let mut row_vq = vec![0.0f32; cols];
+        let mut row_ref = vec![0.0f32; cols];
+        for r in 0..rows {
+            row_ref.copy_from_slice(&weights[r * cols..(r + 1) * cols]);
+            fwht64_signed_inplace(&mut row_ref);
+            e8.dequantize_row_rotated(r, &mut row_e8);
+            vq.dequantize_row_rotated(r, &mut row_vq);
+            for c in 0..cols {
+                let de = (row_ref[c] - row_e8[c]) as f64;
+                let dv = (row_ref[c] - row_vq[c]) as f64;
+                mse_e8 += de * de;
+                mse_vq += dv * dv;
+            }
+        }
+
+        let mut cos_e8 = 0.0f32;
+        let mut cos_vq = 0.0f32;
+        for seed in 3000..3032u64 {
+            let xt = sample_x(seed);
+            let y_fp: Vec<f32> = (0..rows)
+                .map(|r| {
+                    weights[r * cols..(r + 1) * cols]
+                        .iter()
+                        .zip(xt.iter())
+                        .map(|(w, x)| w * x)
+                        .sum()
+                })
+                .collect();
+            let mut xr = xt;
+            fwht64_signed_inplace(&mut xr);
+            let mut act = Int8ChunkActivation::new_zeroed(cols);
+            act.populate(&xr);
+            let vl = Vq2ActivationLut::build(&xr);
+            let mut ye = vec![0.0f32; rows];
+            let mut yv = vec![0.0f32; rows];
+            unsafe {
+                nf_sdot_stripe_range_int8(&e8, &act, 0, e8.num_stripes, ye.as_mut_ptr());
+            }
+            vq2_lut_gemv(&vq, &vl, &mut yv);
+            cos_e8 += cosine_similarity(&ye, &y_fp);
+            cos_vq += cosine_similarity(&yv, &y_fp);
+        }
+        cos_e8 /= 32.0;
+        cos_vq /= 32.0;
+        assert!(
+            mse_e8 < mse_vq && cos_e8 > cos_vq && cos_e8 > 0.975,
+            "Gosset E8Q2 (mse={mse_e8:.5}, cos={cos_e8:.5}) must beat VQ2 (mse={mse_vq:.5}, cos={cos_vq:.5}) at 2.125 bpw"
+        );
     }
 }

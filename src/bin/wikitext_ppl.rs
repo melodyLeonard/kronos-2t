@@ -202,6 +202,7 @@ fn main() {
                 fp32.compile_from_reference(RealWeightMode::GgufQ4_0, None),
             ),
             "nf5" | "nf5g128" | "nf4" | "nf4g128" | "nf3nf4" | "nf3nf4g128" | "nf3" | "nf3g128"
+            | "e8q2" | "e8q2g128" | "e8q2nf4" | "e8q2nf4g128"
             | "vq2" | "vq2g128" | "v2b4" | "v2b5" | "b4" | "mk" | "b5" => {
                 let (label, mode) = match m {
                     "nf5" => (
@@ -259,6 +260,36 @@ fn main() {
                         "Kronos NF3-3.125b + GPTQ",
                         RealWeightMode::KronosNfGptq {
                             bits: 3,
+                            scale_group_chunks: 2,
+                        },
+                    ),
+                    "e8q2" => (
+                        "Kronos E8Q2-2.25b + GPTQ",
+                        RealWeightMode::KronosNfGptq {
+                            bits: 2,
+                            scale_group_chunks: 1,
+                        },
+                    ),
+                    "e8q2g128" => (
+                        "Kronos E8Q2-2.125b + GPTQ",
+                        RealWeightMode::KronosNfGptq {
+                            bits: 2,
+                            scale_group_chunks: 2,
+                        },
+                    ),
+                    "e8q2nf4" => (
+                        "Kronos Mixed E8Q2/NF4 + GPTQ",
+                        RealWeightMode::KronosNfMixedGptq {
+                            attn_head_bits: 4,
+                            ffn_bits: 2,
+                            scale_group_chunks: 1,
+                        },
+                    ),
+                    "e8q2nf4g128" => (
+                        "Kronos Mixed E8Q2/NF4 G128",
+                        RealWeightMode::KronosNfMixedGptq {
+                            attn_head_bits: 4,
+                            ffn_bits: 2,
                             scale_group_chunks: 2,
                         },
                     ),

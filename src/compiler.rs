@@ -11,11 +11,11 @@ use crate::hadamard::{fwht64_signed_inplace, HADAMARD_BLOCK};
 use crate::k2t_format::CompiledSwiGluExpert;
 use crate::lut_gemv::GROUP_SIZE;
 use crate::simd_lut::{
-    bf16_to_f32, decode_nibble_code, default_register_codebook_64, f32_to_bf16,
-    nf_expand_codebook32, FusedBase3LutMatrix, FusedBipolarLutMatrix, MultiPlaneTernaryMatrix,
-    NfSdotMatrix, SimdPackedMatrix, Vq2LutMatrix, NF3_DEFAULT_CODEBOOK_I8,
-    NF4_DEFAULT_CODEBOOK_I8, NF5_DEFAULT_POS_CODEBOOK_I8, QUANT_CHUNK_BLOCKS, SIMD_ROW_STRIPE,
-    VQ2_GAUSSIAN_RING_16,
+    bf16_to_f32, decode_nibble_code, default_register_codebook_64, e8q2_decode_8d,
+    e8q2_quantize_8d, f32_to_bf16, nf_expand_codebook32, FusedBase3LutMatrix,
+    FusedBipolarLutMatrix, MultiPlaneTernaryMatrix, NfSdotMatrix, SimdPackedMatrix, Vq2LutMatrix,
+    NF3_DEFAULT_CODEBOOK_I8, NF4_DEFAULT_CODEBOOK_I8, NF5_DEFAULT_POS_CODEBOOK_I8,
+    QUANT_CHUNK_BLOCKS, SIMD_ROW_STRIPE, VQ2_GAUSSIAN_RING_16,
 };
 
 /// Output of multi-rank Kronecker compilation for a single `[rows, cols]` matrix.
@@ -1525,8 +1525,8 @@ pub fn fit_empirical_nf_codebook(
     (cb, mu_top as f32)
 }
 
-/// Compiles `[rows, cols]` weights into an [`NfSdotMatrix`] (`bits` 5, 4, or 3) with Hadamard GPTQ
-/// and least-squares BF16 scale refit.
+/// Compiles `[rows, cols]` weights into an [`NfSdotMatrix`] (`bits` 5, 4, 3, or 2-bit Gosset `E8Q2`)
+/// with Hadamard GPTQ and least-squares BF16 scale refit.
 pub fn compile_hadamard_gptq_nf(
     weights: &[f32],
     rows: usize,
@@ -1539,10 +1539,20 @@ pub fn compile_hadamard_gptq_nf(
     assert_eq!(weights.len(), rows * cols);
     assert!(rows > 0 && cols > 0 && cols.is_multiple_of(HADAMARD_BLOCK));
     assert!(
-        bits == 3 || bits == 4 || bits == 5,
-        "NF-SDOT bits must be 3, 4, or 5"
+        (2..=5).contains(&bits),
+        "NF-SDOT bits must be 2, 3, 4, or 5"
     );
     assert!((1..=8).contains(&scale_group_chunks));
+    if bits == 2 {
+        return compile_hadamard_gptq_e8q2(
+            weights,
+            rows,
+            cols,
+            scale_group_chunks,
+            hessian,
+            num_threads,
+        );
+    }
     if let Some(h) = hessian {
         assert_eq!(h.cols, cols);
         assert_eq!(h.h_inv_chol_upper.len(), cols * cols);
@@ -1825,6 +1835,427 @@ fn quantize_stripe_batch_nf(
             }
 
             // Propagate this group's error to the remaining columns.
+            if let (true, Some(u_mat)) = (col_e < cols, u_slice) {
+                for t0 in (col_e..cols).step_by(TAIL_TILE) {
+                    let t1 = (t0 + TAIL_TILE).min(cols);
+                    for j in 0..group_len {
+                        let g_col = col_s + j;
+                        let u_tail = &u_mat[g_col * cols + t0..g_col * cols + t1];
+                        for (r, err) in errs.iter().enumerate().take(g_rows) {
+                            let e = err[j];
+                            if e != 0.0 {
+                                for (dst, &u_val) in work[r * cols + t0..r * cols + t1]
+                                    .iter_mut()
+                                    .zip(u_tail)
+                                {
+                                    *dst -= e * u_val;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct E8BlockChol {
+    u: [[f32; 8]; 8],
+    inv_diag: [f32; 8],
+    m_scaled: [[f32; 8]; 8],
+    anisotropic: bool,
+}
+
+impl E8BlockChol {
+    fn from_upper(u_mat: &[f32], cols: usize, col0: usize) -> Self {
+        let mut u = [[0.0f32; 8]; 8];
+        let mut inv_diag = [1.0f32; 8];
+        let mut off_energy = 0.0f32;
+        let mut diag_energy = 0.0f32;
+        for (a, (u_row, dst_inv)) in u.iter_mut().zip(inv_diag.iter_mut()).enumerate() {
+            let ga = col0 + a;
+            let d = u_mat[ga * cols + ga].max(1e-12);
+            u_row[a] = d;
+            *dst_inv = 1.0 / d;
+            diag_energy += d * d;
+            for (b, slot) in u_row.iter_mut().enumerate().skip(a + 1) {
+                let v = u_mat[ga * cols + col0 + b];
+                *slot = v;
+                off_energy += v * v;
+            }
+        }
+        let mut a_inv = [[0.0f32; 8]; 8];
+        for i in (0..8).rev() {
+            a_inv[i][i] = inv_diag[i];
+            for j in (i + 1)..8 {
+                let mut acc = 0.0f32;
+                for (k, a_row) in a_inv.iter().enumerate().take(j + 1).skip(i + 1) {
+                    acc += u[i][k] * a_row[j];
+                }
+                a_inv[i][j] = -acc * inv_diag[i];
+            }
+        }
+        let mut m = [[0.0f32; 8]; 8];
+        let mut mu = 1e-12f32;
+        for i in 0..8 {
+            let mut row_abs = 0.0f32;
+            for j in 0..8 {
+                let start = i.max(j);
+                let mut s = 0.0f32;
+                for (&aik, &ajk) in a_inv[i][start..].iter().zip(a_inv[j][start..].iter()) {
+                    s += aik * ajk;
+                }
+                m[i][j] = s;
+                row_abs += s.abs();
+            }
+            if row_abs > mu {
+                mu = row_abs;
+            }
+        }
+        let inv_mu = 1.0 / mu;
+        let mut m_scaled = [[0.0f32; 8]; 8];
+        for (dst_r, src_r) in m_scaled.iter_mut().zip(m.iter()) {
+            for (d, &s) in dst_r.iter_mut().zip(src_r.iter()) {
+                *d = s * inv_mu;
+            }
+        }
+        Self {
+            u,
+            inv_diag,
+            m_scaled,
+            anisotropic: off_energy > 1e-5 * diag_energy,
+        }
+    }
+
+    #[inline]
+    fn solve_err_and_norm2(&self, y: &[f32; 8], q: &[i8; 8]) -> ([f32; 8], f32) {
+        let mut e = [0.0f32; 8];
+        let mut n2 = 0.0f32;
+        for a in 0..8 {
+            let mut r = y[a] - (q[a] as f32);
+            for (p, &ep) in e.iter().enumerate().take(a) {
+                r -= self.u[p][a] * ep;
+            }
+            let ea = r * self.inv_diag[a];
+            e[a] = ea;
+            n2 += ea * ea;
+        }
+        (e, n2)
+    }
+}
+
+/// Compiles `[rows, cols]` weights into a 2-bit Walsh-Hadamard + Gosset `E8Q2` [`NfSdotMatrix`]
+/// (`bits = 2`, `2.125 bpw` at `G=128`, `2.25 bpw` at `G=64`) using Block-8 Cholesky GPTQ.
+pub fn compile_hadamard_gptq_e8q2(
+    weights: &[f32],
+    rows: usize,
+    cols: usize,
+    scale_group_chunks: usize,
+    hessian: Option<&FullRowGptqHessian>,
+    num_threads: usize,
+) -> NfSdotMatrix {
+    assert_eq!(weights.len(), rows * cols);
+    assert!(rows > 0 && cols > 0 && cols.is_multiple_of(HADAMARD_BLOCK));
+    assert!((1..=8).contains(&scale_group_chunks));
+    if let Some(h) = hessian {
+        assert_eq!(h.cols, cols);
+        assert_eq!(h.h_inv_chol_upper.len(), cols * cols);
+    }
+
+    let blocks_per_row = cols / 8;
+    let num_stripes = rows.div_ceil(SIMD_ROW_STRIPE);
+    let num_chunks = cols / HADAMARD_BLOCK;
+    let num_scale_groups = num_chunks.div_ceil(scale_group_chunks);
+
+    let mut tpl_codes = vec![0u8; rows * blocks_per_row];
+    let mut sgn_codes = vec![1u8; rows * blocks_per_row];
+    let mut bf16_scales = vec![0u16; num_stripes * num_scale_groups * SIMD_ROW_STRIPE];
+
+    let u_slice = hessian.map(|h| h.h_inv_chol_upper.as_slice());
+    let block_chols: Option<Vec<E8BlockChol>> = u_slice.map(|u_mat| {
+        (0..blocks_per_row)
+            .map(|eb| E8BlockChol::from_upper(u_mat, cols, eb * 8))
+            .collect()
+    });
+    let chols_ref = block_chols.as_deref();
+
+    let workers = num_threads.max(1).min(num_stripes);
+    let stripes_per_worker = num_stripes.div_ceil(workers);
+
+    std::thread::scope(|s| {
+        let mut rem_w = weights;
+        let mut rem_tpl = tpl_codes.as_mut_slice();
+        let mut rem_sgn = sgn_codes.as_mut_slice();
+        let mut rem_scales = bf16_scales.as_mut_slice();
+        let mut stripe_cursor = 0usize;
+
+        while stripe_cursor < num_stripes && !rem_w.is_empty() {
+            let take_stripes = stripes_per_worker.min(num_stripes - stripe_cursor);
+            let row_start = stripe_cursor * SIMD_ROW_STRIPE;
+            let row_end = ((stripe_cursor + take_stripes) * SIMD_ROW_STRIPE).min(rows);
+            let take_rows = row_end - row_start;
+
+            let (w_chunk, next_w) = rem_w.split_at(take_rows * cols);
+            let (tpl_chunk, next_tpl) = rem_tpl.split_at_mut(take_rows * blocks_per_row);
+            let (sgn_chunk, next_sgn) = rem_sgn.split_at_mut(take_rows * blocks_per_row);
+            let (sc_chunk, next_sc) =
+                rem_scales.split_at_mut(take_stripes * num_scale_groups * SIMD_ROW_STRIPE);
+
+            rem_w = next_w;
+            rem_tpl = next_tpl;
+            rem_sgn = next_sgn;
+            rem_scales = next_sc;
+            stripe_cursor += take_stripes;
+
+            s.spawn(move || {
+                quantize_stripe_batch_e8q2(
+                    w_chunk,
+                    tpl_chunk,
+                    sgn_chunk,
+                    sc_chunk,
+                    take_rows,
+                    cols,
+                    num_chunks,
+                    scale_group_chunks,
+                    num_scale_groups,
+                    u_slice,
+                    chols_ref,
+                );
+            });
+        }
+    });
+
+    NfSdotMatrix::from_e8q2_codes(
+        &tpl_codes,
+        &sgn_codes,
+        &bf16_scales,
+        rows,
+        cols,
+        scale_group_chunks,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quantize_stripe_batch_e8q2(
+    w_chunk: &[f32],
+    tpl_chunk: &mut [u8],
+    sgn_chunk: &mut [u8],
+    sc_chunk: &mut [u16],
+    take_rows: usize,
+    cols: usize,
+    num_chunks: usize,
+    sgc: usize,
+    nsg: usize,
+    u_slice: Option<&[f32]>,
+    chols: Option<&[E8BlockChol]>,
+) {
+    let ratios = [
+        0.64f32, 0.71, 0.78, 0.85, 0.91, 0.96, 1.00, 1.05, 1.11, 1.18, 1.26, 1.36, 1.48,
+    ];
+    const TAIL_TILE: usize = 512;
+    let blocks_per_row = cols / 8;
+    let max_group_len = sgc * HADAMARD_BLOCK;
+    let max_group_blocks = max_group_len / 8;
+
+    let mut work = vec![0.0f32; SIMD_ROW_STRIPE * cols];
+    let mut errs = vec![vec![0.0f32; max_group_len]; SIMD_ROW_STRIPE];
+    let mut blk_work = vec![0.0f32; max_group_len];
+    let mut best_tpl = vec![0u8; max_group_blocks];
+    let mut best_sgn = vec![1u8; max_group_blocks];
+    let mut cand_tpl = vec![0u8; max_group_blocks];
+    let mut cand_sgn = vec![1u8; max_group_blocks];
+    let mut cand_err = vec![0.0f32; max_group_len];
+
+    for g0 in (0..take_rows).step_by(SIMD_ROW_STRIPE) {
+        let g_rows = (take_rows - g0).min(SIMD_ROW_STRIPE);
+        let local_stripe = g0 / SIMD_ROW_STRIPE;
+        for r in 0..g_rows {
+            let dst = &mut work[r * cols..(r + 1) * cols];
+            dst.copy_from_slice(&w_chunk[(g0 + r) * cols..(g0 + r + 1) * cols]);
+            fwht64_signed_inplace(dst);
+        }
+
+        for sg in 0..nsg {
+            let c_start = sg * sgc;
+            let c_end = (c_start + sgc).min(num_chunks);
+            let col_s = c_start * HADAMARD_BLOCK;
+            let col_e = c_end * HADAMARD_BLOCK;
+            let group_len = col_e - col_s;
+            let eb_s = col_s / 8;
+            let eb_e = col_e / 8;
+            let group_blocks = eb_e - eb_s;
+
+            for (r, err_out) in errs.iter_mut().enumerate().take(g_rows) {
+                let sub = &work[r * cols + col_s..r * cols + col_e];
+                err_out[..group_len].fill(0.0);
+                let sum_sq: f32 = sub.iter().map(|&v| v * v).sum();
+                let rms = (sum_sq / (group_len as f32)).sqrt();
+                let row = g0 + r;
+                if rms <= 1e-12 {
+                    tpl_chunk[row * blocks_per_row + eb_s..row * blocks_per_row + eb_e].fill(0u8);
+                    sgn_chunk[row * blocks_per_row + eb_s..row * blocks_per_row + eb_e].fill(1u8);
+                    sc_chunk[(local_stripe * nsg + sg) * SIMD_ROW_STRIPE + r] = 0;
+                    continue;
+                }
+
+                let base_delta = rms / 26.0;
+                let mut best_loss = f32::INFINITY;
+                let mut best_bf16 = 0u16;
+
+                let mut eval_delta = |d_bf16: u16,
+                                      best_loss: &mut f32,
+                                      best_bf16: &mut u16,
+                                      best_tpl: &mut [u8],
+                                      best_sgn: &mut [u8],
+                                      err_out: &mut [f32]| {
+                    let delta = bf16_to_f32(d_bf16);
+                    if delta <= 0.0 {
+                        return;
+                    }
+                    let inv_delta = 1.0 / delta;
+                    let delta2 = delta * delta;
+                    blk_work[..group_len].copy_from_slice(sub);
+                    let mut loss = 0.0f32;
+
+                    if let (Some(u_mat), Some(chol_arr)) = (u_slice, chols) {
+                        for b in 0..group_blocks {
+                            let j0 = b * 8;
+                            let mut y8 = [0.0f32; 8];
+                            for (a, dst_y) in y8.iter_mut().enumerate() {
+                                *dst_y = blk_work[j0 + a] * inv_delta;
+                            }
+                            let (mut tpl, mut sgn, mut q8, _) = e8q2_quantize_8d(&y8);
+                            let bc = &chol_arr[eb_s + b];
+                            let (mut e_tilde, mut n2) = bc.solve_err_and_norm2(&y8, &q8);
+                            if bc.anisotropic {
+                                for _ in 0..2 {
+                                    let mut rem = [0.0f32; 8];
+                                    for a in 0..8 {
+                                        rem[a] = y8[a] - (q8[a] as f32);
+                                    }
+                                    let mut z8 = [0.0f32; 8];
+                                    for a in 0..8 {
+                                        let mut step = 0.0f32;
+                                        for (&mac, &rc) in bc.m_scaled[a].iter().zip(rem.iter()) {
+                                            step += mac * rc;
+                                        }
+                                        z8[a] = (q8[a] as f32) + step;
+                                    }
+                                    let (tc, sc, qc, _) = e8q2_quantize_8d(&z8);
+                                    if tc == tpl && sc == sgn {
+                                        break;
+                                    }
+                                    let (ec, n2_c) = bc.solve_err_and_norm2(&y8, &qc);
+                                    if n2_c < n2 {
+                                        tpl = tc;
+                                        sgn = sc;
+                                        q8 = qc;
+                                        e_tilde = ec;
+                                        n2 = n2_c;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+
+                            cand_tpl[b] = tpl;
+                            cand_sgn[b] = sgn;
+                            loss += delta2 * n2;
+                            if loss >= *best_loss {
+                                return;
+                            }
+                            for a in 0..8 {
+                                cand_err[j0 + a] = delta * e_tilde[a];
+                            }
+                            let j_next = j0 + 8;
+                            if j_next < group_len {
+                                for a in 0..8 {
+                                    let ea = cand_err[j0 + a];
+                                    if ea == 0.0 {
+                                        continue;
+                                    }
+                                    let g_col = col_s + j0 + a;
+                                    let u_sub =
+                                        &u_mat[g_col * cols + col_s + j_next..g_col * cols + col_e];
+                                    for (k_slot, &u_jk) in
+                                        blk_work[j_next..group_len].iter_mut().zip(u_sub)
+                                    {
+                                        *k_slot -= ea * u_jk;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for b in 0..group_blocks {
+                            let j0 = b * 8;
+                            let mut y8 = [0.0f32; 8];
+                            for (a, dst_y) in y8.iter_mut().enumerate() {
+                                *dst_y = blk_work[j0 + a] * inv_delta;
+                            }
+                            let (tpl, sgn, _, sq_err) = e8q2_quantize_8d(&y8);
+                            cand_tpl[b] = tpl;
+                            cand_sgn[b] = sgn;
+                            loss += delta2 * sq_err;
+                            if loss >= *best_loss {
+                                return;
+                            }
+                        }
+                    }
+
+                    if loss < *best_loss {
+                        *best_loss = loss;
+                        *best_bf16 = d_bf16;
+                        best_tpl[..group_blocks].copy_from_slice(&cand_tpl[..group_blocks]);
+                        best_sgn[..group_blocks].copy_from_slice(&cand_sgn[..group_blocks]);
+                        err_out[..group_len].copy_from_slice(&cand_err[..group_len]);
+                    }
+                };
+
+                for &rat in &ratios {
+                    eval_delta(
+                        f32_to_bf16(base_delta * rat),
+                        &mut best_loss,
+                        &mut best_bf16,
+                        &mut best_tpl,
+                        &mut best_sgn,
+                        err_out,
+                    );
+                }
+
+                // Least-squares BF16 scale refit on the chosen Gosset lattice vectors.
+                let mut dot_wc = 0.0f32;
+                let mut dot_cc = 0.0f32;
+                for b in 0..group_blocks {
+                    let q8 = e8q2_decode_8d(best_tpl[b], best_sgn[b]);
+                    let j0 = b * 8;
+                    for a in 0..8 {
+                        let qf = q8[a] as f32;
+                        dot_wc += sub[j0 + a] * qf;
+                        dot_cc += qf * qf;
+                    }
+                }
+                if dot_cc > 1e-12 && dot_wc > 0.0 {
+                    let ls_bf16 = f32_to_bf16(dot_wc / dot_cc);
+                    if ls_bf16 != best_bf16 {
+                        eval_delta(
+                            ls_bf16,
+                            &mut best_loss,
+                            &mut best_bf16,
+                            &mut best_tpl,
+                            &mut best_sgn,
+                            err_out,
+                        );
+                    }
+                }
+
+                sc_chunk[(local_stripe * nsg + sg) * SIMD_ROW_STRIPE + r] = best_bf16;
+                tpl_chunk[row * blocks_per_row + eb_s..row * blocks_per_row + eb_e]
+                    .copy_from_slice(&best_tpl[..group_blocks]);
+                sgn_chunk[row * blocks_per_row + eb_s..row * blocks_per_row + eb_e]
+                    .copy_from_slice(&best_sgn[..group_blocks]);
+            }
+
             if let (true, Some(u_mat)) = (col_e < cols, u_slice) {
                 for t0 in (col_e..cols).step_by(TAIL_TILE) {
                     let t1 = (t0 + TAIL_TILE).min(cols);

@@ -1415,15 +1415,15 @@ impl RealLlamaEngine {
         self.ws.q8_kv.is_some()
     }
 
-    /// Enables zero-copy Metal GPU execution for NF4 engines (`0` duplicate weight RAM).
+    /// Enables zero-copy Metal GPU execution for NfSdot engines (`0` duplicate weight RAM).
     pub fn enable_metal(&mut self) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
             fn as_nf4<'a>(b: &'a LinearBackend, name: &str) -> Result<&'a NfSdotMatrix, String> {
                 match b {
-                    LinearBackend::NfSdot(m) if m.bits == 4 => Ok(m),
+                    LinearBackend::NfSdot(m) if (2..=5).contains(&m.bits) => Ok(m),
                     LinearBackend::NfSdot(m) => {
-                        Err(format!("{name}: Metal GPU requires 4-bit NF4 (got {}-bit)", m.bits))
+                        Err(format!("{name}: Metal GPU requires 2..=5-bit NfSdot (got {}-bit)", m.bits))
                     }
                     _ => Err(format!("{name}: Metal GPU requires NfSdot weights")),
                 }
