@@ -39,9 +39,10 @@ pub mod json;
 pub mod k2t_format;
 pub mod lut_gemv;
 pub mod memory_budget;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod metal_gpu;
 pub mod mmap_pager;
+pub mod mobile_ffi;
 pub mod moe_800b;
 pub mod prefetch;
 pub mod real_llm;

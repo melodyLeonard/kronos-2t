@@ -14,8 +14,8 @@ use crate::simd_lut::{
     bf16_to_f32, decode_nibble_code, default_register_codebook_64, e8q2_decode_8d,
     e8q2_quantize_8d, f32_to_bf16, nf_expand_codebook32, FusedBase3LutMatrix,
     FusedBipolarLutMatrix, MultiPlaneTernaryMatrix, NfSdotMatrix, SimdPackedMatrix, Vq2LutMatrix,
-    NF3_DEFAULT_CODEBOOK_I8, NF4_DEFAULT_CODEBOOK_I8, NF5_DEFAULT_POS_CODEBOOK_I8,
-    QUANT_CHUNK_BLOCKS, SIMD_ROW_STRIPE, VQ2_GAUSSIAN_RING_16,
+    E8Q2_EVEN_TEMPLATES_I8, NF3_DEFAULT_CODEBOOK_I8, NF4_DEFAULT_CODEBOOK_I8,
+    NF5_DEFAULT_POS_CODEBOOK_I8, QUANT_CHUNK_BLOCKS, SIMD_ROW_STRIPE, VQ2_GAUSSIAN_RING_16,
 };
 
 /// Output of multi-rank Kronecker compilation for a single `[rows, cols]` matrix.
@@ -1863,7 +1863,6 @@ fn quantize_stripe_batch_nf(
 struct E8BlockChol {
     u: [[f32; 8]; 8],
     inv_diag: [f32; 8],
-    m_scaled: [[f32; 8]; 8],
     anisotropic: bool,
 }
 
@@ -1873,58 +1872,26 @@ impl E8BlockChol {
         let mut inv_diag = [1.0f32; 8];
         let mut off_energy = 0.0f32;
         let mut diag_energy = 0.0f32;
+        let mut min_d = f32::INFINITY;
+        let mut max_d = 0.0f32;
         for (a, (u_row, dst_inv)) in u.iter_mut().zip(inv_diag.iter_mut()).enumerate() {
             let ga = col0 + a;
             let d = u_mat[ga * cols + ga].max(1e-12);
             u_row[a] = d;
             *dst_inv = 1.0 / d;
             diag_energy += d * d;
+            min_d = min_d.min(d);
+            max_d = max_d.max(d);
             for (b, slot) in u_row.iter_mut().enumerate().skip(a + 1) {
                 let v = u_mat[ga * cols + col0 + b];
                 *slot = v;
                 off_energy += v * v;
             }
         }
-        let mut a_inv = [[0.0f32; 8]; 8];
-        for i in (0..8).rev() {
-            a_inv[i][i] = inv_diag[i];
-            for j in (i + 1)..8 {
-                let mut acc = 0.0f32;
-                for (k, a_row) in a_inv.iter().enumerate().take(j + 1).skip(i + 1) {
-                    acc += u[i][k] * a_row[j];
-                }
-                a_inv[i][j] = -acc * inv_diag[i];
-            }
-        }
-        let mut m = [[0.0f32; 8]; 8];
-        let mut mu = 1e-12f32;
-        for i in 0..8 {
-            let mut row_abs = 0.0f32;
-            for j in 0..8 {
-                let start = i.max(j);
-                let mut s = 0.0f32;
-                for (&aik, &ajk) in a_inv[i][start..].iter().zip(a_inv[j][start..].iter()) {
-                    s += aik * ajk;
-                }
-                m[i][j] = s;
-                row_abs += s.abs();
-            }
-            if row_abs > mu {
-                mu = row_abs;
-            }
-        }
-        let inv_mu = 1.0 / mu;
-        let mut m_scaled = [[0.0f32; 8]; 8];
-        for (dst_r, src_r) in m_scaled.iter_mut().zip(m.iter()) {
-            for (d, &s) in dst_r.iter_mut().zip(src_r.iter()) {
-                *d = s * inv_mu;
-            }
-        }
         Self {
             u,
             inv_diag,
-            m_scaled,
-            anisotropic: off_energy > 1e-5 * diag_energy,
+            anisotropic: off_energy > 1e-6 * diag_energy || max_d > 1.01 * min_d,
         }
     }
 
@@ -1942,6 +1909,276 @@ impl E8BlockChol {
             n2 += ea * ea;
         }
         (e, n2)
+    }
+
+    #[inline]
+    fn eval_half_u(&self, y: &[f32; 8], t_idx: usize) -> (u8, [f32; 4], f32) {
+        let tp = E8Q2_EVEN_TEMPLATES_I8[t_idx];
+        let mut sgn4 = 0u8;
+        let mut e4 = [0.0f32; 4];
+        let mut cost4 = 0.0f32;
+        for i in 0..4 {
+            let mut yt = y[i];
+            for (p, &ep) in e4.iter().enumerate().take(i) {
+                yt -= ep * self.u[p][i];
+            }
+            let mag = tp[i];
+            let qi = if mag == 0 {
+                0.0f32
+            } else if yt < 0.0 {
+                sgn4 |= 1u8 << i;
+                -(mag as f32)
+            } else {
+                mag as f32
+            };
+            let ei = (yt - qi) * self.inv_diag[i];
+            e4[i] = ei;
+            cost4 += ei * ei;
+        }
+        (sgn4, e4, cost4)
+    }
+
+    #[inline]
+    fn eval_half_v(&self, y_v: &[f32; 4], t_idx: usize) -> (u8, [f32; 4], f32) {
+        let tp = E8Q2_EVEN_TEMPLATES_I8[t_idx];
+        let mut sgn4 = 0u8;
+        let mut e4 = [0.0f32; 4];
+        let mut cost4 = 0.0f32;
+        for i in 0..4 {
+            let mut yt = y_v[i];
+            for (p, &ep) in e4.iter().enumerate().take(i) {
+                yt -= ep * self.u[4 + p][4 + i];
+            }
+            let mag = tp[i];
+            let qi = if mag == 0 {
+                0.0f32
+            } else if yt < 0.0 {
+                sgn4 |= 1u8 << i;
+                -(mag as f32)
+            } else {
+                mag as f32
+            };
+            let ei = (yt - qi) * self.inv_diag[4 + i];
+            e4[i] = ei;
+            cost4 += ei * ei;
+        }
+        (sgn4, e4, cost4)
+    }
+
+    /// Cholesky decision-feedback Gosset `E8Q2` quantizer minimizing `||(y - q) U^{-1}||_2^2`.
+    #[inline]
+    fn quantize_8d_chol(&self, y: &[f32; 8]) -> (u8, u8, [f32; 8], f32) {
+        let (mut best_tpl, mut best_sgn, q_iso, _) = e8q2_quantize_8d(y);
+        let (mut best_e, mut best_n2) = self.solve_err_and_norm2(y, &q_iso);
+        if !self.anisotropic {
+            return (best_tpl, best_sgn, best_e, best_n2);
+        }
+
+        // 1. Odd-coset 2-state Cholesky-Wagner trellis (`popcount(tpl ^ sgn)` even).
+        let mut st_cost = [0.0f32, f32::INFINITY];
+        let mut st_tpl = [0u8; 2];
+        let mut st_sgn = [0u8; 2];
+        let mut st_e = [[0.0f32; 8]; 2];
+        for a in 0..8 {
+            let inv_d = self.inv_diag[a];
+            let mut nx_cost = [f32::INFINITY; 2];
+            let mut nx_tpl = [0u8; 2];
+            let mut nx_sgn = [0u8; 2];
+            let mut nx_e = [[0.0f32; 8]; 2];
+            for p_prev in 0..2 {
+                let base_c = st_cost[p_prev];
+                if !base_c.is_finite() {
+                    continue;
+                }
+                let mut yt = y[a];
+                for (k, &ek) in st_e[p_prev].iter().enumerate().take(a) {
+                    yt -= ek * self.u[k][a];
+                }
+                let (b0, s0, q0) = if yt >= -16.0 {
+                    (0u8, 0u8, 16.0f32)
+                } else {
+                    (1u8, 1u8, -48.0f32)
+                };
+                let ea0 = (yt - q0) * inv_d;
+                let c0 = base_c + ea0 * ea0;
+                if c0 < nx_cost[p_prev] {
+                    nx_cost[p_prev] = c0;
+                    nx_tpl[p_prev] = st_tpl[p_prev] | (b0 << a);
+                    nx_sgn[p_prev] = st_sgn[p_prev] | (s0 << a);
+                    nx_e[p_prev] = st_e[p_prev];
+                    nx_e[p_prev][a] = ea0;
+                }
+                let (b1, s1, q1) = if yt >= 16.0 {
+                    (1u8, 0u8, 48.0f32)
+                } else {
+                    (0u8, 1u8, -16.0f32)
+                };
+                let ea1 = (yt - q1) * inv_d;
+                let c1 = base_c + ea1 * ea1;
+                let p_odd = p_prev ^ 1;
+                if c1 < nx_cost[p_odd] {
+                    nx_cost[p_odd] = c1;
+                    nx_tpl[p_odd] = st_tpl[p_prev] | (b1 << a);
+                    nx_sgn[p_odd] = st_sgn[p_prev] | (s1 << a);
+                    nx_e[p_odd] = st_e[p_prev];
+                    nx_e[p_odd][a] = ea1;
+                }
+            }
+            st_cost = nx_cost;
+            st_tpl = nx_tpl;
+            st_sgn = nx_sgn;
+            st_e = nx_e;
+        }
+        if st_cost[0] < best_n2 {
+            best_n2 = st_cost[0];
+            best_tpl = st_tpl[0];
+            best_sgn = st_sgn[0];
+            best_e = st_e[0];
+        }
+
+        // 2. All-32 even-coset `(11, 11)` (`0xBB`) 2-state Cholesky-Wagner trellis (`popcount(sgn)` odd).
+        let mut bb_cost = [0.0f32, f32::INFINITY];
+        let mut bb_sgn = [0u8; 2];
+        let mut bb_e = [[0.0f32; 8]; 2];
+        for a in 0..8 {
+            let inv_d = self.inv_diag[a];
+            let mut nx_cost = [f32::INFINITY; 2];
+            let mut nx_sgn = [0u8; 2];
+            let mut nx_e = [[0.0f32; 8]; 2];
+            for p_prev in 0..2 {
+                let base_c = bb_cost[p_prev];
+                if !base_c.is_finite() {
+                    continue;
+                }
+                let mut yt = y[a];
+                for (k, &ek) in bb_e[p_prev].iter().enumerate().take(a) {
+                    yt -= ek * self.u[k][a];
+                }
+                let ea_pos = (yt - 32.0) * inv_d;
+                let c_pos = base_c + ea_pos * ea_pos;
+                if c_pos < nx_cost[p_prev] {
+                    nx_cost[p_prev] = c_pos;
+                    nx_sgn[p_prev] = bb_sgn[p_prev];
+                    nx_e[p_prev] = bb_e[p_prev];
+                    nx_e[p_prev][a] = ea_pos;
+                }
+                let ea_neg = (yt + 32.0) * inv_d;
+                let c_neg = base_c + ea_neg * ea_neg;
+                let p_odd = p_prev ^ 1;
+                if c_neg < nx_cost[p_odd] {
+                    nx_cost[p_odd] = c_neg;
+                    nx_sgn[p_odd] = bb_sgn[p_prev] | (1u8 << a);
+                    nx_e[p_odd] = bb_e[p_prev];
+                    nx_e[p_odd][a] = ea_neg;
+                }
+            }
+            bb_cost = nx_cost;
+            bb_sgn = nx_sgn;
+            bb_e = nx_e;
+        }
+        if bb_cost[1] < best_n2 {
+            best_n2 = bb_cost[1];
+            best_tpl = 0xBB;
+            best_sgn = bb_sgn[1];
+            best_e = bb_e[1];
+        }
+
+        // 3. Factored even-coset Cholesky feedback (`u[0..4]` -> propagate `e_u` -> `v[4..8]`).
+        let mut u_evals = [(0u8, [0.0f32; 4], f32::INFINITY); 28];
+        for (t, slot) in u_evals.iter_mut().enumerate() {
+            *slot = self.eval_half_u(y, t);
+        }
+        let best_two_in = |start: usize, end: usize| -> (usize, usize) {
+            let mut b0 = start;
+            let mut b1 = start;
+            let mut c0 = f32::INFINITY;
+            let mut c1 = f32::INFINITY;
+            for (t, ev) in u_evals.iter().enumerate().take(end).skip(start) {
+                if ev.2 < c0 {
+                    c1 = c0;
+                    b1 = b0;
+                    c0 = ev.2;
+                    b0 = t;
+                } else if ev.2 < c1 {
+                    c1 = ev.2;
+                    b1 = t;
+                }
+            }
+            (b0, b1)
+        };
+        let (u0_a, u0_b) = best_two_in(0, 11);
+        let (up_a, up_b) = best_two_in(12, 16);
+        let (ua_a, ua_b) = best_two_in(16, 28);
+
+        let u_groups: [(usize, usize, usize); 7] = [
+            (u0_a, 0, 12),
+            (u0_b, 0, 12),
+            (11, 0, 11),
+            (up_a, 12, 28),
+            (up_b, 12, 28),
+            (ua_a, 12, 16),
+            (ua_b, 12, 16),
+        ];
+
+        for (k, &(u_idx, v_start, v_end)) in u_groups.iter().enumerate() {
+            if k > 0 && u_groups[..k].iter().any(|&(prev_u, _, _)| prev_u == u_idx) {
+                continue;
+            }
+            let (sgn_u, e_u, cost_u) = u_evals[u_idx];
+            if cost_u >= best_n2 {
+                continue;
+            }
+            let tu = if u_idx >= 16 { u_idx - 16 } else { u_idx };
+            let mut y_v = [0.0f32; 4];
+            for b in 0..4 {
+                y_v[b] = y[4 + b]
+                    - (e_u[0] * self.u[0][4 + b]
+                        + e_u[1] * self.u[1][4 + b]
+                        + e_u[2] * self.u[2][4 + b]
+                        + e_u[3] * self.u[3][4 + b]);
+            }
+            for (v_idx, &tv_arr) in E8Q2_EVEN_TEMPLATES_I8
+                .iter()
+                .enumerate()
+                .take(v_end)
+                .skip(v_start)
+            {
+                let (sgn_v, e_v, cost_v) = self.eval_half_v(&y_v, v_idx);
+                let tot = cost_u + cost_v;
+                if tot < best_n2 {
+                    let tv = if v_idx >= 16 { v_idx - 16 } else { v_idx };
+                    let tpl_ev = (tu as u8) | ((tv as u8) << 4);
+                    let mut sgn_ev = sgn_u | (sgn_v << 4);
+                    if ((tpl_ev ^ sgn_ev).count_ones() & 1) == 0 {
+                        let tu_arr = E8Q2_EVEN_TEMPLATES_I8[u_idx];
+                        let mut zero_i = 0usize;
+                        for i in 0..4 {
+                            if tu_arr[i] == 0 {
+                                zero_i = i;
+                                break;
+                            }
+                            if tv_arr[i] == 0 {
+                                zero_i = 4 + i;
+                                break;
+                            }
+                        }
+                        sgn_ev ^= 1u8 << zero_i;
+                    }
+                    best_n2 = tot;
+                    best_tpl = tpl_ev;
+                    best_sgn = sgn_ev;
+                    best_e[..4].copy_from_slice(&e_u);
+                    best_e[4..].copy_from_slice(&e_v);
+                }
+            }
+        }
+
+        debug_assert!({
+            let q_chk = e8q2_decode_8d(best_tpl, best_sgn);
+            let (_, n2_chk) = self.solve_err_and_norm2(y, &q_chk);
+            (n2_chk - best_n2).abs() <= 1e-3 * best_n2.max(1.0)
+        });
+        (best_tpl, best_sgn, best_e, best_n2)
     }
 }
 
@@ -2051,7 +2288,7 @@ fn quantize_stripe_batch_e8q2(
     chols: Option<&[E8BlockChol]>,
 ) {
     let ratios = [
-        0.64f32, 0.71, 0.78, 0.85, 0.91, 0.96, 1.00, 1.05, 1.11, 1.18, 1.26, 1.36, 1.48,
+        1.00f32, 0.94, 1.07, 0.88, 1.15, 0.82, 1.24, 0.76, 1.35, 0.70, 1.48, 0.64, 1.62,
     ];
     const TAIL_TILE: usize = 512;
     let blocks_per_row = cols / 8;
@@ -2099,7 +2336,7 @@ fn quantize_stripe_batch_e8q2(
                     continue;
                 }
 
-                let base_delta = rms / 26.0;
+                let base_delta = rms / 35.0;
                 let mut best_loss = f32::INFINITY;
                 let mut best_bf16 = 0u16;
 
@@ -2125,39 +2362,8 @@ fn quantize_stripe_batch_e8q2(
                             for (a, dst_y) in y8.iter_mut().enumerate() {
                                 *dst_y = blk_work[j0 + a] * inv_delta;
                             }
-                            let (mut tpl, mut sgn, mut q8, _) = e8q2_quantize_8d(&y8);
                             let bc = &chol_arr[eb_s + b];
-                            let (mut e_tilde, mut n2) = bc.solve_err_and_norm2(&y8, &q8);
-                            if bc.anisotropic {
-                                for _ in 0..2 {
-                                    let mut rem = [0.0f32; 8];
-                                    for a in 0..8 {
-                                        rem[a] = y8[a] - (q8[a] as f32);
-                                    }
-                                    let mut z8 = [0.0f32; 8];
-                                    for a in 0..8 {
-                                        let mut step = 0.0f32;
-                                        for (&mac, &rc) in bc.m_scaled[a].iter().zip(rem.iter()) {
-                                            step += mac * rc;
-                                        }
-                                        z8[a] = (q8[a] as f32) + step;
-                                    }
-                                    let (tc, sc, qc, _) = e8q2_quantize_8d(&z8);
-                                    if tc == tpl && sc == sgn {
-                                        break;
-                                    }
-                                    let (ec, n2_c) = bc.solve_err_and_norm2(&y8, &qc);
-                                    if n2_c < n2 {
-                                        tpl = tc;
-                                        sgn = sc;
-                                        q8 = qc;
-                                        e_tilde = ec;
-                                        n2 = n2_c;
-                                    } else {
-                                        break;
-                                    }
-                                }
-                            }
+                            let (tpl, sgn, e_tilde, n2) = bc.quantize_8d_chol(&y8);
 
                             cand_tpl[b] = tpl;
                             cand_sgn[b] = sgn;

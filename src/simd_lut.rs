@@ -3622,7 +3622,7 @@ unsafe fn sdot_lane<const L: i32>(
     // unsigned codes `0..=63` (bit 7 == 0) so reading it as signed bytes is exact.
     unsafe {
         core::arch::asm!(
-            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.4b[{l}]",
+            ".arch_extension dotprod\nsdot {acc:v}.4s, {a:v}.16b, {b:v}.4b[{l}]",
             acc = inout(vreg) acc,
             a = in(vreg) a,
             b = in(vreg) b,
@@ -3643,7 +3643,7 @@ unsafe fn sdot_s8_lane<const L: i32>(
     // SAFETY: `sdot` (FEAT_DotProd) is available on all Apple Silicon.
     unsafe {
         core::arch::asm!(
-            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.4b[{l}]",
+            ".arch_extension dotprod\nsdot {acc:v}.4s, {a:v}.16b, {b:v}.4b[{l}]",
             acc = inout(vreg) acc,
             a = in(vreg) a,
             b = in(vreg) b,
@@ -4398,7 +4398,7 @@ pub const E8Q2_EVEN_NORM2: [f32; 28] = {
     out
 };
 
-/// Transposed 32-byte `vqtbl2q_s8` lookup tables for coordinates `0..4` of [`E8Q2_EVEN_TEMPLATES_I8`].
+/// Transposed 32-byte lookup tables for coordinates `0..4` of [`E8Q2_EVEN_TEMPLATES_I8`].
 pub const E8Q2_EVEN_COL_TABLES_I8: [[i8; 32]; 4] = {
     let mut cols = [[0i8; 32]; 4];
     let mut c = 0;
@@ -4411,6 +4411,23 @@ pub const E8Q2_EVEN_COL_TABLES_I8: [[i8; 32]; 4] = {
         c += 1;
     }
     cols
+};
+
+/// Packed 32-byte 2-bit-per-coordinate table (`q0 | (q1 << 2) | (q2 << 4) | (q3 << 6)` where
+/// `q_t = template[t] / 32`) so one 2-register `vqtbl2q_u8` decodes all 4 even-coset magnitudes.
+pub const E8Q2_EVEN_PACKED_U8: [u8; 32] = {
+    let mut out = [0u8; 32];
+    let mut idx = 0;
+    while idx < 28 {
+        let t = E8Q2_EVEN_TEMPLATES_I8[idx];
+        let q0 = (t[0] as u8) >> 5;
+        let q1 = (t[1] as u8) >> 5;
+        let q2 = (t[2] as u8) >> 5;
+        let q3 = (t[3] as u8) >> 5;
+        out[idx] = q0 | (q1 << 2) | (q2 << 4) | (q3 << 6);
+        idx += 1;
+    }
+    out
 };
 
 /// Decodes a 16-bit `(tpl_byte, sgn_byte)` Gosset `E8Q2` codeword into 8 signed `INT8` coordinates
@@ -4957,6 +4974,97 @@ impl NfSdotMatrix {
                 }
             }
             debug_assert_eq!(cursor, tail_tot);
+        }
+
+        Self {
+            rows,
+            cols,
+            bits,
+            scale_group_chunks,
+            num_stripes,
+            num_pairs,
+            num_chunks,
+            num_scale_groups,
+            codebook,
+            pair_stream,
+            tail_stream,
+        }
+    }
+
+    /// Allocates a deterministic synthetic `NfSdotMatrix` (`bits` in `2..=5`) with finite BF16
+    /// group scales and pseudo-random packed weights in O(bytes) time for hardware envelope benchmarks.
+    pub fn new_synthetic(
+        rows: usize,
+        cols: usize,
+        bits: usize,
+        scale_group_chunks: usize,
+        seed: u64,
+    ) -> Self {
+        assert!((2..=5).contains(&bits));
+        assert!(rows > 0 && cols > 0 && cols.is_multiple_of(64));
+        let scale_group_chunks = scale_group_chunks.max(1);
+        let num_stripes = rows.div_ceil(SIMD_ROW_STRIPE);
+        let num_pairs = num_stripes / 2;
+        let has_tail = (num_stripes & 1) != 0;
+        let num_chunks = cols / 64;
+        let num_scale_groups = num_chunks.div_ceil(scale_group_chunks);
+        let chunk_b = Self::stripe_chunk_bytes(bits);
+        let pair_tot = num_scale_groups * 64 + num_chunks * 2 * chunk_b;
+        let tail_tot = num_scale_groups * 32 + num_chunks * chunk_b;
+        let mut pair_stream = PageAlignedBytes::zeroed(num_pairs * pair_tot);
+        let mut tail_stream = PageAlignedBytes::zeroed(usize::from(has_tail) * tail_tot);
+
+        let codebook: [i8; 16] = match bits {
+            2 => [0; 16],
+            3 => NF3_DEFAULT_CODEBOOK_I8,
+            5 => NF5_DEFAULT_POS_CODEBOOK_I8,
+            _ => NF4_DEFAULT_CODEBOOK_I8,
+        };
+
+        let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+        let mut next_u64 = || -> u64 {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+
+        for p in 0..num_pairs {
+            let mut cursor = p * pair_tot;
+            for sg in 0..num_scale_groups {
+                for lane in 0..(2 * SIMD_ROW_STRIPE) {
+                    let bf16: u16 = 0x3B00 + (((p + sg + lane) as u16 * 13) & 0x007F);
+                    pair_stream[cursor + lane * 2..cursor + lane * 2 + 2]
+                        .copy_from_slice(&bf16.to_le_bytes());
+                }
+                cursor += 64;
+                let c_start = sg * scale_group_chunks;
+                let c_end = (c_start + scale_group_chunks).min(num_chunks);
+                let data_len = (c_end - c_start) * 2 * chunk_b;
+                for word in pair_stream[cursor..cursor + data_len].chunks_exact_mut(8) {
+                    word.copy_from_slice(&next_u64().to_le_bytes());
+                }
+                cursor += data_len;
+            }
+        }
+
+        if has_tail {
+            let mut cursor = 0usize;
+            for sg in 0..num_scale_groups {
+                for lane in 0..SIMD_ROW_STRIPE {
+                    let bf16: u16 = 0x3B00 + (((sg + lane) as u16 * 17) & 0x007F);
+                    tail_stream[cursor + lane * 2..cursor + lane * 2 + 2]
+                        .copy_from_slice(&bf16.to_le_bytes());
+                }
+                cursor += 32;
+                let c_start = sg * scale_group_chunks;
+                let c_end = (c_start + scale_group_chunks).min(num_chunks);
+                let data_len = (c_end - c_start) * chunk_b;
+                for word in tail_stream[cursor..cursor + data_len].chunks_exact_mut(8) {
+                    word.copy_from_slice(&next_u64().to_le_bytes());
+                }
+                cursor += data_len;
+            }
         }
 
         Self {
@@ -5784,14 +5892,12 @@ unsafe fn nf3_accum_32cols(
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn e8q2_load_tables() -> [std::arch::aarch64::int8x16x2_t; 4] {
+unsafe fn e8q2_load_packed_table() -> std::arch::aarch64::uint8x16x2_t {
     use std::arch::aarch64::*;
-    // SAFETY: `E8Q2_EVEN_COL_TABLES_I8` holds four 32-byte static arrays.
+    // SAFETY: `E8Q2_EVEN_PACKED_U8` is a 32-byte static array.
     unsafe {
-        std::array::from_fn(|c| {
-            let p = E8Q2_EVEN_COL_TABLES_I8[c].as_ptr();
-            int8x16x2_t(vld1q_s8(p), vld1q_s8(p.add(16)))
-        })
+        let p = E8Q2_EVEN_PACKED_U8.as_ptr();
+        uint8x16x2_t(vld1q_u8(p), vld1q_u8(p.add(16)))
     }
 }
 
@@ -5802,7 +5908,7 @@ unsafe fn e8q2_unpack_quad_transpose<const IS_V: bool>(
     vsgn: std::arch::aarch64::uint8x16_t,
     is_even: std::arch::aarch64::uint8x16_t,
     ev_idx: std::arch::aarch64::uint8x16_t,
-    tbl: &[std::arch::aarch64::int8x16x2_t; 4],
+    tbl: std::arch::aarch64::uint8x16x2_t,
 ) -> (
     std::arch::aarch64::int8x16_t,
     std::arch::aarch64::int8x16_t,
@@ -5811,24 +5917,74 @@ unsafe fn e8q2_unpack_quad_transpose<const IS_V: bool>(
 ) {
     use std::arch::aarch64::*;
     // SAFETY: NEON intrinsics are baseline on `aarch64`.
-    let (v48, v16) = unsafe { (vdupq_n_u8(48), vdupq_n_u8(16)) };
-    let coord = |t: usize| -> int8x16_t {
-        let bit = if IS_V { 1u8 << (4 + t) } else { 1u8 << t };
-        // SAFETY: NEON intrinsics are baseline on `aarch64`.
-        unsafe {
-            let bmask = vdupq_n_u8(bit);
-            let even_mag = vqtbl2q_s8(tbl[t], ev_idx);
-            let odd_mag = vreinterpretq_s8_u8(vbslq_u8(vtstq_u8(vtpl, bmask), v48, v16));
-            let mag = vbslq_s8(is_even, even_mag, odd_mag);
-            vbslq_s8(vtstq_u8(vsgn, bmask), vnegq_s8(mag), mag)
-        }
-    };
-    let c0 = coord(0);
-    let c1 = coord(1);
-    let c2 = coord(2);
-    let c3 = coord(3);
-    // SAFETY: NEON zip intrinsics transpose `[eb * 4 + j, t]` into `[eb, j * 4 + t]`.
     unsafe {
+        let m60 = vdupq_n_u8(0x60);
+        let m20 = vdupq_n_u8(0x20);
+        let m10 = vdupq_n_u8(0x10);
+        let p = vqtbl2q_u8(tbl, ev_idx);
+        let vsgn_s8 = vreinterpretq_s8_u8(vsgn);
+
+        let c0 = {
+            let ev = vandq_u8(vshlq_n_u8::<5>(p), m60);
+            let od = if IS_V {
+                vbslq_u8(m20, vshlq_n_u8::<1>(vtpl), m10)
+            } else {
+                vbslq_u8(m20, vshlq_n_u8::<5>(vtpl), m10)
+            };
+            let mag = vreinterpretq_s8_u8(vbslq_u8(is_even, ev, od));
+            let sm = if IS_V {
+                vshrq_n_s8::<7>(vshlq_n_s8::<3>(vsgn_s8))
+            } else {
+                vshrq_n_s8::<7>(vshlq_n_s8::<7>(vsgn_s8))
+            };
+            vsubq_s8(veorq_s8(mag, sm), sm)
+        };
+        let c1 = {
+            let ev = vandq_u8(vshlq_n_u8::<3>(p), m60);
+            let od = if IS_V {
+                vbslq_u8(m20, vtpl, m10)
+            } else {
+                vbslq_u8(m20, vshlq_n_u8::<4>(vtpl), m10)
+            };
+            let mag = vreinterpretq_s8_u8(vbslq_u8(is_even, ev, od));
+            let sm = if IS_V {
+                vshrq_n_s8::<7>(vshlq_n_s8::<2>(vsgn_s8))
+            } else {
+                vshrq_n_s8::<7>(vshlq_n_s8::<6>(vsgn_s8))
+            };
+            vsubq_s8(veorq_s8(mag, sm), sm)
+        };
+        let c2 = {
+            let ev = vandq_u8(vshlq_n_u8::<1>(p), m60);
+            let od = if IS_V {
+                vbslq_u8(m20, vshrq_n_u8::<1>(vtpl), m10)
+            } else {
+                vbslq_u8(m20, vshlq_n_u8::<3>(vtpl), m10)
+            };
+            let mag = vreinterpretq_s8_u8(vbslq_u8(is_even, ev, od));
+            let sm = if IS_V {
+                vshrq_n_s8::<7>(vshlq_n_s8::<1>(vsgn_s8))
+            } else {
+                vshrq_n_s8::<7>(vshlq_n_s8::<5>(vsgn_s8))
+            };
+            vsubq_s8(veorq_s8(mag, sm), sm)
+        };
+        let c3 = {
+            let ev = vandq_u8(vshrq_n_u8::<1>(p), m60);
+            let od = if IS_V {
+                vbslq_u8(m20, vshrq_n_u8::<2>(vtpl), m10)
+            } else {
+                vbslq_u8(m20, vshlq_n_u8::<2>(vtpl), m10)
+            };
+            let mag = vreinterpretq_s8_u8(vbslq_u8(is_even, ev, od));
+            let sm = if IS_V {
+                vshrq_n_s8::<7>(vsgn_s8)
+            } else {
+                vshrq_n_s8::<7>(vshlq_n_s8::<4>(vsgn_s8))
+            };
+            vsubq_s8(veorq_s8(mag, sm), sm)
+        };
+
         let z01_lo = vreinterpretq_s16_s8(vzip1q_s8(c0, c1));
         let z23_lo = vreinterpretq_s16_s8(vzip1q_s8(c2, c3));
         let z01_hi = vreinterpretq_s16_s8(vzip2q_s8(c0, c1));
@@ -5849,7 +6005,7 @@ unsafe fn e8q2_accum_32cols(
     blk: *const u8,
     x0: std::arch::aarch64::int8x16_t,
     x1: std::arch::aarch64::int8x16_t,
-    tbl: &[std::arch::aarch64::int8x16x2_t; 4],
+    tbl: std::arch::aarch64::uint8x16x2_t,
 ) -> std::arch::aarch64::int32x4_t {
     use std::arch::aarch64::*;
     // SAFETY: `blk` holds 32 B (`16` tpl + `16` sgn); NEON + `sdot` are available on Apple Silicon.
@@ -5894,9 +6050,21 @@ unsafe fn nf_sdot_one_stripe_neon<const BITS: usize>(
     use std::arch::aarch64::*;
     let nc = matrix.num_chunks;
     let cb32 = matrix.codebook32();
-    let cb = unsafe { vld1q_s8(cb32.as_ptr()) };
-    let cb2 = unsafe { int8x16x2_t(cb, vld1q_s8(cb32.as_ptr().add(16))) };
-    let e8_tbl = unsafe { e8q2_load_tables() };
+    let cb = if BITS >= 3 {
+        unsafe { vld1q_s8(cb32.as_ptr()) }
+    } else {
+        vdupq_n_s8(0)
+    };
+    let cb2 = if BITS == 5 {
+        unsafe { int8x16x2_t(cb, vld1q_s8(cb32.as_ptr().add(16))) }
+    } else {
+        int8x16x2_t(cb, cb)
+    };
+    let e8_tbl = if BITS == 2 {
+        unsafe { e8q2_load_packed_table() }
+    } else {
+        uint8x16x2_t(vdupq_n_u8(0), vdupq_n_u8(0))
+    };
     let mask_0f = vdupq_n_u8(0x0F);
     let m10 = vdupq_n_u8(0x10);
     let m07 = vdupq_n_u8(0x07);
@@ -5942,8 +6110,8 @@ unsafe fn nf_sdot_one_stripe_neon<const BITS: usize>(
                 }
             } else {
                 for (g, ag) in a.iter_mut().enumerate() {
-                    *ag = e8q2_accum_32cols(*ag, d_ptr.add(g * 32), x0, x1, &e8_tbl);
-                    *ag = e8q2_accum_32cols(*ag, d_ptr.add(128 + g * 32), x2, x3, &e8_tbl);
+                    *ag = e8q2_accum_32cols(*ag, d_ptr.add(g * 32), x0, x1, e8_tbl);
+                    *ag = e8q2_accum_32cols(*ag, d_ptr.add(128 + g * 32), x2, x3, e8_tbl);
                 }
             }
             let vsx = vdupq_n_f32(sx);
@@ -6010,9 +6178,21 @@ unsafe fn nf_sdot_decode_neon<const BITS: usize>(
     let chunk_b = NfSdotMatrix::stripe_chunk_bytes(BITS);
     let pair_tot = matrix.pair_total_bytes();
     let cb32 = matrix.codebook32();
-    let cb = unsafe { vld1q_s8(cb32.as_ptr()) };
-    let cb2 = unsafe { int8x16x2_t(cb, vld1q_s8(cb32.as_ptr().add(16))) };
-    let e8_tbl = unsafe { e8q2_load_tables() };
+    let cb = if BITS >= 3 {
+        unsafe { vld1q_s8(cb32.as_ptr()) }
+    } else {
+        vdupq_n_s8(0)
+    };
+    let cb2 = if BITS == 5 {
+        unsafe { int8x16x2_t(cb, vld1q_s8(cb32.as_ptr().add(16))) }
+    } else {
+        int8x16x2_t(cb, cb)
+    };
+    let e8_tbl = if BITS == 2 {
+        unsafe { e8q2_load_packed_table() }
+    } else {
+        uint8x16x2_t(vdupq_n_u8(0), vdupq_n_u8(0))
+    };
     let mask_0f = vdupq_n_u8(0x0F);
     let m10 = vdupq_n_u8(0x10);
     let m07 = vdupq_n_u8(0x07);
@@ -6108,10 +6288,10 @@ unsafe fn nf_sdot_decode_neon<const BITS: usize>(
                         }
                     } else {
                         for g in 0..4 {
-                            let mut aag = e8q2_accum_32cols(vdupq_n_s32(0), da.add(g * 32), x0, x1, &e8_tbl);
-                            aag = e8q2_accum_32cols(aag, da.add(128 + g * 32), x2, x3, &e8_tbl);
-                            let mut abg = e8q2_accum_32cols(vdupq_n_s32(0), db.add(g * 32), x0, x1, &e8_tbl);
-                            abg = e8q2_accum_32cols(abg, db.add(128 + g * 32), x2, x3, &e8_tbl);
+                            let mut aag = e8q2_accum_32cols(vdupq_n_s32(0), da.add(g * 32), x0, x1, e8_tbl);
+                            aag = e8q2_accum_32cols(aag, da.add(128 + g * 32), x2, x3, e8_tbl);
+                            let mut abg = e8q2_accum_32cols(vdupq_n_s32(0), db.add(g * 32), x0, x1, e8_tbl);
+                            abg = e8q2_accum_32cols(abg, db.add(128 + g * 32), x2, x3, e8_tbl);
                             let wsa_g = load_bf16x4_as_f32(sc_ptr.add(g * 8));
                             let wsb_g = load_bf16x4_as_f32(sc_ptr.add(32 + g * 8));
                             fa[g] = vfmaq_f32(fa[g], vmulq_f32(vcvtq_f32_s32(aag), vsx), wsa_g);
@@ -6347,9 +6527,21 @@ unsafe fn nf_sdot_pairs_slice_neon<const BITS: usize>(
     use std::arch::aarch64::*;
     let chunk_b = NfSdotMatrix::stripe_chunk_bytes(BITS);
     let cb32 = nf_expand_codebook32(BITS, codebook);
-    let cb = unsafe { vld1q_s8(cb32.as_ptr()) };
-    let cb2 = unsafe { int8x16x2_t(cb, vld1q_s8(cb32.as_ptr().add(16))) };
-    let e8_tbl = unsafe { e8q2_load_tables() };
+    let cb = if BITS >= 3 {
+        unsafe { vld1q_s8(cb32.as_ptr()) }
+    } else {
+        vdupq_n_s8(0)
+    };
+    let cb2 = if BITS == 5 {
+        unsafe { int8x16x2_t(cb, vld1q_s8(cb32.as_ptr().add(16))) }
+    } else {
+        int8x16x2_t(cb, cb)
+    };
+    let e8_tbl = if BITS == 2 {
+        unsafe { e8q2_load_packed_table() }
+    } else {
+        uint8x16x2_t(vdupq_n_u8(0), vdupq_n_u8(0))
+    };
     let mask_0f = vdupq_n_u8(0x0F);
     let m10 = vdupq_n_u8(0x10);
     let m07 = vdupq_n_u8(0x07);
@@ -6430,10 +6622,10 @@ unsafe fn nf_sdot_pairs_slice_neon<const BITS: usize>(
                         }
                     } else {
                         for g in 0..4 {
-                            let mut aag = e8q2_accum_32cols(vdupq_n_s32(0), da.add(g * 32), x0, x1, &e8_tbl);
-                            aag = e8q2_accum_32cols(aag, da.add(128 + g * 32), x2, x3, &e8_tbl);
-                            let mut abg = e8q2_accum_32cols(vdupq_n_s32(0), db.add(g * 32), x0, x1, &e8_tbl);
-                            abg = e8q2_accum_32cols(abg, db.add(128 + g * 32), x2, x3, &e8_tbl);
+                            let mut aag = e8q2_accum_32cols(vdupq_n_s32(0), da.add(g * 32), x0, x1, e8_tbl);
+                            aag = e8q2_accum_32cols(aag, da.add(128 + g * 32), x2, x3, e8_tbl);
+                            let mut abg = e8q2_accum_32cols(vdupq_n_s32(0), db.add(g * 32), x0, x1, e8_tbl);
+                            abg = e8q2_accum_32cols(abg, db.add(128 + g * 32), x2, x3, e8_tbl);
                             let wsa_g = load_bf16x4_as_f32(sc_ptr.add(g * 8));
                             let wsb_g = load_bf16x4_as_f32(sc_ptr.add(32 + g * 8));
                             fa[g] = vfmaq_f32(fa[g], vmulq_f32(vcvtq_f32_s32(aag), vsx), wsa_g);
@@ -6598,9 +6790,21 @@ unsafe fn nf_sdot_batch_tile_neon<const BITS: usize, const NT: usize>(
     let i8a: [&Int8ChunkActivation; NT] =
         std::array::from_fn(|t| acts[t].int8.as_ref().expect("int8 activations required for NfSdotMatrix"));
     let cb32 = matrix.codebook32();
-    let cb = unsafe { vld1q_s8(cb32.as_ptr()) };
-    let cb2 = unsafe { int8x16x2_t(cb, vld1q_s8(cb32.as_ptr().add(16))) };
-    let e8_tbl = unsafe { e8q2_load_tables() };
+    let cb = if BITS >= 3 {
+        unsafe { vld1q_s8(cb32.as_ptr()) }
+    } else {
+        vdupq_n_s8(0)
+    };
+    let cb2 = if BITS == 5 {
+        unsafe { int8x16x2_t(cb, vld1q_s8(cb32.as_ptr().add(16))) }
+    } else {
+        int8x16x2_t(cb, cb)
+    };
+    let e8_tbl = if BITS == 2 {
+        unsafe { e8q2_load_packed_table() }
+    } else {
+        uint8x16x2_t(vdupq_n_u8(0), vdupq_n_u8(0))
+    };
     let mask_0f = vdupq_n_u8(0x0F);
     let m10 = vdupq_n_u8(0x10);
     let m07 = vdupq_n_u8(0x07);
@@ -6737,23 +6941,29 @@ unsafe fn nf_sdot_batch_tile_neon<const BITS: usize, const NT: usize>(
                         let v_lt12 = vcltq_u8(tpl_v, v12);
                         let u_idx = vorrq_u8(tpl_u, vandq_u8(vbicq_u8(u_lt12, v_lt12), m10));
                         let v_idx = vorrq_u8(tpl_v, vandq_u8(vbicq_u8(v_lt12, u_lt12), m10));
-                        let (u0, u1, u2, u3) =
-                            e8q2_unpack_quad_transpose::<false>(vtpl, vsgn, is_even, u_idx, &e8_tbl);
-                        let (v0, v1, v2, v3) =
-                            e8q2_unpack_quad_transpose::<true>(vtpl, vsgn, is_even, v_idx, &e8_tbl);
                         let off0 = c * 64 + k0 * 16;
                         let off1 = c * 64 + k1 * 16;
+                        let (u0, u1, u2, u3) =
+                            e8q2_unpack_quad_transpose::<false>(vtpl, vsgn, is_even, u_idx, e8_tbl);
                         for t in 0..NT {
                             let x0 = vld1q_s8(i8a[t].q.as_ptr().add(off0));
                             let x1 = vld1q_s8(i8a[t].q.as_ptr().add(off1));
                             let mut a = acc[t];
                             a = sdot_s8_lane::<0>(a, u0, x0);
-                            a = sdot_s8_lane::<1>(a, v0, x0);
                             a = sdot_s8_lane::<2>(a, u1, x0);
-                            a = sdot_s8_lane::<3>(a, v1, x0);
                             a = sdot_s8_lane::<0>(a, u2, x1);
-                            a = sdot_s8_lane::<1>(a, v2, x1);
                             a = sdot_s8_lane::<2>(a, u3, x1);
+                            acc[t] = a;
+                        }
+                        let (v0, v1, v2, v3) =
+                            e8q2_unpack_quad_transpose::<true>(vtpl, vsgn, is_even, v_idx, e8_tbl);
+                        for t in 0..NT {
+                            let x0 = vld1q_s8(i8a[t].q.as_ptr().add(off0));
+                            let x1 = vld1q_s8(i8a[t].q.as_ptr().add(off1));
+                            let mut a = acc[t];
+                            a = sdot_s8_lane::<1>(a, v0, x0);
+                            a = sdot_s8_lane::<3>(a, v1, x0);
+                            a = sdot_s8_lane::<1>(a, v2, x1);
                             a = sdot_s8_lane::<3>(a, v3, x1);
                             acc[t] = a;
                         }

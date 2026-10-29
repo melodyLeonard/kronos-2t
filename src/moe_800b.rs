@@ -2549,7 +2549,7 @@ fn dot_i8_64(a: &[i8], b: &[i8]) -> i32 {
                 let va = vld1q_s8(ap.add(k * 16));
                 let vb = vld1q_s8(bp.add(k * 16));
                 core::arch::asm!(
-                    "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+                    ".arch_extension dotprod\nsdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
                     acc = inout(vreg) acc,
                     a = in(vreg) va,
                     b = in(vreg) vb,

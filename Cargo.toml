@@ -5,6 +5,9 @@ edition = "2021"
 description = "Sub-bit Kronecker-synthesized, multiplication-free sparse inference engine"
 default-run = "kronos-2t"
 
+[lib]
+crate-type = ["rlib", "staticlib"]
+
 [features]
 # Core ML (Neural Engine) prompt prefill on macOS.
 ane = []

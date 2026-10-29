@@ -7,6 +7,11 @@ const MIB: usize = 1024 * 1024;
 
 static GLOBAL_BUDGET_OVERRIDE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(test)]
+thread_local! {
+    static TEST_THREAD_BUDGET_OVERRIDE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryTier {
     /// Smartphone / iOS extended-address-space budget (`<= 5.0 GiB` usable working set).
@@ -45,7 +50,14 @@ pub struct MemoryBudgetProfile {
 impl MemoryBudgetProfile {
     /// Installs a process-wide memory budget cap in bytes (`0` clears the override).
     pub fn set_global_budget_override_bytes(bytes: usize) {
-        GLOBAL_BUDGET_OVERRIDE_BYTES.store(bytes, Ordering::SeqCst);
+        #[cfg(test)]
+        {
+            TEST_THREAD_BUDGET_OVERRIDE_BYTES.with(|c| c.set(bytes));
+        }
+        #[cfg(not(test))]
+        {
+            GLOBAL_BUDGET_OVERRIDE_BYTES.store(bytes, Ordering::SeqCst);
+        }
     }
 
     /// Installs a process-wide memory budget cap in MiB (`0` clears the override).
@@ -71,7 +83,21 @@ impl MemoryBudgetProfile {
         let rec_ws = metal_ws_bytes
             .filter(|&b| b >= 512 * MIB)
             .unwrap_or_else(|| default_working_set_from_ram(hw_ram));
-        let override_b = GLOBAL_BUDGET_OVERRIDE_BYTES.load(Ordering::Relaxed);
+        let override_b = {
+            #[cfg(test)]
+            {
+                let tl = TEST_THREAD_BUDGET_OVERRIDE_BYTES.with(|c| c.get());
+                if tl > 0 {
+                    tl
+                } else {
+                    GLOBAL_BUDGET_OVERRIDE_BYTES.load(Ordering::Relaxed)
+                }
+            }
+            #[cfg(not(test))]
+            {
+                GLOBAL_BUDGET_OVERRIDE_BYTES.load(Ordering::Relaxed)
+            }
+        };
         let env_b = std::env::var("KRONOS_MEMORY_BUDGET_MB")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())

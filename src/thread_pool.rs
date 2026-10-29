@@ -8,19 +8,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn pin_macos_p_core_qos() {
     const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
     }
-    // SAFETY: Standard macOS libsystem call setting current thread scheduling QoS hint.
+    // SAFETY: Standard Darwin libsystem call setting current thread scheduling QoS hint.
     unsafe {
         let _ = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn pin_macos_p_core_qos() {}
 
 #[inline]
@@ -58,7 +58,7 @@ fn spin_or_yield(spins: &mut u32) {
 /// Detects the exact physical Performance-core count (`hw.perflevel0.physicalcpu` on Apple Silicon,
 /// e.g. `10` on M4 Pro).
 pub fn physical_p_cores() -> usize {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         unsafe extern "C" {
             fn sysctlbyname(

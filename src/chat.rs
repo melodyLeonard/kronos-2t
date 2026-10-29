@@ -409,6 +409,8 @@ pub struct ChatModel {
     im_end: usize,
     /// Token ids currently in the target KV cache.
     cached: Vec<usize>,
+    /// Small 2-slot LRU KV prefix cache (`<= 80` tokens/slot) accelerating repeated `Kronos-Jev` calls.
+    jev_caches: Vec<(Vec<usize>, crate::real_llm::KvPrefixSnapshot)>,
     ctx: usize,
     scratch: ChatScratch,
     pub name: String,
@@ -439,9 +441,11 @@ impl ChatModel {
         calib: Option<(&Path, usize)>,
     ) -> Result<Self, String> {
         let mut engine = load_or_compile_engine(model_dir, cache_dir, mode_key, ctx, threads, calib)?;
-        // Hadamard KV cache (`Q4` under `<= 8 GB` budget profile, `Q8` otherwise).
+        // Hadamard KV cache (`Q4` for `> 1B` models under `<= 8 GB` budget profile, `Q8` otherwise).
         if matches!(engine.cfg.head_dim(), 64 | 128) {
-            let kv_bits = if crate::memory_budget::MemoryBudgetProfile::active().prefer_q4_kv {
+            let kv_bits = if crate::memory_budget::MemoryBudgetProfile::active().prefer_q4_kv
+                && engine.cfg.hidden_size > 1024
+            {
                 4
             } else {
                 8
@@ -476,6 +480,7 @@ impl ChatModel {
             im_start,
             im_end,
             cached: Vec::new(),
+            jev_caches: Vec::with_capacity(2),
             ctx,
             scratch: ChatScratch::new(vocab_size),
             name,
@@ -488,6 +493,7 @@ impl ChatModel {
     pub fn enable_q8_kv_cache(&mut self, enable: bool) {
         self.engine.enable_q8_kv_cache(enable);
         self.cached.clear();
+        self.jev_caches.clear();
         if let Some(d) = self.draft.as_mut() {
             d.engine.enable_q8_kv_cache(enable);
             d.cached.clear();
@@ -502,6 +508,7 @@ impl ChatModel {
     pub fn set_kv_bits(&mut self, bits: u8) {
         self.engine.set_kv_bits(bits);
         self.cached.clear();
+        self.jev_caches.clear();
         if let Some(d) = self.draft.as_mut() {
             d.engine.set_kv_bits(bits);
             d.cached.clear();
@@ -516,6 +523,7 @@ impl ChatModel {
     pub fn set_kv_sliding_window(&mut self, window: Option<usize>, sink_tokens: usize) {
         self.engine.set_kv_sliding_window(window, sink_tokens);
         self.cached.clear();
+        self.jev_caches.clear();
         if let Some(d) = self.draft.as_mut() {
             d.engine.set_kv_sliding_window(window, sink_tokens);
             d.cached.clear();
@@ -538,6 +546,7 @@ impl ChatModel {
     pub fn enable_metal(&mut self) -> Result<(), String> {
         self.engine.enable_metal()?;
         self.cached.clear();
+        self.jev_caches.clear();
         let target_bits = if self.engine.kv_bits() == 4 { 4 } else { 8 };
         let target_win = self.engine.kv_sliding_window();
         if let Some(d) = self.draft.as_mut() {
@@ -546,7 +555,12 @@ impl ChatModel {
             } else {
                 d.engine.disable_metal();
                 if matches!(d.engine.cfg.head_dim(), 64 | 128) {
-                    d.engine.set_kv_bits(target_bits);
+                    let draft_bits = if d.engine.cfg.hidden_size > 1024 {
+                        target_bits
+                    } else {
+                        8
+                    };
+                    d.engine.set_kv_bits(draft_bits);
                     if let Some((w, s)) = target_win {
                         d.engine.set_kv_sliding_window(Some(w), s);
                     }
@@ -564,6 +578,7 @@ impl ChatModel {
     pub fn disable_metal(&mut self) {
         self.engine.disable_metal();
         self.cached.clear();
+        self.jev_caches.clear();
         if let Some(d) = self.draft.as_mut() {
             d.engine.disable_metal();
             d.cached.clear();
@@ -605,6 +620,7 @@ impl ChatModel {
 
     pub fn detach_draft(&mut self) {
         self.draft = None;
+        self.jev_caches.clear();
     }
 
     /// Attaches a draft model for lossless speculative decoding.
@@ -664,7 +680,12 @@ impl ChatModel {
         } else if (self.engine.is_q8_kv_enabled() || self.engine.is_metal_enabled())
             && matches!(draft_eng.cfg.head_dim(), 64 | 128)
         {
-            draft_eng.set_kv_bits(target_bits);
+            let draft_bits = if draft_eng.cfg.hidden_size > 1024 {
+                target_bits
+            } else {
+                8
+            };
+            draft_eng.set_kv_bits(draft_bits);
             if let Some((w, s)) = target_win {
                 draft_eng.set_kv_sliding_window(Some(w), s);
             }
@@ -672,6 +693,7 @@ impl ChatModel {
         if self.engine.is_metal_enabled() {
             crate::thread_pool::SpinThreadPool::park_idle_workers();
         }
+        self.jev_caches.clear();
         self.draft = Some(DraftEngine {
             engine: draft_eng,
             cached: Vec::new(),
@@ -813,6 +835,67 @@ impl ChatModel {
             (out, mass.clamp(0.0, 1.0) as f32)
         };
 
+        const JEV_CACHE_SLOTS: usize = 2;
+        const JEV_PREFIX_CAP: usize = 80;
+
+        fn eval_with_jev_prefix<F, R>(
+            eng: &mut RealLlamaEngine,
+            saved_total: usize,
+            tokens: &[usize],
+            caches: &mut Vec<(Vec<usize>, crate::real_llm::KvPrefixSnapshot)>,
+            score_fn: F,
+        ) -> Option<R>
+        where
+            F: FnOnce(&[f32]) -> R,
+        {
+            let overlap = saved_total.min(tokens.len());
+            let snap = eng.save_kv_prefix(overlap)?;
+
+            let max_reuse = tokens.len().saturating_sub(1);
+            let mut best_slot: Option<(usize, usize)> = None;
+            for (idx, (cached_toks, _)) in caches.iter().enumerate() {
+                let common = cached_toks
+                    .iter()
+                    .zip(tokens)
+                    .take_while(|(a, b)| a == b)
+                    .count()
+                    .min(max_reuse);
+                if common >= 8 && best_slot.is_none_or(|(_, best_c)| common > best_c) {
+                    best_slot = Some((idx, common));
+                }
+            }
+
+            let start_pos = if let Some((idx, common)) = best_slot {
+                eng.restore_kv_prefix_slice(&caches[idx].1, common, common);
+                if idx > 0 {
+                    let entry = caches.remove(idx);
+                    caches.insert(0, entry);
+                }
+                common
+            } else {
+                eng.reset_context();
+                0
+            };
+
+            let res = {
+                let logits = eng.forward_prompt(&tokens[start_pos..]);
+                score_fn(logits)
+            };
+
+            let save_len = max_reuse.min(JEV_PREFIX_CAP);
+            if start_pos < 16 && save_len >= 12 {
+                if let Some(jev_snap) = eng.save_linear_kv_prefix(save_len) {
+                    if caches.len() >= JEV_CACHE_SLOTS {
+                        caches.pop();
+                    }
+                    caches.insert(0, (tokens[..save_len].to_vec(), jev_snap));
+                }
+            }
+
+            eng.restore_kv_prefix(&snap, saved_total);
+            Some(res)
+        }
+
         let metal_active = self.engine.is_metal_enabled();
         if let Some(d) = self.draft.as_mut() {
             let dv = d.draft_vocab;
@@ -821,14 +904,13 @@ impl ChatModel {
                 .map(|&id| if id < dv { id } else { 0 })
                 .collect();
             let saved_total = d.cached.len();
-            let overlap = saved_total.min(mapped.len());
-            let snap = d.engine.save_kv_prefix(overlap)?;
-            d.engine.reset_context();
-            let res = {
-                let logits = d.engine.forward_prompt(&mapped);
-                score_logits(logits)
-            };
-            d.engine.restore_kv_prefix(&snap, saved_total);
+            let res = eval_with_jev_prefix(
+                &mut d.engine,
+                saved_total,
+                &mapped,
+                &mut self.jev_caches,
+                score_logits,
+            )?;
             if metal_active {
                 crate::thread_pool::SpinThreadPool::park_idle_workers();
             }
@@ -836,15 +918,13 @@ impl ChatModel {
         }
 
         let saved_total = self.cached.len();
-        let overlap = saved_total.min(raw_tokens.len());
-        let snap = self.engine.save_kv_prefix(overlap)?;
-        self.engine.reset_context();
-        let res = {
-            let logits = self.engine.forward_prompt(&raw_tokens);
-            score_logits(logits)
-        };
-        self.engine.restore_kv_prefix(&snap, saved_total);
-        Some(res)
+        eval_with_jev_prefix(
+            &mut self.engine,
+            saved_total,
+            &raw_tokens,
+            &mut self.jev_caches,
+            score_logits,
+        )
     }
 
     /// Pre-warms the fixed system + tool-schema prefix into target and draft KV caches.
@@ -977,6 +1057,71 @@ impl ChatModel {
     pub fn render_with_tools(&self, messages: &[Message], tools_json: &[String]) -> Vec<usize> {
         let prompt_str = render_chatml_prompt(messages, tools_json, self.default_system());
         self.tok.encode(&prompt_str)
+    }
+
+    /// Prefills `messages` (reusing any hot KV prefix) and returns `(first_greedy_token, prefilled_tokens)`.
+    pub fn prefill_messages(&mut self, messages: &[Message]) -> Result<(usize, usize), String> {
+        let prompt = self.render(messages);
+        if prompt.is_empty() {
+            return Err("rendered prompt is empty".to_string());
+        }
+        if prompt.len() >= self.ctx {
+            return Err(format!(
+                "prompt of {} tokens exceeds {}-token context",
+                prompt.len(),
+                self.ctx
+            ));
+        }
+        let mut common = self
+            .cached
+            .iter()
+            .zip(&prompt)
+            .take_while(|(a, b)| a == b)
+            .count();
+        common = common.min(prompt.len() - 1);
+        if !self.engine.can_truncate_kv_to(common) {
+            common = 0;
+        }
+        self.engine.truncate_context(common);
+        self.cached.truncate(common);
+        let tail = &prompt[common..];
+        let vocab = self.engine.cfg.vocab_size;
+        let logits = self.engine.forward_prompt(tail);
+        self.scratch.cur_logits[..vocab].copy_from_slice(&logits[..vocab]);
+        self.cached.extend_from_slice(tail);
+        if self.im_start < self.scratch.cur_logits.len() {
+            self.scratch.cur_logits[self.im_start] = f32::NEG_INFINITY;
+        }
+        let next = argmax(&self.scratch.cur_logits[..vocab]);
+        Ok((next, tail.len()))
+    }
+
+    /// Returns whether `tok_id` is an end-of-turn or end-of-sequence stop token.
+    pub fn is_stop_token(&self, tok_id: usize) -> bool {
+        tok_id == self.im_end
+            || tok_id == self.im_start
+            || tok_id == self.tok.eos_token_id
+            || self.tok.eos_token_ids.contains(&tok_id)
+    }
+
+    /// Appends raw BPE bytes for `tok_id` onto `raw_bytes`.
+    pub fn append_token_bytes(&self, tok_id: usize, raw_bytes: &mut Vec<u8>) {
+        self.tok.append_token_bytes(tok_id, raw_bytes);
+    }
+
+    /// Runs one greedy autoregressive forward step for `tok_id` and returns the next predicted token ID.
+    pub fn advance_greedy_token(&mut self, tok_id: usize) -> Result<usize, String> {
+        if self.cached.len() >= self.ctx {
+            return Err(format!("context limit ({}) reached", self.ctx));
+        }
+        let vocab = self.engine.cfg.vocab_size;
+        let logits = self.engine.forward_token(tok_id);
+        self.scratch.cur_logits[..vocab].copy_from_slice(&logits[..vocab]);
+        self.cached.push(tok_id);
+        if self.im_start < self.scratch.cur_logits.len() {
+            self.scratch.cur_logits[self.im_start] = f32::NEG_INFINITY;
+        }
+        Ok(argmax(&self.scratch.cur_logits[..vocab]))
     }
 
     /// Generates a reply, calling `on_text` with each new piece of text; return `false` from it

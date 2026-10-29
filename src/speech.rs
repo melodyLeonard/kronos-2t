@@ -1,18 +1,28 @@
 //! Local on-device speech-to-text pipeline backed by macOS SpeechAnalyzer on the Apple Neural Engine.
 
+#[cfg(target_os = "macos")]
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::net::UnixStream;
+#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
+#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "macos")]
 use std::sync::{Mutex, OnceLock};
+#[cfg(target_os = "macos")]
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
+#[cfg(target_os = "macos")]
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::device::{global_device_manager, split_camel_case_parts};
+#[cfg(target_os = "macos")]
+use crate::device::global_device_manager;
+use crate::device::split_camel_case_parts;
 use crate::json::quote;
 use crate::vision::decode_base64;
 
@@ -32,7 +42,9 @@ pub struct PreparedWav {
     pub speech_detected: bool,
 }
 
+#[cfg(target_os = "macos")]
 static SPEECH_WARMED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
 static SPEECH_REQ_SEQ: AtomicU64 = AtomicU64::new(1);
 
 // Packaged as a LaunchServices `.app` bundle (`KronosVoice.app`) so macOS TCC attributes microphone access

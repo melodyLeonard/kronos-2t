@@ -171,6 +171,7 @@ pub fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+#[cfg(target_os = "macos")]
 fn spatial_zone(left_x: f32, top_y: f32, width_n: f32) -> String {
     let v = if top_y < 0.24 {
         "top"
@@ -190,6 +191,7 @@ fn spatial_zone(left_x: f32, top_y: f32, width_n: f32) -> String {
     format!("{v}-{h}")
 }
 
+#[cfg(target_os = "macos")]
 struct PaletteSummary {
     theme: String,
     bg_hex: String,
@@ -198,6 +200,7 @@ struct PaletteSummary {
     band_colors: [String; 3],
 }
 
+#[cfg(target_os = "macos")]
 fn analyze_rgba_grid(rgba: &[u8], w: usize, h: usize) -> PaletteSummary {
     if w == 0 || h == 0 || rgba.len() < w * h * 4 {
         return PaletteSummary {

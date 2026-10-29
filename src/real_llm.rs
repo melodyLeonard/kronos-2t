@@ -1393,7 +1393,7 @@ impl LlamaWorkspace {
 
 /// Real pretrained `LlamaForCausalLM` / `Qwen2ForCausalLM` / Sparse-MoE engine.
 pub struct RealLlamaEngine {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub(crate) metal: Option<crate::metal_gpu::MetalLlamaEngine>,
     pub cfg: LlamaConfig,
     pub mode: RealWeightMode,
@@ -1470,7 +1470,7 @@ impl RealLlamaEngine {
         assert!(bits == 4 || bits == 8, "KV bits must be 4 or 8 (got {bits})");
         self.kv_bits_pref = bits;
         self.ws.pos = 0;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(gpu) = self.metal.as_mut() {
             gpu.reconfigure_kv(&self.cfg, bits, self.kv_window_pref, self.kv_sinks_pref)
                 .expect("Metal KV reconfigure failed");
@@ -1490,7 +1490,7 @@ impl RealLlamaEngine {
 
     /// Active KV-cache bit-width (`4`, `8`, or `32`).
     pub fn kv_bits(&self) -> u8 {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(gpu) = &self.metal {
             return gpu.kv_bits();
         }
@@ -1506,7 +1506,7 @@ impl RealLlamaEngine {
             0
         };
         self.ws.pos = 0;
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(gpu) = self.metal.as_mut() {
             let bits = if self.kv_bits_pref == 4 { 4 } else { 8 };
             gpu.reconfigure_kv(&self.cfg, bits, self.kv_window_pref, self.kv_sinks_pref)
@@ -1528,7 +1528,7 @@ impl RealLlamaEngine {
 
     /// Returns `(window_size, sink_tokens)` when a sliding-window ring buffer is active.
     pub fn kv_sliding_window(&self) -> Option<(usize, usize)> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(gpu) = &self.metal {
             return gpu.kv_sliding_window();
         }
@@ -1544,7 +1544,7 @@ impl RealLlamaEngine {
         if target_len >= self.ws.pos {
             return true;
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(gpu) = &self.metal {
             return gpu.can_truncate_kv_to(self.ws.pos, target_len);
         }
@@ -1589,7 +1589,7 @@ impl RealLlamaEngine {
     /// Whether the quantized KV cache is active.
     #[inline]
     pub fn is_q8_kv_enabled(&self) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if self.metal.is_some() {
             return true;
         }
@@ -1628,7 +1628,7 @@ impl RealLlamaEngine {
         {
             return Err("Metal GPU requires q_dim == hidden_size without q_norm/k_norm/o_bias".to_string());
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             fn as_nf4<'a>(b: &'a LinearBackend, name: &str) -> Result<&'a NfSdotMatrix, String> {
                 match b {
@@ -1692,15 +1692,15 @@ impl RealLlamaEngine {
             }
             Ok(())
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
-            Err("Metal GPU backend is only available on macOS".to_string())
+            Err("Metal GPU backend is only available on Apple platforms".to_string())
         }
     }
 
     /// Disables Metal GPU execution and restores CPU quantized KV cache and P-core worker pool.
     pub fn disable_metal(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if self.metal.take().is_some() {
             self.ws.pos = 0;
             if matches!(self.cfg.head_dim(), 64 | 128) {
@@ -1713,11 +1713,11 @@ impl RealLlamaEngine {
     /// Whether the Metal GPU backend is active.
     #[inline]
     pub fn is_metal_enabled(&self) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             self.metal.is_some()
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             false
         }
@@ -1725,7 +1725,7 @@ impl RealLlamaEngine {
 
     /// Bytes allocated for the active KV cache.
     pub fn kv_cache_bytes(&self) -> usize {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(gpu) = &self.metal {
             return gpu.kv_cache_bytes();
         }
@@ -1913,7 +1913,7 @@ impl RealLlamaEngine {
         let rope_cos_sin = build_rope_table(&cfg);
         let ws = LlamaWorkspace::new(&cfg);
         Ok(Self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal: None,
             kv_bits_pref: 8,
             kv_window_pref: cfg.sliding_window,
@@ -2223,7 +2223,7 @@ impl RealLlamaEngine {
         mat_count += 1;
 
         let mut eng = Self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal: None,
             kv_bits_pref: 8,
             kv_window_pref: self.cfg.sliding_window,
@@ -2512,7 +2512,7 @@ impl RealLlamaEngine {
         );
 
         Self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal: None,
             kv_bits_pref: 8,
             kv_window_pref: self.cfg.sliding_window,
@@ -2765,7 +2765,7 @@ impl RealLlamaEngine {
         );
 
         let mut eng = Self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal: None,
             kv_bits_pref: 8,
             kv_window_pref: self.cfg.sliding_window,
@@ -3108,7 +3108,7 @@ impl RealLlamaEngine {
         drop(hess_head);
 
         let mut eng = Self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal: None,
             kv_bits_pref: 8,
             kv_window_pref: cfg.sliding_window,
@@ -3179,7 +3179,7 @@ impl RealLlamaEngine {
     /// Repacks projections for `SDOT`, interleaves dense `gate_up_proj` in 64-row blocks, and enables INT8
     /// chunk activations.
     pub fn repack_sdot(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             self.metal = None;
         }
@@ -3630,7 +3630,7 @@ impl RealLlamaEngine {
 
         let budget = crate::memory_budget::MemoryBudgetProfile::active();
         let mut eng = Self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal: None,
             kv_bits_pref: if budget.prefer_q4_kv { 4 } else { 8 },
             kv_window_pref: cfg.sliding_window,
@@ -4873,7 +4873,7 @@ impl RealLlamaEngine {
             };
 
         let mut eng = Self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             metal: None,
             kv_bits_pref: if budget.prefer_q4_kv { 4 } else { 8 },
             kv_window_pref,
@@ -4913,6 +4913,175 @@ impl RealLlamaEngine {
             pinned_bytes,
             kv_and_scratch_bytes,
             0,
+            policy,
+        )?;
+        eng.moe_runtime = Some(moe_rt);
+        Ok(eng)
+    }
+
+    /// Constructs a synthetic Sparse-MoE `RealLlamaEngine` with full `nf4g128` pinned attention,
+    /// `nf4g128` untied embeddings and `lm_head`, `Q4`/`Q8` sliding-window KV cache, Zipf-skewed
+    /// routers, 3-layer `SubspaceProjector` lookahead, and a physical `.k2tm` expert shard on disk.
+    pub fn new_synthetic_moe_for_bench(
+        cfg: LlamaConfig,
+        expert_bits: usize,
+        experts_k2tm_path: &Path,
+        draft_reserve_bytes: usize,
+        policy: MoeExpertOpenPolicy,
+        seed: u64,
+    ) -> io::Result<Self> {
+        let h_dim = cfg.hidden_size;
+        let q_dim = cfg.q_dim();
+        let kv_dim = cfg.kv_dim();
+        let qkv_rows = q_dim + 2 * kv_dim;
+        let num_layers = cfg.num_hidden_layers;
+        let num_exp = cfg.num_experts;
+        let rank = 32usize.min(h_dim);
+
+        let mut rng = seed ^ 0xA5A5_5A5A_F0F0_0F0F;
+        let mut next_f32 = || -> f32 {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            let u = (rng.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32
+                * (1.0 / ((1u32 << 24) as f32));
+            (u - 0.5) * 2.0
+        };
+
+        let mut layers = Vec::with_capacity(num_layers);
+        let router_scale = 0.85f32 / (h_dim as f32).sqrt();
+        for l in 0..num_layers {
+            let input_norm = vec![1.0f32; h_dim];
+            let post_attn_norm = vec![1.0f32; h_dim];
+            let qkv_proj = LinearBackend::NfSdot(NfSdotMatrix::new_synthetic(
+                qkv_rows,
+                h_dim,
+                4,
+                2,
+                seed.wrapping_add((l * 17 + 1) as u64),
+            ));
+            let o_proj = LinearBackend::NfSdot(NfSdotMatrix::new_synthetic(
+                h_dim,
+                q_dim,
+                4,
+                2,
+                seed.wrapping_add((l * 17 + 2) as u64),
+            ));
+            let mut r_weights = Vec::with_capacity(num_exp * h_dim);
+            for _ in 0..(num_exp * h_dim) {
+                r_weights.push(next_f32() * router_scale);
+            }
+            let mut r_bias = vec![0.0f32; num_exp];
+            for rank_idx in 0..num_exp {
+                let eid = (rank_idx * 7 + l * 3) % num_exp;
+                r_bias[eid] = -1.65f32 * ((rank_idx + 1) as f32).ln();
+            }
+            let router = DenseMoeRouter::new(num_exp, h_dim, r_weights, Some(r_bias));
+            let lookahead = (l + 3 < num_layers).then(|| {
+                let mut u_proj = vec![0.0f32; rank * h_dim];
+                let mut v_proj = vec![0.0f32; h_dim * rank];
+                for r in 0..rank {
+                    u_proj[r * h_dim + r] = 1.0;
+                    v_proj[r * rank + r] = 1.0;
+                }
+                (
+                    l + 3,
+                    SubspaceProjector {
+                        d_model: h_dim,
+                        rank,
+                        u_proj,
+                        v_proj,
+                    },
+                )
+            });
+
+            layers.push(LlamaLayer {
+                input_norm,
+                post_attn_norm,
+                o_inv_scale: None,
+                down_inv_scale: None,
+                qkv_bias: None,
+                o_bias: None,
+                q_norm: None,
+                k_norm: None,
+                qkv_proj,
+                o_proj,
+                gate_up_proj: LinearBackend::Empty,
+                gate_up_interleaved: false,
+                down_proj: LinearBackend::Empty,
+                moe: Some(MoeLayerCore {
+                    moe_slot_idx: l,
+                    router,
+                    shared_expert: None,
+                    lookahead,
+                }),
+            });
+        }
+
+        let final_norm = vec![1.0f32; h_dim];
+        let lm_head = LinearBackend::NfSdot(NfSdotMatrix::new_synthetic(
+            cfg.vocab_size,
+            h_dim,
+            4,
+            2,
+            seed.wrapping_add(0xBEEF),
+        ));
+        let embed_nf4 = (!cfg.tie_word_embeddings).then(|| {
+            NfSdotMatrix::new_synthetic(
+                cfg.vocab_size,
+                h_dim,
+                4,
+                2,
+                seed.wrapping_add(0xCAFE),
+            )
+        });
+
+        let budget = crate::memory_budget::MemoryBudgetProfile::active();
+        let kv_bits = if budget.prefer_q4_kv { 4 } else { 8 };
+        let mut eng = Self {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            metal: None,
+            kv_bits_pref: kv_bits,
+            kv_window_pref: cfg.sliding_window,
+            kv_sinks_pref: cfg.sink_tokens,
+            rope_cos_sin: build_rope_table(&cfg),
+            ws: LlamaWorkspace::new(&cfg),
+            cfg,
+            mode: RealWeightMode::KronosNfMixedGptq {
+                attn_head_bits: 4,
+                ffn_bits: expert_bits,
+                scale_group_chunks: 2,
+            },
+            mean_weight_rel_error: 0.0,
+            embed_f32_rows: Vec::new(),
+            embed_bf16_rows: Vec::new(),
+            embed_nf4,
+            layers,
+            final_norm,
+            lm_head,
+            pool: None,
+            moe_runtime: None,
+        };
+        eng.repack_sdot();
+        eng.set_default_p_cores();
+        eng.enable_q8_kv_cache(true);
+
+        let pinned_bytes = eng.pinned_core_bytes();
+        let kv_and_scratch_bytes = eng.kv_cache_bytes() + (48 << 20);
+        let moe_rt = SparseMoeRuntime::open_k2tm(
+            experts_k2tm_path,
+            eng.cfg.hidden_size,
+            eng.cfg.eff_moe_inter(),
+            eng.cfg.num_experts,
+            eng.cfg.num_experts_per_tok,
+            eng.cfg.norm_topk_prob,
+            eng.cfg.router_scoring,
+            0,
+            expert_bits,
+            2,
+            pinned_bytes,
+            kv_and_scratch_bytes,
+            draft_reserve_bytes,
             policy,
         )?;
         eng.moe_runtime = Some(moe_rt);
@@ -5060,7 +5229,7 @@ pub enum KvPrefixSnapshot {
 impl RealLlamaEngine {
     /// Saves the first `n` CPU KV-cache positions (`None` on Metal-backed engines).
     pub fn save_kv_prefix(&self, n: usize) -> Option<KvPrefixSnapshot> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if self.metal.is_some() {
             return None;
         }
@@ -5144,8 +5313,94 @@ impl RealLlamaEngine {
         }
     }
 
+    /// Saves a linear (pre-wrap) CPU KV-cache prefix of `n` tokens without allocating full ring slack.
+    pub fn save_linear_kv_prefix(&self, n: usize) -> Option<KvPrefixSnapshot> {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if self.metal.is_some() {
+            return None;
+        }
+        let len = n.min(self.ws.pos);
+        if let Some(q) = self.ws.q8_kv.as_ref() {
+            if q.ring_len > 0 && len > q.sink_tokens + q.ring_len {
+                return None;
+            }
+            let heads = q.num_layers * q.num_kv_heads;
+            let hd = q.head_dim;
+            let slots_per_head = len;
+            if q.bits == 8 {
+                let mut k_q8 = vec![0i8; heads * slots_per_head * hd];
+                let mut v_q8 = vec![0i8; heads * slots_per_head * hd];
+                let mut k_scales = vec![0.0f32; heads * slots_per_head];
+                let mut v_scales = vec![0.0f32; heads * slots_per_head];
+                if slots_per_head > 0 {
+                    for h in 0..heads {
+                        let src = h * q.cap_seq_len;
+                        let dst = h * slots_per_head;
+                        k_q8[dst * hd..(dst + slots_per_head) * hd]
+                            .copy_from_slice(&q.k_q8[src * hd..(src + slots_per_head) * hd]);
+                        v_q8[dst * hd..(dst + slots_per_head) * hd]
+                            .copy_from_slice(&q.v_q8[src * hd..(src + slots_per_head) * hd]);
+                        k_scales[dst..dst + slots_per_head]
+                            .copy_from_slice(&q.k_scales[src..src + slots_per_head]);
+                        v_scales[dst..dst + slots_per_head]
+                            .copy_from_slice(&q.v_scales[src..src + slots_per_head]);
+                    }
+                }
+                Some(KvPrefixSnapshot::Q8 {
+                    slots_per_head,
+                    k_q8,
+                    v_q8,
+                    k_scales,
+                    v_scales,
+                })
+            } else {
+                let half_hd = hd / 2;
+                let gph64 = hd / 64;
+                let mut k_q4 = vec![0x88u8; heads * slots_per_head * half_hd];
+                let mut v_q4 = vec![0x88u8; heads * slots_per_head * half_hd];
+                let mut k_s16 = vec![0u16; heads * slots_per_head * gph64];
+                let mut v_s16 = vec![0u16; heads * slots_per_head * gph64];
+                if slots_per_head > 0 {
+                    for h in 0..heads {
+                        let src = h * q.cap_seq_len;
+                        let dst = h * slots_per_head;
+                        k_q4[dst * half_hd..(dst + slots_per_head) * half_hd].copy_from_slice(
+                            &q.k_q4[src * half_hd..(src + slots_per_head) * half_hd],
+                        );
+                        v_q4[dst * half_hd..(dst + slots_per_head) * half_hd].copy_from_slice(
+                            &q.v_q4[src * half_hd..(src + slots_per_head) * half_hd],
+                        );
+                        k_s16[dst * gph64..(dst + slots_per_head) * gph64]
+                            .copy_from_slice(&q.k_s16[src * gph64..(src + slots_per_head) * gph64]);
+                        v_s16[dst * gph64..(dst + slots_per_head) * gph64]
+                            .copy_from_slice(&q.v_s16[src * gph64..(src + slots_per_head) * gph64]);
+                    }
+                }
+                Some(KvPrefixSnapshot::Q4 {
+                    slots_per_head,
+                    k_q4,
+                    v_q4,
+                    k_s16,
+                    v_s16,
+                })
+            }
+        } else {
+            self.save_kv_prefix(len)
+        }
+    }
+
     /// Restores a previously saved CPU KV-cache prefix and sets `pos = total_pos`.
     pub fn restore_kv_prefix(&mut self, snap: &KvPrefixSnapshot, total_pos: usize) {
+        self.restore_kv_prefix_slice(snap, usize::MAX, total_pos);
+    }
+
+    /// Restores up to `copy_slots` leading tokens from `snap` and sets `pos = total_pos`.
+    pub fn restore_kv_prefix_slice(
+        &mut self,
+        snap: &KvPrefixSnapshot,
+        copy_slots: usize,
+        total_pos: usize,
+    ) {
         match snap {
             KvPrefixSnapshot::Q8 {
                 slots_per_head,
@@ -5156,19 +5411,23 @@ impl RealLlamaEngine {
             } => {
                 if let Some(q) = self.ws.q8_kv.as_mut() {
                     let sp = *slots_per_head;
-                    if sp > 0 {
-                        q.ensure_seq_capacity(total_pos.max(sp.min(q.max_seq_len)), total_pos);
+                    let cp = sp.min(copy_slots);
+                    if cp > 0 {
+                        q.ensure_seq_capacity(total_pos.max(cp.min(q.max_seq_len)), total_pos);
                         let heads = q.num_layers * q.num_kv_heads;
                         let hd = q.head_dim;
                         for h in 0..heads {
                             let src = h * sp;
                             let dst = h * q.cap_seq_len;
-                            q.k_q8[dst * hd..(dst + sp) * hd]
-                                .copy_from_slice(&k_q8[src * hd..(src + sp) * hd]);
-                            q.v_q8[dst * hd..(dst + sp) * hd]
-                                .copy_from_slice(&v_q8[src * hd..(src + sp) * hd]);
-                            q.k_scales[dst..dst + sp].copy_from_slice(&k_scales[src..src + sp]);
-                            q.v_scales[dst..dst + sp].copy_from_slice(&v_scales[src..src + sp]);
+                            q.k_q8[dst * hd..(dst + cp) * hd]
+                                .copy_from_slice(&k_q8[src * hd..(src + cp) * hd]);
+                            q.v_q8[dst * hd..(dst + cp) * hd]
+                                .copy_from_slice(&v_q8[src * hd..(src + cp) * hd]);
+                            q.k_scales[dst..dst + cp].copy_from_slice(&k_scales[src..src + cp]);
+                            v_scales[src..src + cp]
+                                .iter()
+                                .enumerate()
+                                .for_each(|(i, &val)| q.v_scales[dst + i] = val);
                         }
                     }
                 }
@@ -5182,39 +5441,41 @@ impl RealLlamaEngine {
             } => {
                 if let Some(q) = self.ws.q8_kv.as_mut() {
                     let sp = *slots_per_head;
-                    if sp > 0 {
-                        q.ensure_seq_capacity(total_pos.max(sp.min(q.max_seq_len)), total_pos);
+                    let cp = sp.min(copy_slots);
+                    if cp > 0 {
+                        q.ensure_seq_capacity(total_pos.max(cp.min(q.max_seq_len)), total_pos);
                         let heads = q.num_layers * q.num_kv_heads;
                         let half_hd = q.head_dim / 2;
                         let gph64 = q.head_dim / 64;
                         for h in 0..heads {
                             let src = h * sp;
                             let dst = h * q.cap_seq_len;
-                            q.k_q4[dst * half_hd..(dst + sp) * half_hd]
-                                .copy_from_slice(&k_q4[src * half_hd..(src + sp) * half_hd]);
-                            q.v_q4[dst * half_hd..(dst + sp) * half_hd]
-                                .copy_from_slice(&v_q4[src * half_hd..(src + sp) * half_hd]);
-                            q.k_s16[dst * gph64..(dst + sp) * gph64]
-                                .copy_from_slice(&k_s16[src * gph64..(src + sp) * gph64]);
-                            q.v_s16[dst * gph64..(dst + sp) * gph64]
-                                .copy_from_slice(&v_s16[src * gph64..(src + sp) * gph64]);
+                            q.k_q4[dst * half_hd..(dst + cp) * half_hd]
+                                .copy_from_slice(&k_q4[src * half_hd..(src + cp) * half_hd]);
+                            q.v_q4[dst * half_hd..(dst + cp) * half_hd]
+                                .copy_from_slice(&v_q4[src * half_hd..(src + cp) * half_hd]);
+                            q.k_s16[dst * gph64..(dst + cp) * gph64]
+                                .copy_from_slice(&k_s16[src * gph64..(src + cp) * gph64]);
+                            q.v_s16[dst * gph64..(dst + cp) * gph64]
+                                .copy_from_slice(&v_s16[src * gph64..(src + cp) * gph64]);
                         }
                     }
                 }
             }
             KvPrefixSnapshot::Fp32 { len, k, v } => {
                 let len = *len;
-                if len > 0 {
+                let cp = len.min(copy_slots);
+                if cp > 0 {
                     self.ws.ensure_fp32_kv(&self.cfg);
                     let kvd = self.cfg.kv_dim();
                     let stride = self.cfg.max_seq_len * kvd;
                     for l in 0..self.layers.len() {
                         let src = l * len * kvd;
                         let dst = l * stride;
-                        self.ws.k_cache[dst..dst + len * kvd]
-                            .copy_from_slice(&k[src..src + len * kvd]);
-                        self.ws.v_cache[dst..dst + len * kvd]
-                            .copy_from_slice(&v[src..src + len * kvd]);
+                        self.ws.k_cache[dst..dst + cp * kvd]
+                            .copy_from_slice(&k[src..src + cp * kvd]);
+                        self.ws.v_cache[dst..dst + cp * kvd]
+                            .copy_from_slice(&v[src..src + cp * kvd]);
                     }
                 }
             }
@@ -5249,7 +5510,7 @@ impl RealLlamaEngine {
         let hd = self.cfg.head_dim();
         assert!(n <= rows && n <= self.cfg.max_seq_len);
         assert_eq!(keys.len(), self.layers.len() * rows * kvd);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(gpu) = self.metal.as_mut() {
             gpu.load_prefix_kv(keys, values, rows, n)
                 .expect("Metal load_prefix_kv failed");
@@ -5393,7 +5654,7 @@ impl RealLlamaEngine {
             self.ws.pos,
             self.cfg.max_seq_len
         );
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(gpu) = self.metal.as_mut() {
             let h_dim = self.cfg.hidden_size;
             let ef32 = &self.embed_f32_rows;
@@ -6332,7 +6593,7 @@ impl RealLlamaEngine {
     /// after its last token. Other engines fall back to token-by-token decoding.
     pub fn forward_prompt(&mut self, tokens: &[usize]) -> &[f32] {
         assert!(!tokens.is_empty());
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(gpu) = self.metal.as_mut() {
             let h_dim = self.cfg.hidden_size;
             let ef32 = &self.embed_f32_rows;
@@ -6375,7 +6636,7 @@ impl RealLlamaEngine {
         assert!(!tokens.is_empty());
         let vocab = self.cfg.vocab_size;
         assert!(out_logits.len() >= tokens.len() * vocab);
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(gpu) = self.metal.as_mut() {
             let h_dim = self.cfg.hidden_size;
             let ef32 = &self.embed_f32_rows;
@@ -7300,7 +7561,7 @@ unsafe fn sdot_v16_i8(
     // SAFETY: `FEAT_DotProd` (`sdot`) is baseline on every Apple Silicon / ARMv8.4+ CPU.
     unsafe {
         core::arch::asm!(
-            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+            ".arch_extension dotprod\nsdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
             acc = inout(vreg) acc,
             a = in(vreg) a,
             b = in(vreg) b,
