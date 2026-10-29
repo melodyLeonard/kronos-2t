@@ -1,23 +1,33 @@
-//! OpenAI-compatible HTTP server (chat completions + tool calling) for compiled Kronos models.
+//! OpenAI-compatible HTTP server and sandboxed workspace agent for compiled Kronos models.
 //!
 //! Usage: `kronos_server <model_dir> [flags]`
 //!   `--host H`            bind address (default 127.0.0.1)
 //!   `--port P`            (default 18080)
 //!   `--api-key KEY`       require `Authorization: Bearer KEY`
+//!   `--workdir DIR`       workspace root for web agent tools and `/preview/*` (default temp dir)
 //!   `--cache-dir DIR`     optional directory to read/write compiled `.k2tb` caches
 //!   `--fp32-kv`           use an `FP32` KV cache instead of the default INT8 one
+//!   `--cpu`               force CPU inference (disables default Metal GPU backend for NF4)
+//!   `--metal`             require Metal GPU inference
+//!   `--draft DIR`         draft model for speculative decoding (`--draft-mode M`)
 //!   `--ane`               prefill on the Neural Engine (`ane` feature, models in `<model_dir>/ane`)
 //!   `--mode M`, `--calib FILE`, `--calib-tokens N`, `--ctx N`, `--threads N` as in `kronos_chat`
 //!
-//! Endpoints: `POST /v1/chat/completions` (supports `"tools"`, `"tool_calls"`, `"role": "tool"`, and
-//! `"stream": true` server-sent events), `GET /v1/models`, `GET /health`, and a web chat page at `/`.
-//! Requests are served one generation at a time.
+//! Endpoints: `POST /v1/chat/completions`, `POST /v1/agent/chat`, `GET /v1/agent/files`,
+//! `GET /v1/agent/file?path=...`, `POST /v1/agent/clear`, `GET /preview/<path>`, `GET /v1/models`,
+//! `GET /health`, and the web UI at `/`.
 
+use kronos_2t::agent::{
+    list_workspace_files, mime_type_for_path, resolve_jailed_path, run_agent_turn,
+    serialize_messages_json, tool_definitions_json, truncate_utf8, validate_file, AgentEvent,
+    AgentTurnConfig, MAX_READ_BYTES,
+};
 use kronos_2t::chat::{ChatModel, Completion, GenParams, Message, ToolCall};
 use kronos_2t::json::{quote, Json};
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,12 +40,14 @@ struct Server {
     model: Mutex<ChatModel>,
     name: String,
     api_key: Option<String>,
+    workdir: PathBuf,
     next_id: AtomicU64,
 }
 
 struct Request {
     method: String,
     path: String,
+    query: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
@@ -44,6 +56,45 @@ impl Request {
     fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
     }
+
+    fn query_param(&self, key: &str) -> Option<String> {
+        for pair in self.query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            if percent_decode(k) == key {
+                return Some(percent_decode(v));
+            }
+        }
+        None
+    }
+}
+
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+        } else if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+            out.push(bytes[i]);
+            i += 1;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<Request, (u16, String)> {
@@ -51,8 +102,11 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, (u16, String)> {
     let mut line = String::new();
     reader.read_line(&mut line).map_err(|e| (400, e.to_string()))?;
     let mut parts = line.split_whitespace();
-    let (method, path) = match (parts.next(), parts.next()) {
-        (Some(m), Some(p)) => (m.to_string(), p.split('?').next().unwrap_or("").to_string()),
+    let (method, path, query) = match (parts.next(), parts.next()) {
+        (Some(m), Some(target)) => {
+            let (p, q) = target.split_once('?').unwrap_or((target, ""));
+            (m.to_string(), p.to_string(), q.to_string())
+        }
         _ => return Err((400, "malformed request line".into())),
     };
     let mut headers = Vec::new();
@@ -71,7 +125,13 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, (u16, String)> {
             headers.push((k.trim().to_string(), v.trim().to_string()));
         }
     }
-    let mut req = Request { method, path, headers, body: Vec::new() };
+    let mut req = Request {
+        method,
+        path,
+        query,
+        headers,
+        body: Vec::new(),
+    };
     let len: usize = req.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
     if len > MAX_BODY {
         return Err((413, "request body too large".into()));
@@ -96,18 +156,33 @@ fn reason(status: u16) -> &'static str {
 
 const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
 
-fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
+fn respond_bytes(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    extra_headers: &str,
+    body: &[u8],
+) {
     let head = format!(
-        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{CORS}Connection: close\r\n\r\n",
+        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{extra_headers}{CORS}Connection: close\r\n\r\n",
         reason(status),
         body.len()
     );
-    let _ = stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(body.as_bytes()));
+    let _ = stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(body));
+}
+
+fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
+    respond_bytes(stream, status, content_type, "", body.as_bytes());
 }
 
 fn error(stream: &mut TcpStream, status: u16, msg: &str) {
     let kind = if status == 401 { "authentication_error" } else { "invalid_request_error" };
-    respond(stream, status, "application/json", &format!(r#"{{"error":{{"message":{},"type":"{kind}"}}}}"#, quote(msg)));
+    respond(
+        stream,
+        status,
+        "application/json",
+        &format!(r#"{{"error":{{"message":{},"type":"{kind}"}}}}"#, quote(msg)),
+    );
 }
 
 /// `content` may be a string, `null`, or an array of `{"type":"text","text":...}` parts.
@@ -143,10 +218,7 @@ fn parse_tool_calls_array(arr: &[Json]) -> Result<Vec<ToolCall>, String> {
     Ok(out)
 }
 
-fn parse_chat(
-    body: &Json,
-    defaults: &GenParams,
-) -> Result<(Vec<Message>, Vec<String>, GenParams, bool), String> {
+fn parse_messages_field(body: &Json) -> Result<Vec<Message>, String> {
     let msgs = body.get("messages").and_then(Json::as_arr).ok_or("`messages` must be an array")?;
     let mut out = Vec::with_capacity(msgs.len());
     for m in msgs {
@@ -177,7 +249,28 @@ fn parse_chat(
     if out.last().is_none_or(|m| m.role == "assistant") {
         return Err("the last message must be from `user`, `system`, or `tool`".into());
     }
+    Ok(out)
+}
 
+fn parse_gen_params(body: &Json, defaults: &GenParams) -> GenParams {
+    let num = |k: &str| body.get(k).and_then(Json::as_f64);
+    GenParams {
+        temperature: num("temperature").map_or(defaults.temperature, |v| v as f32),
+        top_k: num("top_k").map_or(defaults.top_k, |v| v.max(1.0) as usize),
+        top_p: num("top_p").map_or(defaults.top_p, |v| v as f32),
+        repeat_penalty: num("repetition_penalty").map_or(defaults.repeat_penalty, |v| v as f32),
+        max_tokens: num("max_completion_tokens")
+            .or(num("max_tokens"))
+            .map_or(defaults.max_tokens, |v| v.max(1.0) as usize),
+        seed: num("seed").map_or(defaults.seed, |v| v as u64),
+    }
+}
+
+fn parse_chat(
+    body: &Json,
+    defaults: &GenParams,
+) -> Result<(Vec<Message>, Vec<String>, GenParams, bool), String> {
+    let out = parse_messages_field(body)?;
     let tool_choice_none = body
         .get("tool_choice")
         .and_then(Json::as_str)
@@ -190,18 +283,7 @@ fn parse_chat(
             .map(|arr| arr.iter().map(Json::stringify).collect())
             .unwrap_or_default()
     };
-
-    let num = |k: &str| body.get(k).and_then(Json::as_f64);
-    let p = GenParams {
-        temperature: num("temperature").map_or(defaults.temperature, |v| v as f32),
-        top_k: num("top_k").map_or(defaults.top_k, |v| v.max(1.0) as usize),
-        top_p: num("top_p").map_or(defaults.top_p, |v| v as f32),
-        repeat_penalty: num("repetition_penalty").map_or(defaults.repeat_penalty, |v| v as f32),
-        max_tokens: num("max_completion_tokens")
-            .or(num("max_tokens"))
-            .map_or(defaults.max_tokens, |v| v.max(1.0) as usize),
-        seed: num("seed").map_or(defaults.seed, |v| v as u64),
-    };
+    let p = parse_gen_params(body, defaults);
     Ok((out, tools_json, p, body.get("stream").and_then(Json::as_bool).unwrap_or(false)))
 }
 
@@ -211,10 +293,16 @@ fn now() -> u64 {
 
 fn usage(c: &Completion) -> String {
     format!(
-        r#"{{"prompt_tokens":{},"completion_tokens":{},"total_tokens":{}}}"#,
+        r#"{{"prompt_tokens":{},"prefilled_tokens":{},"completion_tokens":{},"total_tokens":{},"drafted_tokens":{},"accepted_tokens":{},"prefill_secs":{:.6},"decode_secs":{:.6},"prefill_unit":{}}}"#,
         c.prompt_tokens,
+        c.prefilled_tokens,
         c.completion_tokens,
-        c.prompt_tokens + c.completion_tokens
+        c.prompt_tokens + c.completion_tokens,
+        c.drafted_tokens,
+        c.accepted_tokens,
+        c.prefill_secs,
+        c.decode_secs,
+        quote(c.prefill_unit),
     )
 }
 
@@ -276,7 +364,9 @@ fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
         return;
     }
 
-    let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{CORS}Connection: close\r\n\r\n");
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{CORS}Connection: close\r\n\r\n"
+    );
     if stream.write_all(head.as_bytes()).is_err() {
         return;
     }
@@ -329,6 +419,207 @@ fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
     let _ = stream.write_all(tail.as_bytes()).and_then(|_| stream.write_all(b"data: [DONE]\n\n"));
 }
 
+fn agent_chat_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
+    let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
+        Ok(b) => b,
+        Err(e) => return error(stream, 400, &format!("invalid JSON: {e}")),
+    };
+    let mut history = match parse_messages_field(&body) {
+        Ok(m) => m,
+        Err(e) => return error(stream, 400, &e),
+    };
+    let agent_defaults = GenParams {
+        temperature: 0.0,
+        top_k: 40,
+        top_p: 0.9,
+        repeat_penalty: 1.05,
+        max_tokens: 4096,
+        seed: 0,
+    };
+    let params = parse_gen_params(&body, &agent_defaults);
+    let max_steps = body
+        .get("max_steps")
+        .and_then(Json::as_f64)
+        .map_or(10, |v| (v as usize).clamp(1, 24));
+    let cmd_timeout = body
+        .get("cmd_timeout")
+        .and_then(Json::as_f64)
+        .map_or(20, |v| (v as u64).clamp(1, 120));
+
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{CORS}Connection: close\r\n\r\n"
+    );
+    if stream.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+
+    let tools_json = tool_definitions_json();
+    let cfg = AgentTurnConfig {
+        workdir: srv.workdir.clone(),
+        params,
+        max_steps,
+        cmd_timeout_secs: cmd_timeout,
+    };
+
+    let mut model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
+    let mut write_sse = |payload: &str| -> bool {
+        let frame = format!("data: {payload}\n\n");
+        stream.write_all(frame.as_bytes()).and_then(|_| stream.flush()).is_ok()
+    };
+
+    let run_res = run_agent_turn(&mut model, &mut history, &tools_json, &cfg, |ev| match ev {
+        AgentEvent::StepStart { step, max_steps } => write_sse(&format!(
+            r#"{{"type":"step_start","step":{step},"max_steps":{max_steps}}}"#
+        )),
+        AgentEvent::TextDelta(delta) => {
+            if delta.is_empty() {
+                true
+            } else {
+                write_sse(&format!(r#"{{"type":"text","delta":{}}}"#, quote(delta)))
+            }
+        }
+        AgentEvent::StepStats { step, completion } => write_sse(&format!(
+            r#"{{"type":"step_stats","step":{step},"usage":{}}}"#,
+            usage(completion)
+        )),
+        AgentEvent::ToolStart { step, call } => write_sse(&format!(
+            r#"{{"type":"tool_start","step":{step},"id":{},"name":{},"arguments":{}}}"#,
+            quote(&call.id),
+            quote(&call.name),
+            quote(&call.arguments),
+        )),
+        AgentEvent::ToolDone { step, call, outcome } => write_sse(&format!(
+            r#"{{"type":"tool_done","step":{step},"id":{},"name":{},"ok":{},"validation_ok":{},"validation_msg":{},"output":{}}}"#,
+            quote(&call.id),
+            quote(&call.name),
+            outcome.ok,
+            outcome.validation_ok,
+            quote(&outcome.validation_msg),
+            quote(&truncate_utf8(&outcome.output, 4096)),
+        )),
+        AgentEvent::ValidationRepair { step, report } => write_sse(&format!(
+            r#"{{"type":"validation_repair","step":{step},"report":{}}}"#,
+            quote(report)
+        )),
+        AgentEvent::Done { .. } => true,
+    });
+
+    match run_res {
+        Ok(final_text) => {
+            let done_json = format!(
+                r#"{{"type":"done","text":{},"messages":{}}}"#,
+                quote(&final_text),
+                serialize_messages_json(&history),
+            );
+            let _ = write_sse(&done_json);
+        }
+        Err(e) => {
+            let err_json = format!(r#"{{"type":"error","message":{}}}"#, quote(&e));
+            let _ = write_sse(&err_json);
+        }
+    }
+    let _ = stream.write_all(b"data: [DONE]\n\n");
+}
+
+fn format_agent_files_json(workdir: &Path) -> String {
+    let entries = list_workspace_files(workdir);
+    let has_index = entries.iter().any(|e| e.path == "index.html")
+        || entries.iter().any(|e| e.path.ends_with(".html"));
+    let preview_entry = entries
+        .iter()
+        .find(|e| e.path == "index.html")
+        .or_else(|| entries.iter().find(|e| e.path.ends_with(".html")))
+        .map(|e| e.path.as_str())
+        .unwrap_or("");
+    let items: Vec<String> = entries
+        .iter()
+        .map(|e| {
+            format!(
+                r#"{{"path":{},"bytes":{},"validation_ok":{},"validation_msg":{}}}"#,
+                quote(&e.path),
+                e.bytes,
+                e.validation_ok,
+                quote(&e.validation_msg),
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"workdir":{},"has_html":{has_index},"preview_path":{},"files":[{}]}}"#,
+        quote(&workdir.to_string_lossy()),
+        quote(preview_entry),
+        items.join(",")
+    )
+}
+
+fn format_agent_file_detail_json(workdir: &Path, rel_path: &str) -> Result<String, (u16, String)> {
+    let target = resolve_jailed_path(workdir, rel_path).map_err(|e| (400, e))?;
+    if !target.is_file() {
+        return Err((404, format!("file `{rel_path}` not found")));
+    }
+    let bytes = fs::read(&target).map_err(|e| (500, format!("read `{rel_path}`: {e}")))?;
+    let total_bytes = bytes.len();
+    let content = truncate_utf8(&String::from_utf8_lossy(&bytes), MAX_READ_BYTES * 2);
+    let (v_ok, v_msg) = match validate_file(workdir, &target, true) {
+        Ok(note) => (true, if note.is_empty() { "ok".to_string() } else { note }),
+        Err(err) => (false, err),
+    };
+    Ok(format!(
+        r#"{{"path":{},"bytes":{total_bytes},"validation_ok":{v_ok},"validation_msg":{},"content":{}}}"#,
+        quote(rel_path),
+        quote(&v_msg),
+        quote(&content),
+    ))
+}
+
+fn clear_workspace_dir(workdir: &Path) -> Result<usize, String> {
+    let Ok(rd) = fs::read_dir(workdir) else {
+        return Ok(0);
+    };
+    let mut removed = 0usize;
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ".git" {
+            continue;
+        }
+        let p = entry.path();
+        if p.is_dir() {
+            fs::remove_dir_all(&p).map_err(|e| e.to_string())?;
+        } else {
+            fs::remove_file(&p).map_err(|e| e.to_string())?;
+        }
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn serve_preview(workdir: &Path, stream: &mut TcpStream, req_path: &str) {
+    let raw_rel = req_path
+        .strip_prefix("/preview")
+        .unwrap_or("")
+        .trim_start_matches('/');
+    let decoded = percent_decode(raw_rel);
+    let rel = if decoded.is_empty() { "index.html" } else { decoded.as_str() };
+    let mut target = match resolve_jailed_path(workdir, rel) {
+        Ok(p) => p,
+        Err(e) => return error(stream, 400, &e),
+    };
+    if target.is_dir() {
+        target = target.join("index.html");
+    }
+    match fs::read(&target) {
+        Ok(bytes) => {
+            let mime = mime_type_for_path(&target);
+            respond_bytes(stream, 200, mime, "Cache-Control: no-store\r\n", &bytes);
+        }
+        Err(_) => respond(
+            stream,
+            404,
+            "text/html; charset=utf-8",
+            "<!doctype html><meta charset=\"utf-8\"><body style=\"font:14px sans-serif;color:#78716c;padding:24px\">No preview file generated yet.</body>",
+        ),
+    }
+}
+
 fn handle(srv: &Server, mut stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let req = match read_request(&mut stream) {
@@ -340,6 +631,9 @@ fn handle(srv: &Server, mut stream: TcpStream) {
     }
     if req.method == "GET" && (req.path == "/" || req.path == "/index.html") {
         return respond(&mut stream, 200, "text/html; charset=utf-8", CHAT_PAGE);
+    }
+    if req.method == "GET" && (req.path == "/preview" || req.path.starts_with("/preview/")) {
+        return serve_preview(&srv.workdir, &mut stream, &req.path);
     }
     if let Some(key) = &srv.api_key {
         let ok = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")) == Some(key.as_str());
@@ -353,9 +647,37 @@ fn handle(srv: &Server, mut stream: TcpStream) {
             &mut stream,
             200,
             "application/json",
-            &format!(r#"{{"object":"list","data":[{{"id":{},"object":"model","owned_by":"kronos"}}]}}"#, quote(&srv.name)),
+            &format!(
+                r#"{{"object":"list","data":[{{"id":{},"object":"model","owned_by":"kronos"}}]}}"#,
+                quote(&srv.name)
+            ),
         ),
         ("POST", "/v1/chat/completions") => chat_completions(srv, &mut stream, &req),
+        ("POST", "/v1/agent/chat") => agent_chat_sse(srv, &mut stream, &req),
+        ("GET", "/v1/agent/files") => respond(
+            &mut stream,
+            200,
+            "application/json",
+            &format_agent_files_json(&srv.workdir),
+        ),
+        ("GET", "/v1/agent/file") => {
+            let Some(rel) = req.query_param("path") else {
+                return error(&mut stream, 400, "missing `path` query parameter");
+            };
+            match format_agent_file_detail_json(&srv.workdir, &rel) {
+                Ok(json_body) => respond(&mut stream, 200, "application/json", &json_body),
+                Err((code, msg)) => error(&mut stream, code, &msg),
+            }
+        }
+        ("POST", "/v1/agent/clear") => match clear_workspace_dir(&srv.workdir) {
+            Ok(n) => respond(
+                &mut stream,
+                200,
+                "application/json",
+                &format!(r#"{{"status":"ok","removed":{n}}}"#),
+            ),
+            Err(e) => error(&mut stream, 500, &e),
+        },
         _ => error(&mut stream, 404, &format!("no route for {} {}", req.method, req.path)),
     }
 }
@@ -364,7 +686,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args[1].starts_with("--") {
         eprintln!(
-            "usage: {} <model_dir> [--cache-dir DIR] [--host 127.0.0.1] [--port 18080] [--api-key KEY] [--mode nf4g128] ...",
+            "usage: {} <model_dir> [--draft DIR] [--workdir DIR] [--cache-dir DIR] [--host 127.0.0.1] [--port 18080] [--api-key KEY] [--mode nf4g128] ...",
             args[0]
         );
         std::process::exit(2);
@@ -390,10 +712,20 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1);
     });
+    let force_cpu = args.iter().any(|a| a == "--cpu" || a == "--fp32-kv" || a == "--ane");
+    let require_metal = args.iter().any(|a| a == "--metal");
     if args.iter().any(|a| a == "--fp32-kv") {
         model.enable_q8_kv_cache(false);
     } else if args.iter().any(|a| a == "--q8-kv") {
         model.enable_q8_kv_cache(true);
+    }
+    if require_metal {
+        model.enable_metal().unwrap_or_else(|e| {
+            eprintln!("metal error: {e}");
+            std::process::exit(1);
+        });
+    } else if !force_cpu {
+        let _ = model.enable_metal();
     }
     if let Some(draft_dir) = flag("--draft") {
         let draft_mode = flag("--draft-mode").unwrap_or_else(|| mode.clone());
@@ -417,24 +749,47 @@ fn main() {
             eprintln!("built without the `ane` feature; prefilling on CPU");
         }
     }
-    let addr = format!("{}:{}", flag("--host").unwrap_or_else(|| "127.0.0.1".into()), num("--port", 18080.0) as u16);
+
+    let raw_workdir = match flag("--workdir") {
+        Some(w) => PathBuf::from(w),
+        None => std::env::temp_dir().join("kronos_server_workspace"),
+    };
+    fs::create_dir_all(&raw_workdir).unwrap_or_else(|e| {
+        eprintln!("create workdir {}: {e}", raw_workdir.display());
+        std::process::exit(1);
+    });
+    let workdir = raw_workdir.canonicalize().unwrap_or(raw_workdir);
+
+    let addr = format!(
+        "{}:{}",
+        flag("--host").unwrap_or_else(|| "127.0.0.1".into()),
+        num("--port", 18080.0) as u16
+    );
     let listener = TcpListener::bind(&addr).unwrap_or_else(|e| {
         eprintln!("bind {addr}: {e}");
         std::process::exit(1);
     });
     let weights_gib = model.resident_weight_bytes() as f64 / (1u64 << 30) as f64;
     let kv_gib = model.kv_cache_bytes() as f64 / (1u64 << 30) as f64;
-    let kv_tag = if model.is_q8_kv_enabled() { "Q8-KV" } else { "FP32-KV" };
+    let kv_tag = if model.is_metal_enabled() {
+        "Metal-Q8-KV"
+    } else if model.is_q8_kv_enabled() {
+        "Q8-KV"
+    } else {
+        "FP32-KV"
+    };
     let ctx_sz = model.context_size();
     let srv = Arc::new(Server {
         name: model.name.clone(),
         model: Mutex::new(model),
         api_key: flag("--api-key"),
+        workdir: workdir.clone(),
         next_id: AtomicU64::new(1),
     });
     eprintln!(
-        "serving {} on http://{addr}/v1 (weights {weights_gib:.2} GiB + {kv_tag} {kv_gib:.2} GiB @ ctx={ctx_sz})",
-        srv.name
+        "serving {} on http://{addr}/ (weights {weights_gib:.2} GiB + {kv_tag} {kv_gib:.2} GiB @ ctx={ctx_sz} · workdir={})",
+        srv.name,
+        workdir.display()
     );
     for conn in listener.incoming().flatten() {
         let srv = Arc::clone(&srv);
@@ -499,6 +854,7 @@ mod tests {
 
         let comp = Completion {
             text: String::new(),
+            token_ids: Vec::new(),
             tool_calls: vec![ToolCall {
                 id: "call_0".to_string(),
                 name: "write_file".to_string(),
@@ -507,6 +863,8 @@ mod tests {
             prompt_tokens: 120,
             prefilled_tokens: 120,
             completion_tokens: 24,
+            drafted_tokens: 0,
+            accepted_tokens: 0,
             finish: FinishReason::ToolCalls,
             prefill_secs: 0.2,
             decode_secs: 1.0,
@@ -524,5 +882,49 @@ mod tests {
             tc0.get("function").unwrap().get("arguments").and_then(Json::as_str),
             Some(r#"{"path":"index.html","content":"<h1>ok</h1>"}"#)
         );
+    }
+
+    #[test]
+    fn test_agent_workspace_endpoints_and_query_decoding() {
+        let html_check = kronos_2t::agent::validate_content_by_ext(
+            Path::new("."),
+            Path::new("chat.html"),
+            "html",
+            CHAT_PAGE,
+            false,
+        );
+        assert!(html_check.is_ok(), "chat.html validation failed: {html_check:?}");
+
+        let req = Request {
+            method: "GET".into(),
+            path: "/v1/agent/file".into(),
+            query: "path=src%2Fapp.js&t=123".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        assert_eq!(req.query_param("path").as_deref(), Some("src/app.js"));
+        assert_eq!(req.query_param("t").as_deref(), Some("123"));
+
+        let dir = std::env::temp_dir().join(format!("kronos_srv_agent_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("index.html"), "<!doctype html><html><body><script src=\"src/app.js\"></script></body></html>").unwrap();
+        fs::write(dir.join("src/app.js"), "const ok = 1;\n").unwrap();
+
+        let files_json = Json::parse(&format_agent_files_json(&dir)).unwrap();
+        assert_eq!(files_json.get("has_html").and_then(Json::as_bool), Some(true));
+        assert_eq!(files_json.get("preview_path").and_then(Json::as_str), Some("index.html"));
+        let arr = files_json.get("files").and_then(Json::as_arr).unwrap();
+        assert_eq!(arr.len(), 2);
+
+        let detail = Json::parse(&format_agent_file_detail_json(&dir, "src/app.js").unwrap()).unwrap();
+        assert_eq!(detail.get("validation_ok").and_then(Json::as_bool), Some(true));
+        assert_eq!(detail.get("content").and_then(Json::as_str), Some("const ok = 1;\n"));
+
+        assert!(format_agent_file_detail_json(&dir, "../escape.js").is_err());
+
+        let removed = clear_workspace_dir(&dir).unwrap();
+        assert_eq!(removed, 2);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

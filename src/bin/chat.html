@@ -3,80 +3,202 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kronos Chat</title>
+<title>Kronos</title>
 <style>
-  :root { --bg:#fafaf9; --panel:#fff; --text:#1c1917; --muted:#78716c; --line:#e7e5e4; --me:#1c1917; --me-text:#fafaf9; --accent:#c2410c; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg:#0c0a09; --panel:#1c1917; --text:#f5f5f4; --muted:#a8a29e; --line:#292524; --me:#f5f5f4; --me-text:#0c0a09; --accent:#fb923c; }
+  :root {
+    --bg:#fafaf9; --panel:#ffffff; --subtle:#f5f5f4; --text:#1c1917; --muted:#78716c;
+    --line:#e7e5e4; --me:#1c1917; --me-text:#fafaf9; --accent:#c2410c;
+    --ok-bg:#dcfce7; --ok-fg:#166534; --warn-bg:#fef3c7; --warn-fg:#92400e; --err-bg:#fee2e2; --err-fg:#991b1b;
   }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 -apple-system, BlinkMacSystemFont, "Inter", sans-serif; height:100dvh; display:flex; flex-direction:column; }
-  header { display:flex; align-items:center; gap:12px; padding:12px 16px; border-bottom:1px solid var(--line); }
-  header h1 { font-size:15px; margin:0; font-weight:600; }
-  header .model { color:var(--muted); font-size:13px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  button, select, input { font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:6px 10px; }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0c0a09; --panel:#1c1917; --subtle:#141210; --text:#f5f5f4; --muted:#a8a29e;
+      --line:#292524; --me:#f5f5f4; --me-text:#0c0a09; --accent:#ea580c;
+      --ok-bg:#052e16; --ok-fg:#86efac; --warn-bg:#451a03; --warn-fg:#fcd34d; --err-bg:#450a0a; --err-fg:#fca5a5;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 -apple-system, BlinkMacSystemFont, "Inter", sans-serif; height:100dvh; display:flex; flex-direction:column; overflow:hidden; }
+  header { display:flex; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--line); background:var(--panel); z-index:3; }
+  header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:-0.01em; }
+  header .model { color:var(--muted); font-size:12px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  button, select, input { font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:5px 10px; }
   button { cursor:pointer; }
-  #log { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:12px; max-width:820px; width:100%; margin:0 auto; }
-  .msg { padding:10px 14px; border-radius:12px; white-space:pre-wrap; word-wrap:break-word; max-width:85%; }
+  button:hover { border-color:var(--muted); }
+  .seg { display:inline-flex; background:var(--subtle); border:1px solid var(--line); border-radius:9px; padding:2px; gap:2px; }
+  .seg button { border:none; background:transparent; padding:4px 11px; border-radius:7px; font-size:13px; color:var(--muted); }
+  .seg button.active { background:var(--panel); color:var(--text); font-weight:600; box-shadow:0 1px 2px rgba(0,0,0,0.08); }
+  #ws-toggle.active { border-color:var(--accent); color:var(--accent); }
+  details.menu { position:relative; font-size:13px; color:var(--muted); }
+  details.menu > summary { list-style:none; cursor:pointer; padding:5px 10px; border:1px solid var(--line); border-radius:8px; background:var(--panel); color:var(--text); }
+  details.menu > summary::-webkit-details-marker { display:none; }
+  .settings { position:absolute; right:0; top:38px; width:250px; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; z-index:5; box-shadow:0 8px 24px rgba(0,0,0,0.16); }
+  .settings label { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:6px 0; color:var(--text); font-size:12px; }
+  .settings input { width:115px; font-size:12px; padding:4px 7px; }
+
+  #layout { flex:1; display:flex; min-height:0; overflow:hidden; }
+  #chat-col { flex:1; display:flex; flex-direction:column; min-width:320px; min-height:0; }
+  #log { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:10px; max-width:860px; width:100%; margin:0 auto; }
+  .msg { padding:10px 14px; border-radius:12px; white-space:pre-wrap; word-wrap:break-word; max-width:90%; }
   .user { align-self:flex-end; background:var(--me); color:var(--me-text); }
-  .assistant { align-self:flex-start; background:var(--panel); border:1px solid var(--line); }
-  .assistant code { font:13px ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--line); padding:1px 4px; border-radius:4px; }
-  .assistant pre { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px; overflow-x:auto; white-space:pre; margin:6px 0; }
-  .assistant pre code { background:none; padding:0; }
-  .stats { align-self:flex-start; color:var(--muted); font-size:12px; margin-top:-6px; }
-  .empty { margin:auto; color:var(--muted); text-align:center; }
-  form { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); max-width:820px; width:100%; margin:0 auto; }
-  textarea { flex:1; resize:none; font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; min-height:44px; max-height:200px; }
-  #send { background:var(--accent); color:#fff; border:none; padding:0 18px; }
-  #send:disabled { opacity:.5; }
-  details { font-size:13px; color:var(--muted); }
-  details label { display:flex; justify-content:space-between; gap:8px; margin:6px 0; }
-  details input { width:110px; }
-  .settings { position:absolute; right:16px; top:52px; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 14px; z-index:2; }
+  .reply { align-self:flex-start; background:var(--panel); border:1px solid var(--line); width:100%; max-width:92%; white-space:normal; }
+  .reply-prose { white-space:pre-wrap; word-wrap:break-word; }
+  .reply code { font:12.5px ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--subtle); padding:1px 4px; border-radius:4px; }
+  .reply pre { background:var(--subtle); border:1px solid var(--line); border-radius:8px; padding:10px; overflow-x:auto; white-space:pre; margin:6px 0; }
+  .reply pre code { background:none; padding:0; }
+  .stats { align-self:flex-start; color:var(--muted); font-size:12px; margin-top:-4px; }
+  .empty { margin:auto; color:var(--muted); text-align:center; max-width:420px; line-height:1.6; }
+
+  .agent-steps { display:flex; flex-direction:column; gap:6px; margin-bottom:8px; }
+  .agent-steps:empty { display:none; }
+  .step-line { font-size:11.5px; color:var(--muted); display:flex; align-items:center; justify-content:space-between; gap:8px; padding:2px 0; }
+  details.tool-card { border:1px solid var(--line); background:var(--subtle); border-radius:8px; overflow:hidden; font-size:12.5px; }
+  details.tool-card > summary { cursor:pointer; padding:6px 10px; display:flex; align-items:center; gap:8px; user-select:none; }
+  .tool-name { font:600 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .tool-target { color:var(--muted); font:12px ui-monospace, SFMono-Regular, Menlo, monospace; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .pill { font-size:11px; padding:1px 7px; border-radius:999px; font-weight:500; white-space:nowrap; }
+  .pill.run { background:var(--line); color:var(--muted); }
+  .pill.ok { background:var(--ok-bg); color:var(--ok-fg); }
+  .pill.warn { background:var(--warn-bg); color:var(--warn-fg); }
+  .pill.err { background:var(--err-bg); color:var(--err-fg); }
+  .tool-body { border-top:1px solid var(--line); padding:8px 10px; background:var(--panel); font:12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; max-height:220px; overflow:auto; color:var(--muted); }
+  .repair-banner { font-size:12px; padding:6px 10px; border-radius:8px; background:var(--warn-bg); color:var(--warn-fg); white-space:pre-wrap; }
+
+  form { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); max-width:860px; width:100%; margin:0 auto; }
+  textarea { flex:1; resize:none; font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; min-height:42px; max-height:200px; }
+  #send { background:var(--accent); color:#fff; border:none; padding:0 18px; font-weight:500; }
+  #send:disabled { opacity:.5; cursor:default; }
+
+  #ws-pane { width:50%; min-width:340px; border-left:1px solid var(--line); background:var(--panel); display:flex; flex-direction:column; min-height:0; }
+  #ws-pane.hidden { display:none; }
+  .ws-bar { display:flex; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid var(--line); background:var(--subtle); flex-wrap:wrap; }
+  #file-select { flex:1; min-width:130px; font:12.5px ui-monospace, SFMono-Regular, Menlo, monospace; padding:4px 8px; }
+  .ws-link { font-size:12px; color:var(--text); text-decoration:none; padding:4px 9px; border:1px solid var(--line); border-radius:7px; background:var(--panel); }
+  .ws-body { flex:1; position:relative; min-height:0; display:flex; flex-direction:column; }
+  #preview-wrap { flex:1; display:flex; flex-direction:column; min-height:0; background:#fff; }
+  #preview-frame { flex:1; width:100%; border:none; background:#fff; }
+  #preview-empty { flex:1; display:flex; align-items:center; justify-content:center; color:var(--muted); background:var(--bg); padding:24px; text-align:center; }
+  #code-wrap { flex:1; display:none; flex-direction:column; min-height:0; background:var(--bg); }
+  .code-meta { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 12px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); background:var(--panel); }
+  #code-view { flex:1; margin:0; padding:12px; overflow:auto; font:12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre; color:var(--text); }
+  @media (max-width: 900px) {
+    #layout { flex-direction:column; }
+    #ws-pane { width:100%; height:48%; border-left:none; border-top:1px solid var(--line); }
+  }
 </style>
 </head>
 <body>
 <header>
   <h1>Kronos</h1>
   <span class="model" id="model">connecting…</span>
-  <details>
+  <div class="seg" role="tablist" aria-label="Mode">
+    <button id="mode-chat" type="button" class="active">Chat</button>
+    <button id="mode-agent" type="button">Agent</button>
+  </div>
+  <button id="ws-toggle" type="button">Workspace (<span id="ws-count">0</span>)</button>
+  <details class="menu">
     <summary>Settings</summary>
     <div class="settings">
       <label>Temperature <input id="temp" type="number" step="0.1" min="0" max="2" value="0.7"></label>
-      <label>Max tokens <input id="maxtok" type="number" min="1" max="2048" value="512"></label>
+      <label>Max tokens <input id="maxtok" type="number" min="1" max="16384" value="512"></label>
+      <label>Max steps <input id="maxsteps" type="number" min="1" max="24" value="10"></label>
       <label>System <input id="system" placeholder="default"></label>
       <label>API key <input id="key" type="password" placeholder="if required"></label>
     </div>
   </details>
-  <button id="new" type="button">New chat</button>
+  <button id="new" type="button">New session</button>
 </header>
-<main id="log"><div class="empty" id="empty">Ask anything. Replies stream from the local Kronos server.</div></main>
-<form id="form">
-  <textarea id="input" rows="1" placeholder="Message Kronos…" autofocus></textarea>
-  <button id="send" type="submit">Send</button>
-</form>
+
+<div id="layout">
+  <section id="chat-col">
+    <main id="log">
+      <div class="empty" id="empty">Ask a question in Chat mode, or switch to Agent mode to write, validate, and preview files in the workspace.</div>
+    </main>
+    <form id="form">
+      <textarea id="input" rows="1" placeholder="Message Kronos…" autofocus></textarea>
+      <button id="send" type="submit">Send</button>
+    </form>
+  </section>
+
+  <aside id="ws-pane" class="hidden">
+    <div class="ws-bar">
+      <div class="seg">
+        <button id="tab-preview" type="button" class="active">Preview</button>
+        <button id="tab-code" type="button">Code</button>
+      </div>
+      <select id="file-select" aria-label="Workspace file"></select>
+      <button id="ws-reload" type="button">Reload</button>
+      <a id="ws-open" class="ws-link" href="/preview/index.html" target="_blank" rel="noopener">Open</a>
+      <button id="ws-clear" type="button">Clear</button>
+    </div>
+    <div class="ws-body">
+      <div id="preview-wrap">
+        <div id="preview-empty">No HTML file in workspace yet.</div>
+        <iframe id="preview-frame" title="Workspace preview" style="display:none"></iframe>
+      </div>
+      <div id="code-wrap">
+        <div class="code-meta">
+          <span id="code-path">no file selected</span>
+          <span id="code-status" class="pill run">empty</span>
+        </div>
+        <pre id="code-view"></pre>
+      </div>
+    </div>
+  </aside>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const log = $("log"), input = $("input"), send = $("send");
-let history = [];
+let mode = "chat";
+let chatHistory = [];
+let agentHistory = [];
+let wsFiles = [];
+let previewPath = "";
+let wsTab = "preview";
 
-const store = (k, v) => { try { v === undefined ? (v = localStorage.getItem(k)) : localStorage.setItem(k, v); } catch (e) {} return v; };
-for (const id of ["temp", "maxtok", "system", "key"]) {
-  const saved = store("kronos-" + id); if (saved !== null && saved !== undefined) $(id).value = saved;
+const store = (k, v) => {
+  try {
+    if (v === undefined) return localStorage.getItem(k);
+    localStorage.setItem(k, v);
+  } catch (e) {}
+  return v;
+};
+
+for (const id of ["system", "key", "maxsteps"]) {
+  const saved = store("kronos-" + id);
+  if (saved !== null && saved !== undefined) $(id).value = saved;
   $(id).addEventListener("change", () => store("kronos-" + id, $(id).value));
 }
+
+function syncModeParams() {
+  const tKey = mode === "agent" ? "kronos-agent-temp" : "kronos-temp";
+  const mKey = mode === "agent" ? "kronos-agent-maxtok" : "kronos-maxtok";
+  const tDef = mode === "agent" ? "0" : "0.7";
+  const mDef = mode === "agent" ? "4096" : "512";
+  $("temp").value = store(tKey) ?? tDef;
+  $("maxtok").value = store(mKey) ?? mDef;
+}
+$("temp").addEventListener("change", () => store(mode === "agent" ? "kronos-agent-temp" : "kronos-temp", $("temp").value));
+$("maxtok").addEventListener("change", () => store(mode === "agent" ? "kronos-agent-maxtok" : "kronos-maxtok", $("maxtok").value));
+syncModeParams();
+
 const headers = () => {
   const h = { "Content-Type": "application/json" };
   if ($("key").value) h.Authorization = "Bearer " + $("key").value;
   return h;
 };
+
 fetch("/v1/models", { headers: headers() }).then(r => r.json())
   .then(j => $("model").textContent = j.data ? j.data[0].id : (j.error?.message || "unavailable"))
   .catch(() => $("model").textContent = "server unreachable");
 
-// Escape first, then apply a few Markdown forms; nothing from the model is inserted as raw HTML.
+function escHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 function render(md) {
-  const esc = md.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const esc = escHtml(md);
   return esc.split(/```/).map((part, i) => {
     if (i % 2) return "<pre><code>" + part.replace(/^[\w+-]*\n/, "") + "</code></pre>";
     return part.replace(/`([^`\n]+)`/g, "<code>$1</code>")
@@ -85,34 +207,193 @@ function render(md) {
   }).join("");
 }
 
-function bubble(role, text) {
+function setMode(next) {
+  mode = next;
+  $("mode-chat").classList.toggle("active", mode === "chat");
+  $("mode-agent").classList.toggle("active", mode === "agent");
+  input.placeholder = mode === "agent"
+    ? "Describe files or features to build or edit in the workspace…"
+    : "Message Kronos…";
+  syncModeParams();
+  if (mode === "agent") {
+    refreshWorkspace(false);
+  }
+  input.focus();
+}
+$("mode-chat").onclick = () => setMode("chat");
+$("mode-agent").onclick = () => setMode("agent");
+
+function setWorkspaceOpen(open) {
+  $("ws-pane").classList.toggle("hidden", !open);
+  $("ws-toggle").classList.toggle("active", open);
+}
+$("ws-toggle").onclick = () => {
+  const willOpen = $("ws-pane").classList.contains("hidden");
+  setWorkspaceOpen(willOpen);
+  if (willOpen) refreshWorkspace(true);
+};
+
+function setWsTab(tab) {
+  wsTab = tab;
+  $("tab-preview").classList.toggle("active", tab === "preview");
+  $("tab-code").classList.toggle("active", tab === "code");
+  $("preview-wrap").style.display = tab === "preview" ? "flex" : "none";
+  $("code-wrap").style.display = tab === "code" ? "flex" : "none";
+  if (tab === "code" && $("file-select").value) {
+    loadSelectedFile($("file-select").value);
+  }
+}
+$("tab-preview").onclick = () => setWsTab("preview");
+$("tab-code").onclick = () => setWsTab("code");
+
+async function loadSelectedFile(relPath) {
+  if (!relPath) {
+    $("code-path").textContent = "no file selected";
+    $("code-status").className = "pill run";
+    $("code-status").textContent = "empty";
+    $("code-view").textContent = "";
+    return;
+  }
+  try {
+    const r = await fetch("/v1/agent/file?path=" + encodeURIComponent(relPath), { headers: headers() });
+    if (!r.ok) return;
+    const j = await r.json();
+    $("code-path").textContent = `${j.path} (${j.bytes} B)`;
+    $("code-status").className = "pill " + (j.validation_ok ? "ok" : "warn");
+    $("code-status").textContent = j.validation_ok ? "valid" : j.validation_msg;
+    $("code-view").textContent = j.content || "";
+  } catch (e) {}
+}
+
+$("file-select").onchange = () => {
+  const v = $("file-select").value;
+  if (wsTab === "code") {
+    loadSelectedFile(v);
+  } else if (v.endsWith(".html")) {
+    previewPath = v;
+    reloadPreviewFrame();
+  }
+};
+
+function reloadPreviewFrame() {
+  const frame = $("preview-frame");
+  const empty = $("preview-empty");
+  if (!previewPath) {
+    frame.style.display = "none";
+    empty.style.display = "flex";
+    return;
+  }
+  empty.style.display = "none";
+  frame.style.display = "block";
+  const url = "/preview/" + previewPath + "?t=" + Date.now();
+  $("ws-open").href = "/preview/" + previewPath;
+  frame.src = url;
+}
+$("ws-reload").onclick = () => refreshWorkspace(true);
+
+$("ws-clear").onclick = async () => {
+  try {
+    await fetch("/v1/agent/clear", { method: "POST", headers: headers() });
+    wsFiles = [];
+    previewPath = "";
+    await refreshWorkspace(true);
+  } catch (e) {}
+};
+
+async function refreshWorkspace(reloadIframe) {
+  try {
+    const r = await fetch("/v1/agent/files", { headers: headers() });
+    if (!r.ok) return;
+    const j = await r.json();
+    wsFiles = j.files || [];
+    previewPath = j.preview_path || "";
+    $("ws-count").textContent = String(wsFiles.length);
+    const sel = $("file-select");
+    const prevVal = sel.value;
+    sel.innerHTML = "";
+    for (const f of wsFiles) {
+      const opt = document.createElement("option");
+      opt.value = f.path;
+      const mark = f.validation_ok ? "ok" : "check";
+      opt.textContent = `${f.path} (${f.bytes} B · ${mark})`;
+      sel.appendChild(opt);
+    }
+    if (wsFiles.some(f => f.path === prevVal)) {
+      sel.value = prevVal;
+    } else if (previewPath) {
+      sel.value = previewPath;
+    } else if (wsFiles.length > 0) {
+      sel.value = wsFiles[0].path;
+    }
+    if (reloadIframe) reloadPreviewFrame();
+    if (wsTab === "code") loadSelectedFile(sel.value);
+  } catch (e) {}
+}
+
+refreshWorkspace(false);
+
+function userBubble(text) {
   $("empty")?.remove();
   const d = document.createElement("div");
-  d.className = "msg " + role; d.textContent = text;
-  log.appendChild(d); log.scrollTop = log.scrollHeight;
+  d.className = "msg user";
+  d.textContent = text;
+  log.appendChild(d);
+  log.scrollTop = log.scrollHeight;
   return d;
 }
 
-$("new").onclick = () => { history = []; log.innerHTML = '<div class="empty" id="empty">New conversation.</div>'; input.focus(); };
-input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 200) + "px"; });
-input.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("form").requestSubmit(); } });
+function summarizeArgs(name, rawArgs) {
+  try {
+    const a = JSON.parse(rawArgs);
+    if (a.path) return a.path;
+    if (a.pattern) return a.pattern;
+    if (a.cmd) return a.cmd;
+  } catch (e) {}
+  return rawArgs.slice(0, 60);
+}
 
-$("form").onsubmit = async (e) => {
-  e.preventDefault();
-  const text = input.value.trim();
-  if (!text || send.disabled) return;
-  input.value = ""; input.style.height = "auto";
-  history.push({ role: "user", content: text });
-  bubble("user", text);
-  const out = bubble("assistant", "…");
-  send.disabled = true;
-  const messages = $("system").value ? [{ role: "system", content: $("system").value }, ...history] : history;
+$("new").onclick = () => {
+  chatHistory = [];
+  agentHistory = [];
+  log.innerHTML = '<div class="empty" id="empty">Session history cleared.</div>';
+  input.focus();
+};
+
+input.addEventListener("input", () => {
+  input.style.height = "auto";
+  input.style.height = Math.min(input.scrollHeight, 200) + "px";
+});
+input.addEventListener("keydown", e => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    $("form").requestSubmit();
+  }
+});
+
+async function runChatTurn(text) {
+  chatHistory.push({ role: "user", content: text });
+  userBubble(text);
+  const out = document.createElement("div");
+  out.className = "msg reply";
+  out.textContent = "…";
+  log.appendChild(out);
+  log.scrollTop = log.scrollHeight;
+
+  const messages = $("system").value
+    ? [{ role: "system", content: $("system").value }, ...chatHistory]
+    : chatHistory;
   const t0 = performance.now();
   let reply = "", usage = null, first = null;
   try {
     const r = await fetch("/v1/chat/completions", {
-      method: "POST", headers: headers(),
-      body: JSON.stringify({ messages, stream: true, temperature: +$("temp").value, max_tokens: +$("maxtok").value }),
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({
+        messages,
+        stream: true,
+        temperature: +$("temp").value,
+        max_tokens: +$("maxtok").value,
+      }),
     });
     if (!r.ok) throw new Error((await r.json()).error?.message || r.statusText);
     const reader = r.body.getReader(), dec = new TextDecoder();
@@ -123,26 +404,187 @@ $("form").onsubmit = async (e) => {
       buf += dec.decode(value, { stream: true });
       let i;
       while ((i = buf.indexOf("\n\n")) >= 0) {
-        const line = buf.slice(0, i).replace(/^data: /, ""); buf = buf.slice(i + 2);
+        const line = buf.slice(0, i).replace(/^data: /, "");
+        buf = buf.slice(i + 2);
         if (line === "[DONE]") continue;
         const j = JSON.parse(line);
         if (j.error) throw new Error(j.error.message);
         const piece = j.choices?.[0]?.delta?.content;
-        if (piece) { first ??= performance.now(); reply += piece; out.innerHTML = render(reply); log.scrollTop = log.scrollHeight; }
+        if (piece) {
+          first ??= performance.now();
+          reply += piece;
+          out.innerHTML = '<div class="reply-prose">' + render(reply) + '</div>';
+          log.scrollTop = log.scrollHeight;
+        }
         if (j.usage) usage = j.usage;
       }
     }
-    history.push({ role: "assistant", content: reply });
-    if (usage && first) {
-      const s = document.createElement("div"); s.className = "stats";
-      const secs = (performance.now() - first) / 1000;
-      s.textContent = `${usage.completion_tokens} tokens · ${(usage.completion_tokens / Math.max(secs, 1e-3)).toFixed(1)} tok/s · first token ${((first - t0) / 1000).toFixed(2)} s`;
+    chatHistory.push({ role: "assistant", content: reply });
+    if (usage) {
+      const s = document.createElement("div");
+      s.className = "stats";
+      const decTokS = (usage.completion_tokens / Math.max(usage.decode_secs || 1e-3, 1e-3)).toFixed(1);
+      const prefTokS = (usage.prefilled_tokens / Math.max(usage.prefill_secs || 1e-3, 1e-3)).toFixed(0);
+      const acc = usage.drafted_tokens > 0
+        ? ` · accept ${(100 * usage.accepted_tokens / usage.drafted_tokens).toFixed(1)}%`
+        : "";
+      const ttft = first ? ((first - t0) / 1000).toFixed(2) : (usage.prefill_secs || 0).toFixed(2);
+      s.textContent = `${usage.prefilled_tokens} prefill @ ${prefTokS} tok/s · ${usage.completion_tokens} gen @ ${decTokS} tok/s${acc} · first token ${ttft} s`;
       log.appendChild(s);
     }
   } catch (err) {
-    out.textContent = "Error: " + err.message; history.pop();
+    out.textContent = "Error: " + err.message;
+    chatHistory.pop();
+  }
+}
+
+async function runAgentTurnUi(text) {
+  if (agentHistory.length === 0 && $("system").value.trim()) {
+    agentHistory.push({ role: "system", content: $("system").value.trim() });
+  }
+  const prevLen = agentHistory.length;
+  agentHistory.push({ role: "user", content: text });
+  userBubble(text);
+
+  const card = document.createElement("div");
+  card.className = "msg reply";
+  const stepsBox = document.createElement("div");
+  stepsBox.className = "agent-steps";
+  const proseBox = document.createElement("div");
+  proseBox.className = "reply-prose";
+  proseBox.textContent = "Running workspace step…";
+  card.appendChild(stepsBox);
+  card.appendChild(proseBox);
+  log.appendChild(card);
+  log.scrollTop = log.scrollHeight;
+
+  const toolEls = new Map();
+  let stepLabels = new Map();
+  let prose = "";
+  let touchedFiles = false;
+  const t0 = performance.now();
+
+  try {
+    const r = await fetch("/v1/agent/chat", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({
+        messages: agentHistory,
+        temperature: +$("temp").value,
+        max_tokens: +$("maxtok").value,
+        max_steps: +($("maxsteps").value || 10),
+      }),
+    });
+    if (!r.ok) throw new Error((await r.json()).error?.message || r.statusText);
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, i).replace(/^data: /, "");
+        buf = buf.slice(i + 2);
+        if (!line || line === "[DONE]") continue;
+        const j = JSON.parse(line);
+        if (j.type === "error") throw new Error(j.message || "agent step failed");
+
+        if (j.type === "step_start") {
+          const sl = document.createElement("div");
+          sl.className = "step-line";
+          sl.innerHTML = `<span>Step ${j.step}/${j.max_steps}</span><span class="step-perf">generating…</span>`;
+          stepsBox.appendChild(sl);
+          stepLabels.set(j.step, sl.querySelector(".step-perf"));
+          if (!prose) proseBox.textContent = "";
+        } else if (j.type === "text") {
+          prose += j.delta;
+          proseBox.innerHTML = render(prose);
+        } else if (j.type === "step_stats") {
+          const u = j.usage || {};
+          const el = stepLabels.get(j.step);
+          if (el) {
+            const pRate = (u.prefilled_tokens / Math.max(u.prefill_secs || 1e-3, 1e-3)).toFixed(0);
+            const dRate = (u.completion_tokens / Math.max(u.decode_secs || 1e-3, 1e-3)).toFixed(1);
+            const acc = u.drafted_tokens > 0
+              ? ` · accept ${(100 * u.accepted_tokens / u.drafted_tokens).toFixed(1)}%`
+              : "";
+            el.textContent = `${u.prefilled_tokens} prefill @ ${pRate} tok/s · ${u.completion_tokens} gen @ ${dRate} tok/s${acc}`;
+          }
+        } else if (j.type === "tool_start") {
+          const det = document.createElement("details");
+          det.className = "tool-card";
+          const target = summarizeArgs(j.name, j.arguments || "");
+          det.innerHTML = `<summary><span class="tool-name">${escHtml(j.name)}</span><span class="tool-target">${escHtml(target)}</span><span class="pill run">running</span></summary><div class="tool-body">args: ${escHtml(j.arguments || "")}</div>`;
+          stepsBox.appendChild(det);
+          toolEls.set(j.id, det);
+        } else if (j.type === "tool_done") {
+          const det = toolEls.get(j.id);
+          if (det) {
+            const pill = det.querySelector(".pill");
+            const body = det.querySelector(".tool-body");
+            if (!j.ok) {
+              pill.className = "pill err";
+              pill.textContent = "error";
+            } else if (!j.validation_ok) {
+              pill.className = "pill warn";
+              pill.textContent = "repair needed";
+            } else {
+              pill.className = "pill ok";
+              pill.textContent = (j.name === "write_file" || j.name === "edit_file") ? "valid" : "ok";
+            }
+            body.textContent += "\n\nresult: " + (j.output || "");
+          }
+          if (j.name === "write_file" || j.name === "edit_file") {
+            touchedFiles = true;
+            if ($("ws-pane").classList.contains("hidden")) setWorkspaceOpen(true);
+            refreshWorkspace(true);
+          }
+        } else if (j.type === "validation_repair") {
+          const b = document.createElement("div");
+          b.className = "repair-banner";
+          b.textContent = "Post-edit validation triggered repair:\n" + j.report;
+          stepsBox.appendChild(b);
+        } else if (j.type === "done") {
+          if (Array.isArray(j.messages)) agentHistory = j.messages;
+          if (!prose && j.text) {
+            prose = j.text;
+            proseBox.innerHTML = render(prose);
+          }
+        }
+        log.scrollTop = log.scrollHeight;
+      }
+    }
+    if (touchedFiles) {
+      await refreshWorkspace(true);
+      if (!previewPath && wsFiles.length > 0) setWsTab("code");
+    }
+    const s = document.createElement("div");
+    s.className = "stats";
+    s.textContent = `completed in ${((performance.now() - t0) / 1000).toFixed(2)} s`;
+    log.appendChild(s);
+  } catch (err) {
+    proseBox.textContent = "Error: " + err.message;
+    agentHistory.length = prevLen;
+  }
+}
+
+$("form").onsubmit = async (e) => {
+  e.preventDefault();
+  const text = input.value.trim();
+  if (!text || send.disabled) return;
+  input.value = "";
+  input.style.height = "auto";
+  send.disabled = true;
+  try {
+    if (mode === "agent") {
+      await runAgentTurnUi(text);
+    } else {
+      await runChatTurn(text);
+    }
   } finally {
-    send.disabled = false; input.focus();
+    send.disabled = false;
+    input.focus();
   }
 };
 </script>

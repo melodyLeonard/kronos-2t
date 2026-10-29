@@ -23,6 +23,7 @@
 //! - [`moe_800b`]: 800B-class sparse MoE engine streaming `.k2tm` experts from NVMe with an SLRU cache.
 
 pub mod accel;
+pub mod agent;
 pub mod bpe_tokenizer;
 pub mod chat;
 pub mod compiler;
@@ -34,6 +35,8 @@ pub mod hadamard;
 pub mod json;
 pub mod k2t_format;
 pub mod lut_gemv;
+#[cfg(target_os = "macos")]
+pub mod metal_gpu;
 pub mod mmap_pager;
 pub mod moe_800b;
 pub mod prefetch;

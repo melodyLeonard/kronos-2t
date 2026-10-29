@@ -366,6 +366,12 @@ impl BpeTokenizer {
         }
     }
 
+    /// Drops literal added tokens rejected by `keep` so untrained zero-embedding entries fall back to BPE subwords.
+    pub fn retain_added_tokens(&mut self, mut keep: impl FnMut(&str, usize) -> bool) {
+        self.added_tokens.retain(|(s, id)| keep(s, *id));
+        self.finalize_special_tables();
+    }
+
     /// Encodes arbitrary UTF-8 `text` into BPE token IDs, matching `added_tokens` literally first.
     pub fn encode(&self, text: &str) -> Vec<usize> {
         let mut ids = Vec::new();

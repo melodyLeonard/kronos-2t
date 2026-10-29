@@ -4365,6 +4365,119 @@ pub fn nf_expand_codebook32(bits: usize, codebook: &[i8; 16]) -> [i8; 32] {
     out
 }
 
+/// 16 KiB VM-page-aligned byte buffer so Metal `newBufferWithBytesNoCopy` maps weights zero-copy.
+pub struct PageAlignedBytes {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+    alloc_bytes: usize,
+}
+
+// SAFETY: `PageAlignedBytes` owns its heap allocation exclusively like `Vec<u8>`.
+unsafe impl Send for PageAlignedBytes {}
+// SAFETY: Shared references only allow immutable byte slice reads.
+unsafe impl Sync for PageAlignedBytes {}
+
+impl PageAlignedBytes {
+    pub const PAGE_ALIGN: usize = 16_384;
+
+    pub fn zeroed(len: usize) -> Self {
+        if len == 0 {
+            return Self {
+                ptr: std::ptr::NonNull::dangling(),
+                len: 0,
+                alloc_bytes: 0,
+            };
+        }
+        let alloc_bytes = len.div_ceil(Self::PAGE_ALIGN) * Self::PAGE_ALIGN;
+        let layout = std::alloc::Layout::from_size_align(alloc_bytes, Self::PAGE_ALIGN)
+            .expect("valid page-aligned layout");
+        // SAFETY: `alloc_bytes > 0` and `PAGE_ALIGN` is a power of two.
+        let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+        let Some(ptr) = std::ptr::NonNull::new(raw) else {
+            std::alloc::handle_alloc_error(layout);
+        };
+        Self {
+            ptr,
+            len,
+            alloc_bytes,
+        }
+    }
+
+    pub fn from_slice(src: &[u8]) -> Self {
+        let mut out = Self::zeroed(src.len());
+        out.copy_from_slice(src);
+        out
+    }
+
+    #[inline]
+    pub fn as_page_ptr(&self) -> *mut std::ffi::c_void {
+        self.ptr.as_ptr().cast()
+    }
+
+    #[inline]
+    pub fn page_alloc_bytes(&self) -> usize {
+        self.alloc_bytes
+    }
+}
+
+impl Default for PageAlignedBytes {
+    fn default() -> Self {
+        Self::zeroed(0)
+    }
+}
+
+impl Clone for PageAlignedBytes {
+    fn clone(&self) -> Self {
+        Self::from_slice(self)
+    }
+}
+
+impl std::fmt::Debug for PageAlignedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageAlignedBytes")
+            .field("len", &self.len)
+            .field("alloc_bytes", &self.alloc_bytes)
+            .finish()
+    }
+}
+
+impl PartialEq for PageAlignedBytes {
+    fn eq(&self, other: &Self) -> bool {
+        (**self) == (**other)
+    }
+}
+
+impl Eq for PageAlignedBytes {}
+
+impl std::ops::Deref for PageAlignedBytes {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `ptr` is valid for `len` initialized bytes (`dangling` when `len == 0`).
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl std::ops::DerefMut for PageAlignedBytes {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `&mut self` guarantees exclusive access to `len` initialized bytes.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for PageAlignedBytes {
+    fn drop(&mut self) {
+        if self.alloc_bytes > 0 {
+            let layout = std::alloc::Layout::from_size_align(self.alloc_bytes, Self::PAGE_ALIGN)
+                .expect("valid page-aligned layout");
+            // SAFETY: Matches the exact `Layout` allocated in `PageAlignedBytes::zeroed`.
+            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) };
+        }
+    }
+}
+
 /// NF5/NF4/NF3 weights: 3-, 4-, or 5-bit indices into a per-matrix INT8 codebook, expanded with
 /// `vqtbl1q_s8`/`vqtbl2q_s8` and multiplied with `SDOT`. Stored as stripe pairs like [`Nibble4SdotMatrix`].
 #[derive(Clone, Debug)]
@@ -4382,9 +4495,9 @@ pub struct NfSdotMatrix {
     /// INT8 centroids (16 positive centroids for NF5, 16 signed for NF4, 8 signed for NF3).
     pub codebook: [i8; 16],
     /// `[pair, scale_group]` records: 64 B of scales, then `c_len * 2 * chunk_bytes` of data.
-    pub pair_stream: Vec<u8>,
+    pub pair_stream: PageAlignedBytes,
     /// Odd last stripe: 32 B of scales plus data per scale group; empty when `num_stripes` is even.
-    pub tail_stream: Vec<u8>,
+    pub tail_stream: PageAlignedBytes,
 }
 
 impl NfSdotMatrix {
@@ -4446,8 +4559,8 @@ impl NfSdotMatrix {
         let chunk_b = Self::stripe_chunk_bytes(bits);
         let pair_tot = num_scale_groups * 64 + num_chunks * 2 * chunk_b;
         let tail_tot = num_scale_groups * 32 + num_chunks * chunk_b;
-        let mut pair_stream = vec![0u8; num_pairs * pair_tot];
-        let mut tail_stream = vec![0u8; usize::from(has_tail) * tail_tot];
+        let mut pair_stream = PageAlignedBytes::zeroed(num_pairs * pair_tot);
+        let mut tail_stream = PageAlignedBytes::zeroed(usize::from(has_tail) * tail_tot);
 
         let pack_one_stripe_chunk = |stripe: usize, c: usize, dst: &mut [u8]| {
             debug_assert_eq!(dst.len(), chunk_b);
@@ -4604,7 +4717,7 @@ impl NfSdotMatrix {
         let nc_i = self.rows / 128;
         let block64_bytes = 2 * self.pair_total_bytes();
         debug_assert_eq!(self.pair_stream.len(), 2 * nc_i * block64_bytes);
-        let mut new_pairs = vec![0u8; self.pair_stream.len()];
+        let mut new_pairs = PageAlignedBytes::zeroed(self.pair_stream.len());
         for ic in 0..nc_i {
             let g_src = ic * block64_bytes;
             let u_src = (nc_i + ic) * block64_bytes;
@@ -4614,9 +4727,11 @@ impl NfSdotMatrix {
             new_pairs[dst + block64_bytes..dst + 2 * block64_bytes]
                 .copy_from_slice(&self.pair_stream[u_src..u_src + block64_bytes]);
         }
-        let mut out = self.clone();
-        out.pair_stream = new_pairs;
-        out
+        Self {
+            pair_stream: new_pairs,
+            tail_stream: self.tail_stream.clone(),
+            ..*self
+        }
     }
 
     /// `(data, BF16 scales)` pointers for `(stripe, chunk)`.
@@ -5676,43 +5791,30 @@ unsafe fn nf_sdot_batch_tile_neon<const BITS: usize, const NT: usize>(
     let full_stripe = valid == SIMD_ROW_STRIPE;
     let num_g = valid.div_ceil(4);
 
-    let mut facc: [[float32x4_t; NT]; 4] = [[vdupq_n_f32(0.0); NT]; 4];
-    if !first_tile {
-        for (g, fg) in facc.iter_mut().enumerate().take(num_g) {
-            let g_off = g * 4;
-            let g_valid = (valid - g_off).min(4);
-            if full_stripe || g_valid == 4 {
-                *fg = std::array::from_fn(|t| unsafe {
-                    vld1q_f32(out_base.add(t * out_stride + row_start + g_off))
-                });
-            } else {
-                *fg = std::array::from_fn(|t| unsafe {
-                    let mut tmp = [0.0f32; 4];
-                    std::ptr::copy_nonoverlapping(
-                        out_base.add(t * out_stride + row_start + g_off),
-                        tmp.as_mut_ptr(),
-                        g_valid,
-                    );
-                    vld1q_f32(tmp.as_ptr())
-                });
-            }
-        }
-    }
-
-    for c in c_base..c_end {
-        let (d_ptr, sc_ptr) = matrix.stripe_chunk_ptrs(s, c);
-        // SAFETY: `sc_ptr` holds `32` B (`16` BF16 scales).
-        let ws: [float32x4_t; 4] = unsafe {
-            let bf0 = vreinterpretq_u16_u8(vld1q_u8(sc_ptr));
-            let bf1 = vreinterpretq_u16_u8(vld1q_u8(sc_ptr.add(16)));
-            [
-                vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(bf0))),
-                vreinterpretq_f32_u32(vshll_high_n_u16::<16>(bf0)),
-                vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(bf1))),
-                vreinterpretq_f32_u32(vshll_high_n_u16::<16>(bf1)),
-            ]
+    // Outer `g` keeps only `fg: [float32x4_t; NT]` (<=8 regs) + `acc` (<=8 regs) live across L1D-hot `c_base..c_end`.
+    for g in 0..num_g {
+        let g_off = g * 4;
+        let g_valid = (valid - g_off).min(4);
+        let mut fg: [float32x4_t; NT] = if first_tile {
+            [vdupq_n_f32(0.0); NT]
+        } else if full_stripe || g_valid == 4 {
+            std::array::from_fn(|t| unsafe {
+                vld1q_f32(out_base.add(t * out_stride + row_start + g_off))
+            })
+        } else {
+            std::array::from_fn(|t| unsafe {
+                let mut tmp = [0.0f32; 4];
+                std::ptr::copy_nonoverlapping(
+                    out_base.add(t * out_stride + row_start + g_off),
+                    tmp.as_mut_ptr(),
+                    g_valid,
+                );
+                vld1q_f32(tmp.as_ptr())
+            })
         };
-        for (g, fg) in facc.iter_mut().enumerate().take(num_g) {
+
+        for c in c_base..c_end {
+            let (d_ptr, sc_ptr) = matrix.stripe_chunk_ptrs(s, c);
             let mut acc = [vdupq_n_s32(0); NT];
             if BITS == 5 {
                 // SAFETY: `c * 64 + 64 <= cols`; `d_ptr` holds `640` B.
@@ -5800,7 +5902,8 @@ unsafe fn nf_sdot_batch_tile_neon<const BITS: usize, const NT: usize>(
                     }
                 }
             }
-            let wsg = ws[g];
+            // SAFETY: `sc_ptr` holds `32` B (`16` BF16 scales).
+            let wsg = unsafe { load_bf16x4_as_f32(sc_ptr.add(g * 8)) };
             for t in 0..NT {
                 let sx = i8a[t].scales[c];
                 if sx != 0.0 {
@@ -5809,11 +5912,7 @@ unsafe fn nf_sdot_batch_tile_neon<const BITS: usize, const NT: usize>(
                 }
             }
         }
-    }
 
-    for (g, fg) in facc.iter().enumerate().take(num_g) {
-        let g_off = g * 4;
-        let g_valid = (valid - g_off).min(4);
         for (t, &ft) in fg.iter().enumerate() {
             // SAFETY: `row_start + valid <= out_stride` for token `t`.
             unsafe {

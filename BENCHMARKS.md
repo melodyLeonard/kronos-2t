@@ -115,6 +115,37 @@ With `--ane`, prompt prefill runs on the Neural Engine: the first token of a 290
 arrives in about 340 ms instead of 650–850 ms, with the same output quality (WikiText PPL
 12.05 vs 12.06 for CPU prefill).
 
+## Qwen2.5-Coder-14B-Instruct (32k context)
+
+Measured on the same 24 GB M4 Pro (20-core GPU) with `--mode nf4g128 --ctx 32768` and the
+Hadamard int8 KV cache. When `--draft models/Qwen2.5-Coder-0.5B-Instruct` (`nf4g128`, 243 MiB)
+is attached, the 14B target runs on the Metal GPU using zero-copy `MTLStorageModeShared` weight
+views while the 0.5B draft runs on CPU P-cores, overlapping draft prompt sync with GPU prefill.
+
+Across 10 coding prompts, max last-token KL divergence between the Metal GPU path and the CPU
+`nf4g128` path is 0.000109 (9/10 exact 32-token greedy matches), and greedy speculative decoding
+matches greedy target decoding token-for-token.
+
+Coding workload (median of 3 runs on a 1,451-token prompt + 400-token reply, normalized to a
+1,300-token read + 400-token write step alongside `llama-bench -p 1300 -n 400 -r 3`, plus a
+2-step `kronos_agent` 3-file to-do web app build with syntax validation):
+
+| Configuration | Weights | Max RSS (32k ctx) | Prefill | Decode | 1300 + 400 step | 3-file app build |
+|---|---:|---:|---:|---:|---:|---:|
+| Kronos nf4g128, CPU | 8.17 GiB | 10.16 GiB | 57.0 tok/s | 21.5 tok/s | 41.4 s | 259.4 s |
+| Kronos nf4g128, CPU + 0.5B draft | 8.41 GiB | 10.21 GiB | 57.0 tok/s | 30.1 tok/s | 36.1 s | 67.6 s |
+| Kronos nf4g128, Metal | 8.17 GiB | 9.32 GiB | 252.9 tok/s | 25.1 tok/s | 21.1 s | – |
+| Kronos nf4g128, Metal + 0.5B draft | 8.41 GiB | 10.21 GiB | 249.0 tok/s | 48.5 tok/s | 13.4 s | 22.7 s |
+| llama.cpp Q4_K_M, Metal (`llama-bench`) | 8.37 GiB | – | 229.8 tok/s | 26.0 tok/s | 21.1 s | – |
+
+Notes:
+- Draft acceptance is 74.1% (320/432) on the 400-token coding benchmark and 77.5% (595/768) on
+  Step 1 of the 3-file web app build (50.8 tok/s decode).
+- The 1,451 + 400 coding benchmark completes in 14.1 s on Metal + 0.5B draft (5.83 s prefill +
+  8.25 s decode) with zero swap activity.
+- Pure 14B Metal prefill reaches 262.6 tok/s at 512 tokens (`simdgroup_matrix` FP32 accumulate
+  with on-the-fly NF4 codebook dequantization in threadgroup memory).
+
 ## MoE streaming experiment
 
 `bench_800b` models an 812B-parameter mixture-of-experts layout (80 layers, 7168 hidden,
@@ -134,11 +165,12 @@ will be lower than with Zipf routing. On FFN layers from SmolLM2-1.7B, 3-bit NF3
 
 ## Remaining limitations
 
-- GPU prefill is far ahead; CPU prefill trails llama.cpp for some quant types.
+- Only 4-bit NF4 (`nf4`, `nf4g128`) runs on the Metal GPU; bipolar and mixed-plane tiers run on
+  CPU (or `--ane` for prefill).
 - 4-bit quality depends on the calibration domain (see above).
 - Bipolar-6 single-core decode is ~7% slower than Q6_K at 135M/360M (43% faster at 1.7B).
 - GPTQ compile: 34 s (135M), 90 s (360M), ~12 min (1.7B) per tier.
-- Apple Silicon only (NEON + `sdot`).
+- Apple Silicon only (NEON + `sdot`, `Metal.framework` on macOS).
 
 ## Reproduce
 

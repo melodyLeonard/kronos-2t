@@ -15,9 +15,10 @@ const ANE_MIN_NEW_TOKENS: usize = 32;
 pub const DEFAULT_SYSTEM: &str = "You are a helpful AI assistant named SmolLM, trained by Hugging Face";
 pub const DEFAULT_SYSTEM_QWEN: &str = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
 
-/// Maximum draft lookahead tokens verified in a single batched target DRAM pass (`1 + 7 = 8` tokens = exact `NT = 8` NEON tile!).
+/// Maximum draft tokens verified in one single-pass target batch (`1 + 7 = 8` tokens).
 const SPEC_DRAFT_K_GREEDY: usize = 7;
 const SPEC_DRAFT_K_SAMPLE: usize = 7;
+const SPEC_DRAFT_K_INIT: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCall {
@@ -101,16 +102,25 @@ impl FinishReason {
 #[derive(Clone, Debug)]
 pub struct Completion {
     pub text: String,
+    pub token_ids: Vec<usize>,
     pub tool_calls: Vec<ToolCall>,
     pub prompt_tokens: usize,
     /// Prompt tokens actually run (the rest came from the KV cache).
     pub prefilled_tokens: usize,
     pub completion_tokens: usize,
+    pub drafted_tokens: usize,
+    pub accepted_tokens: usize,
     pub finish: FinishReason,
     pub prefill_secs: f64,
     pub decode_secs: f64,
     /// `"ane"` when the Neural Engine ran the prefill, else `"cpu"`.
     pub prefill_unit: &'static str,
+}
+
+impl Completion {
+    pub fn acceptance_rate(&self) -> Option<f64> {
+        (self.drafted_tokens > 0).then(|| self.accepted_tokens as f64 / self.drafted_tokens as f64)
+    }
 }
 
 /// Parses a mode key: `nf5`, `nf4`, `nf3`, `nf3nf4` (optional `g128`), `nfpQOGDH` (`G=64`),
@@ -252,6 +262,8 @@ fn load_or_compile_engine(
 struct DraftEngine {
     engine: RealLlamaEngine,
     cached: Vec<usize>,
+    shared_vocab: usize,
+    draft_vocab: usize,
 }
 
 /// Reusable zero-allocation sampling & speculative verification scratch buffers.
@@ -320,7 +332,18 @@ impl ChatModel {
             engine.enable_q8_kv_cache(true);
         }
         let vocab_size = engine.cfg.vocab_size;
-        let tok = BpeTokenizer::from_model_dir(model_dir).map_err(|e| format!("tokenizer: {e}"))?;
+        let mut tok = BpeTokenizer::from_model_dir(model_dir).map_err(|e| format!("tokenizer: {e}"))?;
+        let mut emb_probe = vec![0.0f32; engine.cfg.hidden_size];
+        tok.retain_added_tokens(|s, id| {
+            if s.starts_with("<|") && s.ends_with("|>") {
+                return true;
+            }
+            if id >= vocab_size {
+                return false;
+            }
+            engine.embed(id, &mut emb_probe);
+            emb_probe.iter().any(|&v| v != 0.0)
+        });
         let special =
             |s: &str| tok.token_to_id.get(s).copied().ok_or(format!("tokenizer lacks {s}; use an Instruct model"));
         let im_start = special("<|im_start|>")?;
@@ -358,6 +381,41 @@ impl ChatModel {
         self.engine.is_q8_kv_enabled()
     }
 
+    /// Enables zero-copy Metal GPU inference on the target model; small draft models stay on CPU.
+    pub fn enable_metal(&mut self) -> Result<(), String> {
+        self.engine.enable_metal()?;
+        self.cached.clear();
+        if let Some(d) = self.draft.as_mut() {
+            if d.engine.cfg.hidden_size > 1536 {
+                let _ = d.engine.enable_metal();
+            } else {
+                d.engine.disable_metal();
+                if matches!(d.engine.cfg.head_dim(), 64 | 128) {
+                    d.engine.enable_q8_kv_cache(true);
+                }
+                d.engine
+                    .set_num_threads(crate::thread_pool::default_inference_threads());
+                crate::thread_pool::SpinThreadPool::park_idle_workers();
+            }
+            d.cached.clear();
+        }
+        Ok(())
+    }
+
+    /// Disables Metal GPU inference and restores CPU execution.
+    pub fn disable_metal(&mut self) {
+        self.engine.disable_metal();
+        self.cached.clear();
+        if let Some(d) = self.draft.as_mut() {
+            d.engine.disable_metal();
+            d.cached.clear();
+        }
+    }
+
+    pub fn is_metal_enabled(&self) -> bool {
+        self.engine.is_metal_enabled()
+    }
+
     pub fn resident_weight_bytes(&self) -> usize {
         self.engine.resident_weight_bytes()
     }
@@ -373,9 +431,25 @@ impl ChatModel {
         }
     }
 
-    /// Attaches a fast Kronos draft model (e.g. `SmolLM2-135M-Instruct`) for **100% lossless**
-    /// speculative decoding (exact greedy match at `temp == 0` and exact Leviathan-Chen rejection
-    /// sampling at `temp > 0`), sharing the global P-core thread pool with zero thread contention!
+    /// Clears the target and draft KV caches.
+    pub fn reset_cache(&mut self) {
+        self.engine.reset_context();
+        self.cached.clear();
+        if let Some(d) = self.draft.as_mut() {
+            d.engine.reset_context();
+            d.cached.clear();
+        }
+    }
+
+    pub fn has_draft(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    pub fn detach_draft(&mut self) {
+        self.draft = None;
+    }
+
+    /// Attaches a draft model for lossless speculative decoding.
     pub fn attach_draft(
         &mut self,
         draft_dir: &Path,
@@ -393,19 +467,50 @@ impl ChatModel {
         draft_mode_key: &str,
         calib: Option<(&Path, usize)>,
     ) -> Result<(), String> {
-        let threads = self.engine.num_threads();
+        let draft_tok =
+            BpeTokenizer::from_model_dir(draft_dir).map_err(|e| format!("draft tokenizer: {e}"))?;
+        let threads = if self.engine.is_metal_enabled() {
+            crate::thread_pool::default_inference_threads()
+        } else {
+            self.engine.num_threads()
+        };
         let mut draft_eng =
             load_or_compile_engine(draft_dir, cache_dir, draft_mode_key, self.ctx, threads, calib)?;
-        if draft_eng.cfg.vocab_size != self.engine.cfg.vocab_size {
+        let draft_vocab = draft_eng.cfg.vocab_size;
+        let target_vocab = self.engine.cfg.vocab_size;
+        let shared_vocab = draft_vocab.min(target_vocab);
+        let check_len = draft_tok
+            .id_to_token
+            .len()
+            .min(self.tok.id_to_token.len())
+            .min(shared_vocab);
+        if check_len == 0
+            || draft_tok.pre_tokenizer != self.tok.pre_tokenizer
+            || draft_tok.id_to_token[..check_len] != self.tok.id_to_token[..check_len]
+        {
             return Err(format!(
-                "draft vocab_size ({}) != target vocab_size ({})",
-                draft_eng.cfg.vocab_size, self.engine.cfg.vocab_size
+                "draft tokenizer mismatch over shared {check_len} ids (draft vocab {draft_vocab}, target vocab {target_vocab})"
             ));
         }
-        if self.engine.is_q8_kv_enabled() {
+        if self.scratch.pen_logits.len() < shared_vocab {
+            self.scratch.pen_logits.resize(shared_vocab, 0.0);
+        }
+        if self.engine.is_metal_enabled() && draft_eng.cfg.hidden_size > 1536 {
+            let _ = draft_eng.enable_metal();
+        } else if (self.engine.is_q8_kv_enabled() || self.engine.is_metal_enabled())
+            && matches!(draft_eng.cfg.head_dim(), 64 | 128)
+        {
             draft_eng.enable_q8_kv_cache(true);
         }
-        self.draft = Some(DraftEngine { engine: draft_eng, cached: Vec::new() });
+        if self.engine.is_metal_enabled() {
+            crate::thread_pool::SpinThreadPool::park_idle_workers();
+        }
+        self.draft = Some(DraftEngine {
+            engine: draft_eng,
+            cached: Vec::new(),
+            shared_vocab,
+            draft_vocab,
+        });
         Ok(())
     }
 
@@ -511,7 +616,11 @@ impl ChatModel {
         self.engine.truncate_context(common);
         self.cached.truncate(common);
         let t0 = Instant::now();
-        let mut prefill_unit = "cpu";
+        let mut prefill_unit = if self.engine.is_metal_enabled() {
+            "metal"
+        } else {
+            "cpu"
+        };
         #[cfg(all(feature = "ane", target_os = "macos"))]
         // The Neural Engine recomputes the whole prompt from position 0; worth it once there is
         // a meaningful amount of new text, even when a shared prefix (system prompt) is cached.
@@ -522,6 +631,7 @@ impl ChatModel {
         };
         #[cfg(not(all(feature = "ane", target_os = "macos")))]
         let ane_logits: Option<Vec<f32>> = None;
+        let mut draft_synced_in_parallel = false;
         match ane_logits {
             Some(l) => {
                 prefill_unit = "ane";
@@ -530,20 +640,64 @@ impl ChatModel {
                 self.scratch.cur_logits.copy_from_slice(&l);
             }
             None => {
-                let l = self.engine.forward_prompt(&prompt[common..]);
-                self.scratch.cur_logits.copy_from_slice(l);
+                if self.engine.is_metal_enabled() && self.draft.is_some() {
+                    let target_slice = &prompt[common..];
+                    let t_eng = &mut self.engine;
+                    let cur_logits = &mut self.scratch.cur_logits;
+                    let d = self.draft.as_mut().unwrap();
+                    let dv = d.draft_vocab;
+                    let d_common = d
+                        .cached
+                        .iter()
+                        .zip(&prompt)
+                        .take_while(|(&a, &b)| a == if b < dv { b } else { 0 })
+                        .count();
+                    d.engine.truncate_context(d_common);
+                    d.cached.truncate(d_common);
+                    let mapped: Vec<usize> = prompt[d_common..]
+                        .iter()
+                        .map(|&id| if id < dv { id } else { 0 })
+                        .collect();
+                    std::thread::scope(|s| {
+                        let draft_job = s.spawn(|| {
+                            if !mapped.is_empty() {
+                                d.engine.forward_prompt(&mapped);
+                                d.cached.extend_from_slice(&mapped);
+                            }
+                        });
+                        let l = t_eng.forward_prompt(target_slice);
+                        cur_logits.copy_from_slice(l);
+                        let _ = draft_job.join();
+                    });
+                    draft_synced_in_parallel = true;
+                } else {
+                    let l = self.engine.forward_prompt(&prompt[common..]);
+                    self.scratch.cur_logits.copy_from_slice(l);
+                }
             }
         }
         self.cached.extend_from_slice(&prompt[common..]);
 
-        // Pre-sync draft KV cache on the prompt inside prefill timing so decode starts hot!
-        if let Some(d) = self.draft.as_mut() {
-            let d_common = d.cached.iter().zip(&self.cached).take_while(|(a, b)| a == b).count();
-            d.engine.truncate_context(d_common);
-            d.cached.truncate(d_common);
-            if d_common < self.cached.len() {
-                d.engine.forward_prompt(&self.cached[d_common..]);
-                d.cached.extend_from_slice(&self.cached[d_common..]);
+        // Sync draft KV cache on the prompt when not already overlapped with Metal GPU prefill.
+        if !draft_synced_in_parallel {
+            if let Some(d) = self.draft.as_mut() {
+                let dv = d.draft_vocab;
+                let d_common = d
+                    .cached
+                    .iter()
+                    .zip(&self.cached)
+                    .take_while(|(&a, &b)| a == if b < dv { b } else { 0 })
+                    .count();
+                d.engine.truncate_context(d_common);
+                d.cached.truncate(d_common);
+                if d_common < self.cached.len() {
+                    let mapped: Vec<usize> = self.cached[d_common..]
+                        .iter()
+                        .map(|&id| if id < dv { id } else { 0 })
+                        .collect();
+                    d.engine.forward_prompt(&mapped);
+                    d.cached.extend_from_slice(&mapped);
+                }
             }
         }
         let prefill_secs = t0.elapsed().as_secs_f64();
@@ -554,14 +708,19 @@ impl ChatModel {
         let mut raw_bytes: Vec<u8> = Vec::with_capacity(max_new * 4);
         let mut emitted_bytes = 0usize;
         let mut finish = FinishReason::Length;
+        let mut drafted_total = 0usize;
+        let mut accepted_total = 0usize;
 
         if max_new == 0 {
             return Ok(Completion {
                 text: String::new(),
+                token_ids: Vec::new(),
                 tool_calls: Vec::new(),
                 prompt_tokens: prompt.len(),
                 prefilled_tokens: prompt.len() - common,
                 completion_tokens: 0,
+                drafted_tokens: 0,
+                accepted_tokens: 0,
                 finish,
                 prefill_secs,
                 prefill_unit,
@@ -569,6 +728,9 @@ impl ChatModel {
             });
         }
 
+        if self.im_start < self.scratch.cur_logits.len() {
+            self.scratch.cur_logits[self.im_start] = f32::NEG_INFINITY;
+        }
         let mut next = sample_token(
             &self.scratch.cur_logits,
             &[],
@@ -609,10 +771,11 @@ impl ChatModel {
             true
         };
 
-        let mut cur_draft_k = if params.temperature <= 0.0 { 3usize } else { 2usize };
+        let mut cur_draft_k = SPEC_DRAFT_K_INIT;
+        let mut ewma_accept = 0.70f32;
         let mut zero_accept_streak = 0usize;
         let mut draft_cooldown = 0usize;
-        let mut cooldown_step = 16usize;
+        let mut lookup_cooldown = 0usize;
         'outer: loop {
             if is_stop(next, self.im_end, &self.tok) {
                 finish = FinishReason::Stop;
@@ -632,68 +795,89 @@ impl ChatModel {
             let max_k = if params.temperature <= 0.0 { SPEC_DRAFT_K_GREEDY } else { SPEC_DRAFT_K_SAMPLE };
             let max_draft = rem.min(avail_ctx).min(cur_draft_k.min(max_k));
 
-            // TIER 1: Draft-Model Lossless Speculative Decoding (`--draft`)
+            // Tier 1: draft-model speculative decoding (`--draft`).
             if draft_cooldown > 0 {
                 draft_cooldown -= 1;
-            } else if max_draft >= 2 && self.engine.is_all_sdot() && self.draft.is_some() {
+            } else if max_draft >= 1 && self.engine.is_all_sdot() && self.draft.is_some() {
                 let mut draft_tokens = [0usize; SPEC_DRAFT_K_GREEDY];
                 let mut drafted = 0usize;
                 {
                     let d = self.draft.as_mut().unwrap();
-                    let d_common = d.cached.iter().zip(&self.cached).take_while(|(a, b)| a == b).count();
+                    let dv = d.draft_vocab;
+                    let sv = d.shared_vocab;
+                    let clamp_d = |id: usize| if id < dv { id } else { 0 };
+                    let d_common = d
+                        .cached
+                        .iter()
+                        .zip(&self.cached)
+                        .take_while(|(&a, &b)| a == clamp_d(b))
+                        .count();
                     d.engine.truncate_context(d_common);
                     d.cached.truncate(d_common);
-                    if d_common < self.cached.len() {
-                        let start = d_common;
-                        let mut sync_buf = Vec::with_capacity(self.cached.len() - start + 1);
-                        sync_buf.extend_from_slice(&self.cached[start..]);
-                        sync_buf.push(next);
-                        let dl = d.engine.forward_prompt(&sync_buf);
-                        self.scratch.cur_logits.copy_from_slice(dl);
-                        d.cached.extend_from_slice(&sync_buf);
+                    let next_d = clamp_d(next);
+                    let gap = self.cached.len() - d_common;
+                    let mut dl: &[f32] = if gap == 0 {
+                        d.cached.push(next_d);
+                        d.engine.forward_token(next_d)
+                    } else if gap <= 2 {
+                        for &id in &self.cached[d_common..] {
+                            let cid = clamp_d(id);
+                            d.cached.push(cid);
+                            d.engine.forward_token(cid);
+                        }
+                        d.cached.push(next_d);
+                        d.engine.forward_token(next_d)
                     } else {
-                        let dl = d.engine.forward_token(next);
-                        self.scratch.cur_logits.copy_from_slice(dl);
-                        d.cached.push(next);
-                    }
+                        let mut sync_buf = Vec::with_capacity(gap + 1);
+                        sync_buf.extend(self.cached[d_common..].iter().map(|&id| clamp_d(id)));
+                        sync_buf.push(next_d);
+                        d.cached.extend_from_slice(&sync_buf);
+                        d.engine.forward_prompt(&sync_buf)
+                    };
 
                     let mut sim_recent: Vec<usize> =
                         reply[reply.len().saturating_sub(64 + SPEC_DRAFT_K_GREEDY)..].to_vec();
                     for (j, dt_slot) in draft_tokens.iter_mut().enumerate().take(max_draft) {
                         let rec = &sim_recent[sim_recent.len().saturating_sub(64)..];
-                        let dj = if params.temperature <= 0.0 {
-                            sample_greedy(
-                                &self.scratch.cur_logits,
+                        let dl_shared = &dl[..sv];
+                        let (dj, low_conf) = if params.temperature <= 0.0 {
+                            let (tok_id, margin) = sample_greedy_with_margin(
+                                dl_shared,
                                 rec,
                                 params.repeat_penalty,
                                 &mut self.scratch.pen_logits,
-                            )
+                            );
+                            (tok_id, margin < 0.55)
                         } else {
                             build_sampling_dist(
-                                &self.scratch.cur_logits,
+                                dl_shared,
                                 rec,
                                 params,
                                 &mut self.scratch.pen_logits,
                                 &mut self.scratch.top_heap,
                                 &mut self.scratch.draft_dists[j],
                             );
-                            sample_from_dist(&self.scratch.draft_dists[j], &mut rng)
+                            let top_p = self.scratch.draft_dists[j].first().map_or(0.0, |e| e.1);
+                            (sample_from_dist(&self.scratch.draft_dists[j], &mut rng), top_p < 0.35)
                         };
                         *dt_slot = dj;
                         drafted += 1;
                         if is_stop(dj, self.im_end, &self.tok) {
                             break;
                         }
+                        // Stop extending the burst past an uncertain branch once >= 2 tokens are drafted.
+                        if low_conf && drafted >= 2 {
+                            break;
+                        }
                         sim_recent.push(dj);
                         if j + 1 < max_draft {
-                            let dl = d.engine.forward_token(dj);
-                            self.scratch.cur_logits.copy_from_slice(dl);
                             d.cached.push(dj);
+                            dl = d.engine.forward_token(dj);
                         }
                     }
                 }
 
-                // Single batched DRAM pass on target engine verifying `[next, d_0, ..., d_{drafted-1}]`!
+                // Verify `[next, d_0, ..., d_{drafted-1}]` in one single-pass target batch.
                 let mut batch = [0usize; SPEC_DRAFT_K_GREEDY + 1];
                 batch[0] = next;
                 batch[1..1 + drafted].copy_from_slice(&draft_tokens[..drafted]);
@@ -753,9 +937,10 @@ impl ChatModel {
                         }
                     }
 
-                    // `dj` accepted!
                     accepted_in_round += 1;
                     if is_stop(dj, self.im_end, &self.tok) {
+                        drafted_total += j + 1;
+                        accepted_total += accepted_in_round;
                         self.engine.truncate_context(pos0 + j + 1);
                         if let Some(d) = self.draft.as_mut() {
                             d.engine.truncate_context(pos0 + j + 1);
@@ -765,6 +950,8 @@ impl ChatModel {
                         break 'outer;
                     }
                     if !emit_tok(dj, &self.tok, &mut reply, &mut raw_bytes, &mut emitted_bytes, &mut on_text) {
+                        drafted_total += j + 1;
+                        accepted_total += accepted_in_round;
                         self.engine.truncate_context(pos0 + j + 1);
                         if let Some(d) = self.draft.as_mut() {
                             d.engine.truncate_context(pos0 + j + 1);
@@ -774,6 +961,8 @@ impl ChatModel {
                         break 'outer;
                     }
                     if reply.len() >= max_new {
+                        drafted_total += j + 1;
+                        accepted_total += accepted_in_round;
                         self.engine.truncate_context(pos0 + j + 1);
                         if let Some(d) = self.draft.as_mut() {
                             d.engine.truncate_context(pos0 + j + 1);
@@ -784,11 +973,18 @@ impl ChatModel {
                     }
                 }
 
+                drafted_total += drafted;
+                accepted_total += accepted_in_round;
+                let round_rate = (accepted_in_round as f32) / (drafted.max(1) as f32);
+                ewma_accept = 0.75 * ewma_accept + 0.25 * round_rate;
+
                 if accepted_all {
-                    // All drafts accepted: widen the lookahead.
-                    cur_draft_k = if cur_draft_k < 4 { 4 } else { SPEC_DRAFT_K_GREEDY };
                     zero_accept_streak = 0;
-                    cooldown_step = 16;
+                    cur_draft_k = if ewma_accept >= 0.75 {
+                        (cur_draft_k + 2).min(SPEC_DRAFT_K_GREEDY)
+                    } else {
+                        (cur_draft_k + 1).min(SPEC_DRAFT_K_GREEDY)
+                    };
                     self.cached.push(batch[drafted]);
                     let bonus_logits = &self.scratch.verify_logits[drafted * vocab..(drafted + 1) * vocab];
                     let rec = &reply[reply.len().saturating_sub(64)..];
@@ -801,26 +997,42 @@ impl ChatModel {
                         &mut self.scratch.top_heap,
                     );
                 } else {
-                    cur_draft_k = if params.temperature <= 0.0 && accepted_in_round >= 2 { 3 } else { 2 };
+                    cur_draft_k = if ewma_accept >= 0.80 {
+                        7
+                    } else if ewma_accept >= 0.68 {
+                        6
+                    } else if ewma_accept >= 0.55 {
+                        5
+                    } else if ewma_accept >= 0.40 {
+                        4
+                    } else if ewma_accept >= 0.25 {
+                        3
+                    } else {
+                        2
+                    };
                     if accepted_in_round == 0 {
                         zero_accept_streak += 1;
-                        if zero_accept_streak >= 2 {
-                            draft_cooldown = cooldown_step;
-                            cooldown_step = (cooldown_step * 2).min(64);
+                        if zero_accept_streak >= 4 {
+                            draft_cooldown = 4;
                             zero_accept_streak = 0;
                         }
                     } else {
                         zero_accept_streak = 0;
-                        cooldown_step = 16;
                     }
                 }
                 continue;
             }
 
-            // TIER 2: Zero-RAM Prompt/History Suffix-Lookup Speculation (greedy, `0` extra RAM)
-            if params.temperature <= 0.0 && max_draft >= 3 && self.engine.is_all_sdot() {
+            // Tier 2: prompt/history suffix lookup when no draft model is attached.
+            if lookup_cooldown > 0 {
+                lookup_cooldown -= 1;
+            } else if self.draft.is_none()
+                && params.temperature <= 0.0
+                && max_draft >= 3
+                && self.engine.is_all_sdot()
+            {
                 let mut draft_tokens = [0usize; SPEC_DRAFT_K_GREEDY];
-                let drafted = find_suffix_continuation(&self.cached, next, max_draft, &mut draft_tokens);
+                let drafted = find_suffix_continuation(&self.cached, next, max_draft.min(5), &mut draft_tokens);
                 if drafted >= 2 {
                     let mut batch = [0usize; SPEC_DRAFT_K_GREEDY + 1];
                     batch[0] = next;
@@ -865,7 +1077,7 @@ impl ChatModel {
                         }
                     }
                     if accepted_all {
-                        cur_draft_k = if cur_draft_k < 5 { 5 } else { SPEC_DRAFT_K_GREEDY };
+                        cur_draft_k = (cur_draft_k + 1).min(SPEC_DRAFT_K_GREEDY);
                         self.cached.push(batch[drafted]);
                         let bonus_logits = &self.scratch.verify_logits[drafted * vocab..(drafted + 1) * vocab];
                         let rec = &reply[reply.len().saturating_sub(64)..];
@@ -875,8 +1087,11 @@ impl ChatModel {
                             params.repeat_penalty,
                             &mut self.scratch.pen_logits,
                         );
+                    } else if accepted_in_round == 0 {
+                        lookup_cooldown = 8;
+                        cur_draft_k = 3;
                     } else {
-                        cur_draft_k = if accepted_in_round >= 2 { 4 } else { 3 };
+                        cur_draft_k = 4;
                     }
                     continue;
                 }
@@ -905,6 +1120,9 @@ impl ChatModel {
         }
 
         let decode_secs = t1.elapsed().as_secs_f64();
+        if self.engine.is_metal_enabled() && self.draft.is_some() {
+            crate::thread_pool::SpinThreadPool::park_idle_workers();
+        }
         let raw_text = String::from_utf8_lossy(&raw_bytes).into_owned();
         let (text, tool_calls) = if !tools_json.is_empty() || raw_text.contains("<tool_call>") {
             let (prose, calls) = parse_qwen_tool_calls(&raw_text);
@@ -920,12 +1138,16 @@ impl ChatModel {
             (raw_text, Vec::new())
         };
 
+        let completion_tokens = reply.len();
         Ok(Completion {
             text,
+            token_ids: reply,
             tool_calls,
             prompt_tokens: prompt.len(),
             prefilled_tokens: prompt.len() - common,
-            completion_tokens: reply.len(),
+            completion_tokens,
+            drafted_tokens: drafted_total,
+            accepted_tokens: accepted_total,
             finish,
             prefill_secs,
             decode_secs,
@@ -1243,15 +1465,14 @@ fn find_balanced_json_object_end(s: &str) -> Option<usize> {
     None
 }
 
-/// Scans `cached` + `next` backwards for an exact suffix match of length `5`, `4`, or `3` and copies up
-/// to `max_k` continuation tokens into `out` (`< 0.5 µs`, `0` heap allocations).
+/// Scans `cached` + `next` backwards for a 6-, 5-, or 4-token suffix match and copies continuation tokens.
 fn find_suffix_continuation(cached: &[usize], next: usize, max_k: usize, out: &mut [usize]) -> usize {
     let n = cached.len();
-    if n < 4 {
+    if n < 5 {
         return 0;
     }
     let limit = max_k.min(out.len());
-    for ngram in [5usize, 4, 3] {
+    for ngram in [6usize, 5, 4] {
         if n + 1 < ngram + 2 {
             continue;
         }
@@ -1290,7 +1511,51 @@ impl Rng {
     }
 }
 
-/// Fast zero-allocation greedy argmax with repetition penalty (`2.5 µs` zero-copy fast path!).
+#[inline]
+fn top1_and_margin(logits: &[f32]) -> (usize, f32) {
+    let mut best_idx = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    let mut second_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val {
+            second_val = best_val;
+            best_val = v;
+            best_idx = i;
+        } else if v > second_val {
+            second_val = v;
+        }
+    }
+    let margin = if second_val.is_finite() { best_val - second_val } else { f32::INFINITY };
+    (best_idx, margin)
+}
+
+#[inline]
+fn sample_greedy_with_margin(
+    logits: &[f32],
+    recent: &[usize],
+    repeat_penalty: f32,
+    scratch: &mut [f32],
+) -> (usize, f32) {
+    if recent.is_empty() || (repeat_penalty - 1.0).abs() <= f32::EPSILON {
+        return top1_and_margin(logits);
+    }
+    if repeat_penalty >= 1.0 {
+        let (best, margin) = top1_and_margin(logits);
+        if !recent.contains(&best) {
+            return (best, margin);
+        }
+    }
+    let l = &mut scratch[..logits.len()];
+    l.copy_from_slice(logits);
+    for &t in recent {
+        if t < l.len() {
+            l[t] = if l[t] > 0.0 { l[t] / repeat_penalty } else { l[t] * repeat_penalty };
+        }
+    }
+    top1_and_margin(l)
+}
+
+/// Zero-copy greedy argmax with repetition penalty.
 #[inline]
 fn sample_greedy(logits: &[f32], recent: &[usize], repeat_penalty: f32, scratch: &mut [f32]) -> usize {
     if recent.is_empty() || (repeat_penalty - 1.0).abs() <= f32::EPSILON {
@@ -1305,7 +1570,9 @@ fn sample_greedy(logits: &[f32], recent: &[usize], repeat_penalty: f32, scratch:
     let l = &mut scratch[..logits.len()];
     l.copy_from_slice(logits);
     for &t in recent {
-        l[t] = if l[t] > 0.0 { l[t] / repeat_penalty } else { l[t] * repeat_penalty };
+        if t < l.len() {
+            l[t] = if l[t] > 0.0 { l[t] / repeat_penalty } else { l[t] * repeat_penalty };
+        }
     }
     argmax(l)
 }
@@ -1347,7 +1614,9 @@ fn build_sampling_dist(
         let l = &mut pen_scratch[..logits.len()];
         l.copy_from_slice(logits);
         for &t in recent {
-            l[t] = if l[t] > 0.0 { l[t] / p.repeat_penalty } else { l[t] * p.repeat_penalty };
+            if t < l.len() {
+                l[t] = if l[t] > 0.0 { l[t] / p.repeat_penalty } else { l[t] * p.repeat_penalty };
+            }
         }
         l
     };
@@ -1598,5 +1867,202 @@ mod tests {
         assert_eq!(b_calls.len(), 2);
         assert_eq!(b_calls[0].name, "run_command");
         assert_eq!(b_calls[1].name, "run_command");
+    }
+
+    static HEAVY_14B_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_qwen25_14b_draft_05b_greedy_exact_5_coding_prompts() {
+        let _guard = HEAVY_14B_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target_dir = Path::new("models/Qwen2.5-Coder-14B-Instruct");
+        let draft_dir = Path::new("models/Qwen2.5-Coder-0.5B-Instruct");
+        if !target_dir.join("kronos-nf4g128.k2tb").exists()
+            || !draft_dir.join("kronos-nf4g128.k2tb").exists()
+        {
+            return;
+        }
+
+        let threads = crate::thread_pool::default_inference_threads();
+        let mut model = ChatModel::load(target_dir, "nf4g128", 2048, threads, None).unwrap();
+
+        let bad_draft = Path::new("models/SmolLM2-135M-Instruct");
+        if bad_draft.join("kronos-nf4g128.k2tb").exists() {
+            assert!(model.attach_draft(bad_draft, "nf4g128", None).is_err());
+        }
+
+        let prompts = [
+            "Write a Rust function `pub fn binary_search(xs: &[i32], target: i32) -> Option<usize>` without comments.",
+            "Write a Python function `merge_intervals(intervals: list[list[int]]) -> list[list[int]]`.",
+            "Write a JavaScript function `debounce(fn, delayMs)` using `setTimeout` and `clearTimeout`.",
+            "Write an SQL query returning the top 3 departments by average salary from `employees(id, dept, salary)`.",
+            "Write a C function `size_t str_lcpy(char *dst, const char *src, size_t cap)` that always NUL-terminates when `cap > 0`.",
+        ];
+        let params = GenParams {
+            temperature: 0.0,
+            top_k: 40,
+            top_p: 1.0,
+            repeat_penalty: 1.0,
+            max_tokens: 64,
+            seed: 0,
+        };
+
+        let mut baseline = Vec::with_capacity(prompts.len());
+        for p in &prompts {
+            model.reset_cache();
+            let msgs = [Message::new("user", p)];
+            let out = model.generate(&msgs, &params, |_| true).unwrap();
+            assert!(!out.token_ids.is_empty());
+            baseline.push((out.token_ids, out.text, out.decode_secs));
+        }
+
+        model.attach_draft(draft_dir, "nf4g128", None).unwrap();
+        assert!(model.has_draft());
+
+        for (idx, p) in prompts.iter().enumerate() {
+            model.reset_cache();
+            let msgs = [Message::new("user", p)];
+            let out = model.generate(&msgs, &params, |_| true).unwrap();
+            assert!(out.drafted_tokens > 0, "prompt {idx} did not use draft");
+            assert_eq!(
+                out.token_ids, baseline[idx].0,
+                "token-id mismatch on coding prompt {idx}"
+            );
+            assert_eq!(out.text, baseline[idx].1, "text mismatch on coding prompt {idx}");
+            eprintln!(
+                "prompt {}: {} tok | base {:.1} tok/s -> spec {:.1} tok/s | accept {:.1}% ({}/{})",
+                idx,
+                out.completion_tokens,
+                out.completion_tokens as f64 / baseline[idx].2.max(1e-9),
+                out.completion_tokens as f64 / out.decode_secs.max(1e-9),
+                out.acceptance_rate().unwrap_or(0.0) * 100.0,
+                out.accepted_tokens,
+                out.drafted_tokens,
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_qwen25_14b_metal_vs_cpu_kl_and_greedy_10_prompts() {
+        let _guard = HEAVY_14B_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target_dir = Path::new("models/Qwen2.5-Coder-14B-Instruct");
+        let draft_dir = Path::new("models/Qwen2.5-Coder-0.5B-Instruct");
+        if !target_dir.join("kronos-nf4g128.k2tb").exists() {
+            return;
+        }
+
+        let kl_div = |ref_l: &[f32], test_l: &[f32]| -> f64 {
+            let max_r = ref_l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let max_t = test_l.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let sum_r: f64 = ref_l.iter().map(|&v| ((v as f64) - max_r).exp()).sum();
+            let sum_t: f64 = test_l.iter().map(|&v| ((v as f64) - max_t).exp()).sum();
+            let lse_r = max_r + sum_r.ln();
+            let lse_t = max_t + sum_t.ln();
+            let mut kl = 0.0f64;
+            for (&rv, &tv) in ref_l.iter().zip(test_l.iter()) {
+                let log_p = (rv as f64) - lse_r;
+                let log_q = (tv as f64) - lse_t;
+                let p = log_p.exp();
+                if p > 1e-15 {
+                    kl += p * (log_p - log_q);
+                }
+            }
+            kl
+        };
+
+        let threads = crate::thread_pool::default_inference_threads();
+        let mut model = ChatModel::load(target_dir, "nf4g128", 2048, threads, None).unwrap();
+
+        let prompts = [
+            "Write a Rust function `pub fn gcd(mut a: u64, mut b: u64) -> u64` using Euclid's algorithm.",
+            "Write a Python function `toposort(adj: dict[str, list[str]]) -> list[str]` using Kahn's algorithm.",
+            "Write a JavaScript function `lruCache(capacity)` returning `{ get, put }` backed by a `Map`.",
+            "Write an SQL query with a CTE that finds consecutive 3-day login streaks in `logins(user_id, day)`.",
+            "Write a C function `uint32_t fnv1a32(const uint8_t *buf, size_t len)` with standard FNV-1a constants.",
+            "Explain in two concise sentences why causal self-attention scales quadratically with sequence length.",
+            "Write a Go function `ReverseRunes(s string) string` that handles multi-byte UTF-8 runes properly.",
+            "Write a bash one-liner that counts unique IPv4 addresses in column 1 of `access.log` sorted descending.",
+            "Write a TypeScript type `ReadonlyDeep<T>` that recursively marks object and array fields readonly.",
+            "Write a CSS rule `.grid-cards` using `grid-template-columns: repeat(auto-fill, minmax(240px, 1fr))` and `gap: 16px`.",
+        ];
+        let params = GenParams {
+            temperature: 0.0,
+            top_k: 40,
+            top_p: 1.0,
+            repeat_penalty: 1.0,
+            max_tokens: 32,
+            seed: 0,
+        };
+
+        let mut cpu_logits = Vec::with_capacity(prompts.len());
+        let mut cpu_replies = Vec::with_capacity(prompts.len());
+        model.disable_metal();
+        for p in &prompts {
+            let msgs = [Message::new("user", p)];
+            let toks = model.render(&msgs);
+            model.reset_cache();
+            let l = model.engine.forward_prompt(&toks).to_vec();
+            cpu_logits.push(l);
+            model.reset_cache();
+            let out = model.generate(&msgs, &params, |_| true).unwrap();
+            cpu_replies.push((out.token_ids, out.text));
+        }
+
+        model.enable_metal().unwrap();
+        assert!(model.is_metal_enabled());
+        let mut max_kl = 0.0f64;
+        let mut exact_greedy_matches = 0usize;
+        for (idx, p) in prompts.iter().enumerate() {
+            let msgs = [Message::new("user", p)];
+            let toks = model.render(&msgs);
+            model.reset_cache();
+            let ml = model.engine.forward_prompt(&toks).to_vec();
+            let kl = kl_div(&cpu_logits[idx], &ml);
+            max_kl = max_kl.max(kl);
+            assert!(
+                kl < 0.02,
+                "prompt {idx} Metal vs CPU last-token KL = {kl:.6} exceeds 0.02"
+            );
+
+            model.reset_cache();
+            let out = model.generate(&msgs, &params, |_| true).unwrap();
+            assert_eq!(out.prefill_unit, "metal");
+            let prefix_agree = out
+                .token_ids
+                .iter()
+                .zip(&cpu_replies[idx].0)
+                .take_while(|(a, b)| a == b)
+                .count();
+            if out.token_ids == cpu_replies[idx].0 {
+                exact_greedy_matches += 1;
+            }
+            eprintln!(
+                "metal parity prompt {idx}: prefill {} tok @ {:.0} tok/s | KL={kl:.6} | greedy prefix match {}/{}",
+                out.prefilled_tokens,
+                out.prefilled_tokens as f64 / out.prefill_secs.max(1e-9),
+                prefix_agree,
+                out.token_ids.len(),
+            );
+            assert!(
+                prefix_agree >= 4,
+                "prompt {idx} greedy prefix diverged too early ({prefix_agree} tokens): metal={:?} vs cpu={:?}",
+                out.text,
+                cpu_replies[idx].1
+            );
+
+            if draft_dir.join("kronos-nf4g128.k2tb").exists() && idx == 9 {
+                model.attach_draft(draft_dir, "nf4g128", None).unwrap();
+                model.reset_cache();
+                let spec_out = model.generate(&msgs, &params, |_| true).unwrap();
+                assert_eq!(
+                    spec_out.token_ids, out.token_ids,
+                    "Metal speculative greedy must match Metal target greedy token-for-token"
+                );
+                model.detach_draft();
+            }
+        }
+        eprintln!(
+            "10-prompt 14B Metal vs CPU summary: max_kl={max_kl:.6}, exact_32tok_greedy={exact_greedy_matches}/10"
+        );
     }
 }

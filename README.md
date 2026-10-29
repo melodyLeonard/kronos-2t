@@ -1,9 +1,9 @@
 # kronos-2t
 
-kronos-2t is a CPU inference engine for Llama-architecture language models, written in Rust
-with ARM NEON kernels and no crate dependencies. It quantizes weights to 4–6 bits with a
-Hadamard rotation and GPTQ, stores them as bit-planes, and runs them with integer dot-product
-(`sdot`) kernels. It targets Apple Silicon.
+kronos-2t is an inference engine for Llama and Qwen2 language models, written in Rust with
+ARM NEON and `Metal.framework` kernels and no crate dependencies. It quantizes weights to 3–6 bits
+with a Hadamard rotation and GPTQ, stores them as bit-planes or NF4 codebook stripes, and runs
+them on CPU (`sdot`) or zero-copy Metal GPU buffers on Apple Silicon.
 
 On SmolLM2 models from 135M to 1.7B parameters, compared with llama.cpp on the same machine:
 
@@ -38,10 +38,12 @@ Numbers, method and limitations: [BENCHMARKS.md](BENCHMARKS.md).
 
 ### Why not use it
 
-- The Metal GPU processes prompts 4–10x faster than any CPU path, including this one.
+- Only 4-bit NF4 (`nf4`, `nf4g128`) runs on the Metal GPU; bipolar and mixed-plane tiers run on
+  CPU.
 - With generic calibration data, the 4-bit tiers lose their quality edge over llama.cpp.
 - Compiling a model takes minutes (GPTQ), not seconds.
-- Only Llama-architecture models with tied embeddings, on ARM64 with `dotprod` (Apple Silicon).
+- Only Llama and Qwen2 dense architectures on Apple Silicon (`aarch64` NEON `dotprod` and macOS
+  Metal).
 - One request at a time; it serves a single model on one machine, not a fleet.
 
 ### Building
@@ -67,31 +69,57 @@ a mix of encyclopedic and web text works well) and caches it as
 [BENCHMARKS.md](BENCHMARKS.md) for the size, quality and speed of each.
 
 The KV cache is stored as int8 after a Hadamard rotation, about 4x smaller than FP32;
-`--fp32-kv` turns this off. Built with `--features ane`, `--ane` runs prompt prefill on the
-Neural Engine (see [ane/README.md](ane/README.md)).
-
-`kronos_server` serves the same model over an OpenAI-compatible HTTP API, so any OpenAI client
-library works by changing its base URL:
+`--fp32-kv` turns this off. On macOS, `nf4` and `nf4g128` models run on the Metal GPU by default
+(`--cpu` forces CPU execution). Pass `--draft models/<small-model>` to enable lossless speculative
+decoding with a smaller same-family draft model on CPU while the target runs on Metal:
 
 ```bash
-cargo run --release --bin kronos_server -- models/SmolLM2-1.7B-Instruct --port 8080 --api-key secret
+cargo run --release --bin kronos_chat -- models/Qwen2.5-Coder-14B-Instruct \
+  --mode nf4g128 --ctx 32768 --draft models/Qwen2.5-Coder-0.5B-Instruct
+```
+
+Built with `--features ane`, `--ane` runs prompt prefill on the Neural Engine (see
+[ane/README.md](ane/README.md)).
+
+### Sandboxed workspace tools and web UI
+
+Pass `--agent --workdir <dir>` to `kronos_chat` (or toggle `/agent` interactively) to enable six
+jailed workspace tools (`write_file`, `edit_file`, `read_file`, `list_dir`, `search_files`,
+`run_command`) with post-edit syntax checks for Rust, JS/TS, JSON, HTML, CSS and Python. For
+non-interactive single-goal runs, use `kronos_agent`:
+
+```bash
+cargo run --release --bin kronos_agent -- --model models/Qwen2.5-Coder-14B-Instruct \
+  --draft models/Qwen2.5-Coder-0.5B-Instruct --mode nf4g128 --ctx 32768 \
+  --workdir ./workspace --prompt "Create index.html and app.js for a counter widget."
+```
+
+`kronos_server` serves the same model over an OpenAI-compatible HTTP API (including `tools` and
+`tool_calls`) alongside a split-pane web chat and live workspace preview:
+
+```bash
+cargo run --release --bin kronos_server -- models/Qwen2.5-Coder-14B-Instruct \
+  --mode nf4g128 --ctx 32768 --draft models/Qwen2.5-Coder-0.5B-Instruct \
+  --port 18080 --workdir ./workspace
 ```
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="secret")
+client = OpenAI(base_url="http://127.0.0.1:18080/v1", api_key="secret")
 reply = client.chat.completions.create(
     model="kronos", messages=[{"role": "user", "content": "Summarize GPTQ in one line."}])
 print(reply.choices[0].message.content)
 ```
 
-Open `http://127.0.0.1:8080/` for a web chat page served by the same process.
+Open `http://127.0.0.1:18080/` for the web chat and workspace UI served by the same process.
 
-Endpoints: `POST /v1/chat/completions` (`stream: true` sends server-sent events), `GET /v1/models`,
-`GET /health`. Supported request fields: `messages`, `temperature`, `top_p`, `top_k`,
-`max_tokens`, `repetition_penalty`, `seed`, `stream`. The server binds to `127.0.0.1` by
-default; use `--host 0.0.0.0` and `--api-key` to expose it on a network. It runs one
-generation at a time and reuses the KV cache when a request extends the previous conversation.
+Endpoints: `POST /v1/chat/completions` (`stream: true` sends server-sent events),
+`POST /v1/agent/chat` (streaming tool loop), `GET /v1/agent/files`, `GET /v1/agent/file?path=...`,
+`POST /v1/agent/clear`, `GET /preview/<path>`, `GET /v1/models`, `GET /health`. Supported request
+fields: `messages`, `tools`, `tool_choice`, `temperature`, `top_p`, `top_k`, `max_tokens`,
+`repetition_penalty`, `seed`, `stream`. The server binds to `127.0.0.1` by default; use
+`--host 0.0.0.0` and `--api-key` to expose it on a network. It runs one generation at a time and
+reuses the KV cache when a request extends the previous conversation.
 
 To embed Kronos in another Rust program, use `kronos_2t::chat::ChatModel` directly.
 
