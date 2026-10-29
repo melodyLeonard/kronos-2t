@@ -18,21 +18,23 @@
 //! `GET /health`, and the web UI at `/`.
 
 use kronos_2t::agent::{
+    build_unified_system_prompt, classify_turn_intent, compact_conversation_history,
     list_workspace_files, mime_type_for_path, resolve_jailed_path, run_agent_turn,
     serialize_messages_json, tool_definitions_json, truncate_utf8, validate_file, AgentEvent,
-    AgentTurnConfig, MAX_READ_BYTES,
+    AgentTurnConfig, TurnRoute, MAX_READ_BYTES,
 };
 use kronos_2t::chat::{ChatModel, Completion, GenParams, Message, ToolCall};
 use kronos_2t::json::{quote, Json};
+use kronos_2t::vision::analyze_image_payload;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const MAX_BODY: usize = 4 << 20;
+const MAX_BODY: usize = 24 << 20;
 const CHAT_PAGE: &str = include_str!("chat.html");
 const MAX_HEADER: usize = 64 << 10;
 
@@ -41,7 +43,9 @@ struct Server {
     name: String,
     api_key: Option<String>,
     workdir: PathBuf,
+    ctx_limit: usize,
     next_id: AtomicU64,
+    media_seq: AtomicU64,
 }
 
 struct Request {
@@ -185,12 +189,43 @@ fn error(stream: &mut TcpStream, status: u16, msg: &str) {
     );
 }
 
-/// `content` may be a string, `null`, or an array of `{"type":"text","text":...}` parts.
+/// `content` may be a string, `null`, or an OpenAI multimodal array (`text` + `image_url` parts).
 fn message_text(content: Option<&Json>) -> Result<String, String> {
     match content {
         None | Some(Json::Null) => Ok(String::new()),
         Some(Json::Str(s)) => Ok(s.clone()),
-        Some(Json::Arr(parts)) => Ok(parts.iter().filter_map(|p| p.get("text").and_then(Json::as_str)).collect()),
+        Some(Json::Arr(parts)) => {
+            let mut blocks = Vec::new();
+            let mut text_buf = String::new();
+            let mut img_idx = 0usize;
+            for p in parts {
+                let kind = p.get("type").and_then(Json::as_str).unwrap_or("text");
+                if kind == "image_url" || p.get("image_url").is_some() {
+                    let url_opt = p
+                        .get("image_url")
+                        .and_then(|u| u.as_str().or_else(|| u.get("url").and_then(Json::as_str)))
+                        .or_else(|| p.get("url").and_then(Json::as_str));
+                    if let Some(raw_url) = url_opt {
+                        img_idx += 1;
+                        let perc = analyze_image_payload(raw_url, None, img_idx)
+                            .map_err(|e| format!("image #{img_idx}: {e}"))?;
+                        blocks.push(perc.to_prompt_context(img_idx));
+                    }
+                } else if let Some(t) = p.get("text").and_then(Json::as_str) {
+                    text_buf.push_str(t);
+                }
+            }
+            if blocks.is_empty() {
+                Ok(text_buf)
+            } else {
+                let mut combined = blocks.join("\n");
+                if !text_buf.trim().is_empty() {
+                    combined.push('\n');
+                    combined.push_str(&text_buf);
+                }
+                Ok(combined)
+            }
+        }
         Some(_) => Err("message `content` must be text, array, or null".to_string()),
     }
 }
@@ -419,6 +454,190 @@ fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
     let _ = stream.write_all(tail.as_bytes()).and_then(|_| stream.write_all(b"data: [DONE]\n\n"));
 }
 
+fn attach_request_images(
+    body: &Json,
+    history: &mut [Message],
+    workdir: &Path,
+    media_seq: &AtomicU64,
+) -> Result<(Vec<String>, f64), String> {
+    let Some(arr) = body.get("images").and_then(Json::as_arr) else {
+        return Ok((Vec::new(), 0.0));
+    };
+    if arr.is_empty() {
+        return Ok((Vec::new(), 0.0));
+    }
+    let t0 = Instant::now();
+    let mut blocks = Vec::with_capacity(arr.len());
+    let mut badges = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let raw = item
+            .as_str()
+            .or_else(|| item.get("data_url").and_then(Json::as_str))
+            .or_else(|| item.get("url").and_then(Json::as_str))
+            .ok_or("each entry in `images` must be a base64 string or `{data_url}` object")?;
+        let slot = media_seq.fetch_add(1, Ordering::Relaxed) as usize;
+        let perc = analyze_image_payload(raw, Some(workdir), slot)
+            .map_err(|e| format!("image #{}: {e}", idx + 1))?;
+        badges.push(perc.short_badge());
+        blocks.push(perc.to_prompt_context(idx + 1));
+    }
+    if let Some(last_user) = history.iter_mut().rev().find(|m| m.role == "user") {
+        let user_prompt = if last_user.content.trim().is_empty() {
+            "Analyze the attached image concisely, covering visible text, layout structure, and color palette."
+        } else {
+            last_user.content.as_str()
+        };
+        last_user.content = format!("{}\n{}", blocks.join("\n"), user_prompt);
+    }
+    Ok((badges, t0.elapsed().as_secs_f64() * 1000.0))
+}
+
+struct StreamTurnSpec {
+    history: Vec<Message>,
+    params: GenParams,
+    max_steps: usize,
+    cmd_timeout: u64,
+    initial_route: TurnRoute,
+    vision_badges: Vec<String>,
+    vision_ms: f64,
+}
+
+fn stream_agent_loop_sse(srv: &Server, stream: &mut TcpStream, spec: StreamTurnSpec) {
+    let StreamTurnSpec {
+        mut history,
+        params,
+        max_steps,
+        cmd_timeout,
+        initial_route,
+        vision_badges,
+        vision_ms,
+    } = spec;
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{CORS}Connection: close\r\n\r\n"
+    );
+    if stream.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+
+    let mut write_sse = |payload: &str| -> bool {
+        let frame = format!("data: {payload}\n\n");
+        stream.write_all(frame.as_bytes()).and_then(|_| stream.flush()).is_ok()
+    };
+
+    let mut active_route = initial_route;
+    let _ = write_sse(&format!(r#"{{"type":"route","mode":{}}}"#, quote(active_route.as_str())));
+
+    if !vision_badges.is_empty() {
+        let badge_items: Vec<String> = vision_badges.iter().map(|b| quote(b)).collect();
+        let _ = write_sse(&format!(
+            r#"{{"type":"vision","count":{},"elapsed_ms":{:.1},"badges":[{}]}}"#,
+            vision_badges.len(),
+            vision_ms,
+            badge_items.join(",")
+        ));
+    }
+
+    if history.first().is_none_or(|m| m.role != "system") {
+        let sys = build_unified_system_prompt(&srv.workdir);
+        history.insert(0, Message::new("system", &sys));
+    }
+
+    let tools_json = tool_definitions_json();
+    let cfg = AgentTurnConfig {
+        workdir: srv.workdir.clone(),
+        params,
+        max_steps,
+        cmd_timeout_secs: cmd_timeout,
+        expect_tool_call: initial_route == TurnRoute::Agent,
+    };
+
+    let mut model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
+    let run_res = run_agent_turn(&mut model, &mut history, &tools_json, &cfg, |ev| match ev {
+        AgentEvent::ContextCompacted {
+            before_tokens,
+            after_tokens,
+            compacted_messages,
+        } => write_sse(&format!(
+            r#"{{"type":"compacted","before_tokens":{before_tokens},"after_tokens":{after_tokens},"compacted_messages":{compacted_messages}}}"#
+        )),
+        AgentEvent::StepStart { step, max_steps } => write_sse(&format!(
+            r#"{{"type":"step_start","step":{step},"max_steps":{max_steps}}}"#
+        )),
+        AgentEvent::TextDelta(delta) => {
+            if delta.is_empty() {
+                true
+            } else {
+                write_sse(&format!(r#"{{"type":"text","delta":{}}}"#, quote(delta)))
+            }
+        }
+        AgentEvent::ToolProgress {
+            step,
+            name,
+            target,
+            bytes,
+        } => {
+            if active_route != TurnRoute::Agent {
+                active_route = TurnRoute::Agent;
+                let _ = write_sse(r#"{"type":"route","mode":"agent"}"#);
+            }
+            write_sse(&format!(
+                r#"{{"type":"tool_progress","step":{step},"name":{},"target":{},"bytes":{bytes}}}"#,
+                quote(name),
+                quote(target),
+            ))
+        }
+        AgentEvent::StepStats { step, completion } => write_sse(&format!(
+            r#"{{"type":"step_stats","step":{step},"usage":{}}}"#,
+            usage(completion)
+        )),
+        AgentEvent::ToolStart { step, call } => {
+            if active_route != TurnRoute::Agent {
+                active_route = TurnRoute::Agent;
+                let _ = write_sse(r#"{"type":"route","mode":"agent"}"#);
+            }
+            write_sse(&format!(
+                r#"{{"type":"tool_start","step":{step},"id":{},"name":{},"arguments":{}}}"#,
+                quote(&call.id),
+                quote(&call.name),
+                quote(&call.arguments),
+            ))
+        }
+        AgentEvent::ToolDone { step, call, outcome } => write_sse(&format!(
+            r#"{{"type":"tool_done","step":{step},"id":{},"name":{},"ok":{},"validation_ok":{},"validation_msg":{},"output":{}}}"#,
+            quote(&call.id),
+            quote(&call.name),
+            outcome.ok,
+            outcome.validation_ok,
+            quote(&outcome.validation_msg),
+            quote(&truncate_utf8(&outcome.output, 4096)),
+        )),
+        AgentEvent::ValidationRepair { step, report } => write_sse(&format!(
+            r#"{{"type":"validation_repair","step":{step},"report":{}}}"#,
+            quote(report)
+        )),
+        AgentEvent::Done { .. } => true,
+    });
+
+    match run_res {
+        Ok(final_text) => {
+            let ctx_tokens = model.count_prompt_tokens(&history, &tools_json);
+            let ctx_limit = model.context_size();
+            let done_json = format!(
+                r#"{{"type":"done","route":{},"context_tokens":{ctx_tokens},"context_limit":{ctx_limit},"text":{},"messages":{}}}"#,
+                quote(active_route.as_str()),
+                quote(&final_text),
+                serialize_messages_json(&history),
+            );
+            let _ = write_sse(&done_json);
+        }
+        Err(e) => {
+            let err_json = format!(r#"{{"type":"error","message":{}}}"#, quote(&e));
+            let _ = write_sse(&err_json);
+        }
+    }
+    let _ = stream.write_all(b"data: [DONE]\n\n");
+}
+
 fn agent_chat_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
     let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
         Ok(b) => b,
@@ -426,6 +645,10 @@ fn agent_chat_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
     };
     let mut history = match parse_messages_field(&body) {
         Ok(m) => m,
+        Err(e) => return error(stream, 400, &e),
+    };
+    let (vision_badges, vision_ms) = match attach_request_images(&body, &mut history, &srv.workdir, &srv.media_seq) {
+        Ok(v) => v,
         Err(e) => return error(stream, 400, &e),
     };
     let agent_defaults = GenParams {
@@ -445,83 +668,173 @@ fn agent_chat_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
         .get("cmd_timeout")
         .and_then(Json::as_f64)
         .map_or(20, |v| (v as u64).clamp(1, 120));
-
-    let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{CORS}Connection: close\r\n\r\n"
+    stream_agent_loop_sse(
+        srv,
+        stream,
+        StreamTurnSpec {
+            history,
+            params,
+            max_steps,
+            cmd_timeout,
+            initial_route: TurnRoute::Agent,
+            vision_badges,
+            vision_ms,
+        },
     );
-    if stream.write_all(head.as_bytes()).is_err() {
-        return;
-    }
-
-    let tools_json = tool_definitions_json();
-    let cfg = AgentTurnConfig {
-        workdir: srv.workdir.clone(),
-        params,
-        max_steps,
-        cmd_timeout_secs: cmd_timeout,
-    };
-
-    let mut model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
-    let mut write_sse = |payload: &str| -> bool {
-        let frame = format!("data: {payload}\n\n");
-        stream.write_all(frame.as_bytes()).and_then(|_| stream.flush()).is_ok()
-    };
-
-    let run_res = run_agent_turn(&mut model, &mut history, &tools_json, &cfg, |ev| match ev {
-        AgentEvent::StepStart { step, max_steps } => write_sse(&format!(
-            r#"{{"type":"step_start","step":{step},"max_steps":{max_steps}}}"#
-        )),
-        AgentEvent::TextDelta(delta) => {
-            if delta.is_empty() {
-                true
-            } else {
-                write_sse(&format!(r#"{{"type":"text","delta":{}}}"#, quote(delta)))
-            }
-        }
-        AgentEvent::StepStats { step, completion } => write_sse(&format!(
-            r#"{{"type":"step_stats","step":{step},"usage":{}}}"#,
-            usage(completion)
-        )),
-        AgentEvent::ToolStart { step, call } => write_sse(&format!(
-            r#"{{"type":"tool_start","step":{step},"id":{},"name":{},"arguments":{}}}"#,
-            quote(&call.id),
-            quote(&call.name),
-            quote(&call.arguments),
-        )),
-        AgentEvent::ToolDone { step, call, outcome } => write_sse(&format!(
-            r#"{{"type":"tool_done","step":{step},"id":{},"name":{},"ok":{},"validation_ok":{},"validation_msg":{},"output":{}}}"#,
-            quote(&call.id),
-            quote(&call.name),
-            outcome.ok,
-            outcome.validation_ok,
-            quote(&outcome.validation_msg),
-            quote(&truncate_utf8(&outcome.output, 4096)),
-        )),
-        AgentEvent::ValidationRepair { step, report } => write_sse(&format!(
-            r#"{{"type":"validation_repair","step":{step},"report":{}}}"#,
-            quote(report)
-        )),
-        AgentEvent::Done { .. } => true,
-    });
-
-    match run_res {
-        Ok(final_text) => {
-            let done_json = format!(
-                r#"{{"type":"done","text":{},"messages":{}}}"#,
-                quote(&final_text),
-                serialize_messages_json(&history),
-            );
-            let _ = write_sse(&done_json);
-        }
-        Err(e) => {
-            let err_json = format!(r#"{{"type":"error","message":{}}}"#, quote(&e));
-            let _ = write_sse(&err_json);
-        }
-    }
-    let _ = stream.write_all(b"data: [DONE]\n\n");
 }
 
+fn unified_turn_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
+    let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
+        Ok(b) => b,
+        Err(e) => return error(stream, 400, &format!("invalid JSON: {e}")),
+    };
+    let mut history = match parse_messages_field(&body) {
+        Ok(m) => m,
+        Err(e) => return error(stream, 400, &e),
+    };
+    let raw_user_text = history
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    let (vision_badges, vision_ms) = match attach_request_images(&body, &mut history, &srv.workdir, &srv.media_seq) {
+        Ok(v) => v,
+        Err(e) => return error(stream, 400, &e),
+    };
+    let workspace_has_files = !list_workspace_files(&srv.workdir).is_empty();
+    let history_used_tools = history.iter().any(|m| m.role == "tool" || !m.tool_calls.is_empty());
+    let route = match body.get("route").and_then(Json::as_str).unwrap_or("auto") {
+        "chat" => TurnRoute::Chat,
+        "agent" => TurnRoute::Agent,
+        _ => classify_turn_intent(
+            &raw_user_text,
+            !vision_badges.is_empty(),
+            workspace_has_files,
+            history_used_tools,
+        ),
+    };
+    let defaults = match route {
+        TurnRoute::Chat => GenParams {
+            temperature: 0.35,
+            top_k: 40,
+            top_p: 0.9,
+            repeat_penalty: 1.06,
+            max_tokens: 1536,
+            seed: 0,
+        },
+        TurnRoute::Agent => GenParams {
+            temperature: 0.0,
+            top_k: 40,
+            top_p: 0.9,
+            repeat_penalty: 1.05,
+            max_tokens: 4096,
+            seed: 0,
+        },
+    };
+    let params = parse_gen_params(&body, &defaults);
+    let default_steps = if route == TurnRoute::Chat { 4 } else { 10 };
+    let max_steps = body
+        .get("max_steps")
+        .and_then(Json::as_f64)
+        .map_or(default_steps, |v| (v as usize).clamp(1, 24));
+    let cmd_timeout = body
+        .get("cmd_timeout")
+        .and_then(Json::as_f64)
+        .map_or(20, |v| (v as u64).clamp(1, 120));
+    stream_agent_loop_sse(
+        srv,
+        stream,
+        StreamTurnSpec {
+            history,
+            params,
+            max_steps,
+            cmd_timeout,
+            initial_route: route,
+            vision_badges,
+            vision_ms,
+        },
+    );
+}
+
+fn compact_history_http(srv: &Server, stream: &mut TcpStream, req: &Request) {
+    let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
+        Ok(b) => b,
+        Err(e) => return error(stream, 400, &format!("invalid JSON: {e}")),
+    };
+    let Some(msgs_arr) = body.get("messages").and_then(Json::as_arr) else {
+        return error(stream, 400, "`messages` must be an array");
+    };
+    if msgs_arr.is_empty() {
+        return respond(
+            stream,
+            200,
+            "application/json",
+            &format!(
+                r#"{{"compacted":false,"before_tokens":0,"after_tokens":0,"context_limit":{},"compacted_messages":0,"messages":[]}}"#,
+                srv.ctx_limit
+            ),
+        );
+    }
+    let mut history = Vec::with_capacity(msgs_arr.len());
+    for m in msgs_arr {
+        let Some(role) = m.get("role").and_then(Json::as_str) else {
+            return error(stream, 400, "each message needs a `role`");
+        };
+        let text = match message_text(m.get("content")) {
+            Ok(t) => t,
+            Err(e) => return error(stream, 400, &e),
+        };
+        if role == "assistant" {
+            let tcs = match m.get("tool_calls").and_then(Json::as_arr) {
+                Some(arr) if !arr.is_empty() => match parse_tool_calls_array(arr) {
+                    Ok(v) => v,
+                    Err(e) => return error(stream, 400, &e),
+                },
+                _ => Vec::new(),
+            };
+            if tcs.is_empty() {
+                history.push(Message::new("assistant", &text));
+            } else {
+                history.push(Message::assistant_tool_calls(&text, tcs));
+            }
+        } else if role == "tool" {
+            let id = m.get("tool_call_id").and_then(Json::as_str).unwrap_or("call_0");
+            history.push(Message::tool_result(id, &text));
+        } else {
+            history.push(Message::new(role, &text));
+        }
+    }
+    if history.first().is_none_or(|m| m.role != "system") {
+        let sys = build_unified_system_prompt(&srv.workdir);
+        history.insert(0, Message::new("system", &sys));
+    }
+    let tools_json = tool_definitions_json();
+    let model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
+    let rep = compact_conversation_history(&model, &mut history, &tools_json, &srv.workdir, true);
+    let ctx_limit = model.context_size();
+    drop(model);
+    respond(
+        stream,
+        200,
+        "application/json",
+        &format!(
+            r#"{{"compacted":{},"before_tokens":{},"after_tokens":{},"context_limit":{ctx_limit},"compacted_messages":{},"messages":{}}}"#,
+            rep.compacted,
+            rep.before_tokens,
+            rep.after_tokens,
+            rep.compacted_messages,
+            serialize_messages_json(&history),
+        ),
+    );
+}
+
+#[cfg(test)]
 fn format_agent_files_json(workdir: &Path) -> String {
+    format_agent_files_with_ctx(workdir, 16384)
+}
+
+fn format_agent_files_with_ctx(workdir: &Path, ctx_limit: usize) -> String {
     let entries = list_workspace_files(workdir);
     let has_index = entries.iter().any(|e| e.path == "index.html")
         || entries.iter().any(|e| e.path.ends_with(".html"));
@@ -544,7 +857,7 @@ fn format_agent_files_json(workdir: &Path) -> String {
         })
         .collect();
     format!(
-        r#"{{"workdir":{},"has_html":{has_index},"preview_path":{},"files":[{}]}}"#,
+        r#"{{"workdir":{},"context_limit":{ctx_limit},"has_html":{has_index},"preview_path":{},"files":[{}]}}"#,
         quote(&workdir.to_string_lossy()),
         quote(preview_entry),
         items.join(",")
@@ -609,7 +922,13 @@ fn serve_preview(workdir: &Path, stream: &mut TcpStream, req_path: &str) {
     match fs::read(&target) {
         Ok(bytes) => {
             let mime = mime_type_for_path(&target);
-            respond_bytes(stream, 200, mime, "Cache-Control: no-store\r\n", &bytes);
+            respond_bytes(
+                stream,
+                200,
+                mime,
+                "Cache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\n",
+                &bytes,
+            );
         }
         Err(_) => respond(
             stream,
@@ -654,11 +973,13 @@ fn handle(srv: &Server, mut stream: TcpStream) {
         ),
         ("POST", "/v1/chat/completions") => chat_completions(srv, &mut stream, &req),
         ("POST", "/v1/agent/chat") => agent_chat_sse(srv, &mut stream, &req),
+        ("POST", "/v1/turn") => unified_turn_sse(srv, &mut stream, &req),
+        ("POST", "/v1/compact") => compact_history_http(srv, &mut stream, &req),
         ("GET", "/v1/agent/files") => respond(
             &mut stream,
             200,
             "application/json",
-            &format_agent_files_json(&srv.workdir),
+            &format_agent_files_with_ctx(&srv.workdir, srv.ctx_limit),
         ),
         ("GET", "/v1/agent/file") => {
             let Some(rel) = req.query_param("path") else {
@@ -700,11 +1021,14 @@ fn main() {
     let calib_opt = calib.as_deref().map(|c| (Path::new(c), num("--calib-tokens", 16384.0) as usize));
     let cache_dir_flag = flag("--cache-dir");
     let cache_dir_opt = cache_dir_flag.as_deref().map(Path::new);
+    let requested_ctx = flag("--ctx")
+        .or_else(|| flag("--max-seq-len"))
+        .map_or(16384usize, |v| v.parse().expect("numeric --ctx"));
     let mut model = ChatModel::load_with_cache_dir(
         model_dir,
         cache_dir_opt,
         &mode,
-        num("--ctx", 2048.0) as usize,
+        requested_ctx,
         num("--threads", default_threads) as usize,
         calib_opt,
     )
@@ -760,6 +1084,20 @@ fn main() {
     });
     let workdir = raw_workdir.canonicalize().unwrap_or(raw_workdir);
 
+    let t_warm = Instant::now();
+    let warm_sys = build_unified_system_prompt(&workdir);
+    let warm_tools = tool_definitions_json();
+    let mut prewarmed_tokens = 0usize;
+    std::thread::scope(|s| {
+        let vj = s.spawn(kronos_2t::vision::prewarm_vision);
+        prewarmed_tokens = model.prewarm_prefix(&warm_sys, &warm_tools);
+        let _ = vj.join();
+    });
+    eprintln!(
+        "pre-warmed {prewarmed_tokens} system+tool KV tokens and Apple Vision pipeline in {:.2}s",
+        t_warm.elapsed().as_secs_f64()
+    );
+
     let addr = format!(
         "{}:{}",
         flag("--host").unwrap_or_else(|| "127.0.0.1".into()),
@@ -784,7 +1122,9 @@ fn main() {
         model: Mutex::new(model),
         api_key: flag("--api-key"),
         workdir: workdir.clone(),
+        ctx_limit: ctx_sz,
         next_id: AtomicU64::new(1),
+        media_seq: AtomicU64::new(1),
     });
     eprintln!(
         "serving {} on http://{addr}/ (weights {weights_gib:.2} GiB + {kv_tag} {kv_gib:.2} GiB @ ctx={ctx_sz} · workdir={})",

@@ -518,6 +518,84 @@ impl ChatModel {
         self.ctx
     }
 
+    pub fn cached_prefix_len(&self) -> usize {
+        self.cached.len()
+    }
+
+    pub fn count_prompt_tokens(&self, messages: &[Message], tools_json: &[String]) -> usize {
+        self.render_with_tools(messages, tools_json).len()
+    }
+
+    /// Pre-warms the fixed system + tool-schema prefix into target and draft KV caches.
+    pub fn prewarm_prefix(&mut self, system_prompt: &str, tools_json: &[String]) -> usize {
+        let full = render_chatml_prompt(&[Message::new("system", system_prompt)], tools_json, "");
+        let prefix_str = full.strip_suffix("assistant\n").unwrap_or(&full);
+        let tokens = self.tok.encode(prefix_str);
+        if tokens.is_empty() || tokens.len() >= self.ctx {
+            return 0;
+        }
+        let common = self.cached.iter().zip(&tokens).take_while(|(a, b)| a == b).count();
+        if common == tokens.len() {
+            return tokens.len();
+        }
+        self.engine.truncate_context(common);
+        self.cached.truncate(common);
+        let tail = &tokens[common..];
+        if self.engine.is_metal_enabled() && self.draft.is_some() {
+            let t_eng = &mut self.engine;
+            let cur_logits = &mut self.scratch.cur_logits;
+            let d = self.draft.as_mut().unwrap();
+            let dv = d.draft_vocab;
+            let d_common = d
+                .cached
+                .iter()
+                .zip(&tokens)
+                .take_while(|(&a, &b)| a == if b < dv { b } else { 0 })
+                .count();
+            d.engine.truncate_context(d_common);
+            d.cached.truncate(d_common);
+            let mapped: Vec<usize> = tokens[d_common..]
+                .iter()
+                .map(|&id| if id < dv { id } else { 0 })
+                .collect();
+            std::thread::scope(|s| {
+                let dj = s.spawn(|| {
+                    if !mapped.is_empty() {
+                        d.engine.forward_prompt(&mapped);
+                        d.cached.extend_from_slice(&mapped);
+                    }
+                });
+                let l = t_eng.forward_prompt(tail);
+                cur_logits.copy_from_slice(l);
+                let _ = dj.join();
+            });
+        } else {
+            let l = self.engine.forward_prompt(tail);
+            self.scratch.cur_logits.copy_from_slice(l);
+            if let Some(d) = self.draft.as_mut() {
+                let dv = d.draft_vocab;
+                let d_common = d
+                    .cached
+                    .iter()
+                    .zip(&tokens)
+                    .take_while(|(&a, &b)| a == if b < dv { b } else { 0 })
+                    .count();
+                d.engine.truncate_context(d_common);
+                d.cached.truncate(d_common);
+                let mapped: Vec<usize> = tokens[d_common..]
+                    .iter()
+                    .map(|&id| if id < dv { id } else { 0 })
+                    .collect();
+                if !mapped.is_empty() {
+                    d.engine.forward_prompt(&mapped);
+                    d.cached.extend_from_slice(&mapped);
+                }
+            }
+        }
+        self.cached.extend_from_slice(tail);
+        self.cached.len()
+    }
+
     /// Loads Neural Engine prefill models `prefill_s<N>.mlmodelc` from `dir` (see
     /// `ane/export_prefill.py`); returns the prompt-length buckets found.
     #[cfg(all(feature = "ane", target_os = "macos"))]
@@ -594,7 +672,7 @@ impl ChatModel {
         mut on_text: impl FnMut(&str) -> bool,
     ) -> Result<Completion, String> {
         let mut msgs = messages.to_vec();
-        let reserve = params.max_tokens.min(self.ctx / 2).max(1);
+        let reserve = params.max_tokens.min(512).min(self.ctx / 4).max(1);
         let mut prompt = self.render_with_tools(&msgs, tools_json);
         while prompt.len() + reserve > self.ctx {
             let first = usize::from(msgs.first().is_some_and(|m| m.role == "system"));
@@ -1226,6 +1304,52 @@ pub fn render_chatml_prompt(messages: &[Message], tools_json: &[String], default
     out
 }
 
+/// Escapes raw control bytes (`\n`, `\r`, `\t`) inside JSON string literals when models emit multiline arguments.
+fn sanitize_json_control_chars(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut in_str = false;
+    let mut esc = false;
+    for ch in s.chars() {
+        if in_str {
+            if esc {
+                esc = false;
+                out.push(ch);
+                continue;
+            }
+            match ch {
+                '\\' => {
+                    esc = true;
+                    out.push('\\');
+                }
+                '"' => {
+                    in_str = false;
+                    out.push('"');
+                }
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    let code = c as u32;
+                    out.push_str(&format!("\\u{code:04x}"));
+                }
+                c => out.push(c),
+            }
+        } else {
+            if ch == '"' {
+                in_str = true;
+            }
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn parse_json_lenient(s: &str) -> Option<Json> {
+    Json::parse(s)
+        .ok()
+        .or_else(|| Json::parse(&sanitize_json_control_chars(s)).ok())
+}
+
 /// Extracts Qwen2.5 `<tool_call>...</tool_call>` JSON invocations from `text`, returning
 /// `(remaining_prose, parsed_tool_calls)` using JSON-string-aware brace matching so literal
 /// `</tool_call>` substrings inside string arguments never corrupt parsing.
@@ -1266,7 +1390,7 @@ pub fn parse_qwen_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
         };
 
         let json_slice = &text[obj_start..obj_end];
-        let parsed = Json::parse(json_slice).ok().and_then(|v| {
+        let parsed = parse_json_lenient(json_slice).and_then(|v| {
             let fn_obj = v.get("function").unwrap_or(&v);
             let name = fn_obj.get("name").and_then(Json::as_str)?.to_string();
             let arguments = match fn_obj.get("arguments") {
@@ -1306,7 +1430,7 @@ pub fn parse_qwen_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     if cursor < text.len() {
         prose.push_str(&text[cursor..]);
     }
-    if calls.is_empty() && text.contains("```json") {
+    if calls.is_empty() && text.contains("```") && text.contains("\"name\"") {
         let (fenced_prose, fenced_calls) = parse_fenced_json_tool_calls(text);
         if !fenced_calls.is_empty() {
             return (fenced_prose, fenced_calls);
@@ -1344,9 +1468,10 @@ fn parse_bare_json_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
             continue;
         };
         let obj_end = obj_start + obj_len;
-        let parsed = Json::parse(&text[obj_start..obj_end]).ok().and_then(|v| {
-            let name = v.get("name").and_then(Json::as_str)?.to_string();
-            let args_val = v.get("arguments")?;
+        let parsed = parse_json_lenient(&text[obj_start..obj_end]).and_then(|v| {
+            let fn_obj = v.get("function").unwrap_or(&v);
+            let name = fn_obj.get("name").and_then(Json::as_str)?.to_string();
+            let args_val = fn_obj.get("arguments")?;
             let arguments = match args_val {
                 Json::Str(s) => s.clone(),
                 other => other.stringify(),
@@ -1381,25 +1506,38 @@ fn parse_bare_json_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
 }
 
 fn parse_fenced_json_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
-    const FENCE: &str = "```json";
+    const FENCE: &str = "```";
     let mut prose = String::new();
     let mut calls = Vec::new();
     let mut cursor = 0usize;
 
     while let Some(rel) = text[cursor..].find(FENCE) {
         let fence_start = cursor + rel;
-        let body_start = fence_start + FENCE.len();
+        let after_ticks = fence_start + FENCE.len();
+        let lang_end = text[after_ticks..]
+            .find(['\n', '{'])
+            .map(|i| after_ticks + i)
+            .unwrap_or(after_ticks);
+        let lang_tag = text[after_ticks..lang_end].trim();
+        let body_start = if lang_tag.is_empty() || lang_tag.eq_ignore_ascii_case("json") || lang_tag.eq_ignore_ascii_case("tool_call") {
+            lang_end
+        } else {
+            prose.push_str(&text[cursor..after_ticks]);
+            cursor = after_ticks;
+            continue;
+        };
         let trimmed = text[body_start..].trim_start();
         let p = body_start + (text[body_start..].len() - trimmed.len());
         let Some(obj_len) = find_balanced_json_object_end(&text[p..]) else {
-            prose.push_str(&text[cursor..body_start]);
-            cursor = body_start;
+            prose.push_str(&text[cursor..after_ticks]);
+            cursor = after_ticks;
             continue;
         };
         let obj_end = p + obj_len;
-        let parsed = Json::parse(&text[p..obj_end]).ok().and_then(|v| {
-            let name = v.get("name").and_then(Json::as_str)?.to_string();
-            let args_val = v.get("arguments")?;
+        let parsed = parse_json_lenient(&text[p..obj_end]).and_then(|v| {
+            let fn_obj = v.get("function").unwrap_or(&v);
+            let name = fn_obj.get("name").and_then(Json::as_str)?.to_string();
+            let args_val = fn_obj.get("arguments")?;
             let arguments = match args_val {
                 Json::Str(s) => s.clone(),
                 other => other.stringify(),
@@ -1867,6 +2005,26 @@ mod tests {
         assert_eq!(b_calls.len(), 2);
         assert_eq!(b_calls[0].name, "run_command");
         assert_eq!(b_calls[1].name, "run_command");
+
+        let multiline_css = concat!(
+            "<tool_call>\n",
+            "{\"name\": \"write_file\", \"arguments\": {\"path\": \"style.css\", \"content\": \"body {\n\tbackground: #0f172a;\n\tcolor: #f8fafc;\n}\"}}\n",
+            "</tool_call>",
+        );
+        let (_, m_calls) = parse_qwen_tool_calls(multiline_css);
+        assert_eq!(m_calls.len(), 1);
+        assert_eq!(m_calls[0].name, "write_file");
+        let m_args = Json::parse(&m_calls[0].arguments).unwrap();
+        assert_eq!(
+            m_args.get("content").and_then(Json::as_str),
+            Some("body {\n\tbackground: #0f172a;\n\tcolor: #f8fafc;\n}")
+        );
+
+        let generic_fence = "Applying styles:\n```\n{\"name\":\"edit_file\",\"arguments\":{\"path\":\"style.css\",\"old_text\":\"\",\"new_text\":\"h1 { color: teal; }\"}}\n```";
+        let (gf_prose, gf_calls) = parse_qwen_tool_calls(generic_fence);
+        assert_eq!(gf_prose, "Applying styles:");
+        assert_eq!(gf_calls.len(), 1);
+        assert_eq!(gf_calls[0].name, "edit_file");
     }
 
     static HEAVY_14B_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

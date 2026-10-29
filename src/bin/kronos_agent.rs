@@ -148,10 +148,20 @@ fn run_agent_goal(
                 params: cfg.params.clone(),
                 max_steps: cfg.max_steps,
                 cmd_timeout_secs: cfg.cmd_timeout_secs,
+                expect_tool_call: true,
             };
             let mut printed_prose = false;
             run_agent_turn(model, history, tools_json, &turn_cfg, |ev| {
                 match ev {
+                    AgentEvent::ContextCompacted {
+                        before_tokens,
+                        after_tokens,
+                        compacted_messages,
+                    } => {
+                        eprintln!(
+                            "  [context compacted: {before_tokens} -> {after_tokens} tokens ({compacted_messages} items pruned)]"
+                        );
+                    }
                     AgentEvent::StepStart { step, max_steps } => {
                         printed_prose = false;
                         eprintln!("\n=== [Agent Step {step}/{max_steps}] ===");
@@ -163,6 +173,7 @@ fn run_agent_goal(
                             let _ = io::stderr().flush();
                         }
                     }
+                    AgentEvent::ToolProgress { .. } => {}
                     AgentEvent::StepStats { completion: c, .. } => {
                         if printed_prose {
                             eprintln!();

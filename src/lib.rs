@@ -47,3 +47,4 @@ pub mod simd_lut;
 pub mod ssd;
 pub mod synthesis;
 pub mod thread_pool;
+pub mod vision;

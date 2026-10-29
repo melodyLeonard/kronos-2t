@@ -252,10 +252,20 @@ fn main() {
                 params: params.clone(),
                 max_steps,
                 cmd_timeout_secs: cmd_timeout,
+                expect_tool_call: true,
             };
             let mut printed_text = false;
             let res = run_agent_turn(&mut model, &mut history, &tools_json, &cfg, |ev| {
                 match ev {
+                    AgentEvent::ContextCompacted {
+                        before_tokens,
+                        after_tokens,
+                        compacted_messages,
+                    } => {
+                        println!(
+                            "[context compacted: {before_tokens} -> {after_tokens} tokens ({compacted_messages} items pruned)]"
+                        );
+                    }
                     AgentEvent::StepStart { .. } => {
                         printed_text = false;
                     }
@@ -266,6 +276,7 @@ fn main() {
                             out.flush().ok();
                         }
                     }
+                    AgentEvent::ToolProgress { .. } => {}
                     AgentEvent::StepStats { step, completion: c } => {
                         if printed_text {
                             println!();

@@ -7,51 +7,61 @@
 <style>
   :root {
     --bg:#fafaf9; --panel:#ffffff; --subtle:#f5f5f4; --text:#1c1917; --muted:#78716c;
-    --line:#e7e5e4; --me:#1c1917; --me-text:#fafaf9; --accent:#c2410c;
+    --line:#e7e5e4; --me:#1c1917; --me-text:#fafaf9; --accent:#0d9488; --accent-ink:#ffffff;
     --ok-bg:#dcfce7; --ok-fg:#166534; --warn-bg:#fef3c7; --warn-fg:#92400e; --err-bg:#fee2e2; --err-fg:#991b1b;
+    --info-bg:#ccfbf1; --info-fg:#115e59;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg:#0c0a09; --panel:#1c1917; --subtle:#141210; --text:#f5f5f4; --muted:#a8a29e;
-      --line:#292524; --me:#f5f5f4; --me-text:#0c0a09; --accent:#ea580c;
+      --bg:#0c0a09; --panel:#171513; --subtle:#1f1c19; --text:#f5f5f4; --muted:#a8a29e;
+      --line:#292524; --me:#f5f5f4; --me-text:#0c0a09; --accent:#14b8a6; --accent-ink:#042f2e;
       --ok-bg:#052e16; --ok-fg:#86efac; --warn-bg:#451a03; --warn-fg:#fcd34d; --err-bg:#450a0a; --err-fg:#fca5a5;
+      --info-bg:#134e4a; --info-fg:#99f6e4;
     }
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 -apple-system, BlinkMacSystemFont, "Inter", sans-serif; height:100dvh; display:flex; flex-direction:column; overflow:hidden; }
-  header { display:flex; align-items:center; gap:10px; padding:10px 14px; border-bottom:1px solid var(--line); background:var(--panel); z-index:3; }
+  header { display:flex; align-items:center; gap:8px; padding:10px 14px; border-bottom:1px solid var(--line); background:var(--panel); z-index:3; flex-wrap:wrap; }
   header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:-0.01em; }
-  header .model { color:var(--muted); font-size:12px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  header .model { color:var(--muted); font-size:12px; flex:1; min-width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   button, select, input { font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:5px 10px; }
-  button { cursor:pointer; }
-  button:hover { border-color:var(--muted); }
+  button { cursor:pointer; transition:border-color .15s, background .15s; }
+  button:hover:not(:disabled) { border-color:var(--muted); }
+  button:disabled { opacity:.5; cursor:default; }
   .seg { display:inline-flex; background:var(--subtle); border:1px solid var(--line); border-radius:9px; padding:2px; gap:2px; }
-  .seg button { border:none; background:transparent; padding:4px 11px; border-radius:7px; font-size:13px; color:var(--muted); }
+  .seg button { border:none; background:transparent; padding:4px 11px; border-radius:7px; font-size:12.5px; color:var(--muted); }
   .seg button.active { background:var(--panel); color:var(--text); font-weight:600; box-shadow:0 1px 2px rgba(0,0,0,0.08); }
+  .ctx-pill { font:11.5px ui-monospace, SFMono-Regular, Menlo, monospace; color:var(--muted); background:var(--subtle); border:1px solid var(--line); border-radius:999px; padding:3px 9px; white-space:nowrap; }
+  .ctx-pill.high { background:var(--warn-bg); color:var(--warn-fg); border-color:transparent; }
   #ws-toggle.active { border-color:var(--accent); color:var(--accent); }
   details.menu { position:relative; font-size:13px; color:var(--muted); }
   details.menu > summary { list-style:none; cursor:pointer; padding:5px 10px; border:1px solid var(--line); border-radius:8px; background:var(--panel); color:var(--text); }
   details.menu > summary::-webkit-details-marker { display:none; }
-  .settings { position:absolute; right:0; top:38px; width:250px; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; z-index:5; box-shadow:0 8px 24px rgba(0,0,0,0.16); }
+  .settings { position:absolute; right:0; top:38px; width:270px; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; z-index:5; box-shadow:0 8px 24px rgba(0,0,0,0.18); }
   .settings label { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:6px 0; color:var(--text); font-size:12px; }
-  .settings input { width:115px; font-size:12px; padding:4px 7px; }
+  .settings input, .settings select { width:130px; font-size:12px; padding:4px 7px; }
 
   #layout { flex:1; display:flex; min-height:0; overflow:hidden; }
-  #chat-col { flex:1; display:flex; flex-direction:column; min-width:320px; min-height:0; }
+  #chat-col { flex:1; display:flex; flex-direction:column; min-width:320px; min-height:0; position:relative; }
+  #chat-col.drag-over { outline:2px dashed var(--accent); outline-offset:-6px; }
   #log { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:10px; max-width:860px; width:100%; margin:0 auto; }
   .msg { padding:10px 14px; border-radius:12px; white-space:pre-wrap; word-wrap:break-word; max-width:90%; }
-  .user { align-self:flex-end; background:var(--me); color:var(--me-text); }
-  .reply { align-self:flex-start; background:var(--panel); border:1px solid var(--line); width:100%; max-width:92%; white-space:normal; }
+  .user { align-self:flex-end; background:var(--me); color:var(--me-text); display:flex; flex-direction:column; gap:8px; }
+  .user-imgs { display:flex; flex-wrap:wrap; gap:6px; }
+  .user-imgs img { max-height:130px; max-width:220px; border-radius:8px; object-fit:cover; border:1px solid rgba(128,128,128,0.3); }
+  .reply { align-self:flex-start; background:var(--panel); border:1px solid var(--line); width:100%; max-width:93%; white-space:normal; }
+  .reply-head { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:6px; }
   .reply-prose { white-space:pre-wrap; word-wrap:break-word; }
   .reply code { font:12.5px ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--subtle); padding:1px 4px; border-radius:4px; }
   .reply pre { background:var(--subtle); border:1px solid var(--line); border-radius:8px; padding:10px; overflow-x:auto; white-space:pre; margin:6px 0; }
   .reply pre code { background:none; padding:0; }
   .stats { align-self:flex-start; color:var(--muted); font-size:12px; margin-top:-4px; }
-  .empty { margin:auto; color:var(--muted); text-align:center; max-width:420px; line-height:1.6; }
+  .empty { margin:auto; color:var(--muted); text-align:center; max-width:440px; line-height:1.65; }
 
   .agent-steps { display:flex; flex-direction:column; gap:6px; margin-bottom:8px; }
   .agent-steps:empty { display:none; }
   .step-line { font-size:11.5px; color:var(--muted); display:flex; align-items:center; justify-content:space-between; gap:8px; padding:2px 0; }
+  .step-perf { font:11.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
   details.tool-card { border:1px solid var(--line); background:var(--subtle); border-radius:8px; overflow:hidden; font-size:12.5px; }
   details.tool-card > summary { cursor:pointer; padding:6px 10px; display:flex; align-items:center; gap:8px; user-select:none; }
   .tool-name { font:600 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -61,13 +71,21 @@
   .pill.ok { background:var(--ok-bg); color:var(--ok-fg); }
   .pill.warn { background:var(--warn-bg); color:var(--warn-fg); }
   .pill.err { background:var(--err-bg); color:var(--err-fg); }
+  .pill.info { background:var(--info-bg); color:var(--info-fg); }
   .tool-body { border-top:1px solid var(--line); padding:8px 10px; background:var(--panel); font:12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; max-height:220px; overflow:auto; color:var(--muted); }
   .repair-banner { font-size:12px; padding:6px 10px; border-radius:8px; background:var(--warn-bg); color:var(--warn-fg); white-space:pre-wrap; }
+  .compact-banner { font-size:12px; padding:5px 10px; border-radius:8px; background:var(--info-bg); color:var(--info-fg); align-self:center; }
 
-  form { display:flex; gap:8px; padding:12px 16px; border-top:1px solid var(--line); max-width:860px; width:100%; margin:0 auto; }
+  form { display:flex; flex-direction:column; gap:8px; padding:10px 16px 14px; border-top:1px solid var(--line); max-width:860px; width:100%; margin:0 auto; }
+  #img-tray { display:none; flex-wrap:wrap; gap:8px; }
+  #img-tray.has-items { display:flex; }
+  .img-chip { position:relative; display:inline-flex; align-items:center; gap:7px; padding:4px 8px 4px 4px; border:1px solid var(--line); border-radius:9px; background:var(--panel); font-size:11.5px; color:var(--muted); }
+  .img-chip img { width:40px; height:40px; object-fit:cover; border-radius:6px; }
+  .img-chip button { border:none; background:var(--subtle); color:var(--text); border-radius:999px; width:20px; height:20px; padding:0; line-height:1; font-size:13px; }
+  .composer-row { display:flex; gap:8px; align-items:flex-end; }
+  #attach-btn { height:42px; padding:0 11px; display:inline-flex; align-items:center; gap:5px; font-size:13px; color:var(--muted); }
   textarea { flex:1; resize:none; font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; min-height:42px; max-height:200px; }
-  #send { background:var(--accent); color:#fff; border:none; padding:0 18px; font-weight:500; }
-  #send:disabled { opacity:.5; cursor:default; }
+  #send { background:var(--accent); color:var(--accent-ink); border:none; height:42px; padding:0 18px; font-weight:600; }
 
   #ws-pane { width:50%; min-width:340px; border-left:1px solid var(--line); background:var(--panel); display:flex; flex-direction:column; min-height:0; }
   #ws-pane.hidden { display:none; }
@@ -91,16 +109,21 @@
 <header>
   <h1>Kronos</h1>
   <span class="model" id="model">connecting…</span>
-  <div class="seg" role="tablist" aria-label="Mode">
-    <button id="mode-chat" type="button" class="active">Chat</button>
-    <button id="mode-agent" type="button">Agent</button>
-  </div>
+  <span class="ctx-pill" id="ctx-meter" title="Active prompt tokens / context capacity">ctx 0 / 16.4k</span>
+  <button id="compact-btn" type="button" title="Compact older history while preserving workspace state">Compact</button>
   <button id="ws-toggle" type="button">Workspace (<span id="ws-count">0</span>)</button>
   <details class="menu">
     <summary>Settings</summary>
     <div class="settings">
-      <label>Temperature <input id="temp" type="number" step="0.1" min="0" max="2" value="0.7"></label>
-      <label>Max tokens <input id="maxtok" type="number" min="1" max="16384" value="512"></label>
+      <label>Routing
+        <select id="route-mode">
+          <option value="auto" selected>Auto (Chat + Agent)</option>
+          <option value="chat">Force Chat</option>
+          <option value="agent">Force Agent</option>
+        </select>
+      </label>
+      <label>Temperature <input id="temp" type="number" step="0.05" min="0" max="2" placeholder="auto"></label>
+      <label>Max tokens <input id="maxtok" type="number" min="1" max="16384" placeholder="auto"></label>
       <label>Max steps <input id="maxsteps" type="number" min="1" max="24" value="10"></label>
       <label>System <input id="system" placeholder="default"></label>
       <label>API key <input id="key" type="password" placeholder="if required"></label>
@@ -112,11 +135,16 @@
 <div id="layout">
   <section id="chat-col">
     <main id="log">
-      <div class="empty" id="empty">Ask a question in Chat mode, or switch to Agent mode to write, validate, and preview files in the workspace.</div>
+      <div class="empty" id="empty">Ask questions, paste or drop images (Cmd+V), or describe software to build and edit live in the workspace. Routing between direct chat and workspace tools happens automatically.</div>
     </main>
     <form id="form">
-      <textarea id="input" rows="1" placeholder="Message Kronos…" autofocus></textarea>
-      <button id="send" type="submit">Send</button>
+      <div id="img-tray"></div>
+      <div class="composer-row">
+        <input id="file-input" type="file" accept="image/*" multiple hidden>
+        <button id="attach-btn" type="button" title="Attach image or paste with Cmd+V">+ Image</button>
+        <textarea id="input" rows="1" placeholder="Ask anything, build or style workspace files, or paste an image (Cmd+V)…" autofocus></textarea>
+        <button id="send" type="submit">Send</button>
+      </div>
     </form>
   </section>
 
@@ -133,6 +161,10 @@
     </div>
     <div class="ws-body">
       <div id="preview-wrap">
+        <div class="code-meta" id="preview-meta" style="display:none">
+          <span id="preview-title">preview</span>
+          <span id="preview-url"></span>
+        </div>
         <div id="preview-empty">No HTML file in workspace yet.</div>
         <iframe id="preview-frame" title="Workspace preview" style="display:none"></iframe>
       </div>
@@ -149,13 +181,16 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const log = $("log"), input = $("input"), send = $("send");
-let mode = "chat";
-let chatHistory = [];
-let agentHistory = [];
+const log = $("log"), input = $("input"), send = $("send"), imgTray = $("img-tray");
+let sessionHistory = [];
+let pendingImages = [];
 let wsFiles = [];
+let wsWorkdir = "";
 let previewPath = "";
 let wsTab = "preview";
+let ctxUsed = 0;
+let ctxLimit = 16384;
+let autoOpenedInitialWs = false;
 
 const store = (k, v) => {
   try {
@@ -165,29 +200,29 @@ const store = (k, v) => {
   return v;
 };
 
-for (const id of ["system", "key", "maxsteps"]) {
-  const saved = store("kronos-" + id);
-  if (saved !== null && saved !== undefined) $(id).value = saved;
-  $(id).addEventListener("change", () => store("kronos-" + id, $(id).value));
+for (const [id, key] of [["system", "kronos-system"], ["key", "kronos-key"], ["maxsteps", "kronos-maxsteps"], ["temp", "kronos-u-temp"], ["maxtok", "kronos-u-maxtok"], ["route-mode", "kronos-route-mode"]]) {
+  const saved = store(key);
+  if (saved !== null && saved !== undefined && saved !== "") $(id).value = saved;
+  $(id).addEventListener("change", () => store(key, $(id).value));
 }
-
-function syncModeParams() {
-  const tKey = mode === "agent" ? "kronos-agent-temp" : "kronos-temp";
-  const mKey = mode === "agent" ? "kronos-agent-maxtok" : "kronos-maxtok";
-  const tDef = mode === "agent" ? "0" : "0.7";
-  const mDef = mode === "agent" ? "4096" : "512";
-  $("temp").value = store(tKey) ?? tDef;
-  $("maxtok").value = store(mKey) ?? mDef;
-}
-$("temp").addEventListener("change", () => store(mode === "agent" ? "kronos-agent-temp" : "kronos-temp", $("temp").value));
-$("maxtok").addEventListener("change", () => store(mode === "agent" ? "kronos-agent-maxtok" : "kronos-maxtok", $("maxtok").value));
-syncModeParams();
 
 const headers = () => {
   const h = { "Content-Type": "application/json" };
   if ($("key").value) h.Authorization = "Bearer " + $("key").value;
   return h;
 };
+
+function fmtK(n) {
+  return n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
+}
+
+function updateCtxMeter(used, limit) {
+  if (typeof used === "number") ctxUsed = used;
+  if (typeof limit === "number" && limit > 0) ctxLimit = limit;
+  const el = $("ctx-meter");
+  el.textContent = `ctx ${fmtK(ctxUsed)} / ${fmtK(ctxLimit)}`;
+  el.classList.toggle("high", ctxLimit > 0 && ctxUsed / ctxLimit >= 0.62);
+}
 
 fetch("/v1/models", { headers: headers() }).then(r => r.json())
   .then(j => $("model").textContent = j.data ? j.data[0].id : (j.error?.message || "unavailable"))
@@ -206,22 +241,6 @@ function render(md) {
       .replace(/^#{1,6} (.*)$/gm, "<strong>$1</strong>");
   }).join("");
 }
-
-function setMode(next) {
-  mode = next;
-  $("mode-chat").classList.toggle("active", mode === "chat");
-  $("mode-agent").classList.toggle("active", mode === "agent");
-  input.placeholder = mode === "agent"
-    ? "Describe files or features to build or edit in the workspace…"
-    : "Message Kronos…";
-  syncModeParams();
-  if (mode === "agent") {
-    refreshWorkspace(false);
-  }
-  input.focus();
-}
-$("mode-chat").onclick = () => setMode("chat");
-$("mode-agent").onclick = () => setMode("agent");
 
 function setWorkspaceOpen(open) {
   $("ws-pane").classList.toggle("hidden", !open);
@@ -278,15 +297,23 @@ $("file-select").onchange = () => {
 function reloadPreviewFrame() {
   const frame = $("preview-frame");
   const empty = $("preview-empty");
+  const meta = $("preview-meta");
   if (!previewPath) {
     frame.style.display = "none";
+    meta.style.display = "none";
     empty.style.display = "flex";
     return;
   }
   empty.style.display = "none";
+  meta.style.display = "flex";
   frame.style.display = "block";
   const url = "/preview/" + previewPath + "?t=" + Date.now();
   $("ws-open").href = "/preview/" + previewPath;
+  $("preview-url").textContent = wsWorkdir ? `${wsWorkdir} · /preview/${previewPath}` : "/preview/" + previewPath;
+  frame.onload = () => {
+    const t = frame.contentDocument?.title?.trim();
+    $("preview-title").textContent = t ? `title: ${t}` : previewPath;
+  };
   frame.src = url;
 }
 $("ws-reload").onclick = () => refreshWorkspace(true);
@@ -296,6 +323,8 @@ $("ws-clear").onclick = async () => {
     await fetch("/v1/agent/clear", { method: "POST", headers: headers() });
     wsFiles = [];
     previewPath = "";
+    sessionHistory = [];
+    updateCtxMeter(0, ctxLimit);
     await refreshWorkspace(true);
   } catch (e) {}
 };
@@ -305,6 +334,11 @@ async function refreshWorkspace(reloadIframe) {
     const r = await fetch("/v1/agent/files", { headers: headers() });
     if (!r.ok) return;
     const j = await r.json();
+    if (j.context_limit) updateCtxMeter(ctxUsed, j.context_limit);
+    if (j.workdir) {
+      wsWorkdir = j.workdir;
+      $("ws-toggle").title = `Workspace directory: ${wsWorkdir}`;
+    }
     wsFiles = j.files || [];
     previewPath = j.preview_path || "";
     $("ws-count").textContent = String(wsFiles.length);
@@ -325,18 +359,172 @@ async function refreshWorkspace(reloadIframe) {
     } else if (wsFiles.length > 0) {
       sel.value = wsFiles[0].path;
     }
+    if (!autoOpenedInitialWs && wsFiles.length > 0) {
+      autoOpenedInitialWs = true;
+      setWorkspaceOpen(true);
+    }
     if (reloadIframe) reloadPreviewFrame();
     if (wsTab === "code") loadSelectedFile(sel.value);
   } catch (e) {}
 }
 
-refreshWorkspace(false);
+refreshWorkspace(true);
 
-function userBubble(text) {
+function renderImageTray() {
+  imgTray.innerHTML = "";
+  imgTray.classList.toggle("has-items", pendingImages.length > 0);
+  pendingImages.forEach((img, idx) => {
+    const chip = document.createElement("div");
+    chip.className = "img-chip";
+    const thumb = document.createElement("img");
+    thumb.src = img.dataUrl;
+    thumb.alt = img.name;
+    const meta = document.createElement("span");
+    meta.textContent = `${img.width}x${img.height}`;
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.textContent = "×";
+    rm.title = "Remove image";
+    rm.onclick = () => {
+      pendingImages.splice(idx, 1);
+      renderImageTray();
+    };
+    chip.appendChild(thumb);
+    chip.appendChild(meta);
+    chip.appendChild(rm);
+    imgTray.appendChild(chip);
+  });
+}
+
+function ingestImageBlob(blob, label) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const rawUrl = String(reader.result || "");
+      const im = new Image();
+      im.onload = () => {
+        const maxSide = 1440;
+        let w = im.naturalWidth || im.width || 1;
+        let h = im.naturalHeight || im.height || 1;
+        let dataUrl = rawUrl;
+        if (Math.max(w, h) > maxSide) {
+          const scale = maxSide / Math.max(w, h);
+          w = Math.max(1, Math.round(w * scale));
+          h = Math.max(1, Math.round(h * scale));
+          const cv = document.createElement("canvas");
+          cv.width = w;
+          cv.height = h;
+          const ctx = cv.getContext("2d");
+          ctx.drawImage(im, 0, 0, w, h);
+          dataUrl = cv.toDataURL("image/png");
+        }
+        pendingImages.push({ name: label || "pasted.png", dataUrl, width: w, height: h });
+        renderImageTray();
+        resolve(true);
+      };
+      im.onerror = () => resolve(false);
+      im.src = rawUrl;
+    };
+    reader.onerror = () => resolve(false);
+    reader.readAsDataURL(blob);
+  });
+}
+
+$("attach-btn").onclick = () => $("file-input").click();
+$("file-input").onchange = async (e) => {
+  const files = Array.from(e.target.files || []);
+  for (const f of files) {
+    if (f.type.startsWith("image/")) await ingestImageBlob(f, f.name);
+  }
+  e.target.value = "";
+  input.focus();
+};
+
+window.addEventListener("paste", async (e) => {
+  const items = Array.from(e.clipboardData?.items || []);
+  const imgItems = items.filter(it => it.type && it.type.startsWith("image/"));
+  if (imgItems.length === 0) return;
+  e.preventDefault();
+  for (const it of imgItems) {
+    const blob = it.getAsFile();
+    if (blob) await ingestImageBlob(blob, blob.name || "clipboard.png");
+  }
+  input.focus();
+});
+
+const chatCol = $("chat-col");
+chatCol.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  chatCol.classList.add("drag-over");
+});
+chatCol.addEventListener("dragleave", () => chatCol.classList.remove("drag-over"));
+chatCol.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  chatCol.classList.remove("drag-over");
+  const files = Array.from(e.dataTransfer?.files || []);
+  for (const f of files) {
+    if (f.type.startsWith("image/")) await ingestImageBlob(f, f.name);
+  }
+  input.focus();
+});
+
+function appendCompactionNotice(beforeTok, afterTok, count) {
+  $("empty")?.remove();
+  const b = document.createElement("div");
+  b.className = "compact-banner";
+  b.textContent = `Context compacted: ${beforeTok} -> ${afterTok} tokens (${count} older items summarized · workspace files synced)`;
+  log.appendChild(b);
+  log.scrollTop = log.scrollHeight;
+}
+
+$("compact-btn").onclick = async () => {
+  if (sessionHistory.length === 0 || send.disabled) return;
+  $("compact-btn").disabled = true;
+  try {
+    const r = await fetch("/v1/compact", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ messages: sessionHistory }),
+    });
+    if (!r.ok) throw new Error((await r.json()).error?.message || r.statusText);
+    const j = await r.json();
+    if (Array.isArray(j.messages)) sessionHistory = j.messages;
+    updateCtxMeter(j.after_tokens, j.context_limit);
+    if (j.compacted) {
+      appendCompactionNotice(j.before_tokens, j.after_tokens, j.compacted_messages);
+    } else {
+      const b = document.createElement("div");
+      b.className = "compact-banner";
+      b.textContent = `Context already compact (${j.after_tokens} / ${j.context_limit} tokens)`;
+      log.appendChild(b);
+      log.scrollTop = log.scrollHeight;
+    }
+  } catch (e) {
+  } finally {
+    $("compact-btn").disabled = false;
+  }
+};
+
+function userBubble(text, images) {
   $("empty")?.remove();
   const d = document.createElement("div");
   d.className = "msg user";
-  d.textContent = text;
+  if (images && images.length > 0) {
+    const row = document.createElement("div");
+    row.className = "user-imgs";
+    for (const im of images) {
+      const el = document.createElement("img");
+      el.src = im.dataUrl;
+      el.alt = im.name;
+      row.appendChild(el);
+    }
+    d.appendChild(row);
+  }
+  if (text) {
+    const t = document.createElement("div");
+    t.textContent = text;
+    d.appendChild(t);
+  }
   log.appendChild(d);
   log.scrollTop = log.scrollHeight;
   return d;
@@ -345,6 +533,11 @@ function userBubble(text) {
 function summarizeArgs(name, rawArgs) {
   try {
     const a = JSON.parse(rawArgs);
+    if (name === "edit_file" && a.path) {
+      const o = String(a.old_text || "").replace(/\s+/g, " ").trim().slice(0, 22);
+      const n = String(a.new_text || "").replace(/\s+/g, " ").trim().slice(0, 22);
+      return `${a.path} (${o} -> ${n})`;
+    }
     if (a.path) return a.path;
     if (a.pattern) return a.pattern;
     if (a.cmd) return a.cmd;
@@ -353,8 +546,10 @@ function summarizeArgs(name, rawArgs) {
 }
 
 $("new").onclick = () => {
-  chatHistory = [];
-  agentHistory = [];
+  sessionHistory = [];
+  pendingImages = [];
+  renderImageTray();
+  updateCtxMeter(0, ctxLimit);
   log.innerHTML = '<div class="empty" id="empty">Session history cleared.</div>';
   input.focus();
 };
@@ -370,111 +565,71 @@ input.addEventListener("keydown", e => {
   }
 });
 
-async function runChatTurn(text) {
-  chatHistory.push({ role: "user", content: text });
-  userBubble(text);
-  const out = document.createElement("div");
-  out.className = "msg reply";
-  out.textContent = "…";
-  log.appendChild(out);
-  log.scrollTop = log.scrollHeight;
-
-  const messages = $("system").value
-    ? [{ role: "system", content: $("system").value }, ...chatHistory]
-    : chatHistory;
-  const t0 = performance.now();
-  let reply = "", usage = null, first = null;
-  try {
-    const r = await fetch("/v1/chat/completions", {
-      method: "POST",
-      headers: headers(),
-      body: JSON.stringify({
-        messages,
-        stream: true,
-        temperature: +$("temp").value,
-        max_tokens: +$("maxtok").value,
-      }),
-    });
-    if (!r.ok) throw new Error((await r.json()).error?.message || r.statusText);
-    const reader = r.body.getReader(), dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let i;
-      while ((i = buf.indexOf("\n\n")) >= 0) {
-        const line = buf.slice(0, i).replace(/^data: /, "");
-        buf = buf.slice(i + 2);
-        if (line === "[DONE]") continue;
-        const j = JSON.parse(line);
-        if (j.error) throw new Error(j.error.message);
-        const piece = j.choices?.[0]?.delta?.content;
-        if (piece) {
-          first ??= performance.now();
-          reply += piece;
-          out.innerHTML = '<div class="reply-prose">' + render(reply) + '</div>';
-          log.scrollTop = log.scrollHeight;
-        }
-        if (j.usage) usage = j.usage;
-      }
-    }
-    chatHistory.push({ role: "assistant", content: reply });
-    if (usage) {
-      const s = document.createElement("div");
-      s.className = "stats";
-      const decTokS = (usage.completion_tokens / Math.max(usage.decode_secs || 1e-3, 1e-3)).toFixed(1);
-      const prefTokS = (usage.prefilled_tokens / Math.max(usage.prefill_secs || 1e-3, 1e-3)).toFixed(0);
-      const acc = usage.drafted_tokens > 0
-        ? ` · accept ${(100 * usage.accepted_tokens / usage.drafted_tokens).toFixed(1)}%`
-        : "";
-      const ttft = first ? ((first - t0) / 1000).toFixed(2) : (usage.prefill_secs || 0).toFixed(2);
-      s.textContent = `${usage.prefilled_tokens} prefill @ ${prefTokS} tok/s · ${usage.completion_tokens} gen @ ${decTokS} tok/s${acc} · first token ${ttft} s`;
-      log.appendChild(s);
-    }
-  } catch (err) {
-    out.textContent = "Error: " + err.message;
-    chatHistory.pop();
+async function runUnifiedTurn(text, attachedImages) {
+  if (sessionHistory.length === 0 && $("system").value.trim()) {
+    sessionHistory.push({ role: "system", content: $("system").value.trim() });
   }
-}
-
-async function runAgentTurnUi(text) {
-  if (agentHistory.length === 0 && $("system").value.trim()) {
-    agentHistory.push({ role: "system", content: $("system").value.trim() });
-  }
-  const prevLen = agentHistory.length;
-  agentHistory.push({ role: "user", content: text });
-  userBubble(text);
+  const prevLen = sessionHistory.length;
+  sessionHistory.push({ role: "user", content: text });
+  userBubble(text, attachedImages);
 
   const card = document.createElement("div");
   card.className = "msg reply";
+  const headRow = document.createElement("div");
+  headRow.className = "reply-head";
+  const routePill = document.createElement("span");
+  routePill.className = "pill run";
+  routePill.textContent = "routing…";
+  headRow.appendChild(routePill);
+
   const stepsBox = document.createElement("div");
   stepsBox.className = "agent-steps";
+  stepsBox.style.display = "none";
+
   const proseBox = document.createElement("div");
   proseBox.className = "reply-prose";
-  proseBox.textContent = "Running workspace step…";
+  proseBox.textContent = "…";
+
+  card.appendChild(headRow);
   card.appendChild(stepsBox);
   card.appendChild(proseBox);
   log.appendChild(card);
   log.scrollTop = log.scrollHeight;
 
   const toolEls = new Map();
-  let stepLabels = new Map();
+  const stepLabels = new Map();
+  let activeRoute = "chat";
   let prose = "";
   let touchedFiles = false;
+  let lastUsage = null;
+  let firstTokenTime = null;
   const t0 = performance.now();
 
+  const payload = {
+    messages: sessionHistory,
+    route: $("route-mode").value || "auto",
+    max_steps: +($("maxsteps").value || 10),
+  };
+  if (attachedImages.length > 0) {
+    payload.images = attachedImages.map(im => im.dataUrl);
+  }
+  if ($("temp").value !== "") payload.temperature = +$("temp").value;
+  if ($("maxtok").value !== "") payload.max_tokens = +$("maxtok").value;
+
+  let gotDone = false;
   try {
-    const r = await fetch("/v1/agent/chat", {
+    const reqInit = {
       method: "POST",
       headers: headers(),
-      body: JSON.stringify({
-        messages: agentHistory,
-        temperature: +$("temp").value,
-        max_tokens: +$("maxtok").value,
-        max_steps: +($("maxsteps").value || 10),
-      }),
-    });
+      body: JSON.stringify(payload),
+    };
+    let r;
+    try {
+      r = await fetch("/v1/turn", reqInit);
+    } catch (_) {
+      await new Promise(res => setTimeout(res, 900));
+      r = await fetch("/v1/turn", reqInit);
+    }
     if (!r.ok) throw new Error((await r.json()).error?.message || r.statusText);
     const reader = r.body.getReader(), dec = new TextDecoder();
     let buf = "";
@@ -488,20 +643,50 @@ async function runAgentTurnUi(text) {
         buf = buf.slice(i + 2);
         if (!line || line === "[DONE]") continue;
         const j = JSON.parse(line);
-        if (j.type === "error") throw new Error(j.message || "agent step failed");
+        if (j.type === "error") throw new Error(j.message || "turn failed");
 
-        if (j.type === "step_start") {
+        if (j.type === "route") {
+          activeRoute = j.mode || "chat";
+          if (activeRoute === "agent") {
+            routePill.className = "pill info";
+            routePill.textContent = "agent · workspace";
+            stepsBox.style.display = "flex";
+          } else {
+            routePill.className = "pill run";
+            routePill.textContent = "chat";
+          }
+        } else if (j.type === "vision") {
+          for (const b of (j.badges || [])) {
+            const vp = document.createElement("span");
+            vp.className = "pill info";
+            vp.textContent = `vision · ${b}`;
+            headRow.appendChild(vp);
+          }
+        } else if (j.type === "compacted") {
+          appendCompactionNotice(j.before_tokens, j.after_tokens, j.compacted_messages);
+        } else if (j.type === "step_start") {
           const sl = document.createElement("div");
           sl.className = "step-line";
           sl.innerHTML = `<span>Step ${j.step}/${j.max_steps}</span><span class="step-perf">generating…</span>`;
           stepsBox.appendChild(sl);
           stepLabels.set(j.step, sl.querySelector(".step-perf"));
-          if (!prose) proseBox.textContent = "";
+          prose = "";
+          proseBox.textContent = activeRoute === "agent" ? "Drafting workspace actions…" : "…";
         } else if (j.type === "text") {
+          firstTokenTime ??= performance.now();
           prose += j.delta;
           proseBox.innerHTML = render(prose);
+        } else if (j.type === "tool_progress") {
+          firstTokenTime ??= performance.now();
+          stepsBox.style.display = "flex";
+          const el = stepLabels.get(j.step);
+          const tgt = j.target ? ` · ${j.target}` : "";
+          const msg = `drafting ${j.name}${tgt} (${j.bytes} B)…`;
+          if (el) el.textContent = msg;
+          if (!prose) proseBox.textContent = msg;
         } else if (j.type === "step_stats") {
           const u = j.usage || {};
+          lastUsage = u;
           const el = stepLabels.get(j.step);
           if (el) {
             const pRate = (u.prefilled_tokens / Math.max(u.prefill_secs || 1e-3, 1e-3)).toFixed(0);
@@ -509,9 +694,10 @@ async function runAgentTurnUi(text) {
             const acc = u.drafted_tokens > 0
               ? ` · accept ${(100 * u.accepted_tokens / u.drafted_tokens).toFixed(1)}%`
               : "";
-            el.textContent = `${u.prefilled_tokens} prefill @ ${pRate} tok/s · ${u.completion_tokens} gen @ ${dRate} tok/s${acc}`;
+            el.textContent = `${u.prefilled_tokens} new @ ${pRate} tok/s · ${u.completion_tokens} gen @ ${dRate} tok/s${acc}`;
           }
         } else if (j.type === "tool_start") {
+          stepsBox.style.display = "flex";
           const det = document.createElement("details");
           det.className = "tool-card";
           const target = summarizeArgs(j.name, j.arguments || "");
@@ -541,19 +727,34 @@ async function runAgentTurnUi(text) {
             refreshWorkspace(true);
           }
         } else if (j.type === "validation_repair") {
+          stepsBox.style.display = "flex";
           const b = document.createElement("div");
           b.className = "repair-banner";
           b.textContent = "Post-edit validation triggered repair:\n" + j.report;
           stepsBox.appendChild(b);
         } else if (j.type === "done") {
-          if (Array.isArray(j.messages)) agentHistory = j.messages;
+          gotDone = true;
+          if (Array.isArray(j.messages)) sessionHistory = j.messages;
+          if (j.context_tokens !== undefined) updateCtxMeter(j.context_tokens, j.context_limit);
           if (!prose && j.text) {
             prose = j.text;
             proseBox.innerHTML = render(prose);
+          } else if (!prose) {
+            proseBox.textContent = "Workspace updated.";
           }
         }
         log.scrollTop = log.scrollHeight;
       }
+    }
+    if (!gotDone) {
+      for (const el of stepLabels.values()) {
+        if (el.textContent.endsWith("…")) el.textContent = "interrupted";
+      }
+      for (const det of toolEls.values()) {
+        const pill = det.querySelector(".pill.run");
+        if (pill) { pill.className = "pill err"; pill.textContent = "interrupted"; }
+      }
+      throw new Error("Stream closed before turn completed — retry prompt");
     }
     if (touchedFiles) {
       await refreshWorkspace(true);
@@ -561,27 +762,46 @@ async function runAgentTurnUi(text) {
     }
     const s = document.createElement("div");
     s.className = "stats";
-    s.textContent = `completed in ${((performance.now() - t0) / 1000).toFixed(2)} s`;
+    const totalS = ((performance.now() - t0) / 1000).toFixed(2);
+    if (activeRoute === "chat" && lastUsage) {
+      const dRate = (lastUsage.completion_tokens / Math.max(lastUsage.decode_secs || 1e-3, 1e-3)).toFixed(1);
+      const pRate = (lastUsage.prefilled_tokens / Math.max(lastUsage.prefill_secs || 1e-3, 1e-3)).toFixed(0);
+      const acc = lastUsage.drafted_tokens > 0
+        ? ` · accept ${(100 * lastUsage.accepted_tokens / lastUsage.drafted_tokens).toFixed(1)}%`
+        : "";
+      const ttft = firstTokenTime ? ((firstTokenTime - t0) / 1000).toFixed(2) : totalS;
+      s.textContent = `${lastUsage.prefilled_tokens} new @ ${pRate} tok/s · ${lastUsage.completion_tokens} gen @ ${dRate} tok/s${acc} · first token ${ttft} s`;
+    } else {
+      s.textContent = `completed in ${totalS} s`;
+    }
     log.appendChild(s);
   } catch (err) {
+    routePill.className = "pill err";
+    routePill.textContent = "error";
     proseBox.textContent = "Error: " + err.message;
-    agentHistory.length = prevLen;
+    sessionHistory.length = prevLen;
+    if (!gotDone) {
+      if (!input.value && text) input.value = text;
+      if (pendingImages.length === 0 && attachedImages.length > 0) {
+        pendingImages = attachedImages.slice();
+        renderImageTray();
+      }
+    }
   }
 }
 
 $("form").onsubmit = async (e) => {
   e.preventDefault();
   const text = input.value.trim();
-  if (!text || send.disabled) return;
+  if ((!text && pendingImages.length === 0) || send.disabled) return;
+  const imgs = pendingImages.slice();
+  pendingImages = [];
+  renderImageTray();
   input.value = "";
   input.style.height = "auto";
   send.disabled = true;
   try {
-    if (mode === "agent") {
-      await runAgentTurnUi(text);
-    } else {
-      await runChatTurn(text);
-    }
+    await runUnifiedTurn(text, imgs);
   } finally {
     send.disabled = false;
     input.focus();

@@ -17,9 +17,11 @@ pub const AGENT_SYSTEM_PROMPT: &str = concat!(
     "You are Kronos Agent, a local software engineering runner on Apple Silicon. ",
     "Use the workspace tools (write_file, edit_file, read_file, list_dir, search_files, run_command) ",
     "to build, edit, and verify complete working files directly on disk. ",
-    "Do not paste file drafts in prose before calling tools; emit <tool_call> invocations immediately. ",
-    "Prefer edit_file for targeted modifications to existing files and write_file for new files. ",
-    "If a tool response reports a validation error, fix it immediately before finishing."
+    "Do not paste file drafts or completion claims in prose before calling tools; emit <tool_call> invocations immediately, then summarize after tool calls succeed. ",
+    "Use edit_file for small targeted edits to existing files, and use write_file for new files or when rewriting most of an existing file such as restyling a stylesheet. ",
+    "When updating a web page title or heading, update both <title> in <head> and the visible <h1> heading in <body> so the rendered preview shows the change immediately. ",
+    "The live preview reloads automatically after every file edit, so never ask the user to refresh the preview; if the user reports a change is not visible, inspect and update the visible HTML or CSS elements directly. ",
+    "If a tool response reports an error or validation failure, fix it with a tool call immediately before finishing."
 );
 
 #[derive(Clone, Debug)]
@@ -38,12 +40,46 @@ pub struct ToolExecOutcome {
     pub output: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnRoute {
+    Chat,
+    Agent,
+}
+
+impl TurnRoute {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TurnRoute::Chat => "chat",
+            TurnRoute::Agent => "agent",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CompactionReport {
+    pub compacted: bool,
+    pub before_tokens: usize,
+    pub after_tokens: usize,
+    pub compacted_messages: usize,
+}
+
 pub enum AgentEvent<'a> {
+    ContextCompacted {
+        before_tokens: usize,
+        after_tokens: usize,
+        compacted_messages: usize,
+    },
     StepStart {
         step: usize,
         max_steps: usize,
     },
     TextDelta(&'a str),
+    ToolProgress {
+        step: usize,
+        name: &'a str,
+        target: &'a str,
+        bytes: usize,
+    },
     StepStats {
         step: usize,
         completion: &'a Completion,
@@ -74,17 +110,214 @@ pub struct AgentTurnConfig {
     pub params: GenParams,
     pub max_steps: usize,
     pub cmd_timeout_secs: u64,
+    pub expect_tool_call: bool,
 }
 
 pub fn tool_definitions_json() -> Vec<String> {
     vec![
-        r#"{"type":"function","function":{"name":"write_file","description":"Create or overwrite a UTF-8 file inside the workspace directory (parent directories are created automatically) and validate its syntax.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative file path inside the workspace, e.g. index.html or src/app.js"},"content":{"type":"string","description":"Complete file contents to write"}},"required":["path","content"]}}}"#.to_string(),
-        r#"{"type":"function","function":{"name":"edit_file","description":"Replace an exact unique substring in an existing UTF-8 workspace file and validate the updated file.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative file path inside the workspace"},"old_text":{"type":"string","description":"Exact existing text block to replace (must match uniquely)"},"new_text":{"type":"string","description":"Replacement text block"}},"required":["path","old_text","new_text"]}}}"#.to_string(),
-        r#"{"type":"function","function":{"name":"read_file","description":"Read a UTF-8 file inside the workspace with 1-based line numbers and optional line range.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative file path inside the workspace"},"start_line":{"type":"integer","description":"Optional 1-based start line (inclusive)"},"end_line":{"type":"integer","description":"Optional 1-based end line (inclusive)"}}},"required":["path"]}}}"#.to_string(),
-        r#"{"type":"function","function":{"name":"list_dir","description":"List files and subdirectories at a relative path inside the workspace directory.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative directory path (use '.' for workspace root)"}}},"required":[]}}"#.to_string(),
-        r#"{"type":"function","function":{"name":"search_files","description":"Search UTF-8 files in the workspace for a text pattern, returning `path:line: snippet` matches.","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Substring pattern to search for"},"path":{"type":"string","description":"Optional relative subdirectory or file to search (default '.')"},"case_insensitive":{"type":"boolean","description":"Optional case-insensitive match flag"}}},"required":["pattern"]}}}"#.to_string(),
-        r#"{"type":"function","function":{"name":"run_command","description":"Execute a shell command (`sh -c`) inside the workspace directory with a timeout. Redirect stdout/stderr if starting a background server (e.g. `nohup python3 -m http.server 18123 > server.log 2>&1 &`).","parameters":{"type":"object","properties":{"cmd":{"type":"string","description":"Shell command line to run in the workspace"}}},"required":["cmd"]}}}"#.to_string(),
+        r#"{"type":"function","function":{"name":"write_file","description":"Write or overwrite a UTF-8 workspace file and validate syntax.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative workspace path"},"content":{"type":"string","description":"Full file contents"}},"required":["path","content"]}}}"#.to_string(),
+        r#"{"type":"function","function":{"name":"edit_file","description":"Replace a unique text span in an existing workspace file and validate syntax.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative workspace path"},"old_text":{"type":"string","description":"Existing unique text block"},"new_text":{"type":"string","description":"Replacement text block"}},"required":["path","old_text","new_text"]}}}"#.to_string(),
+        r#"{"type":"function","function":{"name":"read_file","description":"Read a workspace file with 1-based line numbers.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative workspace path"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}}},"required":["path"]}}}"#.to_string(),
+        r#"{"type":"function","function":{"name":"list_dir","description":"List directory entries inside workspace.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative directory (default '.')"}}},"required":[]}}"#.to_string(),
+        r#"{"type":"function","function":{"name":"search_files","description":"Search workspace files for a substring pattern.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"case_insensitive":{"type":"boolean"}}},"required":["pattern"]}}}"#.to_string(),
+        r#"{"type":"function","function":{"name":"run_command","description":"Run sh -c command inside workspace with timeout.","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}},"required":["cmd"]}}}"#.to_string(),
     ]
+}
+
+/// Fast latent-feature intent gate routing user prompts between direct streaming chat and workspace tools.
+pub fn classify_turn_intent(
+    user_text: &str,
+    has_images: bool,
+    workspace_has_files: bool,
+    history_used_tools: bool,
+) -> TurnRoute {
+    let lower = user_text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return TurnRoute::Chat;
+    }
+
+    let greetings = [
+        "hi",
+        "hello",
+        "hey",
+        "thanks",
+        "thank you",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "who are you",
+        "what can you do",
+        "help",
+    ];
+    let stripped = lower.trim_end_matches(['?', '.', ',']);
+    if greetings.contains(&stripped) {
+        return TurnRoute::Chat;
+    }
+
+    let mut score = 0i32;
+
+    let file_markers = [
+        ".html", ".css", ".js", ".ts", ".jsx", ".tsx", ".py", ".rs", ".json", ".svg", ".md",
+        ".toml", "index.", "style.", "app.", "src/", "./",
+    ];
+    if file_markers.iter().any(|m| lower.contains(m)) {
+        score += 6;
+    }
+
+    let action_phrases = [
+        "build ",
+        "build a",
+        "create ",
+        "make a ",
+        "make an ",
+        "make it ",
+        "make the ",
+        "write file",
+        "write a file",
+        "write code to",
+        "save to ",
+        "edit ",
+        "update ",
+        "modify ",
+        "change the ",
+        "change it",
+        "style ",
+        "restyle",
+        "beautify",
+        "redesign",
+        "refactor",
+        "scaffold",
+        "implement ",
+        "fix ",
+        "repair ",
+        "debug ",
+        "add a ",
+        "add an ",
+        "add the ",
+        "remove the ",
+        "delete the ",
+        "rename ",
+        "run ",
+        "execute ",
+        "compile ",
+        "center the ",
+        "align ",
+    ];
+    for p in action_phrases {
+        if lower.starts_with(p) || lower.contains(&format!(" {p}")) || lower.contains(&format!(", {p}")) {
+            score += 4;
+            break;
+        }
+    }
+
+    let artifact_nouns = [
+        "webpage",
+        "web page",
+        "website",
+        "web app",
+        "landing page",
+        "dashboard",
+        "todo",
+        "to-do",
+        "tracker",
+        "calculator",
+        "timer",
+        "game",
+        "header",
+        "navbar",
+        "sidebar",
+        "footer",
+        "button",
+        "buttons",
+        "input",
+        "inputs",
+        "form",
+        "modal",
+        "stylesheet",
+        "preview",
+        "workspace",
+        "title",
+        "heading",
+        "dark mode",
+        "light mode",
+    ];
+    if artifact_nouns.iter().any(|n| lower.contains(n)) {
+        score += 2;
+    }
+
+    if workspace_has_files || history_used_tools {
+        let tweak_terms = [
+            "darker", "lighter", "bigger", "smaller", "rounded", "modern", "cleaner", "gradient",
+            "shadow", "padding", "margin", "font", "color", "colors", "theme", "layout",
+            "responsive", "match this", "like this", "still the same", "not working",
+            "doesn't work", "doesnt work", "didn't change", "didnt change", "nothing changed",
+            "don't see", "dont see",
+        ];
+        if score >= 2 || tweak_terms.iter().any(|t| lower.contains(t)) {
+            score += 3;
+        }
+    }
+
+    if has_images {
+        let img_build_terms = [
+            "build", "clone", "recreate", "replicate", "match", "style", "like this", "fix",
+            "embed", "use this", "turn this into", "implement",
+        ];
+        if img_build_terms.iter().any(|t| lower.contains(t)) {
+            score += 5;
+        }
+    }
+
+    let qa_prefixes = [
+        "what ",
+        "which ",
+        "who ",
+        "who's ",
+        "whos ",
+        "where ",
+        "where's ",
+        "wheres ",
+        "when ",
+        "what's ",
+        "whats ",
+        "how's ",
+        "hows ",
+        "why's ",
+        "whys ",
+        "is there ",
+        "are there ",
+        "describe ",
+        "read this",
+        "read the text",
+        "can you read",
+        "can you explain",
+        "explain ",
+        "how does ",
+        "how do ",
+        "why is ",
+        "why does ",
+        "compare ",
+        "summarize ",
+        "translate ",
+        "write a haiku",
+        "write a poem",
+        "write a story",
+    ];
+    let has_followup_mutation = lower.contains(" and fix")
+        || lower.contains(" and build")
+        || lower.contains(" and update")
+        || lower.contains(" and edit")
+        || lower.contains(" and change")
+        || lower.contains(" and style");
+    if !has_followup_mutation && qa_prefixes.iter().any(|q| lower.starts_with(q)) {
+        score -= 6;
+    }
+
+    if score > 0 {
+        TurnRoute::Agent
+    } else {
+        TurnRoute::Chat
+    }
 }
 
 /// Resolves `user_rel` inside `workdir`, rejecting `..` traversal or paths outside `workdir`.
@@ -154,6 +387,7 @@ fn should_skip_entry(name: &str) -> bool {
         || name == "target"
         || name == "__pycache__"
         || name == ".DS_Store"
+        || name == ".kronos_media"
         || name.starts_with(".kronos_cmd_")
 }
 
@@ -1050,6 +1284,25 @@ fn attach_validation_status(workdir: &Path, target: &Path, rel: &str, base_msg: 
     }
 }
 
+fn extract_plain_html_tag_inner(html: &str, tag: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let open_pat = format!("<{tag}");
+    let close_pat = format!("</{tag}>");
+    let open = lower.find(&open_pat)?;
+    if lower[open + open_pat.len()..].contains(&open_pat) {
+        return None;
+    }
+    let gt_rel = html[open..].find('>')?;
+    let inner_start = open + gt_rel + 1;
+    let close_rel = lower[inner_start..].find(&close_pat)?;
+    let inner = html[inner_start..inner_start + close_rel].trim();
+    if inner.is_empty() || inner.contains('<') {
+        None
+    } else {
+        Some(inner.to_string())
+    }
+}
+
 fn exec_write_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
     let Some(rel) = args.get("path").and_then(Json::as_str) else {
         return err_outcome("error: `write_file` requires string argument `path`");
@@ -1066,14 +1319,179 @@ fn exec_write_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
             return err_outcome(&format!("error creating directory `{}`: {e}", parent.display()));
         }
     }
-    match fs::write(&target, content.as_bytes()) {
+    let mut final_content = content.to_string();
+    let mut sync_note = String::new();
+    let lower_rel = rel.to_ascii_lowercase();
+    if lower_rel.ends_with(".html") || lower_rel.ends_with(".htm") {
+        if let Ok(prev) = fs::read_to_string(&target) {
+            if let (Some(old_t), Some(old_h1), Some(new_t), Some(new_h1)) = (
+                extract_plain_html_tag_inner(&prev, "title"),
+                extract_plain_html_tag_inner(&prev, "h1"),
+                extract_plain_html_tag_inner(content, "title"),
+                extract_plain_html_tag_inner(content, "h1"),
+            ) {
+                if old_t != new_t && new_h1 == old_h1 && new_h1 != new_t {
+                    let new_title_tag = format!("<title>{new_t}</title>");
+                    let (synced, h1_opt) =
+                        sync_html_title_and_h1(rel, "<title>", &new_title_tag, final_content);
+                    final_content = synced;
+                    if let Some(t) = h1_opt {
+                        sync_note = format!("; synced visible <h1> to `{t}`");
+                    }
+                }
+            }
+        }
+    }
+    match fs::write(&target, final_content.as_bytes()) {
         Ok(()) => {
             let msg = format!(
-                "ok: wrote {} bytes ({} lines) to `{rel}`",
-                content.len(),
-                content.lines().count()
+                "ok: wrote {} bytes ({} lines{sync_note}) to `{rel}`",
+                final_content.len(),
+                final_content.lines().count()
             );
             attach_validation_status(workdir, &target, rel, msg)
+        }
+        Err(e) => err_outcome(&format!("error writing `{rel}`: {e}")),
+    }
+}
+
+/// Matches `norm_old` against `norm_existing` by comparing contiguous non-empty trimmed lines.
+fn match_unique_trimmed_span(
+    norm_existing: &str,
+    norm_old: &str,
+    new_text: &str,
+) -> Option<(usize, String)> {
+    let old_nonempty: Vec<&str> = norm_old
+        .split('\n')
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if old_nonempty.is_empty() {
+        return None;
+    }
+
+    let mut ex_nonempty: Vec<(usize, usize, &str)> = Vec::new();
+    let mut cursor = 0usize;
+    for raw_line in norm_existing.split('\n') {
+        let start = cursor;
+        let end = start + raw_line.len();
+        let trimmed = raw_line.trim();
+        if !trimmed.is_empty() {
+            ex_nonempty.push((start, end, trimmed));
+        }
+        cursor = end + 1;
+    }
+    if ex_nonempty.len() < old_nonempty.len() {
+        return None;
+    }
+
+    let m = old_nonempty.len();
+    let mut found_range: Option<(usize, usize)> = None;
+    for k in 0..=(ex_nonempty.len() - m) {
+        if (0..m).all(|j| ex_nonempty[k + j].2 == old_nonempty[j]) {
+            if found_range.is_some() {
+                return None;
+            }
+            found_range = Some((ex_nonempty[k].0, ex_nonempty[k + m - 1].1));
+        }
+    }
+
+    let (start_byte, mut end_byte) = found_range?;
+    let norm_new = new_text.replace("\r\n", "\n");
+    if norm_new.ends_with('\n') && norm_existing.as_bytes().get(end_byte) == Some(&b'\n') {
+        end_byte += 1;
+    }
+    let updated = format!(
+        "{}{}{}",
+        &norm_existing[..start_byte],
+        norm_new,
+        &norm_existing[end_byte..]
+    );
+    Some((start_byte, updated))
+}
+
+/// Keeps visible `<h1>` synchronized when `edit_file` updates `<title>...</title>` in an HTML document.
+fn sync_html_title_and_h1(
+    rel: &str,
+    old_text: &str,
+    new_text: &str,
+    updated: String,
+) -> (String, Option<String>) {
+    let lower_rel = rel.to_ascii_lowercase();
+    if !(lower_rel.ends_with(".html") || lower_rel.ends_with(".htm")) {
+        return (updated, None);
+    }
+    let lower_new = new_text.to_ascii_lowercase();
+    let lower_old = old_text.to_ascii_lowercase();
+    if !lower_new.contains("<title>") && !lower_old.contains("<title>") {
+        return (updated, None);
+    }
+    if lower_new.contains("<h1") {
+        return (updated, None);
+    }
+    let Some(t_open) = lower_new.find("<title>") else {
+        return (updated, None);
+    };
+    let after_t = t_open + "<title>".len();
+    let Some(t_close_rel) = lower_new[after_t..].find("</title>") else {
+        return (updated, None);
+    };
+    let new_title = new_text[after_t..after_t + t_close_rel].trim();
+    if new_title.is_empty() || new_title.contains('<') {
+        return (updated, None);
+    }
+
+    let lower_upd = updated.to_ascii_lowercase();
+    let Some(h1_open) = lower_upd.find("<h1") else {
+        return (updated, None);
+    };
+    // Only auto-sync when there is a single `<h1>` element with plain text content.
+    if lower_upd[h1_open + 3..].contains("<h1") {
+        return (updated, None);
+    }
+    let Some(gt_rel) = updated[h1_open..].find('>') else {
+        return (updated, None);
+    };
+    let inner_start = h1_open + gt_rel + 1;
+    let Some(h1_close_rel) = lower_upd[inner_start..].find("</h1>") else {
+        return (updated, None);
+    };
+    let inner_end = inner_start + h1_close_rel;
+    let cur_h1 = updated[inner_start..inner_end].trim();
+    if cur_h1.is_empty() || cur_h1.contains('<') || cur_h1 == new_title {
+        return (updated, None);
+    }
+    let synced = format!(
+        "{}{}{}",
+        &updated[..inner_start],
+        new_title,
+        &updated[inner_end..]
+    );
+    (synced, Some(new_title.to_string()))
+}
+
+fn write_edited_content(
+    workdir: &Path,
+    target: &Path,
+    rel: &str,
+    line_no: usize,
+    old_text: &str,
+    new_text: &str,
+    raw_updated: String,
+) -> ToolExecOutcome {
+    let (updated, h1_synced) = sync_html_title_and_h1(rel, old_text, new_text, raw_updated);
+    match fs::write(target, updated.as_bytes()) {
+        Ok(()) => {
+            let sync_note = match h1_synced {
+                Some(t) => format!("; synced visible <h1> to `{t}`"),
+                None => String::new(),
+            };
+            let msg = format!(
+                "ok: edited `{rel}` at line {line_no} ({} bytes, {} lines{sync_note})",
+                updated.len(),
+                updated.lines().count()
+            );
+            attach_validation_status(workdir, target, rel, msg)
         }
         Err(e) => err_outcome(&format!("error writing `{rel}`: {e}")),
     }
@@ -1089,13 +1507,21 @@ fn exec_edit_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
     let Some(new_text) = args.get("new_text").and_then(Json::as_str) else {
         return err_outcome("error: `edit_file` requires string argument `new_text`");
     };
-    if old_text.is_empty() {
-        return err_outcome("error: `edit_file` `old_text` must not be empty");
-    }
     let target = match resolve_jailed_path(workdir, rel) {
         Ok(p) => p,
         Err(e) => return err_outcome(&format!("error: {e}")),
     };
+    if old_text.trim().is_empty() {
+        if new_text.trim().is_empty() {
+            return err_outcome("error: `edit_file` `old_text` and `new_text` cannot both be empty");
+        }
+        if let Some(parent) = target.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                return err_outcome(&format!("error creating parent dirs for `{rel}`: {e}"));
+            }
+        }
+        return write_edited_content(workdir, &target, rel, 1, old_text, new_text, new_text.to_string());
+    }
     let existing = match fs::read_to_string(&target) {
         Ok(s) => s,
         Err(e) => return err_outcome(&format!("error reading `{rel}`: {e}")),
@@ -1110,39 +1536,59 @@ fn exec_edit_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
     }
 
     if match_positions.is_empty() {
-        // Fallback check for CRLF vs LF mismatch.
+        // Fallback 1: CRLF vs LF mismatch.
         let norm_existing = existing.replace("\r\n", "\n");
         let norm_old = old_text.replace("\r\n", "\n");
         if let Some(pos) = norm_existing.find(&norm_old) {
             if !norm_existing[pos + norm_old.len()..].contains(&norm_old) {
+                let norm_new = new_text.replace("\r\n", "\n");
                 let updated = format!(
                     "{}{}{}",
                     &norm_existing[..pos],
-                    new_text,
+                    norm_new,
                     &norm_existing[pos + norm_old.len()..]
                 );
-                return match fs::write(&target, updated.as_bytes()) {
-                    Ok(()) => {
-                        let (line_no, _) = line_col_at(&norm_existing, pos, 1);
-                        let msg = format!("ok: edited `{rel}` at line {line_no} ({} bytes)", updated.len());
-                        attach_validation_status(workdir, &target, rel, msg)
-                    }
-                    Err(e) => err_outcome(&format!("error writing `{rel}`: {e}")),
-                };
+                let (line_no, _) = line_col_at(&norm_existing, pos, 1);
+                return write_edited_content(workdir, &target, rel, line_no, old_text, new_text, updated);
             }
         }
-        let first_old_line = old_text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+        // Fallback 2: unique contiguous trimmed-line match across indentation or blank-line differences.
+        if let Some((pos, updated)) = match_unique_trimmed_span(&norm_existing, &norm_old, new_text) {
+            let (line_no, _) = line_col_at(&norm_existing, pos, 1);
+            return write_edited_content(workdir, &target, rel, line_no, old_text, new_text, updated);
+        }
+        // Fallback 3: idempotent no-op when a prior edit in the same turn already applied new_text.
+        let norm_new_trim = new_text.replace("\r\n", "\n");
+        let norm_new_trim = norm_new_trim.trim();
+        if !norm_new_trim.is_empty() && norm_existing.contains(norm_new_trim) {
+            let msg = format!("ok: `{rel}` already contains the requested text");
+            return attach_validation_status(workdir, &target, rel, msg);
+        }
+        let first_old_line = old_text
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim();
         let mut hint = String::new();
         if !first_old_line.is_empty() {
             for (idx, line) in existing.lines().enumerate() {
                 if line.contains(first_old_line) {
-                    hint = format!(" (nearest match for `{first_old_line}` is at line {}; call `read_file` to inspect exact text)", idx + 1);
+                    hint = format!(" (nearest match for `{first_old_line}` is at line {})", idx + 1);
                     break;
                 }
             }
         }
+        if existing.len() <= 6144 {
+            let mut numbered = String::new();
+            for (idx, line) in existing.lines().enumerate() {
+                numbered.push_str(&format!("{:>4} | {}\n", idx + 1, line));
+            }
+            return err_outcome(&format!(
+                "error: `old_text` not found in `{rel}`{hint}. Use `write_file` to replace `{rel}` completely, or pass exact lines from `{rel}` below to `edit_file`:\n{numbered}"
+            ));
+        }
         return err_outcome(&format!(
-            "error: `old_text` not found in `{rel}`{hint}"
+            "error: `old_text` not found in `{rel}`{hint}; call `read_file` to inspect exact text or `write_file` to replace the file"
         ));
     }
 
@@ -1162,17 +1608,7 @@ fn exec_edit_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
     let pos = match_positions[0];
     let (line_no, _) = line_col_at(&existing, pos, 1);
     let updated = format!("{}{}{}", &existing[..pos], new_text, &existing[pos + old_text.len()..]);
-    match fs::write(&target, updated.as_bytes()) {
-        Ok(()) => {
-            let msg = format!(
-                "ok: edited `{rel}` at line {line_no} ({} bytes, {} lines)",
-                updated.len(),
-                updated.lines().count()
-            );
-            attach_validation_status(workdir, &target, rel, msg)
-        }
-        Err(e) => err_outcome(&format!("error writing `{rel}`: {e}")),
-    }
+    write_edited_content(workdir, &target, rel, line_no, old_text, new_text, updated)
 }
 
 fn exec_read_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
@@ -1682,6 +2118,378 @@ impl ProseStreamFilter {
         }
         true
     }
+
+    fn active_tool_progress(&self) -> Option<(String, String, usize)> {
+        if self.mode == FilterMode::Normal || self.emitted >= self.buf.len() {
+            return None;
+        }
+        let tail = &self.buf[self.emitted..];
+        let name = extract_partial_json_str(tail, "\"name\"").unwrap_or_else(|| "tool".to_string());
+        let target = extract_partial_json_str(tail, "\"path\"")
+            .or_else(|| extract_partial_json_str(tail, "\"cmd\""))
+            .or_else(|| extract_partial_json_str(tail, "\"pattern\""))
+            .unwrap_or_default();
+        Some((name, target, tail.len()))
+    }
+}
+
+fn extract_partial_json_str(haystack: &str, key: &str) -> Option<String> {
+    let idx = haystack.find(key)?;
+    let after_key = haystack[idx + key.len()..].trim_start();
+    let after_colon = after_key.strip_prefix(':')?.trim_start();
+    let inner = after_colon.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            return Some(out);
+        }
+        if ch == '\\' {
+            if let Some(esc) = chars.next() {
+                out.push(esc);
+            } else {
+                break;
+            }
+        } else {
+            out.push(ch);
+        }
+        if out.len() >= 48 {
+            return Some(out);
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+pub const UNIFIED_SYSTEM_PROMPT: &str = concat!(
+    "You are Kronos, a local multimodal software engineering and reasoning engine on Apple Silicon. ",
+    "For general questions, explanations, or image analysis that do not modify workspace files, reply directly and concisely in prose without calling tools. ",
+    "When asked to build, edit, style, fix, inspect, or run files in the workspace, use the workspace tools (write_file, edit_file, read_file, list_dir, search_files, run_command) directly on disk. ",
+    "Do not paste file drafts or completion claims in prose before calling tools; emit <tool_call> invocations immediately, then summarize briefly after tool calls succeed. ",
+    "Use edit_file for small targeted edits to existing files, and use write_file for new files or when rewriting most of an existing file such as restyling a stylesheet. ",
+    "When updating a web page title or heading, update both <title> in <head> and the visible <h1> heading in <body> so the rendered preview shows the change immediately. ",
+    "The live preview reloads automatically after every file edit, so never ask the user to refresh the preview; if the user reports a change is not visible, inspect and update the visible HTML or CSS elements directly. ",
+    "If a tool response reports an error or validation failure, fix it with a tool call immediately before finishing."
+);
+
+pub fn build_unified_system_prompt(workdir: &Path) -> String {
+    let dir_line = format!("Workspace directory on disk: {}", workdir.display());
+    let snap = format_workspace_snapshot(workdir, 12 * 1024);
+    if snap.is_empty() {
+        format!("{UNIFIED_SYSTEM_PROMPT}\n\n{dir_line}")
+    } else {
+        format!("{UNIFIED_SYSTEM_PROMPT}\n\n{dir_line}\n\n{snap}")
+    }
+}
+
+fn build_initial_system_prompt(workdir: &Path) -> String {
+    format_system_with_workspace(AGENT_SYSTEM_PROMPT, workdir)
+}
+
+fn format_workspace_snapshot(workdir: &Path, max_inline_bytes: u64) -> String {
+    let entries = list_workspace_files(workdir);
+    if entries.is_empty() {
+        return String::new();
+    }
+    let total_bytes: u64 = entries.iter().map(|e| e.bytes).sum();
+    if entries.len() <= 12 && total_bytes <= max_inline_bytes {
+        let mut snapshots = String::new();
+        let mut all_text = true;
+        for entry in &entries {
+            if let Ok(full) = resolve_jailed_path(workdir, &entry.path) {
+                match fs::read_to_string(&full) {
+                    Ok(content) => {
+                        snapshots.push_str(&format!(
+                            "\n--- {} ({} bytes) ---\n{}\n",
+                            entry.path, entry.bytes, content
+                        ));
+                    }
+                    Err(_) => {
+                        all_text = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if all_text && !snapshots.is_empty() {
+            return format!("Existing workspace files on disk:{snapshots}");
+        }
+    }
+    let mut listing = String::from("Existing workspace files on disk (call read_file before targeted edits):\n");
+    for entry in entries.iter().take(40) {
+        let mark = if entry.validation_ok { "valid" } else { &entry.validation_msg };
+        listing.push_str(&format!("- {} ({} bytes, {mark})\n", entry.path, entry.bytes));
+    }
+    listing
+}
+
+fn format_system_with_workspace(base_prompt: &str, workdir: &Path) -> String {
+    let snap = format_workspace_snapshot(workdir, 12 * 1024);
+    if snap.is_empty() {
+        base_prompt.to_string()
+    } else {
+        format!("{base_prompt}\n\n{snap}")
+    }
+}
+
+const COMPACTED_MEMORY_HEADER: &str = "[Compacted Session Memory]";
+
+fn summarize_single_line(text: &str, max_chars: usize) -> String {
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        collapsed
+    } else {
+        let prefix: String = collapsed.chars().take(max_chars).collect();
+        format!("{prefix}...")
+    }
+}
+
+fn extract_user_turn_digest(content: &str) -> String {
+    let mut img_notes = Vec::new();
+    let mut plain_lines = Vec::new();
+    let mut in_ocr_block = false;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.starts_with("[Attached Image #") {
+            img_notes.push(t.to_string());
+            in_ocr_block = false;
+        } else if t.starts_with("- Dominant CSS palette:") || t.starts_with("- Visual categories:") {
+            in_ocr_block = false;
+        } else if t.starts_with("- Detected text") {
+            in_ocr_block = true;
+        } else if in_ocr_block && (line.starts_with("  [") || line.starts_with("  ...")) {
+            continue;
+        } else {
+            in_ocr_block = false;
+            if !t.is_empty() {
+                plain_lines.push(t);
+            }
+        }
+    }
+    let user_req = summarize_single_line(&plain_lines.join(" "), 180);
+    if img_notes.is_empty() {
+        user_req
+    } else if user_req.is_empty() {
+        img_notes.join(" ")
+    } else {
+        format!("{} | {}", img_notes.join(" "), user_req)
+    }
+}
+
+/// Compacts older agentic turns and oversized intermediate tool payloads while preserving `history[0]`
+/// (`system` KV prefix), recent verbatim turns, multimodal image references, and live disk file state.
+pub fn compact_messages_with_budget(
+    history: &mut Vec<Message>,
+    workdir: &Path,
+    force: bool,
+    threshold_tokens: usize,
+    count_fn: impl Fn(&[Message]) -> usize,
+) -> CompactionReport {
+    let before_tokens = count_fn(history);
+    if !force && before_tokens <= threshold_tokens {
+        return CompactionReport {
+            compacted: false,
+            before_tokens,
+            after_tokens: before_tokens,
+            compacted_messages: 0,
+        };
+    }
+
+    let sys_offset = usize::from(history.first().is_some_and(|m| m.role == "system"));
+    if history.len() <= sys_offset + 1 {
+        return CompactionReport {
+            compacted: false,
+            before_tokens,
+            after_tokens: before_tokens,
+            compacted_messages: 0,
+        };
+    }
+
+    // Group non-system messages into user-anchored atomic turns so tool_calls/tool_results never split.
+    let mut group_starts: Vec<usize> = Vec::new();
+    for (i, m) in history.iter().enumerate().skip(sys_offset) {
+        if m.role == "user" || group_starts.is_empty() {
+            group_starts.push(i);
+        }
+    }
+
+    let total_groups = group_starts.len();
+    let ends_with_open_user = history.last().is_some_and(|m| m.role == "user");
+    let mut compacted_messages = 0usize;
+
+    let min_groups_for_inter = if force { 2 } else { 3 };
+    if total_groups >= min_groups_for_inter {
+        let keep_groups = if force {
+            1usize
+        } else if ends_with_open_user && total_groups >= 3 {
+            2usize
+        } else {
+            1usize
+        };
+        let split_group = total_groups.saturating_sub(keep_groups);
+        if split_group > 0 {
+            let split_msg_idx = group_starts[split_group];
+            let mut log_bullets: Vec<String> = Vec::new();
+
+            for g in 0..split_group {
+                let start = group_starts[g];
+                let end = group_starts.get(g + 1).copied().unwrap_or(history.len());
+                let slice = &history[start..end];
+                if slice.first().is_some_and(|m| m.content.starts_with(COMPACTED_MEMORY_HEADER)) {
+                    for line in slice[0].content.lines() {
+                        if line.starts_with("- Turn ") || line.starts_with("- Earlier: ") {
+                            log_bullets.push(line.to_string());
+                        }
+                    }
+                    continue;
+                }
+
+                let req_digest = slice
+                    .first()
+                    .map(|m| extract_user_turn_digest(&m.content))
+                    .unwrap_or_default();
+                let mut actions: Vec<String> = Vec::new();
+                let mut final_reply = String::new();
+                for m in slice.iter().skip(1) {
+                    if m.role == "assistant" {
+                        if !m.tool_calls.is_empty() {
+                            for tc in &m.tool_calls {
+                                let target = Json::parse(&tc.arguments)
+                                    .ok()
+                                    .and_then(|j| {
+                                        j.get("path")
+                                            .or_else(|| j.get("cmd"))
+                                            .or_else(|| j.get("pattern"))
+                                            .and_then(Json::as_str)
+                                            .map(|s| summarize_single_line(s, 36))
+                                    })
+                                    .unwrap_or_default();
+                                if target.is_empty() {
+                                    actions.push(tc.name.clone());
+                                } else {
+                                    actions.push(format!("{}({target})", tc.name));
+                                }
+                            }
+                        } else if !m.content.trim().is_empty() {
+                            final_reply = summarize_single_line(&m.content, 160);
+                        }
+                    }
+                }
+                let mut entry = format!("- Earlier: user=\"{req_digest}\"");
+                if !actions.is_empty() {
+                    let capped: Vec<String> = actions.into_iter().take(8).collect();
+                    entry.push_str(&format!(" -> tools=[{}]", capped.join(", ")));
+                }
+                if !final_reply.is_empty() {
+                    entry.push_str(&format!(" -> outcome=\"{final_reply}\""));
+                }
+                log_bullets.push(entry);
+            }
+
+            if log_bullets.len() > 16 {
+                let drop_n = log_bullets.len() - 16;
+                log_bullets.drain(0..drop_n);
+            }
+
+            let mut base_mem = String::from(COMPACTED_MEMORY_HEADER);
+            base_mem.push_str("\nPrior session log:\n");
+            for b in &log_bullets {
+                base_mem.push_str(b);
+                base_mem.push('\n');
+            }
+            let full_snap = format_workspace_snapshot(workdir, 14 * 1024);
+            let brief_snap = format_workspace_snapshot(workdir, 0);
+
+            let build_candidate = |snap_str: &str| -> Vec<Message> {
+                let mut mem = base_mem.clone();
+                if !snap_str.is_empty() {
+                    mem.push('\n');
+                    mem.push_str(snap_str);
+                }
+                let mut rebuilt = Vec::with_capacity(sys_offset + 2 + (history.len() - split_msg_idx));
+                rebuilt.extend_from_slice(&history[..sys_offset]);
+                rebuilt.push(Message::new("user", &mem));
+                rebuilt.push(Message::new(
+                    "assistant",
+                    "Session memory and current workspace files on disk are synchronized.",
+                ));
+                rebuilt.extend_from_slice(&history[split_msg_idx..]);
+                rebuilt
+            };
+
+            let cand_full = build_candidate(&full_snap);
+            let tok_full = count_fn(&cand_full);
+            if tok_full < before_tokens {
+                compacted_messages += split_msg_idx.saturating_sub(sys_offset);
+                *history = cand_full;
+            } else {
+                let cand_brief = build_candidate(&brief_snap);
+                let tok_brief = count_fn(&cand_brief);
+                if tok_brief < before_tokens {
+                    compacted_messages += split_msg_idx.saturating_sub(sys_offset);
+                    *history = cand_brief;
+                }
+            }
+        }
+    }
+
+    // Intra-turn pass: if history still exceeds budget (e.g., one long multi-step turn), slim older tool steps.
+    let mid_tokens = count_fn(history);
+    if (force && compacted_messages == 0) || mid_tokens > threshold_tokens {
+        let protect_tail = 4usize;
+        let stop_at = history.len().saturating_sub(protect_tail);
+        for m in history.iter_mut().take(stop_at).skip(sys_offset) {
+            if m.role == "assistant" && !m.tool_calls.is_empty() {
+                for tc in &mut m.tool_calls {
+                    if matches!(tc.name.as_str(), "write_file" | "edit_file") && tc.arguments.len() > 260 {
+                        let path = Json::parse(&tc.arguments)
+                            .ok()
+                            .and_then(|j| j.get("path").and_then(Json::as_str).map(str::to_string))
+                            .unwrap_or_else(|| "file".to_string());
+                        let orig_len = tc.arguments.len();
+                        tc.arguments = format!(
+                            r#"{{"path":{},"compacted_bytes":{orig_len}}}"#,
+                            quote(&path)
+                        );
+                        compacted_messages += 1;
+                    }
+                }
+            } else if m.role == "tool" && m.content.len() > 260 {
+                let first = m.content.lines().next().unwrap_or("ok");
+                m.content = format!(
+                    "{}\n[compacted earlier step output; current workspace state is on disk]",
+                    summarize_single_line(first, 140)
+                );
+                compacted_messages += 1;
+            }
+        }
+    }
+
+    let after_tokens = count_fn(history);
+    CompactionReport {
+        compacted: compacted_messages > 0 && after_tokens < before_tokens,
+        before_tokens,
+        after_tokens,
+        compacted_messages,
+    }
+}
+
+pub fn compact_conversation_history(
+    model: &ChatModel,
+    history: &mut Vec<Message>,
+    tools_json: &[String],
+    workdir: &Path,
+    force: bool,
+) -> CompactionReport {
+    let ctx = model.context_size();
+    // Auto-compact once prompt reaches ~68% of context window so multi-step decode always has ample KV room.
+    let threshold = (ctx * 68) / 100;
+    compact_messages_with_budget(history, workdir, force, threshold, |msgs| {
+        model.count_prompt_tokens(msgs, tools_json)
+    })
 }
 
 /// Runs an iterative tool-calling and validation repair loop while preserving the KV-cache prefix.
@@ -1693,13 +2501,27 @@ pub fn run_agent_turn(
     mut on_event: impl FnMut(AgentEvent<'_>) -> bool,
 ) -> Result<String, String> {
     if history.first().is_none_or(|m| m.role != "system") {
-        history.insert(0, Message::new("system", AGENT_SYSTEM_PROMPT));
+        let sys_prompt = build_initial_system_prompt(&cfg.workdir);
+        history.insert(0, Message::new("system", &sys_prompt));
     }
     let t_start = Instant::now();
     let mut touched_files = false;
+    let mut used_any_tools = false;
     let mut repair_attempts = 0usize;
+    let mut unresolved_edits: Vec<(String, String)> = Vec::new();
 
     for step in 1..=cfg.max_steps {
+        let comp_rep = compact_conversation_history(model, history, tools_json, &cfg.workdir, false);
+        if comp_rep.compacted
+            && !on_event(AgentEvent::ContextCompacted {
+                before_tokens: comp_rep.before_tokens,
+                after_tokens: comp_rep.after_tokens,
+                compacted_messages: comp_rep.compacted_messages,
+            })
+        {
+            return Err("cancelled".to_string());
+        }
+
         if !on_event(AgentEvent::StepStart {
             step,
             max_steps: cfg.max_steps,
@@ -1709,8 +2531,27 @@ pub fn run_agent_turn(
 
         let mut filter = ProseStreamFilter::new();
         let mut alive = true;
+        let mut last_prog_bytes = 0usize;
+        let mut last_prog_target = String::new();
         let mut comp = model.generate_with_tools(history, tools_json, &cfg.params, |piece| {
             alive = filter.push(piece, |prose| on_event(AgentEvent::TextDelta(prose)));
+            if alive {
+                if let Some((t_name, t_target, bytes)) = filter.active_tool_progress() {
+                    let target_ready = !t_target.is_empty() && t_target != last_prog_target;
+                    if target_ready || bytes >= last_prog_bytes + 96 {
+                        last_prog_bytes = bytes;
+                        if !t_target.is_empty() {
+                            last_prog_target.clone_from(&t_target);
+                        }
+                        alive = on_event(AgentEvent::ToolProgress {
+                            step,
+                            name: &t_name,
+                            target: &t_target,
+                            bytes,
+                        });
+                    }
+                }
+            }
             alive
         })?;
         if alive {
@@ -1725,6 +2566,34 @@ pub fn run_agent_turn(
 
         if comp.tool_calls.is_empty() {
             history.push(Message::new("assistant", &comp.text));
+            if !unresolved_edits.is_empty() && repair_attempts < 2 && step < cfg.max_steps {
+                repair_attempts += 1;
+                let report = unresolved_edits
+                    .iter()
+                    .map(|(p, err)| {
+                        if p.is_empty() {
+                            err.clone()
+                        } else {
+                            format!("{p}: {err}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                unresolved_edits.clear();
+                if !on_event(AgentEvent::ValidationRepair {
+                    step,
+                    report: &report,
+                }) {
+                    return Err("cancelled".to_string());
+                }
+                history.push(Message::new(
+                    "user",
+                    &format!(
+                        "A file edit failed and has not been written to disk yet:\n{report}\nEmit a <tool_call> with `write_file` or `edit_file` now to apply the change before finishing."
+                    ),
+                ));
+                continue;
+            }
             if touched_files && repair_attempts < 2 && step < cfg.max_steps {
                 if let Err(report) = validate_workspace(&cfg.workdir) {
                     repair_attempts += 1;
@@ -1743,6 +2612,14 @@ pub fn run_agent_turn(
                     continue;
                 }
             }
+            if cfg.expect_tool_call && !used_any_tools && repair_attempts < 2 && step < cfg.max_steps {
+                repair_attempts += 1;
+                history.push(Message::new(
+                    "user",
+                    "No workspace tool call was emitted yet, so no files on disk were modified or inspected. Emit a <tool_call> now (such as `write_file`, `edit_file`, `read_file`, `list_dir`, or `run_command`) to perform the requested workspace action directly on disk before replying.",
+                ));
+                continue;
+            }
             let secs = t_start.elapsed().as_secs_f64();
             let _ = on_event(AgentEvent::Done {
                 steps: step,
@@ -1752,19 +2629,43 @@ pub fn run_agent_turn(
             return Ok(comp.text);
         }
 
+        used_any_tools = true;
+
         for (idx, tc) in comp.tool_calls.iter_mut().enumerate() {
             tc.id = format!("call_s{step}_{idx}");
         }
         history.push(Message::assistant_tool_calls(&comp.text, comp.tool_calls.clone()));
 
         for (idx, tc) in comp.tool_calls.iter().enumerate() {
-            if matches!(tc.name.as_str(), "write_file" | "edit_file") {
+            let is_file_mutation = matches!(tc.name.as_str(), "write_file" | "edit_file");
+            if is_file_mutation {
                 touched_files = true;
             }
             if !on_event(AgentEvent::ToolStart { step, call: tc }) {
                 return Err("cancelled".to_string());
             }
             let outcome = execute_tool(&cfg.workdir, tc, cfg.cmd_timeout_secs, step * 100 + idx);
+            if is_file_mutation {
+                let target_path = Json::parse(&tc.arguments)
+                    .ok()
+                    .and_then(|j| j.get("path").and_then(Json::as_str).map(str::to_string))
+                    .unwrap_or_default();
+                if outcome.ok {
+                    unresolved_edits.retain(|(p, _)| p != &target_path);
+                } else {
+                    let summary = outcome
+                        .output
+                        .lines()
+                        .next()
+                        .unwrap_or("edit failed")
+                        .to_string();
+                    if let Some(existing) = unresolved_edits.iter_mut().find(|(p, _)| p == &target_path) {
+                        existing.1 = summary;
+                    } else {
+                        unresolved_edits.push((target_path, summary));
+                    }
+                }
+            }
             if !on_event(AgentEvent::ToolDone {
                 step,
                 call: tc,
@@ -1976,6 +2877,228 @@ mod tests {
             true
         });
         assert_eq!(c3, "");
+
+        // 7. edit_file trimmed-line fallback handles indentation + blank-line differences.
+        let css_init = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "c7a".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"theme.css","content":"body {\n    margin: 20px;\n}\n\nh1 {\n    text-align: center;\n}\n"}"#.into(),
+            },
+            5,
+            7,
+        );
+        assert!(css_init.ok && css_init.validation_ok);
+
+        let css_trim_edit = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "c7b".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"path":"theme.css","old_text":"body {\n  margin: 20px;\n}\nh1 {\n  text-align: center;\n}","new_text":"body {\n  margin: 0;\n  background: #fafaf9;\n}\n\nh1 {\n  color: #0d9488;\n}"}"#.into(),
+            },
+            5,
+            8,
+        );
+        assert!(css_trim_edit.ok && css_trim_edit.validation_ok);
+        let updated_css = fs::read_to_string(dir.join("theme.css")).unwrap();
+        assert!(updated_css.contains("color: #0d9488;"));
+
+        // 8. edit_file mismatch on small file echoes numbered contents for immediate retry.
+        let css_miss = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "c8".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"path":"theme.css","old_text":".nonexistent { color: red; }","new_text":".nonexistent { color: blue; }"}"#.into(),
+            },
+            5,
+            9,
+        );
+        assert!(!css_miss.ok);
+        assert!(css_miss.output.contains("1 | body {"));
+
+        // 9. build_initial_system_prompt snapshots small populated workspace and stays bare when empty.
+        let populated_sys = build_initial_system_prompt(&dir);
+        assert!(populated_sys.contains("--- theme.css"));
+        let empty_dir = std::env::temp_dir().join(format!("kronos_empty_ws_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&empty_dir);
+        fs::create_dir_all(&empty_dir).unwrap();
+        assert_eq!(build_initial_system_prompt(&empty_dir), AGENT_SYSTEM_PROMPT);
+        let _ = fs::remove_dir_all(&empty_dir);
+
+        // 10. classify_turn_intent automatically distinguishes chat Q&A from workspace engineering.
+        assert_eq!(classify_turn_intent("hello", false, false, false), TurnRoute::Chat);
+        assert_eq!(
+            classify_turn_intent("explain how speculative decoding works", false, true, true),
+            TurnRoute::Chat
+        );
+        assert_eq!(
+            classify_turn_intent("what text is in this screenshot?", true, false, false),
+            TurnRoute::Chat
+        );
+        assert_eq!(
+            classify_turn_intent("build a clean task tracker web app", false, false, false),
+            TurnRoute::Agent
+        );
+        assert_eq!(
+            classify_turn_intent("Edit the title to Kronos is Working", false, true, true),
+            TurnRoute::Agent
+        );
+        assert_eq!(
+            classify_turn_intent(
+                "style It and make it more beautify, style the input, buttons and header",
+                false,
+                true,
+                true
+            ),
+            TurnRoute::Agent
+        );
+        assert_eq!(
+            classify_turn_intent("match this dark UI layout", true, false, false),
+            TurnRoute::Agent
+        );
+        assert_eq!(
+            classify_turn_intent(
+                "What exact text and hex colors appear in this pasted image?",
+                true,
+                true,
+                true
+            ),
+            TurnRoute::Chat
+        );
+        assert_eq!(
+            classify_turn_intent("where's the folder for this website", false, true, true),
+            TurnRoute::Chat
+        );
+        assert_eq!(
+            classify_turn_intent("The title is still the same", true, true, true),
+            TurnRoute::Agent
+        );
+
+        let unified_sys = build_unified_system_prompt(&dir);
+        assert!(unified_sys.contains(&format!("Workspace directory on disk: {}", dir.display())));
+
+        // 10b. edit_file with empty old_text overwrites file, and HTML <title> edits sync visible <h1>.
+        let overwrite_css = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "c10b1".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"path":"style.css","old_text":"","new_text":"body { background: #0f172a; color: #f8fafc; }\nbutton { border-radius: 8px; }\n"}"#.into(),
+            },
+            5,
+            10,
+        );
+        assert!(overwrite_css.ok && overwrite_css.validation_ok);
+        assert!(fs::read_to_string(dir.join("style.css")).unwrap().contains("border-radius: 8px;"));
+
+        let seed_html = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "c10b2".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"page.html","content":"<!doctype html><html><head><title>Initial Title</title></head><body><h1 class=\"header\">Initial Title</h1></body></html>"}"#.into(),
+            },
+            5,
+            11,
+        );
+        assert!(seed_html.ok && seed_html.validation_ok);
+        let edit_title = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "c10b3".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"path":"page.html","old_text":"<title>Initial Title</title>","new_text":"<title>Kronos Workspace</title>"}"#.into(),
+            },
+            5,
+            12,
+        );
+        assert!(edit_title.ok && edit_title.validation_ok);
+        let page_after_edit = fs::read_to_string(dir.join("page.html")).unwrap();
+        assert!(page_after_edit.contains("<title>Kronos Workspace</title>"));
+        assert!(page_after_edit.contains("<h1 class=\"header\">Kronos Workspace</h1>"));
+
+        let idemp_h1 = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "c10b3_dup".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"path":"page.html","old_text":"<h1 class=\"header\">Initial Title</h1>","new_text":"<h1 class=\"header\">Kronos Workspace</h1>"}"#.into(),
+            },
+            5,
+            12,
+        );
+        assert!(idemp_h1.ok && idemp_h1.validation_ok);
+
+        let write_title = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "c10b4".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"page.html","content":"<!doctype html><html><head><title>Kronos Next</title></head><body><h1 class=\"header\">Kronos Workspace</h1></body></html>"}"#.into(),
+            },
+            5,
+            13,
+        );
+        assert!(write_title.ok && write_title.validation_ok);
+        let page_after_write = fs::read_to_string(dir.join("page.html")).unwrap();
+        assert!(page_after_write.contains("<h1 class=\"header\">Kronos Next</h1>"));
+
+        // 11. compact_messages_with_budget prunes older multi-turn and intra-turn tool bloat
+        //     while keeping system prefix, image asset references, and live disk file snapshot.
+        let approx_tokens = |msgs: &[Message]| -> usize {
+            msgs.iter()
+                .map(|m| {
+                    m.content.len() / 4
+                        + m.tool_calls
+                            .iter()
+                            .map(|tc| tc.name.len() + tc.arguments.len() / 4)
+                            .sum::<usize>()
+                        + 6
+                })
+                .sum()
+        };
+        let big_css = "body { color: #111; }\n".repeat(120);
+        let mut hist = vec![
+            Message::new("system", UNIFIED_SYSTEM_PROMPT),
+            Message::new(
+                "user",
+                "[Attached Image #1: 800x600 PNG, theme=dark, background=#0f172a, accent=#14b8a6, workspace_asset_path=\".kronos_media/image_1.png\"]\n- Detected text in 2D reading order:\n  [top-center] Dashboard\nBuild initial theme",
+            ),
+            Message::assistant_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "t1".into(),
+                    name: "write_file".into(),
+                    arguments: format!(r#"{{"path":"theme.css","content":{}}}"#, quote(&big_css)),
+                }],
+            ),
+            Message::tool_result("t1", "ok: wrote theme.css [validation: ok]"),
+            Message::new("assistant", "Created initial stylesheet."),
+            Message::new("user", "Update header accent color"),
+            Message::assistant_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "t2".into(),
+                    name: "write_file".into(),
+                    arguments: format!(r#"{{"path":"theme.css","content":{}}}"#, quote(&big_css)),
+                }],
+            ),
+            Message::tool_result("t2", "ok: wrote theme.css [validation: ok]"),
+            Message::new("assistant", "Updated header accent."),
+            Message::new("user", "Now polish button padding"),
+        ];
+        let sys_before = hist[0].content.clone();
+        let rep = compact_messages_with_budget(&mut hist, &dir, false, 400, approx_tokens);
+        assert!(rep.compacted);
+        assert!(rep.after_tokens < rep.before_tokens);
+        assert_eq!(hist[0].content, sys_before);
+        assert!(hist[1].content.starts_with(COMPACTED_MEMORY_HEADER));
+        assert!(hist[1].content.contains(".kronos_media/image_1.png"));
+        assert!(hist[1].content.contains("--- theme.css"));
+        assert_eq!(hist.last().unwrap().content, "Now polish button padding");
 
         let _ = fs::remove_dir_all(&dir);
     }
