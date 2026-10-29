@@ -333,11 +333,18 @@ impl DeviceIndex {
         kind_filter: Option<EntryKind>,
         limit: usize,
     ) -> Vec<DeviceHit> {
-        let lower = raw_query.to_ascii_lowercase();
-        let query_tokens = extract_meaningful_query_tokens(&lower);
+        let lower_full = raw_query.to_ascii_lowercase();
+        let wants_folder_target = is_workspace_folder_target_query(&lower_full);
+        let effective_query = if wants_folder_target {
+            extract_folder_target_clause(raw_query)
+        } else {
+            raw_query
+        };
+        let lower = effective_query.to_ascii_lowercase();
+        let query_tokens = extract_meaningful_query_tokens(effective_query);
         let synonyms = expand_query_synonyms(&query_tokens);
-        let wants_media = is_media_history_query(&lower);
-        let wants_app = is_app_action_query(&lower);
+        let wants_media = !wants_folder_target && is_media_history_query(&lower_full);
+        let wants_app = !wants_folder_target && is_app_action_query(&lower_full);
 
         let mut scores: HashMap<u32, f32> = HashMap::new();
 
@@ -445,7 +452,11 @@ impl DeviceIndex {
                     sc += 32.0;
                 }
             }
-            if !wants_app && !wants_media && m.kind == EntryKind::Document {
+            if wants_folder_target {
+                if matches!(m.kind, EntryKind::Directory | EntryKind::Project) {
+                    sc += 46.0;
+                }
+            } else if !wants_app && !wants_media && m.kind == EntryKind::Document {
                 sc += 14.0;
             }
             if (m.flags & FLAG_EXISTS_ON_DISK) != 0 {
@@ -462,6 +473,61 @@ impl DeviceIndex {
         });
         hits.truncate(limit);
         hits
+    }
+
+    pub fn camel_case_identifiers(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for m in &self.entries {
+            if !matches!(m.kind, EntryKind::Directory | EntryKind::Project | EntryKind::App) {
+                continue;
+            }
+            let name = self.str_slice(m.name_off, m.name_len).trim();
+            if split_camel_case_parts(name).len() >= 2 && !out.iter().any(|x| x == name) {
+                out.push(name.to_string());
+            }
+        }
+        out
+    }
+
+    pub fn speech_contextual_hints(&self, facts: &[LearnedFact], limit: usize) -> Vec<String> {
+        let mut out = vec![
+            "Kronos".to_string(),
+            "ND certificate".to_string(),
+            "EMR".to_string(),
+            "WhatsApp".to_string(),
+        ];
+        for cc in self.camel_case_identifiers() {
+            if out.len() >= limit {
+                return out;
+            }
+            if !out.iter().any(|x| x.eq_ignore_ascii_case(&cc)) {
+                out.push(cc);
+            }
+        }
+        for f in facts {
+            if out.len() >= limit {
+                return out;
+            }
+            let k = f.key.strip_prefix("app:").unwrap_or(&f.key).trim();
+            if k.len() >= 2 && k.len() <= 36 && !out.iter().any(|x| x.eq_ignore_ascii_case(k)) {
+                out.push(k.to_string());
+            }
+        }
+        for m in &self.entries {
+            if out.len() >= limit {
+                break;
+            }
+            if matches!(m.kind, EntryKind::Directory | EntryKind::Project | EntryKind::App) {
+                let name = self.str_slice(m.name_off, m.name_len).trim();
+                if name.len() >= 3
+                    && name.len() <= 32
+                    && !out.iter().any(|x| x.eq_ignore_ascii_case(name))
+                {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        out
     }
 
     pub fn recent_watched_media(&self, limit: usize) -> Vec<DeviceHit> {
@@ -781,6 +847,22 @@ impl DeviceContextManager {
         render_device_profile_markdown(&idx, &facts)
     }
 
+    pub fn camel_case_identifiers(&self) -> Vec<String> {
+        if self.current_config().enabled && self.current_index().is_empty() {
+            self.rebuild_index_sync();
+        }
+        self.current_index().camel_case_identifiers()
+    }
+
+    pub fn speech_contextual_hints(&self, limit: usize) -> Vec<String> {
+        if self.current_config().enabled && self.current_index().is_empty() {
+            self.rebuild_index_sync();
+        }
+        let idx = self.current_index();
+        let facts = self.current_facts();
+        idx.speech_contextual_hints(&facts, limit)
+    }
+
     /// Evaluates a user turn in sub-millisecond time and returns a compact context block only when relevant.
     pub fn query_for_turn(&self, user_prompt: &str) -> Option<DeviceTurnContext> {
         let trimmed = user_prompt.trim();
@@ -789,15 +871,17 @@ impl DeviceContextManager {
         }
         let lower = trimmed.to_ascii_lowercase();
         let cfg = self.current_config();
-        let wants_computer_action = cfg.allow_computer_control && is_computer_control_prompt(&lower);
-        let wants_media = is_media_history_query(&lower);
-        let wants_device_lookup = is_device_lookup_query(&lower);
+        let wants_folder_target = is_workspace_folder_target_query(&lower);
+        let wants_computer_action =
+            cfg.allow_computer_control && !wants_folder_target && is_computer_control_prompt(&lower);
+        let wants_media = !wants_folder_target && is_media_history_query(&lower);
+        let wants_device_lookup = wants_folder_target || is_device_lookup_query(&lower);
 
         if !wants_computer_action && !wants_media && !wants_device_lookup {
             return None;
         }
 
-        if !cfg.enabled && !wants_computer_action {
+        if !cfg.enabled && !wants_computer_action && !wants_folder_target {
             return Some(DeviceTurnContext {
                 prompt_block: "[Device Context: currently turned OFF in Kronos Settings. Tell the user they can enable 'Develop Device Context' in Settings or the Quick Prompt footer so Kronos indexes local documents, certificates, apps, and watched media history.]".to_string(),
                 hits: Vec::new(),
@@ -806,7 +890,7 @@ impl DeviceContextManager {
             });
         }
 
-        // Ensure index is populated if enabled or if resolving an app/file to open.
+        // Ensure index is populated if enabled or if resolving an app, file, or target folder.
         if self.current_index().is_empty() {
             self.rebuild_index_sync();
         }
@@ -850,12 +934,7 @@ impl DeviceContextManager {
             }
         }
 
-        let kind_filter = if wants_computer_action && !wants_device_lookup && !wants_media {
-            // Check both apps and files so "open whatsapp" and "open my ND certificate" both hit.
-            None
-        } else {
-            None
-        };
+        let kind_filter = None;
         let search_hits = idx.search(trimmed, &facts, kind_filter, 8);
         if !search_hits.is_empty() {
             lines.push("Matched local Mac items from Kronos Device Index:".to_string());
@@ -898,6 +977,8 @@ impl DeviceContextManager {
 
         let action_hint = if wants_computer_action {
             "\nCall `use_computer` immediately with the exact path or application name above to carry out the action on macOS."
+        } else if wants_folder_target {
+            "\nTo create and work inside a new project folder under one of the matched directories above, call `switch_workspace` in step 1 with the full new child directory path (for example `<matched_folder_path>/<new-folder-name>`), and in the next step call `write_file` to build complete, styled, responsive project files (modern CSS layout, navigation, domain-specific sections, and interactive UI) inside that new workspace."
         } else {
             "\nAnswer directly and concisely using the exact local paths and details above."
         };
@@ -1091,10 +1172,11 @@ pub fn use_computer_tool_definition_json() -> String {
 
 pub fn is_computer_control_prompt(lower: &str) -> bool {
     let trimmed = lower.trim();
-    // Avoid hijacking coding workspace prompts like "create index.html" or "edit style.css".
+    // Avoid hijacking coding workspace or folder-creation prompts.
     let workspace_code_markers = [
         "write_file",
         "edit_file",
+        "switch_workspace",
         ".rs",
         ".js",
         ".ts",
@@ -1103,9 +1185,53 @@ pub fn is_computer_control_prompt(lower: &str) -> bool {
         "style.css",
         "in workspace",
         "in the workspace",
+        "new folder",
+        "new directory",
+        "create a folder",
+        "make a folder",
+        "make a website",
+        "build a website",
+        "create a website",
+        "make a web",
+        "build a web",
+        "then make ",
+        "then build ",
+        "and make a ",
+        "and build a ",
     ];
     if workspace_code_markers.iter().any(|m| trimmed.contains(m)) {
         return false;
+    }
+
+    let mut rest = trimmed;
+    loop {
+        let mut stripped = false;
+        for wake in [
+            "hey kronos",
+            "hi kronos",
+            "okay kronos",
+            "ok kronos",
+            "kronos",
+            "please",
+            "can you",
+            "could you",
+            "would you",
+            "go ahead and",
+        ] {
+            if let Some(after) = rest.strip_prefix(wake) {
+                if after.is_empty()
+                    || after.starts_with(|c: char| c.is_ascii_whitespace() || c == ',' || c == '.')
+                {
+                    rest = after
+                        .trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ',' || c == '.');
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        if !stripped {
+            break;
+        }
     }
 
     let direct_prefixes = [
@@ -1115,27 +1241,68 @@ pub fn is_computer_control_prompt(lower: &str) -> bool {
         "reveal ",
         "show in finder",
         "open up ",
-        "can you open ",
-        "please open ",
-        "could you open ",
-        "kronos open ",
         "set volume ",
         "mute volume",
     ];
-    if direct_prefixes.iter().any(|p| trimmed.starts_with(p)) {
+    if direct_prefixes.iter().any(|p| rest.starts_with(p)) {
         return true;
     }
     if (trimmed.contains(" and open it")
         || trimmed.contains(" then open it")
         || trimmed.contains(", open it")
-        || trimmed == "open it"
-        || trimmed == "reveal it"
+        || rest == "open it"
+        || rest == "reveal it"
         || trimmed.contains("reveal it in finder"))
         && !trimmed.contains("html")
     {
         return true;
     }
     false
+}
+
+pub fn is_workspace_folder_target_query(lower: &str) -> bool {
+    let trimmed = lower.trim();
+    if trimmed.contains("new folder")
+        || trimmed.contains("new directory")
+        || trimmed.contains("create a folder")
+        || trimmed.contains("create folder")
+        || trimmed.contains("make a folder")
+        || trimmed.contains("make folder")
+        || trimmed.contains("create a directory")
+        || trimmed.contains("new project in ")
+        || trimmed.contains("new project inside ")
+        || trimmed.contains("switch workspace")
+    {
+        return true;
+    }
+    trimmed.contains(" folder then ")
+        || trimmed.contains(" folder, then ")
+        || trimmed.contains(" directory then ")
+        || trimmed.contains(" directory, then ")
+}
+
+fn extract_folder_target_clause(raw: &str) -> &str {
+    let lower = raw.to_ascii_lowercase();
+    for sep in [
+        ", then make ",
+        " then make ",
+        ", then build ",
+        " then build ",
+        ", then create ",
+        " then create ",
+        ", then write ",
+        " then write ",
+        " and make a ",
+        " and build a ",
+        " and create a ",
+    ] {
+        if let Some(pos) = lower.find(sep) {
+            if pos >= 4 {
+                return &raw[..pos];
+            }
+        }
+    }
+    raw
 }
 
 pub fn is_media_history_query(lower: &str) -> bool {
@@ -1154,6 +1321,9 @@ pub fn is_media_history_query(lower: &str) -> bool {
 }
 
 pub fn is_device_lookup_query(lower: &str) -> bool {
+    if is_workspace_folder_target_query(lower) {
+        return true;
+    }
     let personal_doc_terms = [
         "certificate",
         "certificat",
@@ -1370,7 +1540,7 @@ fn scan_personal_dir(
                 );
                 continue;
             }
-            if depth == 0 {
+            if depth == 0 || (detect_code_repos && depth == 1) {
                 let kind = if looks_like_media_title(fname) {
                     EntryKind::Media
                 } else {
@@ -1751,24 +1921,68 @@ pub fn is_series_episode_name(name: &str) -> bool {
     false
 }
 
+pub fn split_camel_case_parts(word: &str) -> Vec<String> {
+    let chars: Vec<char> = word.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    for i in 0..chars.len() {
+        let ch = chars[i];
+        if i > 0 && ch.is_ascii_uppercase() {
+            let prev = chars[i - 1];
+            let next_is_lower = chars.get(i + 1).is_some_and(|n| n.is_ascii_lowercase());
+            if (prev.is_ascii_lowercase()
+                || prev.is_ascii_digit()
+                || (prev.is_ascii_uppercase() && next_is_lower && cur.len() >= 2))
+                && !cur.is_empty()
+            {
+                parts.push(std::mem::take(&mut cur));
+            }
+        }
+        cur.push(ch.to_ascii_lowercase());
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    parts
+}
+
 fn tokenize_words_with_acronyms(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
+    let mut raw_words = Vec::new();
     let mut cur = String::new();
     for ch in text.chars() {
         if ch.is_ascii_alphanumeric() {
-            cur.push(ch.to_ascii_lowercase());
+            cur.push(ch);
         } else if !cur.is_empty() {
-            tokens.push(std::mem::take(&mut cur));
+            raw_words.push(std::mem::take(&mut cur));
         }
     }
     if !cur.is_empty() {
-        tokens.push(cur);
+        raw_words.push(cur);
+    }
+
+    let mut tokens = Vec::with_capacity(raw_words.len() * 2);
+    for raw in &raw_words {
+        let low = raw.to_ascii_lowercase();
+        if !tokens.contains(&low) {
+            tokens.push(low);
+        }
+        let parts = split_camel_case_parts(raw);
+        if parts.len() >= 2 {
+            for p in parts {
+                if p.len() >= 2 && !tokens.contains(&p) {
+                    tokens.push(p);
+                }
+            }
+        }
     }
 
     // Add initial-letter acronym tokens (e.g. "Notre Dame Certificate" -> "ndc", "nd").
-    let alpha_words: Vec<&str> = tokens
+    let alpha_words: Vec<String> = raw_words
         .iter()
-        .map(String::as_str)
+        .map(|w| w.to_ascii_lowercase())
         .filter(|w| w.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))
         .collect();
     if alpha_words.len() >= 2 {
@@ -1779,30 +1993,140 @@ fn tokenize_words_with_acronyms(text: &str) -> Vec<String> {
             .collect();
         if initials.len() >= 2 {
             if initials.len() > 2 {
-                tokens.push(initials[..2].to_string());
+                let two = initials[..2].to_string();
+                if !tokens.contains(&two) {
+                    tokens.push(two);
+                }
             }
-            tokens.push(initials);
+            if !tokens.contains(&initials) {
+                tokens.push(initials);
+            }
         }
     }
     tokens
 }
 
-fn extract_meaningful_query_tokens(lower: &str) -> Vec<String> {
+fn is_standalone_acronym_after_article(joined: &str) -> bool {
+    matches!(
+        joined,
+        "nd" | "ui"
+            | "ux"
+            | "cv"
+            | "id"
+            | "os"
+            | "ml"
+            | "db"
+            | "pr"
+            | "ci"
+            | "cd"
+            | "qa"
+            | "emr"
+            | "ehr"
+            | "crm"
+            | "erp"
+            | "sdk"
+            | "ide"
+            | "cli"
+            | "gpu"
+            | "cpu"
+            | "ram"
+            | "pdf"
+            | "url"
+            | "ssh"
+            | "sql"
+            | "css"
+    )
+}
+
+fn extract_meaningful_query_tokens(raw_text: &str) -> Vec<String> {
     const STOPWORDS: &[&str] = &[
-        "a", "an", "the", "my", "me", "i", "you", "your", "is", "are", "was", "were", "did", "do",
-        "does", "where", "wheres", "what", "whats", "which", "who", "how", "can", "could", "would",
-        "please", "find", "locate", "show", "open", "launch", "start", "reveal", "in", "on", "at",
-        "to", "for", "of", "it", "this", "that", "last", "recent", "recently", "computer", "mac",
-        "device", "kronos", "and", "or", "file", "app", "application",
+        "a", "an", "the", "teh", "my", "me", "i", "you", "your", "is", "are", "was", "were", "did",
+        "do", "does", "where", "wheres", "what", "which", "who", "how", "can", "could", "would",
+        "please", "find", "locate", "show", "open", "launch", "start", "reveal", "in", "into",
+        "inside", "under", "on", "at", "to", "for", "of", "it", "this", "that", "last", "recent",
+        "recently", "computer", "mac", "device", "kronos", "hey", "hi", "ok", "okay", "and", "or",
+        "then", "file", "app", "application", "create", "make", "build", "new", "folder",
+        "directory", "about", "website", "software",
     ];
-    let mut out = Vec::new();
-    for raw in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
-        if raw.len() < 2 || STOPWORDS.contains(&raw) {
-            continue;
+
+    let raw_words: Vec<&str> = raw_text
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Collapse runs of spoken single-letter acronyms ("N D" -> "nd", "E M R" -> "emr").
+    let mut collapsed: Vec<String> = Vec::with_capacity(raw_words.len());
+    let mut i = 0;
+    while i < raw_words.len() {
+        if raw_words[i].len() == 1 && raw_words[i].chars().all(|c| c.is_ascii_alphabetic()) {
+            let start = i;
+            while i < raw_words.len()
+                && raw_words[i].len() == 1
+                && raw_words[i].chars().all(|c| c.is_ascii_alphabetic())
+            {
+                i += 1;
+            }
+            let run = &raw_words[start..i];
+            if run.len() >= 2 {
+                let first_low = run[0].to_ascii_lowercase();
+                if first_low == "a" && run.len() >= 3 {
+                    let tail: String = run[1..].iter().map(|s| s.to_ascii_lowercase()).collect();
+                    if is_standalone_acronym_after_article(&tail) {
+                        collapsed.push(tail);
+                        continue;
+                    }
+                }
+                let joined: String = run.iter().map(|s| s.to_ascii_lowercase()).collect();
+                collapsed.push(joined);
+                continue;
+            }
+            collapsed.push(run[0].to_ascii_lowercase());
+        } else {
+            collapsed.push(raw_words[i].to_string());
+            i += 1;
         }
-        let s = raw.to_string();
-        if !out.contains(&s) {
-            out.push(s);
+    }
+
+    let has_credential_context = collapsed.iter().any(|w| {
+        let low = w.to_ascii_lowercase();
+        low.starts_with("cert")
+            || low.starts_with("result")
+            || low.starts_with("statement")
+            || low.starts_with("diplom")
+            || low.starts_with("transcript")
+    });
+
+    let mut base_tokens: Vec<String> = Vec::new();
+    for word in &collapsed {
+        let low_raw = word.to_ascii_lowercase();
+        let low = if has_credential_context
+            && matches!(low_raw.as_str(), "undee" | "undy" | "endy" | "indie" | "indy")
+        {
+            "nd".to_string()
+        } else {
+            low_raw
+        };
+        if low.len() >= 2 && !STOPWORDS.contains(&low.as_str()) && !base_tokens.contains(&low) {
+            base_tokens.push(low);
+        }
+        let parts = split_camel_case_parts(word);
+        if parts.len() >= 2 {
+            for p in parts {
+                if p.len() >= 2 && !STOPWORDS.contains(&p.as_str()) && !base_tokens.contains(&p) {
+                    base_tokens.push(p);
+                }
+            }
+        }
+    }
+
+    let mut out = base_tokens.clone();
+    // Concatenate adjacent meaningful tokens so spoken "org prod" / "whats app" aligns with "orgproj" / "whatsapp".
+    for pair in base_tokens.windows(2) {
+        if pair[0].len() <= 12 && pair[1].len() <= 12 {
+            let joined = format!("{}{}", pair[0], pair[1]);
+            if joined.len() >= 4 && !out.contains(&joined) {
+                out.push(joined);
+            }
         }
     }
     out
@@ -2193,6 +2517,91 @@ mod tests {
             .expect("expected device context hit");
         assert!(ctx.prompt_block.contains("ND statement of result.pdf"));
         assert!(ctx.elapsed_ms < 25.0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_spoken_voice_queries_and_folder_target_routing() {
+        let dir = std::env::temp_dir().join(format!(
+            "kronos_dev_voice_test_{}_{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mgr = DeviceContextManager::new(dir.clone(), false);
+
+        let mut b = IndexBuilder::new();
+        b.add_entry(
+            EntryKind::App,
+            "WhatsApp",
+            "/Applications/WhatsApp.app",
+            "installed macOS application",
+            FLAG_EXISTS_ON_DISK,
+            0,
+            200,
+            0,
+        );
+        b.add_entry(
+            EntryKind::Document,
+            "ND statement of result.pdf",
+            "/Users/test/Documents/my_docs/ND statement of result.pdf",
+            "PDF document in Documents",
+            FLAG_EXISTS_ON_DISK,
+            0,
+            300,
+            1024,
+        );
+        b.add_entry(
+            EntryKind::Directory,
+            "orgProj",
+            "/Users/test/Documents/orgProj",
+            "folder in Documents",
+            FLAG_EXISTS_ON_DISK,
+            0,
+            400,
+            0,
+        );
+        b.add_entry(
+            EntryKind::Directory,
+            "project",
+            "/Users/test/Documents/project",
+            "folder in Documents",
+            FLAG_EXISTS_ON_DISK,
+            0,
+            350,
+            0,
+        );
+        mgr.update_config(Some(true), Some(true), false);
+        mgr.install_index(b.finish(120));
+
+        // Spoken variations for ND certificate
+        for q in ["Open my N D certificate.", "Open my undee certificate."] {
+            let ctx = mgr.query_for_turn(q).expect("spoken cert query");
+            assert!(ctx.wants_computer_action);
+            assert_eq!(
+                ctx.hits[0].path,
+                "/Users/test/Documents/my_docs/ND statement of result.pdf"
+            );
+        }
+
+        // Spoken wake-word + WhatsApp
+        let wa = mgr
+            .query_for_turn("Hey Kronos, please open WhatsApp")
+            .expect("spoken whatsapp query");
+        assert!(wa.wants_computer_action);
+        assert_eq!(wa.hits[0].path, "/Applications/WhatsApp.app");
+
+        // Spoken compound folder creation + EMR website prompt (including phonetic "org prod" and typo "teh")
+        for q in [
+            "create a new folder in teh Documents orgProj folder then make a website about an EMR software.",
+            "Create a new folder in the documents org prod folder, then make a website about an EMR software.",
+        ] {
+            let ctx = mgr.query_for_turn(q).expect("folder target query");
+            assert!(!ctx.wants_computer_action);
+            assert_eq!(ctx.hits[0].path, "/Users/test/Documents/orgProj");
+            assert!(ctx.prompt_block.contains("switch_workspace"));
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

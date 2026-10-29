@@ -206,6 +206,9 @@ fn run_agent_goal(
                         let res_preview = truncate_utf8(&outcome.output, 200).replace('\n', " | ");
                         eprintln!("     <- {res_preview}");
                     }
+                    AgentEvent::WorkspaceChanged { workdir } => {
+                        eprintln!("  [workspace switched to {}]", workdir.display());
+                    }
                     AgentEvent::ValidationRepair { step, report } => {
                         eprintln!("  [step {step} validation repair]\n{report}");
                     }
@@ -258,13 +261,18 @@ fn run_agent_goal(
                 }
                 history.push(Message::assistant_tool_calls(&reply.text, reply.tool_calls.clone()));
 
+                let mut active_workdir = cfg.workdir.clone();
                 for (idx, tc) in reply.tool_calls.iter().enumerate() {
                     if matches!(tc.name.as_str(), "write_file" | "edit_file") {
                         touched_files = true;
                     }
                     let arg_preview = truncate_utf8(&tc.arguments, 140).replace('\n', "\\n");
                     eprintln!("  -> tool `{}`({arg_preview})", tc.name);
-                    let outcome = execute_tool(&cfg.workdir, tc, cfg.cmd_timeout_secs, step * 100 + idx);
+                    let outcome =
+                        execute_tool(&active_workdir, tc, cfg.cmd_timeout_secs, step * 100 + idx);
+                    if let Some(ref next_dir) = outcome.new_workdir {
+                        active_workdir.clone_from(next_dir);
+                    }
                     let res_preview = truncate_utf8(&outcome.output, 200).replace('\n', " | ");
                     eprintln!("     <- {res_preview}");
                     history.push(Message::tool_result(&tc.id, &outcome.output));

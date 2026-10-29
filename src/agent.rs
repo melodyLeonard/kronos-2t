@@ -16,8 +16,10 @@ const MAX_SEARCH_MATCHES: usize = 60;
 pub const AGENT_SYSTEM_PROMPT: &str = concat!(
     "Your name is Kronos. You were created and built by Melody Leonard as a local software engineering runner on Apple Silicon. ",
     "When asked your name or who built or created you, answer directly that your name is Kronos and that you were built by Melody Leonard; never say you lack a name and never claim to be built by OpenAI, Alibaba, Qwen, Hugging Face, Anthropic, or any other third-party organization. ",
-    "Use the workspace tools (write_file, edit_file, read_file, list_dir, search_files, run_command) ",
+    "Use the workspace tools (switch_workspace, write_file, edit_file, read_file, list_dir, search_files, run_command) ",
     "to build, edit, and verify complete working files directly on disk. ",
+    "When asked to create a new folder or project inside another directory on this Mac, call switch_workspace first with the new child folder path to create and activate it, then call write_file to build files inside it. ",
+    "When building a website or web app, deliver a complete, styled, responsive page with modern CSS layout, navigation, domain-specific sections, and interactive UI rather than a minimal placeholder page. ",
     "Do not paste file drafts or completion claims in prose before calling tools; emit <tool_call> invocations immediately, then summarize after tool calls succeed. ",
     "Use edit_file for small targeted edits to existing files, and use write_file for new files or when rewriting most of an existing file such as restyling a stylesheet. ",
     "When updating a web page title or heading, update both <title> in <head> and the visible <h1> heading in <body> so the rendered preview shows the change immediately. ",
@@ -58,6 +60,7 @@ pub struct ToolExecOutcome {
     pub validation_msg: String,
     pub output: String,
     pub diff: Option<FileChangeDiff>,
+    pub new_workdir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +118,9 @@ pub enum AgentEvent<'a> {
         call: &'a ToolCall,
         outcome: &'a ToolExecOutcome,
     },
+    WorkspaceChanged {
+        workdir: &'a Path,
+    },
     ValidationRepair {
         step: usize,
         report: &'a str,
@@ -141,6 +147,7 @@ pub struct AgentTurnConfig {
 
 pub fn tool_definitions_json() -> Vec<String> {
     vec![
+        r#"{"type":"function","function":{"name":"switch_workspace","description":"Create or switch Kronos's active project workspace directory on disk (for example creating a new project folder inside ~/Documents/orgProj/<new-folder-name>) so subsequent write_file, edit_file, read_file, and run_command calls operate inside it.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Target project folder path (e.g. '/Users/.../Documents/orgProj/emr-portal' or '~/Documents/orgProj/emr-portal')"},"subfolder":{"type":"string","description":"Optional new child folder name to create inside `path` when `path` is a parent directory"}},"required":["path"]}}}"#.to_string(),
         r#"{"type":"function","function":{"name":"write_file","description":"Write or overwrite a UTF-8 workspace file and validate syntax.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative workspace path"},"content":{"type":"string","description":"Full file contents"}},"required":["path","content"]}}}"#.to_string(),
         r#"{"type":"function","function":{"name":"edit_file","description":"Replace a unique text span in an existing workspace file and validate syntax.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative workspace path"},"old_text":{"type":"string","description":"Existing unique text block"},"new_text":{"type":"string","description":"Replacement text block"}},"required":["path","old_text","new_text"]}}}"#.to_string(),
         r#"{"type":"function","function":{"name":"read_file","description":"Read a workspace file with 1-based line numbers.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative workspace path"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}}},"required":["path"]}}}"#.to_string(),
@@ -370,7 +377,10 @@ pub fn resolve_jailed_path(workdir: &Path, user_rel: &str) -> Result<PathBuf, St
         if let Ok(stripped) = candidate.strip_prefix(workdir) {
             return resolve_jailed_path(workdir, &stripped.to_string_lossy());
         }
-        return Err(format!("path `{trimmed}` escapes workspace directory"));
+        return Err(format!(
+            "path `{trimmed}` is outside current workspace `{}`; call `switch_workspace` first to create or switch to that project directory",
+            workdir.display()
+        ));
     }
 
     let mut clean = PathBuf::new();
@@ -1259,11 +1269,13 @@ pub fn execute_tool(
                 validation_msg: "invalid tool JSON".to_string(),
                 output: format!("error: invalid JSON arguments `{}`: {e}", call.arguments),
                 diff: None,
+                new_workdir: None,
             };
         }
     };
 
     match call.name.as_str() {
+        "switch_workspace" => exec_switch_workspace(workdir, &args),
         "write_file" => exec_write_file(workdir, &args),
         "edit_file" => exec_edit_file(workdir, &args),
         "read_file" => exec_read_file(workdir, &args),
@@ -1277,6 +1289,7 @@ pub fn execute_tool(
                     validation_msg: "ok".to_string(),
                     output: "error: `run_command` requires string argument `cmd`".to_string(),
                     diff: None,
+                    new_workdir: None,
                 };
             };
             let out = run_shell_command_with_timeout(workdir, cmd, cmd_timeout_secs, step_tag);
@@ -1287,6 +1300,7 @@ pub fn execute_tool(
                 validation_msg: "ok".to_string(),
                 output: out,
                 diff: None,
+                new_workdir: None,
             }
         }
         "use_computer" => match crate::device::global_device_manager().execute_computer_action(&args) {
@@ -1296,6 +1310,7 @@ pub fn execute_tool(
                 validation_msg: "ok".to_string(),
                 output: msg,
                 diff: None,
+                new_workdir: None,
             },
             Err(err) => ToolExecOutcome {
                 ok: false,
@@ -1303,6 +1318,7 @@ pub fn execute_tool(
                 validation_msg: "ok".to_string(),
                 output: format!("error: {err}"),
                 diff: None,
+                new_workdir: None,
             },
         },
         other => ToolExecOutcome {
@@ -1311,7 +1327,218 @@ pub fn execute_tool(
             validation_msg: "ok".to_string(),
             output: format!("error: unknown tool `{other}`"),
             diff: None,
+            new_workdir: None,
         },
+    }
+}
+
+fn normalize_lexical_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn is_umbrella_parent_directory(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    const PROJECT_MARKERS: &[&str] = &[
+        ".git",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "mix.exs",
+        "index.html",
+        "Makefile",
+    ];
+    if PROJECT_MARKERS.iter().any(|m| dir.join(m).exists()) {
+        return false;
+    }
+    let Ok(rd) = fs::read_dir(dir) else {
+        return false;
+    };
+    let mut subdirs = 0usize;
+    let mut code_files = 0usize;
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        if s.starts_with('.') {
+            continue;
+        }
+        if let Ok(ft) = entry.file_type() {
+            if ft.is_dir() {
+                subdirs += 1;
+            } else if ft.is_file() {
+                let ext = entry
+                    .path()
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if matches!(
+                    ext.as_str(),
+                    "html" | "css" | "js" | "ts" | "rs" | "py" | "go" | "c" | "cpp" | "swift"
+                ) {
+                    code_files += 1;
+                }
+            }
+        }
+    }
+    subdirs >= 2 && code_files == 0
+}
+
+fn exec_switch_workspace(cur_workdir: &Path, args: &Json) -> ToolExecOutcome {
+    let Some(raw_path) = args.get("path").and_then(Json::as_str) else {
+        return err_outcome("error: `switch_workspace` requires string argument `path`");
+    };
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return err_outcome("error: `switch_workspace` `path` cannot be empty");
+    }
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut candidate = if trimmed == "~" {
+        return err_outcome("error: cannot switch workspace directly to home directory; specify a project subfolder");
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        let Some(ref h) = home else {
+            return err_outcome("error: HOME is not set; provide an absolute path");
+        };
+        h.join(rest)
+    } else {
+        let p = PathBuf::from(trimmed);
+        if p.is_absolute() {
+            p
+        } else if let Some(ref h) = home {
+            if trimmed.starts_with("Documents/")
+                || trimmed.starts_with("Desktop/")
+                || trimmed.starts_with("Downloads/")
+                || trimmed == "Documents"
+                || trimmed == "Desktop"
+                || trimmed == "Downloads"
+            {
+                h.join(trimmed)
+            } else {
+                cur_workdir.join(p)
+            }
+        } else {
+            cur_workdir.join(p)
+        }
+    };
+
+    if let Some(sub) = args
+        .get("subfolder")
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if sub.contains("..") || sub.starts_with('/') {
+            return err_outcome("error: `subfolder` must be a clean child folder name without `..`");
+        }
+        candidate = candidate.join(sub.trim_matches('/'));
+    }
+
+    let norm = normalize_lexical_path(&candidate);
+    let tmp_sys = normalize_lexical_path(&std::env::temp_dir());
+    let in_tmp = norm.starts_with("/tmp/")
+        || norm.starts_with("/private/tmp/")
+        || (norm.starts_with(&tmp_sys) && norm != tmp_sys);
+
+    let in_safe_home = if let Some(ref h) = home {
+        let norm_home = normalize_lexical_path(h);
+        let canon_home = h.canonicalize().unwrap_or_else(|_| norm_home.clone());
+        let rel_opt = norm
+            .strip_prefix(&norm_home)
+            .ok()
+            .or_else(|| norm.strip_prefix(&canon_home).ok());
+        if let Some(rel) = rel_opt {
+            let comps: Vec<String> = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            if comps.is_empty() {
+                return err_outcome("error: cannot switch workspace directly to home directory; pass a child project directory");
+            }
+            let first = comps[0].as_str();
+            if first.starts_with('.') || first.eq_ignore_ascii_case("Library") {
+                return err_outcome(&format!(
+                    "error: switching workspace into protected system/hidden folder `~/{first}` is not permitted"
+                ));
+            }
+            if comps.len() == 1
+                && matches!(
+                    first,
+                    "Documents"
+                        | "Downloads"
+                        | "Desktop"
+                        | "Movies"
+                        | "Music"
+                        | "Pictures"
+                        | "Applications"
+                        | "Public"
+                )
+            {
+                return err_outcome(&format!(
+                    "error: `{}` is a top-level personal folder; pass a new or specific child project folder such as `{}/<project-folder>`",
+                    norm.display(),
+                    norm.display()
+                ));
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if !in_tmp && !in_safe_home {
+        return err_outcome(&format!(
+            "error: workspace path `{}` must reside inside a project folder under the user home directory or /tmp",
+            norm.display()
+        ));
+    }
+
+    if is_umbrella_parent_directory(&norm) {
+        return err_outcome(&format!(
+            "error: `{}` is an existing parent directory containing multiple folders; pass a new child project folder path such as `{}/<new-folder-name>` (or set `subfolder`)",
+            norm.display(),
+            norm.display()
+        ));
+    }
+
+    let existed = norm.exists();
+    if let Err(e) = fs::create_dir_all(&norm) {
+        return err_outcome(&format!(
+            "error creating workspace directory `{}`: {e}",
+            norm.display()
+        ));
+    }
+    let canon = norm.canonicalize().unwrap_or(norm);
+    let file_count = list_workspace_files(&canon).len();
+    let action_verb = if existed {
+        "switched active workspace to"
+    } else {
+        "created and switched active workspace to"
+    };
+    ToolExecOutcome {
+        ok: true,
+        validation_ok: true,
+        validation_msg: "ok".to_string(),
+        output: format!(
+            "ok: {action_verb} `{}` ({file_count} existing files); subsequent write_file and edit_file calls now write inside this folder",
+            canon.display()
+        ),
+        diff: None,
+        new_workdir: Some(canon),
     }
 }
 
@@ -1464,6 +1691,7 @@ fn attach_validation_status(
                 validation_msg: v_msg,
                 output: format!("{base_msg}{suffix}"),
                 diff,
+                new_workdir: None,
             }
         }
         Err(err) => ToolExecOutcome {
@@ -1472,8 +1700,26 @@ fn attach_validation_status(
             validation_msg: err.clone(),
             output: format!("{base_msg}\n[validation error in `{rel}`: {err} — fix with `edit_file` or `write_file`]"),
             diff,
+            new_workdir: None,
         },
     }
+}
+
+fn relative_display_in_workdir(workdir: &Path, target: &Path, fallback: &str) -> String {
+    if let Ok(rel) = target.strip_prefix(workdir) {
+        let s = rel.to_string_lossy().replace('\\', "/");
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    let canon_work = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
+    if let Ok(rel) = target.strip_prefix(&canon_work) {
+        let s = rel.to_string_lossy().replace('\\', "/");
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    fallback.to_string()
 }
 
 fn extract_plain_html_tag_inner(html: &str, tag: &str) -> Option<String> {
@@ -1537,13 +1783,14 @@ fn exec_write_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
     }
     match fs::write(&target, final_content.as_bytes()) {
         Ok(()) => {
-            let diff = build_file_diff(rel, prev_opt, &final_content);
+            let clean_rel = relative_display_in_workdir(workdir, &target, rel);
+            let diff = build_file_diff(&clean_rel, prev_opt, &final_content);
             let msg = format!(
-                "ok: wrote {} bytes ({} lines{sync_note}) to `{rel}`",
+                "ok: wrote {} bytes ({} lines{sync_note}) to `{clean_rel}`",
                 final_content.len(),
                 final_content.lines().count()
             );
-            attach_validation_status(workdir, &target, rel, msg, diff)
+            attach_validation_status(workdir, &target, &clean_rel, msg, diff)
         }
         Err(e) => err_outcome(&format!("error writing `{rel}`: {e}")),
     }
@@ -1674,22 +1921,23 @@ fn write_edited_content(
     raw_updated: String,
 ) -> ToolExecOutcome {
     let prev_opt = fs::read_to_string(target).ok();
-    let (updated, h1_synced) = sync_html_title_and_h1(rel, old_text, new_text, raw_updated);
+    let clean_rel = relative_display_in_workdir(workdir, target, rel);
+    let (updated, h1_synced) = sync_html_title_and_h1(&clean_rel, old_text, new_text, raw_updated);
     match fs::write(target, updated.as_bytes()) {
         Ok(()) => {
-            let diff = build_file_diff(rel, prev_opt, &updated);
+            let diff = build_file_diff(&clean_rel, prev_opt, &updated);
             let sync_note = match h1_synced {
                 Some(t) => format!("; synced visible <h1> to `{t}`"),
                 None => String::new(),
             };
             let msg = format!(
-                "ok: edited `{rel}` at line {line_no} ({} bytes, {} lines{sync_note})",
+                "ok: edited `{clean_rel}` at line {line_no} ({} bytes, {} lines{sync_note})",
                 updated.len(),
                 updated.lines().count()
             );
-            attach_validation_status(workdir, target, rel, msg, diff)
+            attach_validation_status(workdir, target, &clean_rel, msg, diff)
         }
-        Err(e) => err_outcome(&format!("error writing `{rel}`: {e}")),
+        Err(e) => err_outcome(&format!("error writing `{clean_rel}`: {e}")),
     }
 }
 
@@ -1992,6 +2240,7 @@ fn ok_outcome(output: String) -> ToolExecOutcome {
         validation_msg: "ok".to_string(),
         output,
         diff: None,
+        new_workdir: None,
     }
 }
 
@@ -2002,6 +2251,7 @@ fn err_outcome(msg: &str) -> ToolExecOutcome {
         validation_msg: "ok".to_string(),
         output: msg.to_string(),
         diff: None,
+        new_workdir: None,
     }
 }
 
@@ -2324,6 +2574,7 @@ impl ProseStreamFilter {
         let tail = &self.buf[self.emitted..];
         let name = extract_partial_json_str(tail, "\"name\"").unwrap_or_else(|| "tool".to_string());
         let target = extract_partial_json_str(tail, "\"path\"")
+            .or_else(|| extract_partial_json_str(tail, "\"target\""))
             .or_else(|| extract_partial_json_str(tail, "\"cmd\""))
             .or_else(|| extract_partial_json_str(tail, "\"pattern\""))
             .unwrap_or_default();
@@ -2367,7 +2618,9 @@ pub const UNIFIED_SYSTEM_PROMPT: &str = concat!(
     "When asked your name or who built or created you, answer directly that your name is Kronos and that you were built by Melody Leonard; never say you lack a name and never claim to be built by OpenAI, Alibaba, Qwen, Hugging Face, Anthropic, or any other third-party organization. ",
     "For general questions, explanations, or analysis of attached PDFs, documents, CSVs, code snippets, or images that do not modify workspace files, reply directly and concisely from the inline context without calling tools. ",
     "When a [Device Context] block is provided, answer using its exact local paths and watch history, and when `use_computer` is available and the user asks to open or control an application, file, folder, or URL on their Mac, call `use_computer` directly. ",
-    "When asked to build, edit, style, fix, inspect, or run files in the workspace, use the workspace tools (write_file, edit_file, read_file, list_dir, search_files, run_command) directly on disk. ",
+    "When asked to create a new folder or project inside another local directory on this Mac (such as ~/Documents/orgProj), call `switch_workspace` first with the full new child folder path to create and activate that project workspace, then call `write_file` to build the project files inside it. ",
+    "When asked to build, edit, style, fix, inspect, or run files in the workspace, use the workspace tools (switch_workspace, write_file, edit_file, read_file, list_dir, search_files, run_command) directly on disk. ",
+    "When building a website or web app, deliver a complete, styled, responsive page with modern CSS layout, navigation, domain-specific sections, and interactive UI rather than a minimal placeholder page. ",
     "Do not paste file drafts or completion claims in prose before calling tools; emit <tool_call> invocations immediately, then summarize briefly after tool calls succeed. ",
     "Check the Existing workspace files list below before calling edit_file: only call edit_file on files that exist on disk using exact existing lines, and use write_file for new files or full rewrites. ",
     "When updating a web page title or heading, update both <title> in <head> and the visible <h1> heading in <body> so the rendered preview shows the change immediately. ",
@@ -2999,8 +3252,9 @@ pub fn run_agent_turn(
     cfg: &AgentTurnConfig,
     mut on_event: impl FnMut(AgentEvent<'_>) -> bool,
 ) -> Result<String, String> {
+    let mut active_workdir = cfg.workdir.clone();
     if history.first().is_none_or(|m| m.role != "system") {
-        let sys_prompt = build_initial_system_prompt(&cfg.workdir);
+        let sys_prompt = build_initial_system_prompt(&active_workdir);
         history.insert(0, Message::new("system", &sys_prompt));
     }
     let t_start = Instant::now();
@@ -3011,7 +3265,8 @@ pub fn run_agent_turn(
     let mut modified_files: Vec<String> = Vec::new();
 
     for step in 1..=cfg.max_steps {
-        let comp_rep = compact_conversation_history(model, history, tools_json, &cfg.workdir, false);
+        let comp_rep =
+            compact_conversation_history(model, history, tools_json, &active_workdir, false);
         if comp_rep.compacted
             && !on_event(AgentEvent::ContextCompacted {
                 before_tokens: comp_rep.before_tokens,
@@ -3095,7 +3350,7 @@ pub fn run_agent_turn(
                 continue;
             }
             if touched_files {
-                match verify_workspace_work(&cfg.workdir, &modified_files, cfg.cmd_timeout_secs) {
+                match verify_workspace_work(&active_workdir, &modified_files, cfg.cmd_timeout_secs) {
                     Ok(v_rep) => {
                         let _ = on_event(AgentEvent::Verified {
                             step,
@@ -3125,7 +3380,7 @@ pub fn run_agent_turn(
                 repair_attempts += 1;
                 history.push(Message::new(
                     "user",
-                    "No tool call was emitted yet, so the requested action has not run. Emit a <tool_call> now (using `use_computer` for macOS app or file actions, or `write_file`/`edit_file`/`read_file`/`list_dir`/`run_command` for workspace actions) before replying.",
+                    "No tool call was emitted yet, so the requested action has not run. Emit a <tool_call> now (using `use_computer` for macOS app or file actions, or `switch_workspace`/`write_file`/`edit_file`/`read_file`/`list_dir`/`run_command` for workspace actions) before replying.",
                 ));
                 continue;
             }
@@ -3153,14 +3408,29 @@ pub fn run_agent_turn(
             if !on_event(AgentEvent::ToolStart { step, call: tc }) {
                 return Err("cancelled".to_string());
             }
-            let outcome = execute_tool(&cfg.workdir, tc, cfg.cmd_timeout_secs, step * 100 + idx);
+            let outcome = execute_tool(&active_workdir, tc, cfg.cmd_timeout_secs, step * 100 + idx);
+            if let Some(ref next_dir) = outcome.new_workdir {
+                active_workdir.clone_from(next_dir);
+                touched_files = false;
+                modified_files.clear();
+                unresolved_edits.clear();
+                if !on_event(AgentEvent::WorkspaceChanged {
+                    workdir: &active_workdir,
+                }) {
+                    return Err("cancelled".to_string());
+                }
+            }
             if is_file_mutation {
-                let target_path = Json::parse(&tc.arguments)
+                let raw_target = Json::parse(&tc.arguments)
                     .ok()
                     .and_then(|j| j.get("path").and_then(Json::as_str).map(str::to_string))
                     .unwrap_or_default();
+                let target_path = outcome
+                    .diff
+                    .as_ref()
+                    .map_or_else(|| raw_target.clone(), |d| d.path.clone());
                 if outcome.ok {
-                    unresolved_edits.retain(|(p, _)| p != &target_path);
+                    unresolved_edits.retain(|(p, _)| p != &target_path && p != &raw_target);
                     if !target_path.is_empty() && !modified_files.iter().any(|p| p == &target_path) {
                         modified_files.push(target_path);
                     }
@@ -3649,6 +3919,68 @@ mod tests {
         let v_ok = verify_workspace_work(&dir, &["app.js".to_string()], 5).unwrap();
         assert!(v_ok.checks_run >= 2);
         assert!(v_ok.summary.contains("DOM/CSS cross-check ok"));
+
+        // 13. switch_workspace creates new child project folder, blocks umbrella & protected paths, and normalizes write_file paths.
+        let umbrella = dir.join("orgProj_test");
+        fs::create_dir_all(umbrella.join("alpha_proj")).unwrap();
+        fs::create_dir_all(umbrella.join("beta_proj")).unwrap();
+
+        let blocked_umbrella = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "c13a".into(),
+                name: "switch_workspace".into(),
+                arguments: format!(r#"{{"path":{}}}"#, quote(&umbrella.display().to_string())),
+            },
+            5,
+            16,
+        );
+        assert!(!blocked_umbrella.ok);
+        assert!(blocked_umbrella.output.contains("parent directory"));
+
+        let blocked_ssh = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "c13b".into(),
+                name: "switch_workspace".into(),
+                arguments: r#"{"path":"~/.ssh/bad_workspace"}"#.into(),
+            },
+            5,
+            17,
+        );
+        assert!(!blocked_ssh.ok);
+
+        let emr_dir = umbrella.join("emr-software");
+        let switched = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "c13c".into(),
+                name: "switch_workspace".into(),
+                arguments: format!(r#"{{"path":{}}}"#, quote(&emr_dir.display().to_string())),
+            },
+            5,
+            18,
+        );
+        assert!(switched.ok, "switch failed: {}", switched.output);
+        let new_ws = switched.new_workdir.expect("new_workdir");
+        assert!(new_ws.is_dir());
+
+        let abs_html = new_ws.join("index.html");
+        let wrote_in_new = execute_tool(
+            &new_ws,
+            &ToolCall {
+                id: "c13d".into(),
+                name: "write_file".into(),
+                arguments: format!(
+                    r#"{{"path":{},"content":"<!doctype html><html><head><title>EMR</title></head><body><h1>EMR</h1></body></html>"}}"#,
+                    quote(&abs_html.display().to_string())
+                ),
+            },
+            5,
+            19,
+        );
+        assert!(wrote_in_new.ok);
+        assert_eq!(wrote_in_new.diff.unwrap().path, "index.html");
 
         let _ = fs::remove_dir_all(&dir);
     }

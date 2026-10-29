@@ -408,10 +408,27 @@
     width:20px; height:20px; padding:0; line-height:1; font-size:13px; flex-shrink:0;
   }
   .composer-row { display:flex; gap:8px; align-items:flex-end; }
-  #attach-btn {
-    height:42px; padding:0 12px; display:inline-flex; align-items:center; gap:5px;
+  #attach-btn, #voice-btn {
+    height:42px; padding:0 12px; display:inline-flex; align-items:center; gap:6px;
     font-size:13px; color:var(--muted); flex-shrink:0;
   }
+  #voice-btn.recording {
+    background:var(--warn-bg); color:var(--warn-fg); border-color:var(--accent);
+    animation:voicePulse 1.25s ease-in-out infinite;
+  }
+  #voice-btn.transcribing {
+    background:var(--info-bg); color:var(--info-fg); cursor:progress;
+  }
+  @keyframes voicePulse {
+    0%, 100% { box-shadow:0 0 0 0 rgba(217,119,87,0.36); }
+    50% { box-shadow:0 0 0 5px rgba(217,119,87,0.08); }
+  }
+  #voice-status {
+    display:none; align-items:center; justify-content:space-between; gap:8px;
+    padding:5px 10px; border-radius:8px; background:var(--subtle);
+    border:1px solid var(--line); font-size:12px; color:var(--muted);
+  }
+  #voice-status.active { display:flex; }
   textarea#input {
     flex:1; resize:none; min-height:42px; max-height:200px; padding:10px 12px;
     border-radius:10px; line-height:1.45;
@@ -609,10 +626,23 @@
       <main id="log"></main>
       <form id="form">
         <div id="att-tray"></div>
+        <div id="voice-status">
+          <span id="voice-status-text">Listening…</span>
+          <button id="voice-cancel-btn" class="mini-btn" type="button">Cancel</button>
+        </div>
         <div class="composer-row">
           <input id="file-input" type="file" multiple hidden>
           <button id="attach-btn" type="button" title="Attach or paste PDF, code, CSV, DOCX, ZIP, or images (Cmd+V)">+ Attach</button>
-          <textarea id="input" rows="1" placeholder="Ask anything, build software, or paste files (⌘V)…" autofocus></textarea>
+          <textarea id="input" rows="1" placeholder="Ask anything, speak (⌘⇧V), build software, or paste files (⌘V)…" autofocus></textarea>
+          <button id="voice-btn" type="button" title="Speak voice command (Cmd+Shift+V)" aria-label="Voice input">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="2" width="6" height="12" rx="3"/>
+              <path d="M5 10a7 7 0 0 0 14 0"/>
+              <path d="M12 17v4"/>
+              <path d="M8 21h8"/>
+            </svg>
+            <span id="voice-btn-label">Voice</span>
+          </button>
           <button id="send" type="submit">Send</button>
         </div>
       </form>
@@ -680,6 +710,8 @@ let allProjects = [];
 let expandedProjects = new Set();
 
 let pendingAttachments = [];
+let pendingVoiceBadge = "";
+let voiceSession = null;
 let wsFiles = [];
 let wsWorkdir = "";
 let previewPath = "";
@@ -1783,9 +1815,225 @@ chatCol.addEventListener("drop", async (e) => {
   input.focus();
 });
 
-/* Keyboard shortcuts: Cmd+B sidebar, Cmd+N new conversation */
+/* Keyboard shortcuts: Cmd+B sidebar, Cmd+N new conversation, Cmd+Shift+V voice */
+function encodeWav16kMono(chunks, totalSamples, srcRate) {
+  const dstRate = 16000;
+  const merged = new Float32Array(totalSamples);
+  let off = 0;
+  for (const c of chunks) {
+    merged.set(c, off);
+    off += c.length;
+  }
+  const ratio = Math.max(1, (srcRate || 48000) / dstRate);
+  const dstLen = Math.max(1, Math.floor(totalSamples / ratio));
+  const buf = new ArrayBuffer(44 + dstLen * 2);
+  const dv = new DataView(buf);
+  const putStr = (pos, str) => {
+    for (let i = 0; i < str.length; i++) dv.setUint8(pos + i, str.charCodeAt(i));
+  };
+  putStr(0, "RIFF");
+  dv.setUint32(4, 36 + dstLen * 2, true);
+  putStr(8, "WAVE");
+  putStr(12, "fmt ");
+  dv.setUint32(16, 16, true);
+  dv.setUint16(20, 1, true);
+  dv.setUint16(22, 1, true);
+  dv.setUint32(24, dstRate, true);
+  dv.setUint32(28, dstRate * 2, true);
+  dv.setUint16(32, 2, true);
+  dv.setUint16(34, 16, true);
+  putStr(36, "data");
+  dv.setUint32(40, dstLen * 2, true);
+  for (let i = 0; i < dstLen; i++) {
+    const start = Math.floor(i * ratio);
+    const end = Math.min(totalSamples, Math.max(start + 1, Math.floor((i + 1) * ratio)));
+    let acc = 0;
+    for (let j = start; j < end; j++) acc += merged[j];
+    const sample = Math.max(-1, Math.min(1, acc / (end - start)));
+    const s16 = sample < 0 ? Math.round(sample * 32768) : Math.round(sample * 32767);
+    dv.setInt16(44 + i * 2, s16, true);
+  }
+  return buf;
+}
+
+function setVoiceStatusBanner(msg, keepVisible) {
+  const bar = $("voice-status");
+  $("voice-status-text").textContent = msg;
+  bar.classList.toggle("active", Boolean(msg) && keepVisible !== false);
+}
+
+async function stopVoiceCapture(cancelOnly) {
+  const sess = voiceSession;
+  if (!sess || sess.stopping) return;
+  sess.stopping = true;
+  voiceSession = null;
+  if (sess.timer) clearInterval(sess.timer);
+  try { sess.proc.disconnect(); } catch (e) {}
+  try { sess.gain.disconnect(); } catch (e) {}
+  try { sess.source.disconnect(); } catch (e) {}
+  try { sess.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  try { await sess.ctx.close(); } catch (e) {}
+
+  const btn = $("voice-btn");
+  btn.classList.remove("recording");
+  $("voice-btn-label").textContent = "Voice";
+
+  if (cancelOnly || sess.totalSamples < 1600) {
+    btn.classList.remove("transcribing");
+    setVoiceStatusBanner("", false);
+    input.focus();
+    return;
+  }
+
+  btn.classList.add("transcribing");
+  $("voice-btn-label").textContent = "…";
+  setVoiceStatusBanner("Transcribing speech locally on Neural Engine…", true);
+  try {
+    const wavBuf = encodeWav16kMono(sess.chunks, sess.totalSamples, sess.sampleRate);
+    const reqHeaders = { "Content-Type": "audio/wav" };
+    if ($("key").value) reqHeaders.Authorization = "Bearer " + $("key").value;
+    const r = await fetch("/v1/speech/transcribe", {
+      method: "POST",
+      headers: reqHeaders,
+      body: wavBuf,
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error?.message || r.statusText);
+    const spoken = String(j.text || "").trim();
+    if (!spoken) {
+      setVoiceStatusBanner("No speech detected — click Voice to speak again", true);
+      setTimeout(() => { if (!voiceSession) setVoiceStatusBanner("", false); }, 2600);
+      input.focus();
+      return;
+    }
+    const existing = input.value.trim();
+    input.value = existing ? (existing + " " + spoken) : spoken;
+    input.dispatchEvent(new Event("input"));
+    const ms = Math.round(j.transcribe_ms || 0);
+    pendingVoiceBadge = `voice · ${ms} ms`;
+    setVoiceStatusBanner("", false);
+    if (!send.disabled) {
+      $("form").requestSubmit();
+    }
+  } catch (err) {
+    setVoiceStatusBanner("Voice transcription error: " + err.message, true);
+    setTimeout(() => { if (!voiceSession) setVoiceStatusBanner("", false); }, 3600);
+  } finally {
+    btn.classList.remove("transcribing");
+    $("voice-btn-label").textContent = "Voice";
+  }
+}
+
+async function startVoiceCapture() {
+  const btn = $("voice-btn");
+  if (btn.classList.contains("transcribing")) return;
+  if (voiceSession) {
+    await stopVoiceCapture(false);
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setVoiceStatusBanner("Microphone capture is unavailable in this browser context", true);
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+  } catch (err) {
+    setVoiceStatusBanner("Microphone permission denied", true);
+    setTimeout(() => { if (!voiceSession) setVoiceStatusBanner("", false); }, 3200);
+    return;
+  }
+
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new AudioCtx();
+  if (ctx.state === "suspended") {
+    try { await ctx.resume(); } catch (e) {}
+  }
+  const source = ctx.createMediaStreamSource(stream);
+  const proc = ctx.createScriptProcessor(2048, 1, 1);
+  const gain = ctx.createGain();
+  gain.gain.value = 0;
+  source.connect(proc);
+  proc.connect(gain);
+  gain.connect(ctx.destination);
+
+  const startedAt = performance.now();
+  const sess = {
+    stream,
+    ctx,
+    source,
+    proc,
+    gain,
+    sampleRate: ctx.sampleRate || 48000,
+    chunks: [],
+    totalSamples: 0,
+    speechMs: 0,
+    heardSpeech: false,
+    lastVoiceAt: startedAt,
+    startedAt,
+    stopping: false,
+    timer: null,
+  };
+  voiceSession = sess;
+  btn.classList.add("recording");
+  $("voice-btn-label").textContent = "Done";
+  setVoiceStatusBanner("Listening 0:00 · speak naturally (click Done or press Enter to send, Esc to cancel)", true);
+
+  proc.onaudioprocess = (ev) => {
+    if (voiceSession !== sess || sess.stopping) return;
+    const ch = ev.inputBuffer.getChannelData(0);
+    const copy = new Float32Array(ch.length);
+    copy.set(ch);
+    sess.chunks.push(copy);
+    sess.totalSamples += copy.length;
+
+    let sumSq = 0;
+    for (let i = 0; i < ch.length; i++) sumSq += ch[i] * ch[i];
+    const rms = Math.sqrt(sumSq / Math.max(1, ch.length));
+    const now = performance.now();
+    const frameMs = (ch.length / sess.sampleRate) * 1000;
+    if (rms > 0.016) {
+      sess.speechMs += frameMs;
+      sess.lastVoiceAt = now;
+      if (sess.speechMs >= 160) sess.heardSpeech = true;
+    }
+    if (sess.heardSpeech && (now - sess.lastVoiceAt) >= 1350 && (now - sess.startedAt) >= 900) {
+      stopVoiceCapture(false);
+    } else if ((now - sess.startedAt) >= 45000) {
+      stopVoiceCapture(false);
+    }
+  };
+
+  sess.timer = setInterval(() => {
+    if (voiceSession !== sess || sess.stopping) return;
+    const sec = Math.floor((performance.now() - sess.startedAt) / 1000);
+    const mm = Math.floor(sec / 60);
+    const ss = String(sec % 60).padStart(2, "0");
+    setVoiceStatusBanner(`Listening ${mm}:${ss} · click Done or press Enter to finish`, true);
+  }, 300);
+}
+
+$("voice-btn").onclick = () => startVoiceCapture();
+$("voice-cancel-btn").onclick = () => stopVoiceCapture(true);
+
 window.addEventListener("keydown", (e) => {
-  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b") {
+  if (e.key === "Escape" && voiceSession) {
+    e.preventDefault();
+    stopVoiceCapture(true);
+  } else if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "v") {
+    e.preventDefault();
+    startVoiceCapture();
+  } else if (e.key === "Enter" && voiceSession && !e.shiftKey) {
+    e.preventDefault();
+    stopVoiceCapture(false);
+  } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b") {
     e.preventDefault();
     toggleSidebar();
   } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "n" && !send.disabled) {
@@ -1870,6 +2118,9 @@ function summarizeArgs(name, rawArgs) {
     if (name === "use_computer") {
       return `${a.action || "action"} · ${a.target || ""}`;
     }
+    if (name === "switch_workspace") {
+      return a.subfolder ? `${a.path || ""}/${a.subfolder}` : (a.path || "");
+    }
     if (name === "edit_file" && a.path) {
       const o = String(a.old_text || "").replace(/\s+/g, " ").trim().slice(0, 22);
       const n = String(a.new_text || "").replace(/\s+/g, " ").trim().slice(0, 22);
@@ -1889,7 +2140,11 @@ input.addEventListener("input", () => {
 input.addEventListener("keydown", e => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
-    $("form").requestSubmit();
+    if (voiceSession) {
+      stopVoiceCapture(false);
+    } else {
+      $("form").requestSubmit();
+    }
   }
 });
 
@@ -1932,6 +2187,14 @@ async function runUnifiedTurn(text, attachedItems) {
   const toolRecordsById = new Map();
   const toolRecords = [];
   const turnBadges = [];
+  if (pendingVoiceBadge) {
+    turnBadges.push(pendingVoiceBadge);
+    const vp = document.createElement("span");
+    vp.className = "pill info";
+    vp.textContent = pendingVoiceBadge;
+    headRow.appendChild(vp);
+    pendingVoiceBadge = "";
+  }
   const stepLabels = new Map();
   let verifyRecord = null;
   let activeRoute = "chat";
@@ -2063,6 +2326,26 @@ async function runUnifiedTurn(text, attachedItems) {
           const msg = `drafting ${j.name}${tgt} (${j.bytes} B)…`;
           if (el) el.textContent = msg;
           if (!prose) proseBox.textContent = msg;
+        } else if (j.type === "workspace_changed") {
+          if (j.workdir) {
+            wsWorkdir = j.workdir;
+            $("proj-chip").textContent = baseName(wsWorkdir);
+            $("proj-chip").title = wsWorkdir;
+            $("ws-toggle").title = `Workspace directory: ${wsWorkdir}`;
+            if (!allProjects.includes(wsWorkdir)) allProjects.unshift(wsWorkdir);
+            expandedProjects.add(wsWorkdir);
+            renderSidebar();
+            const wb = `workspace · ${baseName(wsWorkdir)}`;
+            turnBadges.push(wb);
+            const wp = document.createElement("span");
+            wp.className = "pill info";
+            wp.textContent = wb;
+            wp.title = wsWorkdir;
+            headRow.appendChild(wp);
+            userClosedWs = false;
+            if ($("ws-pane").classList.contains("hidden")) setWorkspaceOpen(true);
+            refreshWorkspace(true);
+          }
         } else if (j.type === "step_stats") {
           const u = j.usage || {};
           lastUsage = u;

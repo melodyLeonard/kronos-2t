@@ -695,6 +695,14 @@ fn stream_agent_loop_sse(srv: &Server, stream: &mut TcpStream, spec: StreamTurnS
         .map(|m| m.content.clone())
         .unwrap_or_default();
     if !last_user_text.contains("[Device Context") {
+        let lower_user = last_user_text.to_ascii_lowercase();
+        if kronos_2t::device::is_workspace_folder_target_query(&lower_user)
+            && effective_route == TurnRoute::Chat
+        {
+            effective_route = TurnRoute::Agent;
+            active_route = TurnRoute::Agent;
+            let _ = write_sse(r#"{"type":"route","mode":"agent"}"#);
+        }
         if let Some(dev_ctx) = global_device_manager().query_for_turn(&last_user_text) {
             if dev_ctx.wants_computer_action && effective_route == TurnRoute::Chat {
                 effective_route = TurnRoute::Computer;
@@ -817,6 +825,25 @@ fn stream_agent_loop_sse(srv: &Server, stream: &mut TcpStream, spec: StreamTurnS
             quote(&truncate_utf8(&outcome.output, 4096)),
             format_diff_json(outcome.diff.as_ref()),
         )),
+        AgentEvent::WorkspaceChanged { workdir: new_wd } => {
+            let canon = new_wd.to_path_buf();
+            {
+                let mut wd_guard = srv.workdir.lock().unwrap_or_else(|p| p.into_inner());
+                *wd_guard = canon.clone();
+            }
+            {
+                let mut idx = srv.ui_index.lock().unwrap_or_else(|p| p.into_inner());
+                let canon_str = canon.to_string_lossy().into_owned();
+                if !idx.projects.iter().any(|p| p == &canon_str) {
+                    idx.projects.push(canon_str);
+                    persist_projects_file(&srv.state_dir, &idx.projects);
+                }
+            }
+            write_sse(&format!(
+                r#"{{"type":"workspace_changed","workdir":{}}}"#,
+                quote(&canon.to_string_lossy())
+            ))
+        }
         AgentEvent::ValidationRepair { step, report } => write_sse(&format!(
             r#"{{"type":"validation_repair","step":{step},"report":{}}}"#,
             quote(report)
@@ -1343,6 +1370,51 @@ fn handle_screencapture(stream: &mut TcpStream, req: &Request) {
     );
 }
 
+fn handle_speech_transcribe(stream: &mut TcpStream, req: &Request) {
+    if req.body.is_empty() {
+        return error(stream, 400, "empty speech request body");
+    }
+    let ctype = req
+        .header("content-type")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let audio_bytes = if ctype.starts_with("audio/")
+        || ctype.starts_with("application/octet-stream")
+        || req.body.starts_with(b"RIFF")
+    {
+        req.body.clone()
+    } else {
+        let body_json = match std::str::from_utf8(&req.body)
+            .map_err(|e| e.to_string())
+            .and_then(Json::parse)
+        {
+            Ok(j) => j,
+            Err(e) => return error(stream, 400, &format!("invalid speech JSON: {e}")),
+        };
+        let Some(audio_str) = body_json
+            .get("audio")
+            .or_else(|| body_json.get("wav"))
+            .and_then(Json::as_str)
+        else {
+            return error(stream, 400, "missing `audio` base64 field");
+        };
+        match kronos_2t::speech::decode_audio_payload(audio_str) {
+            Ok(b) => b,
+            Err(e) => return error(stream, 400, &e),
+        }
+    };
+
+    match kronos_2t::speech::transcribe_audio_bytes(&audio_bytes) {
+        Ok(vt) => respond(
+            stream,
+            200,
+            "application/json",
+            &kronos_2t::speech::voice_transcription_to_json(&vt),
+        ),
+        Err(e) => error(stream, 500, &e),
+    }
+}
+
 #[cfg(test)]
 fn format_agent_files_json(workdir: &Path) -> String {
     format_agent_files_with_ctx(workdir, 16384)
@@ -1609,6 +1681,13 @@ fn handle(srv: &Server, mut stream: TcpStream) {
             }
         }
         ("POST", "/v1/screencapture") => handle_screencapture(&mut stream, &req),
+        ("GET", "/v1/speech/status") => respond(
+            &mut stream,
+            200,
+            "application/json",
+            &kronos_2t::speech::speech_status_json(),
+        ),
+        ("POST", "/v1/speech/transcribe") => handle_speech_transcribe(&mut stream, &req),
         ("GET", "/v1/device/status") => {
             respond(
                 &mut stream,
@@ -1800,6 +1879,7 @@ fn main() {
     let mut prewarmed_tokens = 0usize;
     std::thread::scope(|s| {
         let vj = s.spawn(kronos_2t::vision::prewarm_vision);
+        let sj = s.spawn(kronos_2t::speech::prewarm_speech);
         let dj = s.spawn(move || {
             let mgr = global_device_manager();
             if enable_dev_ctx {
@@ -1808,6 +1888,7 @@ fn main() {
         });
         prewarmed_tokens = model.prewarm_prefix(&warm_sys, &warm_tools);
         let _ = vj.join();
+        let _ = sj.join();
         let _ = dj.join();
     });
     eprintln!(

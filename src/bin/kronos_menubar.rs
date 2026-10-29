@@ -28,6 +28,48 @@ mod macos {
     type Id = *mut c_void;
     type Sel = *mut c_void;
 
+    macro_rules! embed_info_plist {
+        ($bytes:expr) => {
+            const _: () = {
+                #[used]
+                #[link_section = "__TEXT,__info_plist"]
+                static INFO_PLIST: [u8; $bytes.len()] = {
+                    let mut out = [0u8; $bytes.len()];
+                    let mut i = 0;
+                    while i < $bytes.len() {
+                        out[i] = $bytes[i];
+                        i += 1;
+                    }
+                    out
+                };
+            };
+        };
+    }
+
+    embed_info_plist!(
+        br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.melodyleonard.kronos.menubar</string>
+    <key>CFBundleName</key>
+    <string>Kronos</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Kronos uses the microphone for local on-device voice commands.</string>
+</dict>
+</plist>
+"#
+    );
+
+    #[repr(C)]
+    struct ObjCBlockLiteral {
+        isa: *const c_void,
+        flags: i32,
+        reserved: i32,
+        invoke: Option<unsafe extern "C" fn(*mut ObjCBlockLiteral, isize)>,
+    }
+
     #[repr(C)]
     #[derive(Clone, Copy, Debug)]
     struct NSPoint {
@@ -657,6 +699,18 @@ mod macos {
         toggle_panel();
     }
 
+    unsafe extern "C" fn on_menu_voice_prompt(_this: Id, _cmd: Sel, _sender: Id) {
+        show_panel(false);
+        STATE.with(|cell| {
+            if let Some(st) = cell.borrow().as_ref() {
+                eval_js(
+                    st.webview,
+                    "if (window.kronosStartVoice) window.kronosStartVoice();",
+                );
+            }
+        });
+    }
+
     unsafe extern "C" fn on_menu_new_chat(_this: Id, _cmd: Sel, _sender: Id) {
         show_panel(true);
     }
@@ -837,7 +891,57 @@ mod macos {
                 });
                 show_panel(false);
             }
+            "mic_begin" => {
+                STATE.with(|cell| {
+                    if let Some(st) = cell.borrow_mut().as_mut() {
+                        st.suppress_auto_hide = true;
+                    }
+                });
+            }
+            "mic_end" => {
+                STATE.with(|cell| {
+                    if let Some(st) = cell.borrow_mut().as_mut() {
+                        st.suppress_auto_hide = false;
+                    }
+                });
+            }
             _ => {}
+        }
+    }
+
+    unsafe extern "C" fn on_request_media_capture_permission(
+        _this: Id,
+        _cmd: Sel,
+        _webview: Id,
+        origin: Id,
+        _frame: Id,
+        _media_type: isize,
+        decision_handler: *mut c_void,
+    ) {
+        if decision_handler.is_null() {
+            return;
+        }
+        let mut allow = true;
+        if !origin.is_null() {
+            let host_ns: Id = msg!(origin, "host"; Id);
+            if let Some(host) = ns_string_to_rust(host_ns) {
+                let h = host.trim().to_ascii_lowercase();
+                if !h.is_empty() && h != "127.0.0.1" && h != "localhost" && h != "::1" {
+                    let matches_base = STATE.with(|cell| {
+                        cell.borrow()
+                            .as_ref()
+                            .map(|s| s.base_url.to_ascii_lowercase().contains(&h))
+                            .unwrap_or(false)
+                    });
+                    allow = matches_base;
+                }
+            }
+        }
+        // WKPermissionDecisionGrant = 1, WKPermissionDecisionDeny = 2
+        let decision: isize = if allow { 1 } else { 2 };
+        let block = decision_handler as *mut ObjCBlockLiteral;
+        if let Some(invoke) = (*block).invoke {
+            invoke(block, decision);
         }
     }
 
@@ -879,6 +983,7 @@ mod macos {
             ctrl_cls = objc_allocateClassPair(class("NSObject"), name.as_ptr(), 0);
             let action_sig = CString::new("v@:@").unwrap();
             let msg_sig = CString::new("v@:@@").unwrap();
+            let media_perm_sig = CString::new("v@:@@@q@?").unwrap();
             class_addMethod(
                 ctrl_cls,
                 sel("statusBarClicked:"),
@@ -889,6 +994,12 @@ mod macos {
                 ctrl_cls,
                 sel("toggleQuickPrompt:"),
                 on_menu_toggle as *const c_void,
+                action_sig.as_ptr(),
+            );
+            class_addMethod(
+                ctrl_cls,
+                sel("voiceQuickPrompt:"),
+                on_menu_voice_prompt as *const c_void,
                 action_sig.as_ptr(),
             );
             class_addMethod(
@@ -938,6 +1049,12 @@ mod macos {
                 sel("userContentController:didReceiveScriptMessage:"),
                 on_script_message as *const c_void,
                 msg_sig.as_ptr(),
+            );
+            class_addMethod(
+                ctrl_cls,
+                sel("webView:requestMediaCapturePermissionForOrigin:initiatedByFrame:type:decisionHandler:"),
+                on_request_media_capture_permission as *const c_void,
+                media_perm_sig.as_ptr(),
             );
             objc_registerClassPair(ctrl_cls);
         }
@@ -1001,6 +1118,7 @@ mod macos {
         };
 
         add_item("Quick Prompt (⌥Space)", "toggleQuickPrompt:", "");
+        add_item("Voice Prompt (⌘⇧V)", "voiceQuickPrompt:", "");
         add_item("New Quick Chat", "newQuickChat:", "n");
         add_item("Reset HUD Position", "resetHudPosition:", "");
         add_item("Open Kronos Workspace", "openWorkspace:", "o");
@@ -1176,6 +1294,7 @@ mod macos {
             );
             // NSViewWidthSizable (2) | NSViewHeightSizable (16)
             let _: () = msg!(webview, "setAutoresizingMask:", 18usize => usize; ());
+            let _: () = msg!(webview, "setUIDelegate:", controller => Id; ());
             let false_num: Id = msg!(class("NSNumber"), "numberWithBool:", false => bool; Id);
             let draws_bg_key = ns_string("drawsBackground");
             let _: () = msg!(webview, "setValue:forKey:", false_num => Id, draws_bg_key => Id; ());

@@ -46,6 +46,7 @@ pub mod real_llm;
 pub mod router;
 pub mod safetensors;
 pub mod simd_lut;
+pub mod speech;
 pub mod ssd;
 pub mod synthesis;
 pub mod thread_pool;

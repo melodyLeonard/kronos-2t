@@ -162,6 +162,41 @@
     background: var(--panel);
     color: var(--text);
   }
+  #q-voice {
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: var(--panel);
+    color: #d1d5db;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+  }
+  #q-voice:hover {
+    border-color: rgba(255, 255, 255, 0.28);
+    color: #fff;
+  }
+  #q-voice.recording {
+    background: rgba(217, 119, 87, 0.22);
+    border-color: var(--accent-warm);
+    color: #ffb49a;
+    animation: qVoicePulse 1.25s ease-in-out infinite;
+  }
+  #q-voice.transcribing {
+    background: rgba(13, 148, 136, 0.2);
+    border-color: var(--accent);
+    color: #5eead4;
+    cursor: progress;
+  }
+  @keyframes qVoicePulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(217, 119, 87, 0.42); }
+    50% { box-shadow: 0 0 0 5px rgba(217, 119, 87, 0.08); }
+  }
   #q-send {
     width: 32px;
     height: 32px;
@@ -363,6 +398,14 @@
       <select id="sess-select" title="Active conversation">
         <option value="">New Chat</option>
       </select>
+      <button id="q-voice" type="button" title="Voice command (Cmd+Shift+V)" aria-label="Voice command">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="9" y="2" width="6" height="12" rx="3"/>
+          <path d="M5 10a7 7 0 0 0 14 0"/>
+          <path d="M12 17v4"/>
+          <path d="M8 21h8"/>
+        </svg>
+      </button>
       <button id="q-send" type="submit" title="Send (Enter)">↑</button>
     </div>
     <div id="tray"></div>
@@ -387,7 +430,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const qInput = $("q-input"), qSend = $("q-send"), tray = $("tray"), ansWrap = $("answer-wrap");
+const qInput = $("q-input"), qSend = $("q-send"), qVoice = $("q-voice"), tray = $("tray"), ansWrap = $("answer-wrap");
 let quickSessionId = "";
 let quickTitle = "";
 let quickCreatedAt = 0;
@@ -396,6 +439,8 @@ let quickTurns = [];
 let pendingAttachments = [];
 let lastReplyText = "";
 let activeWorkdir = "";
+let pendingVoiceBadge = "";
+let qVoiceSession = null;
 
 const isNativeHost = Boolean(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.kronos);
 if (!isNativeHost) {
@@ -423,6 +468,206 @@ function syncPanelHeight() {
 function escHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
+
+function baseNamePath(p) {
+  const clean = String(p || "").replace(/\/+$/, "");
+  const parts = clean.split("/");
+  return parts[parts.length - 1] || clean || "workspace";
+}
+
+function encodeWav16kMono(chunks, totalSamples, srcRate) {
+  const dstRate = 16000;
+  const merged = new Float32Array(totalSamples);
+  let off = 0;
+  for (const c of chunks) {
+    merged.set(c, off);
+    off += c.length;
+  }
+  const ratio = Math.max(1, (srcRate || 48000) / dstRate);
+  const dstLen = Math.max(1, Math.floor(totalSamples / ratio));
+  const buf = new ArrayBuffer(44 + dstLen * 2);
+  const dv = new DataView(buf);
+  const putStr = (pos, str) => {
+    for (let i = 0; i < str.length; i++) dv.setUint8(pos + i, str.charCodeAt(i));
+  };
+  putStr(0, "RIFF");
+  dv.setUint32(4, 36 + dstLen * 2, true);
+  putStr(8, "WAVE");
+  putStr(12, "fmt ");
+  dv.setUint32(16, 16, true);
+  dv.setUint16(20, 1, true);
+  dv.setUint16(22, 1, true);
+  dv.setUint32(24, dstRate, true);
+  dv.setUint32(28, dstRate * 2, true);
+  dv.setUint16(32, 2, true);
+  dv.setUint16(34, 16, true);
+  putStr(36, "data");
+  dv.setUint32(40, dstLen * 2, true);
+  for (let i = 0; i < dstLen; i++) {
+    const start = Math.floor(i * ratio);
+    const end = Math.min(totalSamples, Math.max(start + 1, Math.floor((i + 1) * ratio)));
+    let acc = 0;
+    for (let j = start; j < end; j++) acc += merged[j];
+    const sample = Math.max(-1, Math.min(1, acc / (end - start)));
+    const s16 = sample < 0 ? Math.round(sample * 32768) : Math.round(sample * 32767);
+    dv.setInt16(44 + i * 2, s16, true);
+  }
+  return buf;
+}
+
+async function stopQuickVoice(cancelOnly) {
+  const sess = qVoiceSession;
+  if (!sess || sess.stopping) return;
+  sess.stopping = true;
+  qVoiceSession = null;
+  if (sess.timer) clearInterval(sess.timer);
+  try { sess.proc.disconnect(); } catch (e) {}
+  try { sess.gain.disconnect(); } catch (e) {}
+  try { sess.source.disconnect(); } catch (e) {}
+  try { sess.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  try { await sess.ctx.close(); } catch (e) {}
+  qVoice.classList.remove("recording");
+
+  if (cancelOnly || sess.totalSamples < 1600) {
+    qVoice.classList.remove("transcribing");
+    $("q-status").textContent = cancelOnly ? "Voice input cancelled" : "No speech captured";
+    qInput.focus();
+    return;
+  }
+
+  qVoice.classList.add("transcribing");
+  $("q-status").textContent = "Transcribing on Neural Engine…";
+  try {
+    const wavBuf = encodeWav16kMono(sess.chunks, sess.totalSamples, sess.sampleRate);
+    const r = await fetch("/v1/speech/transcribe", {
+      method: "POST",
+      headers: { "Content-Type": "audio/wav" },
+      body: wavBuf,
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error?.message || r.statusText);
+    const spoken = String(j.text || "").trim();
+    if (!spoken) {
+      $("q-status").textContent = "No speech detected — click mic to speak again";
+      qInput.focus();
+      return;
+    }
+    const existing = qInput.value.trim();
+    qInput.value = existing ? (existing + " " + spoken) : spoken;
+    qInput.dispatchEvent(new Event("input"));
+    const ms = Math.round(j.transcribe_ms || 0);
+    pendingVoiceBadge = `voice · ${ms} ms`;
+    $("q-status").textContent = `Transcribed in ${ms} ms`;
+    if (!qSend.disabled) {
+      $("q-form").requestSubmit();
+    }
+  } catch (err) {
+    $("q-status").textContent = "Voice error: " + err.message;
+  } finally {
+    qVoice.classList.remove("transcribing");
+  }
+}
+
+async function startQuickVoice() {
+  if (qVoice.classList.contains("transcribing")) return;
+  if (qVoiceSession) {
+    await stopQuickVoice(false);
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    $("q-status").textContent = "Microphone API unavailable in this view";
+    return;
+  }
+  postHost({ type: "mic_begin" });
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+  } catch (err) {
+    $("q-status").textContent = "Microphone access denied";
+    return;
+  } finally {
+    postHost({ type: "mic_end" });
+  }
+
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new AudioCtx();
+  if (ctx.state === "suspended") {
+    try { await ctx.resume(); } catch (e) {}
+  }
+  const source = ctx.createMediaStreamSource(stream);
+  const proc = ctx.createScriptProcessor(2048, 1, 1);
+  const gain = ctx.createGain();
+  gain.gain.value = 0;
+  source.connect(proc);
+  proc.connect(gain);
+  gain.connect(ctx.destination);
+
+  const startedAt = performance.now();
+  const sess = {
+    stream,
+    ctx,
+    source,
+    proc,
+    gain,
+    sampleRate: ctx.sampleRate || 48000,
+    chunks: [],
+    totalSamples: 0,
+    speechMs: 0,
+    heardSpeech: false,
+    lastVoiceAt: startedAt,
+    startedAt,
+    stopping: false,
+    timer: null,
+  };
+  qVoiceSession = sess;
+  qVoice.classList.add("recording");
+  $("q-status").textContent = "Listening 0:00 · speak command (Enter to send, Esc to cancel)";
+
+  proc.onaudioprocess = (ev) => {
+    if (qVoiceSession !== sess || sess.stopping) return;
+    const ch = ev.inputBuffer.getChannelData(0);
+    const copy = new Float32Array(ch.length);
+    copy.set(ch);
+    sess.chunks.push(copy);
+    sess.totalSamples += copy.length;
+
+    let sumSq = 0;
+    for (let i = 0; i < ch.length; i++) sumSq += ch[i] * ch[i];
+    const rms = Math.sqrt(sumSq / Math.max(1, ch.length));
+    const now = performance.now();
+    const frameMs = (ch.length / sess.sampleRate) * 1000;
+    if (rms > 0.016) {
+      sess.speechMs += frameMs;
+      sess.lastVoiceAt = now;
+      if (sess.speechMs >= 160) sess.heardSpeech = true;
+    }
+    if (sess.heardSpeech && (now - sess.lastVoiceAt) >= 1350 && (now - sess.startedAt) >= 900) {
+      stopQuickVoice(false);
+    } else if ((now - sess.startedAt) >= 45000) {
+      stopQuickVoice(false);
+    }
+  };
+
+  sess.timer = setInterval(() => {
+    if (qVoiceSession !== sess || sess.stopping) return;
+    const sec = Math.floor((performance.now() - sess.startedAt) / 1000);
+    const mm = Math.floor(sec / 60);
+    const ss = String(sec % 60).padStart(2, "0");
+    $("q-status").textContent = `Listening ${mm}:${ss} · click mic or press Enter to finish`;
+  }, 300);
+}
+
+qVoice.onclick = () => startQuickVoice();
+window.kronosStartVoice = () => {
+  if (!qVoiceSession) startQuickVoice();
+};
 
 function renderMd(md) {
   const esc = escHtml(md);
@@ -750,7 +995,17 @@ qInput.addEventListener("input", () => {
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     e.preventDefault();
+    if (qVoiceSession) {
+      stopQuickVoice(true);
+      return;
+    }
     if (!postHost({ type: "hide" })) resetQuickChat();
+  } else if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "v") {
+    e.preventDefault();
+    startQuickVoice();
+  } else if (e.key === "Enter" && qVoiceSession && !e.shiftKey) {
+    e.preventDefault();
+    stopQuickVoice(false);
   } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "n") {
     e.preventDefault();
     resetQuickChat();
@@ -760,7 +1015,11 @@ window.addEventListener("keydown", (e) => {
 qInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
-    $("q-form").requestSubmit();
+    if (qVoiceSession) {
+      stopQuickVoice(false);
+    } else {
+      $("q-form").requestSubmit();
+    }
   }
 });
 
@@ -848,6 +1107,14 @@ $("q-form").onsubmit = async (e) => {
   let prose = "";
   let routeMode = "chat";
   const badges = [];
+  if (pendingVoiceBadge) {
+    badges.push(pendingVoiceBadge);
+    const vp = document.createElement("span");
+    vp.className = "q-pill";
+    vp.textContent = pendingVoiceBadge;
+    badgeRow.appendChild(vp);
+    pendingVoiceBadge = "";
+  }
   const toolRecords = [];
   let verifyRecord = null;
   let ctxTokens = 0;
@@ -921,6 +1188,19 @@ $("q-form").onsubmit = async (e) => {
           syncPanelHeight();
         } else if (j.type === "tool_progress") {
           $("q-status").textContent = `Drafting ${j.name} ${j.target || ""} (${j.bytes} B)…`;
+        } else if (j.type === "workspace_changed") {
+          if (j.workdir) {
+            activeWorkdir = j.workdir;
+            const wb = `workspace · ${baseNamePath(j.workdir)}`;
+            badges.push(wb);
+            const p = document.createElement("span");
+            p.className = "q-pill";
+            p.textContent = wb;
+            p.title = j.workdir;
+            badgeRow.appendChild(p);
+            loadSessionsList();
+            syncPanelHeight();
+          }
         } else if (j.type === "tool_done") {
           toolRecords.push({
             id: j.id,

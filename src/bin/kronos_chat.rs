@@ -255,6 +255,7 @@ fn main() {
                 expect_tool_call: true,
             };
             let mut printed_text = false;
+            let mut next_workdir: Option<PathBuf> = None;
             let res = run_agent_turn(&mut model, &mut history, &tools_json, &cfg, |ev| {
                 match ev {
                     AgentEvent::ContextCompacted {
@@ -309,6 +310,10 @@ fn main() {
                         let preview = truncate_utf8(&outcome.output, 160).replace('\n', " | ");
                         println!("  <- {preview}");
                     }
+                    AgentEvent::WorkspaceChanged { workdir: new_wd } => {
+                        println!("  [workspace switched to {}]", new_wd.display());
+                        next_workdir = Some(new_wd.to_path_buf());
+                    }
                     AgentEvent::ValidationRepair { step, report } => {
                         println!("  [step {step} validation repair]\n{report}");
                     }
@@ -324,6 +329,9 @@ fn main() {
                 }
                 true
             });
+            if let Some(nw) = next_workdir {
+                workdir = nw;
+            }
             params.seed = params.seed.wrapping_add(1);
             if let Err(e) = res {
                 println!("\n(agent error: {e})");
