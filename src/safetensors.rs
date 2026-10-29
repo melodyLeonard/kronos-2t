@@ -72,6 +72,27 @@ impl<'a> TensorView<'a> {
         out
     }
 
+    /// Decodes slice `outer_idx` along axis 0 (e.g., one expert from `[E, R, C]`) into `Vec<f32>`.
+    pub fn slice_outer_to_f32(&self, outer_idx: usize) -> Result<Vec<f32>, String> {
+        if self.shape.len() < 2 {
+            return Err("slice_outer_to_f32 requires rank >= 2".to_string());
+        }
+        let outer = self.shape[0];
+        if outer_idx >= outer {
+            return Err(format!(
+                "outer_idx {outer_idx} out of bounds for shape {:?}",
+                self.shape
+            ));
+        }
+        let inner_numel: usize = self.shape[1..].iter().product();
+        let slice_bytes = inner_numel * self.dtype.byte_size();
+        let start = outer_idx * slice_bytes;
+        let end = start + slice_bytes;
+        let mut out = vec![0.0f32; inner_numel];
+        decode_bytes_to_f32(self.dtype, &self.raw_bytes[start..end], &mut out);
+        Ok(out)
+    }
+
     /// Decodes the entire tensor directly into `BF16` (`Vec<u16>`) without an intermediate `Vec<f32>`.
     pub fn to_bf16_vec(&self) -> Vec<u16> {
         let n = self.numel();
@@ -222,6 +243,25 @@ impl SafeTensorsFile {
             }
         }
     }
+
+    /// Reclaims interior 16 KiB VM pages of axis-0 slice `outer_idx` within tensor `name`.
+    pub fn release_tensor_outer_slice_pages(&self, name: &str, outer_idx: usize) {
+        const VM_PAGE: usize = 16_384;
+        if let Some(meta) = self.tensors.get(name) {
+            if meta.shape.len() < 2 || outer_idx >= meta.shape[0] {
+                return;
+            }
+            let inner_numel: usize = meta.shape[1..].iter().product();
+            let slice_bytes = inner_numel * meta.dtype.byte_size();
+            let abs_start = self.data_section_offset + meta.data_start + outer_idx * slice_bytes;
+            let abs_end = abs_start + slice_bytes;
+            let page_start = (abs_start + (VM_PAGE - 1)) & !(VM_PAGE - 1);
+            let page_end = abs_end & !(VM_PAGE - 1);
+            if page_end > page_start && page_end <= self.byte_len() {
+                self.mmap.advise_dontneed(page_start, page_end - page_start);
+            }
+        }
+    }
 }
 
 /// Unified single-file (`model.safetensors`) or multi-shard (`model.safetensors.index.json`) store.
@@ -288,6 +328,12 @@ impl SafeTensorsStore {
     pub fn release_tensor_pages(&self, name: &str) {
         if let Some(&shard_idx) = self.weight_map.get(name) {
             self.shards[shard_idx].release_tensor_pages(name);
+        }
+    }
+
+    pub fn release_tensor_outer_slice_pages(&self, name: &str, outer_idx: usize) {
+        if let Some(&shard_idx) = self.weight_map.get(name) {
+            self.shards[shard_idx].release_tensor_outer_slice_pages(name, outer_idx);
         }
     }
 }

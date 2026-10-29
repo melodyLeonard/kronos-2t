@@ -32,11 +32,11 @@ pub mod nvme_io {
     use std::os::fd::AsRawFd;
     use std::ptr;
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     const F_NOCACHE: i32 = 48;
 
     unsafe extern "C" {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
         fn pread(fd: i32, buf: *mut c_void, nbyte: usize, offset: i64) -> isize;
         fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> i32;
@@ -45,7 +45,7 @@ pub mod nvme_io {
 
     /// Sets `F_NOCACHE` on `file` so its reads and writes skip the page cache.
     pub fn set_file_nocache(file: &File) -> io::Result<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             // SAFETY: valid fd; the variadic `fcntl` flag is passed as an int.
             let rc = unsafe { fcntl(file.as_raw_fd(), F_NOCACHE, 1i32) };
@@ -53,7 +53,7 @@ pub mod nvme_io {
                 return Err(io::Error::last_os_error());
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             let _ = file;
         }
@@ -62,7 +62,7 @@ pub mod nvme_io {
 
     /// Clears `F_NOCACHE` on `file`; used before `mmap` so mapped pages stay cached.
     pub fn clear_file_nocache(file: &File) -> io::Result<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             // SAFETY: valid fd; the variadic `fcntl` flag is passed as an int.
             let rc = unsafe { fcntl(file.as_raw_fd(), F_NOCACHE, 0i32) };
@@ -70,7 +70,7 @@ pub mod nvme_io {
                 return Err(io::Error::last_os_error());
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             let _ = file;
         }
@@ -293,49 +293,7 @@ impl Kronos800bConfig {
     /// Byte layout of one E8Q2/NF3/NF4/NF5 expert in a `.k2tm` shard.
     /// `gu_rows` and `dn_rows` must be multiples of 32.
     pub fn nf_expert_layout(&self, bits: usize) -> NfExpertByteLayout {
-        assert!((2..=5).contains(&bits));
-        assert!(self.d_model.is_multiple_of(64) && self.d_ff_expert.is_multiple_of(64));
-        let gu_rows = 2 * self.d_ff_expert;
-        let dn_rows = self.d_model;
-        assert!(gu_rows.is_multiple_of(32) && dn_rows.is_multiple_of(32));
-        let sgc = self.scale_group_chunks.max(1);
-        let chunk_b = NfSdotMatrix::stripe_chunk_bytes(bits);
-
-        let gu_chunks = self.d_model / 64;
-        let gu_sg = gu_chunks.div_ceil(sgc);
-        let gu_pairs = gu_rows / 32;
-        let gu_pair_bytes = gu_pairs * (gu_sg * 64 + gu_chunks * 2 * chunk_b);
-
-        let dn_chunks = self.d_ff_expert / 64;
-        let dn_sg = dn_chunks.div_ceil(sgc);
-        let dn_pairs = dn_rows / 32;
-        let dn_pair_bytes = dn_pairs * (dn_sg * 64 + dn_chunks * 2 * chunk_b);
-
-        let gu_codebook_off = 0usize;
-        let dn_codebook_off = 16usize;
-        let gu_pair_off = 64usize;
-        let dn_pair_off = align_up(gu_pair_off + gu_pair_bytes, 64);
-        let aligned_expert_bytes = align_up(dn_pair_off + dn_pair_bytes, K2TM_VM_PAGE_BYTES);
-
-        NfExpertByteLayout {
-            bits,
-            d_model: self.d_model,
-            d_ff: self.d_ff_expert,
-            scale_group_chunks: sgc,
-            gu_rows,
-            gu_pairs,
-            gu_chunks,
-            gu_codebook_off,
-            gu_pair_off,
-            gu_pair_bytes,
-            dn_rows,
-            dn_pairs,
-            dn_chunks,
-            dn_codebook_off,
-            dn_pair_off,
-            dn_pair_bytes,
-            aligned_expert_bytes,
-        }
+        nf_expert_byte_layout(self.d_model, self.d_ff_expert, bits, self.scale_group_chunks)
     }
 
     /// Parameter, disk and RAM budget with NF3/NF4 experts.
@@ -838,6 +796,7 @@ pub struct K2tmShardHeader {
     pub d_ff_expert: usize,
     pub scale_group_chunks: usize,
     pub aligned_expert_bytes: usize,
+    pub bits: usize,
 }
 
 impl K2tmShardHeader {
@@ -851,6 +810,7 @@ impl K2tmShardHeader {
             self.d_ff_expert as u64,
             self.scale_group_chunks as u64,
             self.aligned_expert_bytes as u64,
+            self.bits as u64,
         ];
         for (i, &w) in words.iter().enumerate() {
             page[16 + i * 8..24 + i * 8].copy_from_slice(&w.to_le_bytes());
@@ -875,6 +835,7 @@ impl K2tmShardHeader {
             d_ff_expert: rd(3),
             scale_group_chunks: rd(4),
             aligned_expert_bytes: rd(5),
+            bits: rd(6),
         })
     }
 
@@ -908,6 +869,7 @@ pub fn write_k2tm_shard_file(
         d_ff_expert: cfg.d_ff_expert,
         scale_group_chunks: layout.scale_group_chunks,
         aligned_expert_bytes: layout.aligned_expert_bytes,
+        bits: 0,
     };
 
     let file = File::create(path)?;
@@ -980,6 +942,7 @@ pub fn write_exact_experts_k2tm(
         d_ff_expert: cfg.d_ff_expert,
         scale_group_chunks: layout.scale_group_chunks,
         aligned_expert_bytes: layout.aligned_expert_bytes,
+        bits: 0,
     };
     let file = File::create(path)?;
     #[cfg(unix)]
@@ -1343,7 +1306,7 @@ impl SlruExpertPager {
     }
 }
 
-/// Byte offsets and sizes within one NF3/NF4 expert.
+/// Byte offsets and sizes within one E8Q2/NF3/NF4/NF5 expert.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NfExpertByteLayout {
     pub bits: usize,
@@ -1363,6 +1326,84 @@ pub struct NfExpertByteLayout {
     pub dn_pair_off: usize,
     pub dn_pair_bytes: usize,
     pub aligned_expert_bytes: usize,
+}
+
+/// Computes the 16 KiB-page-aligned `.k2tm` byte layout for one SwiGLU expert (`bits` in `2..=5`).
+pub fn nf_expert_byte_layout(
+    d_model: usize,
+    d_ff: usize,
+    bits: usize,
+    scale_group_chunks: usize,
+) -> NfExpertByteLayout {
+    assert!((2..=5).contains(&bits));
+    assert!(d_model.is_multiple_of(64) && d_ff.is_multiple_of(64));
+    let gu_rows = 2 * d_ff;
+    let dn_rows = d_model;
+    assert!(gu_rows.is_multiple_of(32) && dn_rows.is_multiple_of(32));
+    let sgc = scale_group_chunks.max(1);
+    let chunk_b = NfSdotMatrix::stripe_chunk_bytes(bits);
+
+    let gu_chunks = d_model / 64;
+    let gu_sg = gu_chunks.div_ceil(sgc);
+    let gu_pairs = gu_rows / 32;
+    let gu_pair_bytes = gu_pairs * (gu_sg * 64 + gu_chunks * 2 * chunk_b);
+
+    let dn_chunks = d_ff / 64;
+    let dn_sg = dn_chunks.div_ceil(sgc);
+    let dn_pairs = dn_rows / 32;
+    let dn_pair_bytes = dn_pairs * (dn_sg * 64 + dn_chunks * 2 * chunk_b);
+
+    let gu_codebook_off = 0usize;
+    let dn_codebook_off = 16usize;
+    let gu_pair_off = 64usize;
+    let dn_pair_off = align_up(gu_pair_off + gu_pair_bytes, 64);
+    let aligned_expert_bytes = align_up(dn_pair_off + dn_pair_bytes, K2TM_VM_PAGE_BYTES);
+
+    NfExpertByteLayout {
+        bits,
+        d_model,
+        d_ff,
+        scale_group_chunks: sgc,
+        gu_rows,
+        gu_pairs,
+        gu_chunks,
+        gu_codebook_off,
+        gu_pair_off,
+        gu_pair_bytes,
+        dn_rows,
+        dn_pairs,
+        dn_chunks,
+        dn_codebook_off,
+        dn_pair_off,
+        dn_pair_bytes,
+        aligned_expert_bytes,
+    }
+}
+
+/// Packs a compiled `(gate_up, down)` pair of [`NfSdotMatrix`] into a 16 KiB-aligned `.k2tm` record buffer.
+pub fn pack_nf_expert_record(
+    layout: &NfExpertByteLayout,
+    gu: &NfSdotMatrix,
+    dn: &NfSdotMatrix,
+    buf: &mut [u8],
+) {
+    assert_eq!(buf.len(), layout.aligned_expert_bytes);
+    buf.fill(0);
+    assert_eq!(gu.bits, layout.bits);
+    assert_eq!(dn.bits, layout.bits);
+    assert!(gu.tail_stream.is_empty() && dn.tail_stream.is_empty());
+    assert_eq!(gu.pair_stream.len(), layout.gu_pair_bytes);
+    assert_eq!(dn.pair_stream.len(), layout.dn_pair_bytes);
+    for (i, &c) in gu.codebook.iter().enumerate() {
+        buf[layout.gu_codebook_off + i] = c as u8;
+    }
+    for (i, &c) in dn.codebook.iter().enumerate() {
+        buf[layout.dn_codebook_off + i] = c as u8;
+    }
+    buf[layout.gu_pair_off..layout.gu_pair_off + layout.gu_pair_bytes]
+        .copy_from_slice(&gu.pair_stream);
+    buf[layout.dn_pair_off..layout.dn_pair_off + layout.dn_pair_bytes]
+        .copy_from_slice(&dn.pair_stream);
 }
 
 /// Borrowed NF3/NF4 expert inside a DRAM slot or mapped shard.
@@ -1520,6 +1561,132 @@ impl<'a> MmapNfExpertView<'a> {
             }
         }
     }
+
+    /// Coalesced SwiGLU forward across `m` tokens routed to this expert (`bits` in `2..=5`).
+    /// Keeps each 128-row weight tile in L1D across all `m` tokens and accumulates weighted outputs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_swiglu_coalesced(
+        &self,
+        in_acts: &[&Int8ChunkActivation],
+        routes: &[(usize, f32)],
+        gate_up_batch: &mut [f32],
+        mid_acts: &mut [Int8ChunkActivation],
+        down_batch: &mut [f32],
+        out_batch: &mut [f32],
+        pool: Option<&SpinThreadPool>,
+    ) {
+        let m = in_acts.len();
+        assert!(m > 0 && routes.len() == m && mid_acts.len() >= m);
+        let lay = self.layout;
+        assert!(gate_up_batch.len() >= m * lay.gu_rows);
+        assert!(down_batch.len() >= m * lay.d_model);
+
+        let gu_addr = gate_up_batch.as_mut_ptr() as usize;
+        let gu_cb = &self.gate_up_codebook;
+        let run_gu_block = |p0: usize, p1: usize| {
+            let mut pb = p0;
+            while pb < p1 {
+                let pe = (pb + 4).min(p1);
+                for (j, act) in in_acts.iter().enumerate() {
+                    debug_assert_eq!(act.cols, lay.d_model);
+                    // SAFETY: Disjoint 32-row pairs `[pb, pe)` within each token's `gu_rows` slice.
+                    unsafe {
+                        nf_sdot_pair_stream_range_slices(
+                            self.gate_up_pairs,
+                            gu_cb,
+                            lay.gu_rows,
+                            lay.d_model,
+                            lay.bits,
+                            lay.scale_group_chunks,
+                            act.q.as_ptr(),
+                            act.scales.as_ptr(),
+                            pb,
+                            pe,
+                            (gu_addr as *mut f32).add(j * lay.gu_rows),
+                        );
+                    }
+                }
+                pb = pe;
+            }
+        };
+
+        if let Some(p) = pool.filter(|p| p.num_threads() > 1 && lay.gu_pairs >= 8) {
+            let grain = (lay.gu_pairs / (p.num_threads() * 2)).clamp(1, 4);
+            p.parallel_for(lay.gu_pairs, grain, run_gu_block);
+        } else {
+            run_gu_block(0, lay.gu_pairs);
+        }
+
+        let nc_mid = lay.d_ff / 64;
+        for (j, mid) in mid_acts[..m].iter_mut().enumerate() {
+            debug_assert_eq!(mid.cols, lay.d_ff);
+            let gu_t = &gate_up_batch[j * lay.gu_rows..(j + 1) * lay.gu_rows];
+            let (gate_s, up_s) = gu_t.split_at(lay.d_ff);
+            let mut sw64 = [0.0f32; 64];
+            for c in 0..nc_mid {
+                let g64 = &gate_s[c * 64..(c + 1) * 64];
+                let u64 = &up_s[c * 64..(c + 1) * 64];
+                for ((dst, &g), &u) in sw64.iter_mut().zip(g64).zip(u64) {
+                    *dst = (g / (1.0 + (-g).exp())) * u;
+                }
+                // SAFETY: `c < nc_mid` and `mid` has capacity `nc_mid * 64`.
+                unsafe {
+                    Int8ChunkActivation::populate_chunk_fwht_raw(
+                        mid.q.as_mut_ptr(),
+                        mid.scales.as_mut_ptr(),
+                        mid.sums.as_mut_ptr(),
+                        c,
+                        &sw64,
+                        None,
+                    );
+                }
+            }
+        }
+
+        let mid_slice = &mid_acts[..m];
+        let dn_addr = down_batch.as_mut_ptr() as usize;
+        let dn_cb = &self.down_codebook;
+        let run_dn_block = |p0: usize, p1: usize| {
+            let mut pb = p0;
+            while pb < p1 {
+                let pe = (pb + 4).min(p1);
+                for (j, mid) in mid_slice.iter().enumerate() {
+                    // SAFETY: Disjoint 32-row pairs `[pb, pe)` within each token's `d_model` slice.
+                    unsafe {
+                        nf_sdot_pair_stream_range_slices(
+                            self.down_pairs,
+                            dn_cb,
+                            lay.dn_rows,
+                            lay.d_ff,
+                            lay.bits,
+                            lay.scale_group_chunks,
+                            mid.q.as_ptr(),
+                            mid.scales.as_ptr(),
+                            pb,
+                            pe,
+                            (dn_addr as *mut f32).add(j * lay.d_model),
+                        );
+                    }
+                }
+                pb = pe;
+            }
+        };
+
+        if let Some(p) = pool.filter(|p| p.num_threads() > 1 && lay.dn_pairs >= 8) {
+            let grain = (lay.dn_pairs / (p.num_threads() * 2)).clamp(1, 4);
+            p.parallel_for(lay.dn_pairs, grain, run_dn_block);
+        } else {
+            run_dn_block(0, lay.dn_pairs);
+        }
+
+        for (j, &(tok_idx, weight)) in routes.iter().enumerate() {
+            let dst = &mut out_batch[tok_idx * lay.d_model..(tok_idx + 1) * lay.d_model];
+            let src = &down_batch[j * lay.d_model..(j + 1) * lay.d_model];
+            for (d, &s) in dst.iter_mut().zip(src.iter()) {
+                *d += weight * s;
+            }
+        }
+    }
 }
 
 /// Writes compiled [`NfSdotMatrix`] experts to a `.k2tm` shard with `F_NOCACHE` and `fsync`,
@@ -1541,6 +1708,7 @@ pub fn write_exact_nf_experts_k2tm(
         d_ff_expert: cfg.d_ff_expert,
         scale_group_chunks: layout.scale_group_chunks,
         aligned_expert_bytes: layout.aligned_expert_bytes,
+        bits,
     };
     let file = File::create(path)?;
     #[cfg(unix)]
@@ -1550,22 +1718,7 @@ pub fn write_exact_nf_experts_k2tm(
 
     let mut buf = vec![0u8; layout.aligned_expert_bytes];
     for (gu, dn) in experts {
-        buf.fill(0);
-        assert_eq!(gu.bits, bits);
-        assert_eq!(dn.bits, bits);
-        assert!(gu.tail_stream.is_empty() && dn.tail_stream.is_empty());
-        assert_eq!(gu.pair_stream.len(), layout.gu_pair_bytes);
-        assert_eq!(dn.pair_stream.len(), layout.dn_pair_bytes);
-        for (i, &c) in gu.codebook.iter().enumerate() {
-            buf[layout.gu_codebook_off + i] = c as u8;
-        }
-        for (i, &c) in dn.codebook.iter().enumerate() {
-            buf[layout.dn_codebook_off + i] = c as u8;
-        }
-        buf[layout.gu_pair_off..layout.gu_pair_off + layout.gu_pair_bytes]
-            .copy_from_slice(&gu.pair_stream);
-        buf[layout.dn_pair_off..layout.dn_pair_off + layout.dn_pair_bytes]
-            .copy_from_slice(&dn.pair_stream);
+        pack_nf_expert_record(&layout, gu, dn, &mut buf);
         w.write_all(&buf)?;
     }
     w.flush()?;
@@ -1573,7 +1726,7 @@ pub fn write_exact_nf_experts_k2tm(
     Ok(hdr)
 }
 
-/// Writes a `.k2tm` shard of synthetic NF3/NF4 experts with `F_NOCACHE` and `fsync`, for SSD benchmarks.
+/// Writes a `.k2tm` shard of synthetic E8Q2/NF3/NF4/NF5 experts with `F_NOCACHE` and `fsync`.
 pub fn write_nf_k2tm_shard_file(
     path: &Path,
     cfg: &Kronos800bConfig,
@@ -1590,6 +1743,7 @@ pub fn write_nf_k2tm_shard_file(
         d_ff_expert: cfg.d_ff_expert,
         scale_group_chunks: layout.scale_group_chunks,
         aligned_expert_bytes: layout.aligned_expert_bytes,
+        bits,
     };
     let file = File::create(path)?;
     #[cfg(unix)]
@@ -1598,10 +1752,11 @@ pub fn write_nf_k2tm_shard_file(
     w.write_all(&hdr.encode_page())?;
 
     let mut expert_buf = vec![0u8; layout.aligned_expert_bytes];
-    let default_cb: [i8; 16] = if bits == 3 {
-        [-127, -71, -39, -12, 12, 39, 71, 127, 0, 0, 0, 0, 0, 0, 0, 0]
-    } else {
-        [-127, -92, -69, -52, -38, -25, -14, -4, 4, 14, 25, 38, 52, 69, 92, 127]
+    let default_cb: [i8; 16] = match bits {
+        2 => [0; 16],
+        3 => [-127, -71, -39, -12, 12, 39, 71, 127, 0, 0, 0, 0, 0, 0, 0, 0],
+        5 => [4, 11, 18, 25, 32, 39, 46, 53, 60, 68, 76, 85, 95, 106, 117, 127],
+        _ => [-127, -92, -69, -52, -38, -25, -14, -4, 4, 14, 25, 38, 52, 69, 92, 127],
     };
     for (i, &c) in default_cb.iter().enumerate() {
         expert_buf[layout.gu_codebook_off + i] = c as u8;
@@ -2123,6 +2278,11 @@ impl DirectNvmeSlruPager {
             }
         };
         Ok(self.arena.slot_slice(slot))
+    }
+
+    #[inline]
+    pub fn arena_bytes(&self) -> usize {
+        self.arena.total_bytes()
     }
 
     #[inline]

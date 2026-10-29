@@ -16,7 +16,13 @@ use crate::compiler::{
 };
 use crate::hadamard::{fwht64_signed_inplace, ifwht64_signed_inplace};
 use crate::mmap_pager::sys::RawMmap;
+use crate::prefetch::SubspaceProjector;
 use crate::safetensors::{JsonCursor, SafeTensorsStore};
+use crate::sparse_moe::{
+    fit_subspace_projector, read_moe_expert_f32, read_moe_router_f32, read_moe_shared_expert_f32,
+    DenseMoeRouter, MoeExpertOpenPolicy, MoeLayerCore, MoeRouterScoring, MoeRuntimeStats,
+    SharedExpertBackend, SharedMoeExpert, SparseMoeRuntime, StreamingK2tmWriter,
+};
 use crate::simd_lut::{
     bf16_to_f32, f32_to_bf16, nf_sdot_batch_stripe_range, nf_sdot_stripe_range,
     nf_sdot_stripe_range_int8, nf_sdot_stripe_range_raw, nibble4_sdot_batch_stripe_range,
@@ -47,6 +53,9 @@ const KRONOS3_CACHE_MAGIC: &[u8] = b"K2TKRONOS3\n";
 
 /// Cache magic adding `NF4` quantized untied embeddings (`-1.08 GiB` wired RAM on `152k`-vocab models).
 const KRONOS4_CACHE_MAGIC: &[u8] = b"K2TKRONOS4\n";
+
+/// Cache magic for pinned Sparse-MoE cores paired with `.k2tm` routed expert shards.
+const KRONOS5_CACHE_MAGIC: &[u8] = b"K2TKRONOS5\n";
 
 /// Little-endian cursor over a [`RealLlamaEngine::save_bipolar`] cache.
 struct CacheReader<'a> {
@@ -94,6 +103,10 @@ pub struct LlamaConfig {
     pub moe_intermediate_size: usize,
     pub shared_expert_intermediate_size: usize,
     pub norm_topk_prob: bool,
+    pub router_scoring: MoeRouterScoring,
+    pub decoder_sparse_step: usize,
+    pub mlp_only_layers: Vec<usize>,
+    pub sliding_layer_mask: Vec<bool>,
 }
 
 impl LlamaConfig {
@@ -121,6 +134,11 @@ impl LlamaConfig {
         let mut moe_intermediate_size = 0usize;
         let mut shared_expert_intermediate_size = 0usize;
         let mut norm_topk_prob = true;
+        let mut router_scoring: Option<MoeRouterScoring> = None;
+        let mut is_gpt_oss_arch = false;
+        let mut decoder_sparse_step = 1usize;
+        let mut mlp_only_layers: Vec<usize> = Vec::new();
+        let mut sliding_layer_mask: Vec<bool> = Vec::new();
 
         let parse_opt_usize = |cur: &mut JsonCursor| -> io::Result<Option<usize>> {
             if cur.peek() == Some(b'n') {
@@ -154,6 +172,29 @@ impl LlamaConfig {
             cur.expect_byte(b':')
                 .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
             match key.as_str() {
+                "architectures" => {
+                    if cur.peek() == Some(b'[') {
+                        cur.expect_byte(b'[').unwrap();
+                        while cur.peek() != Some(b']') {
+                            let arch = cur
+                                .parse_string()
+                                .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                            if arch.contains("GptOss") {
+                                is_gpt_oss_arch = true;
+                            }
+                            if cur.peek() == Some(b',') {
+                                cur.expect_byte(b',').unwrap();
+                            } else {
+                                break;
+                            }
+                        }
+                        cur.expect_byte(b']')
+                            .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                    } else {
+                        cur.skip_value()
+                            .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                    }
+                }
                 "vocab_size" => vocab_size = cur.parse_u64().unwrap() as usize,
                 "hidden_size" => hidden_size = cur.parse_u64().unwrap() as usize,
                 "intermediate_size" => intermediate_size = cur.parse_u64().unwrap() as usize,
@@ -177,7 +218,7 @@ impl LlamaConfig {
                 "num_experts" | "num_local_experts" => {
                     num_experts = parse_opt_usize(&mut cur)?.unwrap_or(0);
                 }
-                "num_experts_per_tok" => {
+                "num_experts_per_tok" | "experts_per_token" | "moe_topk" => {
                     num_experts_per_tok = parse_opt_usize(&mut cur)?.unwrap_or(0);
                 }
                 "moe_intermediate_size" => {
@@ -187,6 +228,62 @@ impl LlamaConfig {
                     shared_expert_intermediate_size = parse_opt_usize(&mut cur)?.unwrap_or(0);
                 }
                 "norm_topk_prob" => norm_topk_prob = parse_bool(&mut cur)?,
+                "scoring_func" => {
+                    let s = cur
+                        .parse_string()
+                        .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                    router_scoring = Some(match s.as_str() {
+                        "sigmoid" => MoeRouterScoring::Sigmoid,
+                        "topk_softmax" => MoeRouterScoring::TopkSoftmax,
+                        _ => MoeRouterScoring::Softmax,
+                    });
+                }
+                "decoder_sparse_step" => {
+                    decoder_sparse_step = parse_opt_usize(&mut cur)?.unwrap_or(1).max(1);
+                }
+                "mlp_only_layers" => {
+                    if cur.peek() == Some(b'[') {
+                        cur.expect_byte(b'[').unwrap();
+                        while cur.peek() != Some(b']') {
+                            let idx = cur
+                                .parse_u64()
+                                .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?
+                                as usize;
+                            mlp_only_layers.push(idx);
+                            if cur.peek() == Some(b',') {
+                                cur.expect_byte(b',').unwrap();
+                            } else {
+                                break;
+                            }
+                        }
+                        cur.expect_byte(b']')
+                            .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                    } else {
+                        cur.skip_value()
+                            .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                    }
+                }
+                "layer_types" => {
+                    if cur.peek() == Some(b'[') {
+                        cur.expect_byte(b'[').unwrap();
+                        while cur.peek() != Some(b']') {
+                            let lt = cur
+                                .parse_string()
+                                .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                            sliding_layer_mask.push(lt.contains("sliding"));
+                            if cur.peek() == Some(b',') {
+                                cur.expect_byte(b',').unwrap();
+                            } else {
+                                break;
+                            }
+                        }
+                        cur.expect_byte(b']')
+                            .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                    } else {
+                        cur.skip_value()
+                            .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                    }
+                }
                 _ => cur
                     .skip_value()
                     .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?,
@@ -198,12 +295,24 @@ impl LlamaConfig {
             }
         }
 
-        let sliding_window = if use_sliding_window == Some(false) {
+        let all_sliding = sliding_layer_mask.is_empty() || sliding_layer_mask.iter().all(|&b| b);
+        let sliding_window = if use_sliding_window == Some(false) || !all_sliding {
             None
         } else {
             raw_sliding_window.filter(|&w| w >= 8)
         };
         let sink_tokens = explicit_sinks.unwrap_or(if sliding_window.is_some() { 4 } else { 0 });
+        if num_experts > 1 && moe_intermediate_size == 0 {
+            moe_intermediate_size = intermediate_size;
+        }
+        if intermediate_size == 0 && moe_intermediate_size > 0 {
+            intermediate_size = moe_intermediate_size;
+        }
+        let resolved_scoring = router_scoring.unwrap_or(if is_gpt_oss_arch {
+            MoeRouterScoring::TopkSoftmax
+        } else {
+            MoeRouterScoring::Softmax
+        });
 
         Ok(Self {
             vocab_size,
@@ -224,6 +333,10 @@ impl LlamaConfig {
             moe_intermediate_size,
             shared_expert_intermediate_size,
             norm_topk_prob,
+            router_scoring: resolved_scoring,
+            decoder_sparse_step,
+            mlp_only_layers,
+            sliding_layer_mask,
         })
     }
 
@@ -246,6 +359,29 @@ impl LlamaConfig {
     #[inline]
     pub fn is_moe(&self) -> bool {
         self.num_experts > 1 && self.num_experts_per_tok > 0
+    }
+
+    #[inline]
+    pub fn eff_moe_inter(&self) -> usize {
+        if self.moe_intermediate_size > 0 {
+            self.moe_intermediate_size
+        } else {
+            self.intermediate_size
+        }
+    }
+
+    #[inline]
+    pub fn layer_is_moe(&self, layer_idx: usize) -> bool {
+        self.is_moe()
+            && !self.mlp_only_layers.contains(&layer_idx)
+            && (layer_idx + 1).is_multiple_of(self.decoder_sparse_step.max(1))
+    }
+
+    #[inline]
+    pub fn num_moe_layers(&self) -> usize {
+        (0..self.num_hidden_layers)
+            .filter(|&l| self.layer_is_moe(l))
+            .count()
     }
 }
 
@@ -313,6 +449,7 @@ pub enum RealWeightMode {
 }
 
 enum LinearBackend {
+    Empty,
     Fp32 {
         rows: usize,
         cols: usize,
@@ -463,6 +600,7 @@ impl LinearBackend {
 
     fn physical_bytes(&self) -> usize {
         match self {
+            Self::Empty => 0,
             Self::Fp32 { weights, .. } => weights.len() * std::mem::size_of::<f32>(),
             Self::LutMultiPlane(m) => m.physical_bytes(),
             Self::GgufQ4_0(m) => m.physical_bytes(),
@@ -488,6 +626,7 @@ impl LinearBackend {
         out: &mut [f32],
     ) {
         match self {
+            Self::Empty => panic!("LinearBackend::Empty executed on dense FFN path"),
             Self::Fp32 {
                 rows,
                 cols,
@@ -721,14 +860,20 @@ struct LlamaLayer {
     down_inv_scale: Option<Vec<f32>>,
     /// Optional fused `[q_bias; k_bias; v_bias]` (`Qwen2` / `Qwen2.5-Coder`).
     qkv_bias: Option<Vec<f32>>,
-    /// Fused `[q_proj; k_proj; v_proj]` (`[hidden_size + 2 * kv_dim, hidden_size]`).
+    /// Optional `o_proj.bias` (`GptOss`).
+    o_bias: Option<Vec<f32>>,
+    /// Optional per-head RMSNorm `[head_dim]` weights (`Qwen3Moe`).
+    q_norm: Option<Vec<f32>>,
+    k_norm: Option<Vec<f32>>,
+    /// Fused `[q_proj; k_proj; v_proj]` (`[q_dim + 2 * kv_dim, hidden_size]`).
     qkv_proj: LinearBackend,
     o_proj: LinearBackend,
-    /// Fused `[gate_proj; up_proj]` (`[2 * intermediate_size, hidden_size]`).
+    /// Fused `[gate_proj; up_proj]` (`[2 * intermediate_size, hidden_size]`), or `Empty` on MoE layers.
     gate_up_proj: LinearBackend,
     /// `gate_up_proj` rows interleaved in 64-row blocks `[gate_64(ic), up_64(ic)]`.
     gate_up_interleaved: bool,
     down_proj: LinearBackend,
+    moe: Option<MoeLayerCore>,
 }
 
 /// Per-layer and final-head channel activation statistics gathered on a calibration passage.
@@ -745,27 +890,33 @@ pub struct ActivationCalibration {
 struct PromptScratch {
     hidden: Vec<f32>,
     acts_h: Vec<BipolarActivationLut>,
+    acts_q: Vec<BipolarActivationLut>,
     acts_i: Vec<BipolarActivationLut>,
     qkv: Vec<f32>,
     attn: Vec<f32>,
     proj: Vec<f32>,
     gate_up: Vec<f32>,
     sw: Vec<f32>,
+    moe_norm: Vec<f32>,
     scores: Vec<f32>,
 }
 
 impl PromptScratch {
+    #[allow(clippy::too_many_arguments)]
     fn ensure_capacity(
         &mut self,
         n: usize,
         cfg: &LlamaConfig,
+        has_dense_ffn: bool,
         qkv_rows: usize,
         lut_h: bool,
+        lut_q: bool,
         lut_i: bool,
         need_fp32_scores: bool,
     ) {
         let h = cfg.hidden_size;
-        let inter = cfg.intermediate_size;
+        let q_dim = cfg.q_dim();
+        let inter = cfg.intermediate_size.max(64);
         let kv_group = (cfg.num_attention_heads / cfg.num_key_value_heads).max(1);
         let score_stride = if cfg.head_dim() == 64 {
             cfg.max_seq_len
@@ -778,17 +929,22 @@ impl PromptScratch {
         if self.qkv.len() < n * qkv_rows {
             self.qkv.resize(n * qkv_rows, 0.0);
         }
-        if self.attn.len() < n * h {
-            self.attn.resize(n * h, 0.0);
+        if self.attn.len() < n * q_dim {
+            self.attn.resize(n * q_dim, 0.0);
         }
         if self.proj.len() < n * h {
             self.proj.resize(n * h, 0.0);
         }
-        if self.gate_up.len() < n * 2 * inter {
-            self.gate_up.resize(n * 2 * inter, 0.0);
+        if cfg.is_moe() && self.moe_norm.len() < n * h {
+            self.moe_norm.resize(n * h, 0.0);
         }
-        if self.sw.len() < n * inter {
-            self.sw.resize(n * inter, 0.0);
+        if has_dense_ffn {
+            if self.gate_up.len() < n * 2 * inter {
+                self.gate_up.resize(n * 2 * inter, 0.0);
+            }
+            if self.sw.len() < n * inter {
+                self.sw.resize(n * inter, 0.0);
+            }
         }
         if need_fp32_scores && self.scores.len() < n * score_stride {
             self.scores.resize(n * score_stride, 0.0);
@@ -802,14 +958,25 @@ impl PromptScratch {
         for b in &mut self.acts_h[..n] {
             b.lut_enabled = lut_h;
         }
-        while self.acts_i.len() < n {
-            let mut b = BipolarActivationLut::new_zeroed(inter);
-            b.lut_enabled = lut_i;
-            b.int8 = Some(Int8ChunkActivation::new_zeroed(inter));
-            self.acts_i.push(b);
+        while self.acts_q.len() < n {
+            let mut b = BipolarActivationLut::new_zeroed(q_dim);
+            b.lut_enabled = lut_q;
+            b.int8 = Some(Int8ChunkActivation::new_zeroed(q_dim));
+            self.acts_q.push(b);
         }
-        for b in &mut self.acts_i[..n] {
-            b.lut_enabled = lut_i;
+        for b in &mut self.acts_q[..n] {
+            b.lut_enabled = lut_q;
+        }
+        if has_dense_ffn {
+            while self.acts_i.len() < n {
+                let mut b = BipolarActivationLut::new_zeroed(inter);
+                b.lut_enabled = lut_i;
+                b.int8 = Some(Int8ChunkActivation::new_zeroed(inter));
+                self.acts_i.push(b);
+            }
+            for b in &mut self.acts_i[..n] {
+                b.lut_enabled = lut_i;
+            }
         }
     }
 }
@@ -1151,13 +1318,18 @@ struct LlamaWorkspace {
     scores: Vec<f32>,
     logits: Vec<f32>,
     qlut_hidden: QuantizedActivationLut,
+    qlut_q: QuantizedActivationLut,
     qlut_inter: QuantizedActivationLut,
     blut_hidden: BipolarActivationLut,
+    blut_q: BipolarActivationLut,
     blut_inter: BipolarActivationLut,
     vqlut_hidden: Vq2ActivationLut,
+    vqlut_q: Vq2ActivationLut,
     vqlut_inter: Vq2ActivationLut,
     q8_hidden_vals: Vec<i8>,
     q8_hidden_scales: Vec<f32>,
+    q8_q_vals: Vec<i8>,
+    q8_q_scales: Vec<f32>,
     q8_inter_vals: Vec<i8>,
     q8_inter_scales: Vec<f32>,
     prompt_scratch: PromptScratch,
@@ -1165,7 +1337,10 @@ struct LlamaWorkspace {
 
 impl LlamaWorkspace {
     fn new(cfg: &LlamaConfig) -> Self {
-        let qkv_rows = cfg.hidden_size + 2 * cfg.kv_dim();
+        let q_dim = cfg.q_dim();
+        let qkv_rows = q_dim + 2 * cfg.kv_dim();
+        let inter = cfg.intermediate_size.max(64);
+        let inter_aligned = inter.next_multiple_of(64);
         Self {
             pos: 0,
             // Allocated lazily on first FP32-KV forward so Q8-KV models never allocate a multi-GiB throwaway FP32 cache.
@@ -1175,22 +1350,27 @@ impl LlamaWorkspace {
             hidden: vec![0.0f32; cfg.hidden_size],
             norm_buf: vec![0.0f32; cfg.hidden_size],
             qkv_buf: vec![0.0f32; qkv_rows],
-            attn_out: vec![0.0f32; cfg.hidden_size],
+            attn_out: vec![0.0f32; q_dim],
             proj_out: vec![0.0f32; cfg.hidden_size],
-            gate_up_buf: vec![0.0f32; 2 * cfg.intermediate_size],
-            swiglu_buf: vec![0.0f32; cfg.intermediate_size],
+            gate_up_buf: vec![0.0f32; 2 * inter],
+            swiglu_buf: vec![0.0f32; inter],
             scores: vec![0.0f32; cfg.max_seq_len * cfg.num_attention_heads],
             logits: vec![0.0f32; cfg.vocab_size],
             qlut_hidden: QuantizedActivationLut::new_zeroed(cfg.hidden_size),
-            qlut_inter: QuantizedActivationLut::new_zeroed(cfg.intermediate_size),
+            qlut_q: QuantizedActivationLut::new_zeroed(q_dim),
+            qlut_inter: QuantizedActivationLut::new_zeroed(inter_aligned),
             blut_hidden: BipolarActivationLut::new_zeroed(cfg.hidden_size),
-            blut_inter: BipolarActivationLut::new_zeroed(cfg.intermediate_size),
+            blut_q: BipolarActivationLut::new_zeroed(q_dim),
+            blut_inter: BipolarActivationLut::new_zeroed(inter_aligned),
             vqlut_hidden: Vq2ActivationLut::new_zeroed(cfg.hidden_size),
-            vqlut_inter: Vq2ActivationLut::new_zeroed(cfg.intermediate_size),
+            vqlut_q: Vq2ActivationLut::new_zeroed(q_dim),
+            vqlut_inter: Vq2ActivationLut::new_zeroed(inter_aligned),
             q8_hidden_vals: vec![0i8; cfg.hidden_size],
-            q8_hidden_scales: vec![0.0f32; cfg.hidden_size / 32],
-            q8_inter_vals: vec![0i8; cfg.intermediate_size],
-            q8_inter_scales: vec![0.0f32; cfg.intermediate_size / 32],
+            q8_hidden_scales: vec![0.0f32; cfg.hidden_size.div_ceil(32)],
+            q8_q_vals: vec![0i8; q_dim],
+            q8_q_scales: vec![0.0f32; q_dim.div_ceil(32)],
+            q8_inter_vals: vec![0i8; inter],
+            q8_inter_scales: vec![0.0f32; inter.div_ceil(32)],
             prompt_scratch: PromptScratch::default(),
         }
     }
@@ -1211,7 +1391,7 @@ impl LlamaWorkspace {
     }
 }
 
-/// Real pretrained `LlamaForCausalLM` / `Qwen2ForCausalLM` engine.
+/// Real pretrained `LlamaForCausalLM` / `Qwen2ForCausalLM` / Sparse-MoE engine.
 pub struct RealLlamaEngine {
     #[cfg(target_os = "macos")]
     pub(crate) metal: Option<crate::metal_gpu::MetalLlamaEngine>,
@@ -1230,6 +1410,7 @@ pub struct RealLlamaEngine {
     /// Precomputed `[max_seq_len, half_dim * 2]` (`[cos_0..cos_{half-1}, sin_0..sin_{half-1}]`).
     rope_cos_sin: Vec<f32>,
     pool: Option<SpinThreadPool>,
+    moe_runtime: Option<SparseMoeRuntime>,
     ws: LlamaWorkspace,
 }
 
@@ -1415,8 +1596,38 @@ impl RealLlamaEngine {
         self.ws.q8_kv.is_some()
     }
 
+    /// Whether this engine executes Sparse-MoE layers via [`SparseMoeRuntime`].
+    #[inline]
+    pub fn is_moe(&self) -> bool {
+        self.moe_runtime.is_some()
+    }
+
+    /// Live SLRU / NVMe / zero-copy `mmap` telemetry when running a Sparse-MoE model.
+    #[inline]
+    pub fn moe_stats(&self) -> Option<MoeRuntimeStats> {
+        self.moe_runtime.as_ref().map(|r| r.stats())
+    }
+
+    /// Evicts all DRAM SLRU slots on Sparse-MoE NVMe engines (used for cold-start benchmarks).
+    pub fn clear_moe_slru_cache(&mut self) {
+        if let Some(r) = self.moe_runtime.as_mut() {
+            r.clear_slru_cache();
+        }
+    }
+
     /// Enables zero-copy Metal GPU execution for NfSdot engines (`0` duplicate weight RAM).
     pub fn enable_metal(&mut self) -> Result<(), String> {
+        if self.is_moe() {
+            return Err("Sparse-MoE engines execute hybrid CPU P-core + NVMe SLRU paging".to_string());
+        }
+        if self.cfg.q_dim() != self.cfg.hidden_size
+            || self
+                .layers
+                .iter()
+                .any(|l| l.q_norm.is_some() || l.k_norm.is_some() || l.o_bias.is_some())
+        {
+            return Err("Metal GPU requires q_dim == hidden_size without q_norm/k_norm/o_bias".to_string());
+        }
         #[cfg(target_os = "macos")]
         {
             fn as_nf4<'a>(b: &'a LinearBackend, name: &str) -> Result<&'a NfSdotMatrix, String> {
@@ -1530,7 +1741,7 @@ impl RealLlamaEngine {
         }
     }
 
-    /// Loads the exact `FP32` reference model from `model_dir` (single or sharded SafeTensors).
+    /// Loads the exact `FP32` reference model from `model_dir` (single or sharded SafeTensors, dense or Sparse-MoE).
     pub fn load_fp32_reference(model_dir: &Path, max_seq_len: usize) -> io::Result<Self> {
         let cfg = LlamaConfig::from_config_json(&model_dir.join("config.json"), max_seq_len)?;
         let store = SafeTensorsStore::open_dir(model_dir)?;
@@ -1544,7 +1755,10 @@ impl RealLlamaEngine {
 
         let embed_f32_rows = get_f32("model.embed_tokens.weight")?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        let qkv_rows = cfg.hidden_size + 2 * cfg.kv_dim();
+        let q_dim = cfg.q_dim();
+        let qkv_rows = q_dim + 2 * cfg.kv_dim();
+        let mut fp32_moe_layers: Vec<Vec<(Vec<f32>, Vec<f32>)>> = Vec::new();
+        let mut max_shared_inter = 0usize;
 
         for l in 0..cfg.num_hidden_layers {
             let pfx = format!("model.layers.{l}");
@@ -1563,10 +1777,90 @@ impl RealLlamaEngine {
             } else {
                 None
             };
+            let o_bias_name = format!("{pfx}.self_attn.o_proj.bias");
+            let o_bias = if store.has_tensor(&o_bias_name) {
+                Some(get_f32(&o_bias_name)?)
+            } else {
+                None
+            };
+            let q_norm_name = format!("{pfx}.self_attn.q_norm.weight");
+            let q_norm = if store.has_tensor(&q_norm_name) {
+                Some(get_f32(&q_norm_name)?)
+            } else {
+                None
+            };
+            let k_norm_name = format!("{pfx}.self_attn.k_norm.weight");
+            let k_norm = if store.has_tensor(&k_norm_name) {
+                Some(get_f32(&k_norm_name)?)
+            } else {
+                None
+            };
 
-            let mut gate_up_w = Vec::with_capacity(2 * cfg.intermediate_size * cfg.hidden_size);
-            gate_up_w.extend_from_slice(&get_f32(&format!("{pfx}.mlp.gate_proj.weight"))?);
-            gate_up_w.extend_from_slice(&get_f32(&format!("{pfx}.mlp.up_proj.weight"))?);
+            let (gate_up_proj, down_proj, moe) = if cfg.layer_is_moe(l) {
+                let slot = fp32_moe_layers.len();
+                let router = read_moe_router_f32(&store, l, cfg.num_experts, cfg.hidden_size, false)?;
+                let shared = read_moe_shared_expert_f32(
+                    &store,
+                    l,
+                    cfg.hidden_size,
+                    cfg.shared_expert_intermediate_size,
+                    false,
+                )?;
+                let shared_expert = shared.map(|(s_inter, gu, dn, gw)| {
+                    max_shared_inter = max_shared_inter.max(s_inter);
+                    SharedMoeExpert {
+                        inter_dim: s_inter,
+                        backend: SharedExpertBackend::Fp32 {
+                            hidden_size: cfg.hidden_size,
+                            inter_dim: s_inter,
+                            gate_up: gu,
+                            down: dn,
+                        },
+                        gate_weight: gw,
+                    }
+                });
+                let moe_inter = cfg.eff_moe_inter();
+                let mut exps = Vec::with_capacity(cfg.num_experts);
+                for e in 0..cfg.num_experts {
+                    exps.push(read_moe_expert_f32(
+                        &store,
+                        l,
+                        e,
+                        cfg.num_experts,
+                        cfg.hidden_size,
+                        moe_inter,
+                        false,
+                    )?);
+                }
+                fp32_moe_layers.push(exps);
+                (
+                    LinearBackend::Empty,
+                    LinearBackend::Empty,
+                    Some(MoeLayerCore {
+                        moe_slot_idx: slot,
+                        router,
+                        shared_expert,
+                        lookahead: None,
+                    }),
+                )
+            } else {
+                let mut gate_up_w = Vec::with_capacity(2 * cfg.intermediate_size * cfg.hidden_size);
+                gate_up_w.extend_from_slice(&get_f32(&format!("{pfx}.mlp.gate_proj.weight"))?);
+                gate_up_w.extend_from_slice(&get_f32(&format!("{pfx}.mlp.up_proj.weight"))?);
+                (
+                    LinearBackend::Fp32 {
+                        rows: 2 * cfg.intermediate_size,
+                        cols: cfg.hidden_size,
+                        weights: gate_up_w,
+                    },
+                    LinearBackend::Fp32 {
+                        rows: cfg.hidden_size,
+                        cols: cfg.intermediate_size,
+                        weights: get_f32(&format!("{pfx}.mlp.down_proj.weight"))?,
+                    },
+                    None,
+                )
+            };
 
             layers.push(LlamaLayer {
                 input_norm: get_f32(&format!("{pfx}.input_layernorm.weight"))?,
@@ -1574,6 +1868,9 @@ impl RealLlamaEngine {
                 o_inv_scale: None,
                 down_inv_scale: None,
                 qkv_bias,
+                o_bias,
+                q_norm,
+                k_norm,
                 qkv_proj: LinearBackend::Fp32 {
                     rows: qkv_rows,
                     cols: cfg.hidden_size,
@@ -1581,22 +1878,30 @@ impl RealLlamaEngine {
                 },
                 o_proj: LinearBackend::Fp32 {
                     rows: cfg.hidden_size,
-                    cols: cfg.hidden_size,
+                    cols: q_dim,
                     weights: get_f32(&format!("{pfx}.self_attn.o_proj.weight"))?,
                 },
-                gate_up_proj: LinearBackend::Fp32 {
-                    rows: 2 * cfg.intermediate_size,
-                    cols: cfg.hidden_size,
-                    weights: gate_up_w,
-                },
+                gate_up_proj,
                 gate_up_interleaved: false,
-                down_proj: LinearBackend::Fp32 {
-                    rows: cfg.hidden_size,
-                    cols: cfg.intermediate_size,
-                    weights: get_f32(&format!("{pfx}.mlp.down_proj.weight"))?,
-                },
+                down_proj,
+                moe,
             });
         }
+
+        let moe_runtime = if !fp32_moe_layers.is_empty() {
+            Some(SparseMoeRuntime::new_fp32_reference(
+                cfg.hidden_size,
+                cfg.eff_moe_inter(),
+                cfg.num_experts,
+                cfg.num_experts_per_tok,
+                cfg.norm_topk_prob,
+                cfg.router_scoring,
+                max_shared_inter,
+                fp32_moe_layers,
+            ))
+        } else {
+            None
+        };
 
         let final_norm = get_f32("model.norm.weight")?;
         let lm_head_weights = if cfg.tie_word_embeddings {
@@ -1628,6 +1933,7 @@ impl RealLlamaEngine {
             },
             rope_cos_sin,
             pool: None,
+            moe_runtime,
             ws,
         })
     }
@@ -1883,11 +2189,15 @@ impl RealLlamaEngine {
                 o_inv_scale,
                 down_inv_scale,
                 qkv_bias: ref_layer.qkv_bias.clone(),
+                o_bias: ref_layer.o_bias.clone(),
+                q_norm: ref_layer.q_norm.clone(),
+                k_norm: ref_layer.k_norm.clone(),
                 qkv_proj,
                 o_proj,
                 gate_up_proj,
                 gate_up_interleaved: false,
                 down_proj,
+                moe: None,
             });
         }
 
@@ -1929,6 +2239,7 @@ impl RealLlamaEngine {
             lm_head,
             rope_cos_sin: self.rope_cos_sin.clone(),
             pool: None,
+            moe_runtime: None,
             ws: LlamaWorkspace::new(&self.cfg),
         };
         eng.init_activation_scratch();
@@ -2170,11 +2481,15 @@ impl RealLlamaEngine {
                 o_inv_scale: None,
                 down_inv_scale: None,
                 qkv_bias: ref_layer.qkv_bias.clone(),
+                o_bias: ref_layer.o_bias.clone(),
+                q_norm: ref_layer.q_norm.clone(),
+                k_norm: ref_layer.k_norm.clone(),
                 qkv_proj: LinearBackend::FusedBase3(qkv_mat),
                 o_proj: LinearBackend::FusedBase3(o_mat),
                 gate_up_proj: LinearBackend::FusedBase3(gate_up_mat),
                 gate_up_interleaved: false,
                 down_proj: LinearBackend::FusedBase3(down_mat),
+                moe: None,
             });
         }
 
@@ -2213,6 +2528,7 @@ impl RealLlamaEngine {
             lm_head: LinearBackend::FusedBase3(head_mat),
             rope_cos_sin: self.rope_cos_sin.clone(),
             pool: None,
+            moe_runtime: None,
             ws: LlamaWorkspace::new(&self.cfg),
         }
     }
@@ -2418,11 +2734,15 @@ impl RealLlamaEngine {
                 o_inv_scale: None,
                 down_inv_scale: None,
                 qkv_bias: ref_layer.qkv_bias.clone(),
+                o_bias: ref_layer.o_bias.clone(),
+                q_norm: ref_layer.q_norm.clone(),
+                k_norm: ref_layer.k_norm.clone(),
                 qkv_proj,
                 o_proj,
                 gate_up_proj,
                 gate_up_interleaved: false,
                 down_proj,
+                moe: None,
             });
         }
 
@@ -2474,6 +2794,7 @@ impl RealLlamaEngine {
             lm_head,
             rope_cos_sin: self.rope_cos_sin.clone(),
             pool: None,
+            moe_runtime: None,
             ws: LlamaWorkspace::new(&self.cfg),
         };
         eng.init_activation_scratch();
@@ -2735,11 +3056,15 @@ impl RealLlamaEngine {
                 o_inv_scale: None,
                 down_inv_scale: None,
                 qkv_bias,
+                o_bias: None,
+                q_norm: None,
+                k_norm: None,
                 qkv_proj,
                 o_proj,
                 gate_up_proj,
                 gate_up_interleaved: false,
                 down_proj,
+                moe: None,
             });
             if cfg.num_hidden_layers >= 16 && ((l + 1) % 4 == 0 || l + 1 == cfg.num_hidden_layers) {
                 eprintln!(
@@ -2800,6 +3125,7 @@ impl RealLlamaEngine {
             lm_head,
             rope_cos_sin,
             pool: None,
+            moe_runtime: None,
         };
         eng.init_activation_scratch();
         Ok(eng)
@@ -2813,33 +3139,44 @@ impl RealLlamaEngine {
                 LinearBackend::Nibble4(_) | LinearBackend::NfSdot(_) | LinearBackend::Vq2(_)
             )
         };
+        let same_q = self.cfg.q_dim() == self.cfg.hidden_size;
         let hidden_lut = is_lut(&self.lm_head)
-            || self
-                .layers
-                .iter()
-                .any(|l| is_lut(&l.qkv_proj) || is_lut(&l.o_proj) || is_lut(&l.gate_up_proj));
-        let inter_lut = self.layers.iter().any(|l| is_lut(&l.down_proj));
+            || self.layers.iter().any(|l| {
+                is_lut(&l.qkv_proj)
+                    || (same_q && is_lut(&l.o_proj))
+                    || (l.moe.is_none() && is_lut(&l.gate_up_proj))
+            });
+        let q_lut = self.layers.iter().any(|l| is_lut(&l.o_proj));
+        let inter_lut = self
+            .layers
+            .iter()
+            .any(|l| l.moe.is_none() && is_lut(&l.down_proj));
         let any_int8 = is_int8(&self.lm_head)
             || self.layers.iter().any(|l| {
                 is_int8(&l.qkv_proj)
                     || is_int8(&l.o_proj)
-                    || is_int8(&l.gate_up_proj)
-                    || is_int8(&l.down_proj)
+                    || (l.moe.is_none() && (is_int8(&l.gate_up_proj) || is_int8(&l.down_proj)))
+                    || l.moe.is_some()
             });
         self.ws.blut_hidden.lut_enabled = hidden_lut;
+        self.ws.blut_q.lut_enabled = q_lut;
         self.ws.blut_inter.lut_enabled = inter_lut;
         if any_int8 {
             if self.ws.blut_hidden.int8.is_none() {
-                self.ws.blut_hidden.int8 = Some(Int8ChunkActivation::new_zeroed(self.cfg.hidden_size));
+                self.ws.blut_hidden.int8 =
+                    Some(Int8ChunkActivation::new_zeroed(self.cfg.hidden_size));
+            }
+            if self.ws.blut_q.int8.is_none() {
+                self.ws.blut_q.int8 = Some(Int8ChunkActivation::new_zeroed(self.cfg.q_dim()));
             }
             if self.ws.blut_inter.int8.is_none() {
-                self.ws.blut_inter.int8 =
-                    Some(Int8ChunkActivation::new_zeroed(self.cfg.intermediate_size));
+                let inter_aligned = self.cfg.intermediate_size.max(64).next_multiple_of(64);
+                self.ws.blut_inter.int8 = Some(Int8ChunkActivation::new_zeroed(inter_aligned));
             }
         }
     }
 
-    /// Repacks projections for `SDOT`, interleaves `gate_up_proj` in 64-row blocks and enables INT8
+    /// Repacks projections for `SDOT`, interleaves dense `gate_up_proj` in 64-row blocks, and enables INT8
     /// chunk activations.
     pub fn repack_sdot(&mut self) {
         #[cfg(target_os = "macos")]
@@ -2853,10 +3190,14 @@ impl RealLlamaEngine {
                 }
             }
         };
-        let can_interleave_gu = self.cfg.intermediate_size.is_multiple_of(64);
+        let can_interleave_gu = self.cfg.intermediate_size >= 64
+            && self.cfg.intermediate_size.is_multiple_of(64);
         for l in &mut self.layers {
             repack(&mut l.qkv_proj);
             repack(&mut l.o_proj);
+            if l.moe.is_some() {
+                continue;
+            }
             if !l.gate_up_interleaved && can_interleave_gu {
                 match &mut l.gate_up_proj {
                     LinearBackend::FusedBipolar(m) if (4..=6).contains(&m.num_planes) => {
@@ -3230,11 +3571,15 @@ impl RealLlamaEngine {
                 o_inv_scale: None,
                 down_inv_scale: None,
                 qkv_bias,
+                o_bias: None,
+                q_norm: None,
+                k_norm: None,
                 qkv_proj: r_mat(&mut rd)?,
                 o_proj: r_mat(&mut rd)?,
                 gate_up_proj: r_mat(&mut rd)?,
                 gate_up_interleaved: false,
                 down_proj: r_mat(&mut rd)?,
+                moe: None,
             });
         }
         let final_norm = rd.f32s()?;
@@ -3302,12 +3647,1313 @@ impl RealLlamaEngine {
             final_norm,
             lm_head,
             pool: None,
+            moe_runtime: None,
         };
         eng.init_activation_scratch();
         Ok(eng)
     }
 
-    /// Total physical RAM occupied by all compiled linear projections (`layers` + `lm_head`).
+    /// Streams a Sparse-MoE SafeTensors directory layer-by-layer and expert-by-expert into a
+    /// pinned attention/router/shared-expert/lookahead core (`K2TKRONOS5\n` `.k2tb`) and a
+    /// 16 KiB-aligned `F_NOCACHE` expert shard (`.k2tm`), keeping compile-time RAM bounded.
+    pub fn compile_streaming_moe_to_files(
+        model_dir: &Path,
+        core_k2tb_path: &Path,
+        experts_k2tm_path: &Path,
+        mode: RealWeightMode,
+        calib_sequences: &[Vec<usize>],
+        compile_threads: usize,
+    ) -> io::Result<()> {
+        use std::collections::VecDeque;
+        use std::io::Write;
+
+        assert!(!calib_sequences.is_empty());
+        let max_calib_len = calib_sequences
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let cfg = LlamaConfig::from_config_json(&model_dir.join("config.json"), max_calib_len)?;
+        if !cfg.is_moe() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "compile_streaming_moe_to_files expects a Sparse-MoE config",
+            ));
+        }
+
+        let (qkv_spec, o_spec, gate_up_spec, down_spec, head_spec) = proj_specs_for_mode(mode);
+        let (expert_bits, expert_sgc) = match (gate_up_spec, down_spec) {
+            (
+                ProjSpec::Nf { bits: b1, sgc: s1 },
+                ProjSpec::Nf { bits: b2, sgc: s2 },
+            ) if b1 == b2 && s1 == s2 && (2..=5).contains(&b1) => (b1, s1),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Sparse-MoE .k2tm requires matching 2..=5-bit NF/E8Q2 FFN specs",
+                ));
+            }
+        };
+
+        let mode_words = match mode {
+            RealWeightMode::KronosBipolarGptq { num_planes } => [0, num_planes, 0, 0, 0, 0],
+            RealWeightMode::KronosBipolarGptqMixedK => [1, 0, 0, 0, 0, 0],
+            RealWeightMode::KronosBipolarGptqPlanes {
+                qkv,
+                o,
+                gate_up,
+                down,
+                head,
+            } => [2, qkv, o, gate_up, down, head],
+            RealWeightMode::KronosVq2Gptq { scale_group_chunks } => {
+                [3, scale_group_chunks, 0, 0, 0, 0]
+            }
+            RealWeightMode::KronosVq2MixedGptq {
+                attn_head_planes,
+                scale_group_chunks,
+            } => [4, attn_head_planes, scale_group_chunks, 0, 0, 0],
+            RealWeightMode::KronosNfGptq {
+                bits,
+                scale_group_chunks,
+            } => [5, bits, scale_group_chunks, 0, 0, 0],
+            RealWeightMode::KronosNfMixedGptq {
+                attn_head_bits,
+                ffn_bits,
+                scale_group_chunks,
+            } => [6, attn_head_bits, ffn_bits, scale_group_chunks, 0, 0],
+            RealWeightMode::KronosNfPlanesGptq {
+                qkv,
+                o,
+                gate_up,
+                down,
+                head,
+                scale_group_chunks,
+            } => [
+                7,
+                (qkv & 0xFF) | (scale_group_chunks << 8),
+                o,
+                gate_up,
+                down,
+                head,
+            ],
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unsupported RealWeightMode for K2TKRONOS5",
+                ));
+            }
+        };
+
+        let store = SafeTensorsStore::open_dir(model_dir)?;
+        let get_f32_and_release = |name: &str| -> io::Result<Vec<f32>> {
+            let v = store
+                .tensor(name)
+                .map(|t| t.to_f32_vec())
+                .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+            store.release_tensor_pages(name);
+            Ok(v)
+        };
+
+        let mut embed_bf16_rows = store
+            .tensor("model.embed_tokens.weight")
+            .map(|t| t.to_bf16_vec())
+            .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+        store.release_tensor_pages("model.embed_tokens.weight");
+
+        let h_dim = cfg.hidden_size;
+        let q_dim = cfg.q_dim();
+        let kv_dim = cfg.kv_dim();
+        let qkv_rows = q_dim + 2 * kv_dim;
+        let head_dim = cfg.head_dim();
+        let half_dim = head_dim / 2;
+        let kv_group = cfg.num_attention_heads / cfg.num_key_value_heads;
+        let attn_scale = 1.0 / (head_dim as f32).sqrt();
+        let moe_inter = cfg.eff_moe_inter();
+        let rope_cos_sin = build_rope_table(&cfg);
+
+        let mut seq_hiddens: Vec<Vec<f32>> = calib_sequences
+            .iter()
+            .map(|seq| {
+                assert!(!seq.is_empty() && seq.len() <= cfg.max_seq_len);
+                let mut buf = vec![0.0f32; seq.len() * h_dim];
+                for (t, &tok_id) in seq.iter().enumerate() {
+                    let src = &embed_bf16_rows[tok_id * h_dim..(tok_id + 1) * h_dim];
+                    for (dst, &b16) in buf[t * h_dim..(t + 1) * h_dim].iter_mut().zip(src.iter()) {
+                        *dst = bf16_to_f32(b16);
+                    }
+                }
+                buf
+            })
+            .collect();
+
+        let mut embed_nf4 = None;
+        if cfg.tie_word_embeddings {
+            embed_bf16_rows = Vec::new();
+        } else if h_dim.is_multiple_of(64) {
+            embed_nf4 = Some(NfSdotMatrix::from_bf16_u16_embeddings_nf4(
+                &embed_bf16_rows,
+                cfg.vocab_size,
+                h_dim,
+                2,
+                compile_threads.max(1),
+            ));
+            embed_bf16_rows = Vec::new();
+        }
+
+        let num_moe_layers = (0..cfg.num_hidden_layers)
+            .filter(|&l| cfg.layer_is_moe(l))
+            .count();
+        let mut k2tm_writer = StreamingK2tmWriter::create(
+            experts_k2tm_path,
+            num_moe_layers,
+            cfg.num_experts,
+            h_dim,
+            moe_inter,
+            expert_bits,
+            expert_sgc,
+        )?;
+
+        let total_tokens: usize = calib_sequences.iter().map(|s| s.len()).sum();
+        let mut all_attn_out = vec![0.0f32; total_tokens * q_dim];
+        let mut norm_buf = vec![0.0f32; h_dim];
+        let mut compiled_layers: Vec<LlamaLayer> = Vec::with_capacity(cfg.num_hidden_layers);
+        let mut lookahead_history: VecDeque<(usize, Vec<f32>)> = VecDeque::with_capacity(4);
+        let mut moe_slot_counter = 0usize;
+
+        let subsample_post_attn = |seqs: &[Vec<f32>], max_m: usize| -> Vec<f32> {
+            let tot: usize = seqs.iter().map(|s| s.len() / h_dim).sum();
+            let m = tot.min(max_m).max(1);
+            let mut out = vec![0.0f32; m * h_dim];
+            let mut flat_refs: Vec<&[f32]> = Vec::with_capacity(tot);
+            for s in seqs {
+                for row in s.chunks_exact(h_dim) {
+                    flat_refs.push(row);
+                }
+            }
+            for i in 0..m {
+                let idx = (i * tot) / m;
+                out[i * h_dim..(i + 1) * h_dim].copy_from_slice(flat_refs[idx]);
+            }
+            out
+        };
+
+        for l in 0..cfg.num_hidden_layers {
+            let t_layer = std::time::Instant::now();
+            let pfx = format!("model.layers.{l}");
+            let input_norm = get_f32_and_release(&format!("{pfx}.input_layernorm.weight"))?;
+            let post_attn_norm =
+                get_f32_and_release(&format!("{pfx}.post_attention_layernorm.weight"))?;
+
+            let q_norm_name = format!("{pfx}.self_attn.q_norm.weight");
+            let q_norm = if store.has_tensor(&q_norm_name) {
+                Some(get_f32_and_release(&q_norm_name)?)
+            } else {
+                None
+            };
+            let k_norm_name = format!("{pfx}.self_attn.k_norm.weight");
+            let k_norm = if store.has_tensor(&k_norm_name) {
+                Some(get_f32_and_release(&k_norm_name)?)
+            } else {
+                None
+            };
+
+            // 1. Pre-attention normalized activations -> compile `qkv_proj`.
+            let mut hess_attn = FullRowGptqHessian::new(h_dim);
+            for seq_h in &seq_hiddens {
+                for hid in seq_h.chunks_exact(h_dim) {
+                    rms_norm(hid, &input_norm, cfg.rms_norm_eps, &mut norm_buf);
+                    fwht64_signed_inplace(&mut norm_buf);
+                    hess_attn.observe_prerotated(&norm_buf);
+                }
+            }
+            hess_attn.finalize(BIPOLAR_GPTQ_DAMP);
+
+            let mut qkv_w = Vec::with_capacity(qkv_rows * h_dim);
+            qkv_w.extend_from_slice(&get_f32_and_release(&format!(
+                "{pfx}.self_attn.q_proj.weight"
+            ))?);
+            qkv_w.extend_from_slice(&get_f32_and_release(&format!(
+                "{pfx}.self_attn.k_proj.weight"
+            ))?);
+            qkv_w.extend_from_slice(&get_f32_and_release(&format!(
+                "{pfx}.self_attn.v_proj.weight"
+            ))?);
+            let q_bias_name = format!("{pfx}.self_attn.q_proj.bias");
+            let qkv_bias = if store.has_tensor(&q_bias_name) {
+                let mut b = Vec::with_capacity(qkv_rows);
+                b.extend_from_slice(&get_f32_and_release(&q_bias_name)?);
+                b.extend_from_slice(&get_f32_and_release(&format!(
+                    "{pfx}.self_attn.k_proj.bias"
+                ))?);
+                b.extend_from_slice(&get_f32_and_release(&format!(
+                    "{pfx}.self_attn.v_proj.bias"
+                ))?);
+                Some(b)
+            } else {
+                None
+            };
+            let qkv_proj = compile_proj_spec(
+                &qkv_w,
+                qkv_rows,
+                h_dim,
+                qkv_spec,
+                Some(&hess_attn),
+                compile_threads,
+            );
+            drop(qkv_w);
+            drop(hess_attn);
+
+            // 2. Execute quantized `qkv_proj` (+ optional `q_norm`/`k_norm`) + causal GQA -> rotate `[q_dim]` for `o_proj`.
+            par_calib(
+                &mut seq_hiddens,
+                &mut all_attn_out,
+                h_dim,
+                q_dim,
+                |seq_h, attn_seq| {
+                    let mut norm_local = vec![0.0f32; h_dim];
+                    let mut qkv_buf = vec![0.0f32; qkv_rows];
+                    let mut scores = vec![0.0f32; cfg.max_seq_len * cfg.num_attention_heads];
+                    let mut k_seq_cache = vec![0.0f32; cfg.max_seq_len * kv_dim];
+                    let mut v_seq_cache = vec![0.0f32; cfg.max_seq_len * kv_dim];
+                    let mut blut_h = BipolarActivationLut::new_zeroed(h_dim);
+                    let mut vlut_h = Vq2ActivationLut::new_zeroed(h_dim);
+                    for (pos, (hid, attn_dst)) in seq_h
+                        .chunks_exact(h_dim)
+                        .zip(attn_seq.chunks_exact_mut(q_dim))
+                        .enumerate()
+                    {
+                        rms_norm(hid, &input_norm, cfg.rms_norm_eps, &mut norm_local);
+                        fwht64_signed_inplace(&mut norm_local);
+                        eval_proj_rot(&qkv_proj, &norm_local, &mut blut_h, &mut vlut_h, &mut qkv_buf);
+                        if let Some(bias) = &qkv_bias {
+                            add_inplace(&mut qkv_buf, bias);
+                        }
+                        let rope_row = &rope_cos_sin[pos * head_dim..(pos + 1) * head_dim];
+                        let (q_slice, kv_rest) = qkv_buf.split_at_mut(q_dim);
+                        let (k_slice, v_slice) = kv_rest.split_at_mut(kv_dim);
+                        if let Some(ref qn) = q_norm {
+                            apply_per_head_rms_norm(q_slice, head_dim, qn, cfg.rms_norm_eps);
+                        }
+                        if let Some(ref kn) = k_norm {
+                            apply_per_head_rms_norm(k_slice, head_dim, kn, cfg.rms_norm_eps);
+                        }
+                        apply_llama_rope_precomp(
+                            q_slice,
+                            cfg.num_attention_heads,
+                            head_dim,
+                            half_dim,
+                            rope_row,
+                        );
+                        apply_llama_rope_precomp(
+                            k_slice,
+                            cfg.num_key_value_heads,
+                            head_dim,
+                            half_dim,
+                            rope_row,
+                        );
+                        k_seq_cache[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(k_slice);
+                        v_seq_cache[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(v_slice);
+                        causal_gqa_attention(
+                            q_slice,
+                            &k_seq_cache,
+                            &v_seq_cache,
+                            &mut scores,
+                            attn_dst,
+                            cfg.num_attention_heads,
+                            kv_group,
+                            head_dim,
+                            kv_dim,
+                            pos,
+                            attn_scale,
+                        );
+                        fwht64_signed_inplace(attn_dst);
+                    }
+                },
+            );
+
+            let mut hess_o = FullRowGptqHessian::new(q_dim);
+            for row in all_attn_out.chunks_exact(q_dim) {
+                hess_o.observe_prerotated(row);
+            }
+            hess_o.finalize(BIPOLAR_GPTQ_DAMP);
+            let o_w = get_f32_and_release(&format!("{pfx}.self_attn.o_proj.weight"))?;
+            let o_bias_name = format!("{pfx}.self_attn.o_proj.bias");
+            let o_bias = if store.has_tensor(&o_bias_name) {
+                Some(get_f32_and_release(&o_bias_name)?)
+            } else {
+                None
+            };
+            let o_proj = compile_proj_spec(
+                &o_w,
+                h_dim,
+                q_dim,
+                o_spec,
+                Some(&hess_o),
+                compile_threads,
+            );
+            drop(o_w);
+            drop(hess_o);
+
+            par_calib(
+                &mut seq_hiddens,
+                &mut all_attn_out,
+                h_dim,
+                q_dim,
+                |seq_h, attn_seq| {
+                    let mut proj_out = vec![0.0f32; h_dim];
+                    let mut blut_q = BipolarActivationLut::new_zeroed(q_dim);
+                    let mut vlut_q = Vq2ActivationLut::new_zeroed(q_dim);
+                    for (hid, attn_rot) in
+                        seq_h.chunks_exact_mut(h_dim).zip(attn_seq.chunks_exact(q_dim))
+                    {
+                        eval_proj_rot(&o_proj, attn_rot, &mut blut_q, &mut vlut_q, &mut proj_out);
+                        if let Some(ref ob) = o_bias {
+                            add_inplace(&mut proj_out, ob);
+                        }
+                        add_inplace(hid, &proj_out);
+                    }
+                },
+            );
+
+            // 3. MoE or hybrid-dense FFN compilation.
+            let (gate_up_proj, down_proj, moe) = if cfg.layer_is_moe(l) {
+                let slot = moe_slot_counter;
+                moe_slot_counter += 1;
+
+                // Fit 3-layer-ahead residual drift projector `l_prev -> l` on subsampled post-attention states.
+                let cur_sub = subsample_post_attn(&seq_hiddens, 256);
+                while lookahead_history
+                    .front()
+                    .is_some_and(|(pl, _)| *pl + 3 < l)
+                {
+                    lookahead_history.pop_front();
+                }
+                if lookahead_history
+                    .front()
+                    .is_some_and(|(pl, _)| *pl + 3 == l)
+                {
+                    let (prev_l, prev_sub) = lookahead_history.pop_front().unwrap();
+                    let rank = 32.min(h_dim / 2).max(4);
+                    let proj =
+                        fit_subspace_projector(&prev_sub, &cur_sub, h_dim, rank, 1e-2);
+                    if let Some(ref mut prev_moe) = compiled_layers[prev_l].moe {
+                        prev_moe.lookahead = Some((l, proj));
+                    }
+                }
+                lookahead_history.push_back((l, cur_sub));
+
+                let router =
+                    read_moe_router_f32(&store, l, cfg.num_experts, h_dim, true)?;
+
+                let mut hess_mlp = FullRowGptqHessian::new(h_dim);
+                let mut x_norm_all = vec![0.0f32; total_tokens * h_dim];
+                let mut act_in_all: Vec<Int8ChunkActivation> = Vec::with_capacity(total_tokens);
+                let mut expert_buckets: Vec<Vec<(usize, f32)>> =
+                    (0..cfg.num_experts).map(|_| Vec::new()).collect();
+                let mut routes_buf = vec![(0usize, 0.0f32); cfg.num_experts_per_tok.max(1)];
+
+                let mut tok_cursor = 0usize;
+                for seq_h in &seq_hiddens {
+                    for hid in seq_h.chunks_exact(h_dim) {
+                        let xn = &mut x_norm_all[tok_cursor * h_dim..(tok_cursor + 1) * h_dim];
+                        rms_norm(hid, &post_attn_norm, cfg.rms_norm_eps, xn);
+                        let k = router.route_sorted(
+                            xn,
+                            cfg.num_experts_per_tok,
+                            cfg.norm_topk_prob,
+                            cfg.router_scoring,
+                            &mut routes_buf,
+                        );
+                        for &(exp_id, weight) in &routes_buf[..k] {
+                            expert_buckets[exp_id].push((tok_cursor, weight));
+                        }
+                        norm_buf.copy_from_slice(xn);
+                        fwht64_signed_inplace(&mut norm_buf);
+                        hess_mlp.observe_prerotated(&norm_buf);
+                        let mut i8a = Int8ChunkActivation::new_zeroed(h_dim);
+                        i8a.populate(&norm_buf);
+                        act_in_all.push(i8a);
+                        tok_cursor += 1;
+                    }
+                }
+                hess_mlp.finalize(BIPOLAR_GPTQ_DAMP);
+
+                let mut moe_out_all = vec![0.0f32; total_tokens * h_dim];
+
+                // Optional shared SwiGLU expert (`Qwen2Moe`).
+                let shared_expert = if let Some((s_inter, s_gu_w, s_dn_w, s_gate_w)) =
+                    read_moe_shared_expert_f32(
+                        &store,
+                        l,
+                        h_dim,
+                        cfg.shared_expert_intermediate_size,
+                        true,
+                    )?
+                {
+                    let s_gu = compile_hadamard_gptq_nf(
+                        &s_gu_w,
+                        2 * s_inter,
+                        h_dim,
+                        expert_bits,
+                        expert_sgc,
+                        Some(&hess_mlp),
+                        compile_threads,
+                    );
+                    drop(s_gu_w);
+                    let mut hess_s_dn = FullRowGptqHessian::new(s_inter);
+                    let mut gu_tmp = vec![0.0f32; 2 * s_inter];
+                    let mut sw_tmp = vec![0.0f32; s_inter];
+                    for act_in in &act_in_all {
+                        // SAFETY: `gu_tmp` has `2 * s_inter == s_gu.rows` floats.
+                        unsafe {
+                            nf_sdot_stripe_range_int8(
+                                &s_gu,
+                                act_in,
+                                0,
+                                s_gu.num_stripes,
+                                gu_tmp.as_mut_ptr(),
+                            );
+                        }
+                        let (g, u) = gu_tmp.split_at(s_inter);
+                        swiglu_activate(g, u, &mut sw_tmp);
+                        fwht64_signed_inplace(&mut sw_tmp);
+                        hess_s_dn.observe_prerotated(&sw_tmp);
+                    }
+                    hess_s_dn.finalize(BIPOLAR_GPTQ_DAMP);
+                    let s_dn = compile_hadamard_gptq_nf(
+                        &s_dn_w,
+                        h_dim,
+                        s_inter,
+                        expert_bits,
+                        expert_sgc,
+                        Some(&hess_s_dn),
+                        compile_threads,
+                    );
+                    drop(s_dn_w);
+                    drop(hess_s_dn);
+                    let se = SharedMoeExpert {
+                        inter_dim: s_inter,
+                        backend: SharedExpertBackend::Nf {
+                            inter_dim: s_inter,
+                            gate_up: s_gu,
+                            down: s_dn,
+                        },
+                        gate_weight: s_gate_w,
+                    };
+                    let mut act_mid = Int8ChunkActivation::new_zeroed(s_inter);
+                    for (t, act_in) in act_in_all.iter().enumerate() {
+                        se.forward_single(
+                            &x_norm_all[t * h_dim..(t + 1) * h_dim],
+                            act_in,
+                            &mut gu_tmp,
+                            &mut sw_tmp,
+                            &mut act_mid,
+                            &mut moe_out_all[t * h_dim..(t + 1) * h_dim],
+                        );
+                    }
+                    Some(se)
+                } else {
+                    None
+                };
+
+                // Stream routed experts one-by-one into `.k2tm` (non-interleaved `gu`).
+                let mut gu_tmp = vec![0.0f32; 2 * moe_inter];
+                let mut sw_tmp = vec![0.0f32; moe_inter];
+                let mut dn_tmp = vec![0.0f32; h_dim];
+                let mut act_mid = Int8ChunkActivation::new_zeroed(moe_inter);
+                let fallback_step = (total_tokens / 32).max(1);
+
+                for (e, bucket) in expert_buckets.iter().enumerate() {
+                    let (gu_f32, dn_f32) = read_moe_expert_f32(
+                        &store,
+                        l,
+                        e,
+                        cfg.num_experts,
+                        h_dim,
+                        moe_inter,
+                        true,
+                    )?;
+                    let gu_mat = compile_hadamard_gptq_nf(
+                        &gu_f32,
+                        2 * moe_inter,
+                        h_dim,
+                        expert_bits,
+                        expert_sgc,
+                        Some(&hess_mlp),
+                        compile_threads,
+                    );
+                    drop(gu_f32);
+
+                    let mut hess_e_dn = FullRowGptqHessian::new(moe_inter);
+                    if bucket.len() >= 16 {
+                        for &(tok_idx, _) in bucket {
+                            // SAFETY: `gu_tmp` has `2 * moe_inter == gu_mat.rows` floats.
+                            unsafe {
+                                nf_sdot_stripe_range_int8(
+                                    &gu_mat,
+                                    &act_in_all[tok_idx],
+                                    0,
+                                    gu_mat.num_stripes,
+                                    gu_tmp.as_mut_ptr(),
+                                );
+                            }
+                            let (g, u) = gu_tmp.split_at(moe_inter);
+                            swiglu_activate(g, u, &mut sw_tmp);
+                            fwht64_signed_inplace(&mut sw_tmp);
+                            hess_e_dn.observe_prerotated(&sw_tmp);
+                        }
+                    } else {
+                        for tok_idx in (0..total_tokens).step_by(fallback_step) {
+                            // SAFETY: `gu_tmp` has `2 * moe_inter == gu_mat.rows` floats.
+                            unsafe {
+                                nf_sdot_stripe_range_int8(
+                                    &gu_mat,
+                                    &act_in_all[tok_idx],
+                                    0,
+                                    gu_mat.num_stripes,
+                                    gu_tmp.as_mut_ptr(),
+                                );
+                            }
+                            let (g, u) = gu_tmp.split_at(moe_inter);
+                            swiglu_activate(g, u, &mut sw_tmp);
+                            fwht64_signed_inplace(&mut sw_tmp);
+                            hess_e_dn.observe_prerotated(&sw_tmp);
+                        }
+                    }
+                    hess_e_dn.finalize(BIPOLAR_GPTQ_DAMP);
+                    let dn_mat = compile_hadamard_gptq_nf(
+                        &dn_f32,
+                        h_dim,
+                        moe_inter,
+                        expert_bits,
+                        expert_sgc,
+                        Some(&hess_e_dn),
+                        compile_threads,
+                    );
+                    drop(dn_f32);
+                    drop(hess_e_dn);
+
+                    for &(tok_idx, weight) in bucket {
+                        // SAFETY: `gu_tmp` and `dn_tmp` match `gu_mat.rows` and `dn_mat.rows`.
+                        unsafe {
+                            nf_sdot_stripe_range_int8(
+                                &gu_mat,
+                                &act_in_all[tok_idx],
+                                0,
+                                gu_mat.num_stripes,
+                                gu_tmp.as_mut_ptr(),
+                            );
+                        }
+                        let (g, u) = gu_tmp.split_at(moe_inter);
+                        swiglu_activate(g, u, &mut sw_tmp);
+                        fwht64_signed_inplace(&mut sw_tmp);
+                        act_mid.populate(&sw_tmp);
+                        // SAFETY: `dn_tmp` has `h_dim == dn_mat.rows` floats.
+                        unsafe {
+                            nf_sdot_stripe_range_int8(
+                                &dn_mat,
+                                &act_mid,
+                                0,
+                                dn_mat.num_stripes,
+                                dn_tmp.as_mut_ptr(),
+                            );
+                        }
+                        let dst = &mut moe_out_all[tok_idx * h_dim..(tok_idx + 1) * h_dim];
+                        for (d, &s) in dst.iter_mut().zip(dn_tmp.iter()) {
+                            *d += weight * s;
+                        }
+                    }
+
+                    k2tm_writer.write_expert(&gu_mat, &dn_mat)?;
+                }
+
+                let mut tok_cursor = 0usize;
+                for seq_h in &mut seq_hiddens {
+                    for hid in seq_h.chunks_exact_mut(h_dim) {
+                        add_inplace(
+                            hid,
+                            &moe_out_all[tok_cursor * h_dim..(tok_cursor + 1) * h_dim],
+                        );
+                        tok_cursor += 1;
+                    }
+                }
+
+                (
+                    LinearBackend::Empty,
+                    LinearBackend::Empty,
+                    Some(MoeLayerCore {
+                        moe_slot_idx: slot,
+                        router,
+                        shared_expert,
+                        lookahead: None,
+                    }),
+                )
+            } else {
+                let inter_dim = cfg.intermediate_size;
+                let mut all_swiglu = vec![0.0f32; total_tokens * inter_dim];
+                let mut hess_mlp = FullRowGptqHessian::new(h_dim);
+                for seq_h in &seq_hiddens {
+                    for hid in seq_h.chunks_exact(h_dim) {
+                        rms_norm(hid, &post_attn_norm, cfg.rms_norm_eps, &mut norm_buf);
+                        fwht64_signed_inplace(&mut norm_buf);
+                        hess_mlp.observe_prerotated(&norm_buf);
+                    }
+                }
+                hess_mlp.finalize(BIPOLAR_GPTQ_DAMP);
+                let mut gate_up_w = Vec::with_capacity(2 * inter_dim * h_dim);
+                gate_up_w.extend_from_slice(&get_f32_and_release(&format!(
+                    "{pfx}.mlp.gate_proj.weight"
+                ))?);
+                gate_up_w.extend_from_slice(&get_f32_and_release(&format!(
+                    "{pfx}.mlp.up_proj.weight"
+                ))?);
+                let gu_proj = compile_proj_spec(
+                    &gate_up_w,
+                    2 * inter_dim,
+                    h_dim,
+                    gate_up_spec,
+                    Some(&hess_mlp),
+                    compile_threads,
+                );
+                drop(gate_up_w);
+                drop(hess_mlp);
+
+                par_calib(
+                    &mut seq_hiddens,
+                    &mut all_swiglu,
+                    h_dim,
+                    inter_dim,
+                    |seq_h, sw_seq| {
+                        let mut norm_local = vec![0.0f32; h_dim];
+                        let mut gu_buf = vec![0.0f32; 2 * inter_dim];
+                        let mut blut_h = BipolarActivationLut::new_zeroed(h_dim);
+                        let mut vlut_h = Vq2ActivationLut::new_zeroed(h_dim);
+                        for (hid, sw_dst) in seq_h
+                            .chunks_exact(h_dim)
+                            .zip(sw_seq.chunks_exact_mut(inter_dim))
+                        {
+                            rms_norm(hid, &post_attn_norm, cfg.rms_norm_eps, &mut norm_local);
+                            fwht64_signed_inplace(&mut norm_local);
+                            eval_proj_rot(&gu_proj, &norm_local, &mut blut_h, &mut vlut_h, &mut gu_buf);
+                            let (g, u) = gu_buf.split_at(inter_dim);
+                            swiglu_activate(g, u, sw_dst);
+                            fwht64_signed_inplace(sw_dst);
+                        }
+                    },
+                );
+                let mut hess_down = FullRowGptqHessian::new(inter_dim);
+                for row in all_swiglu.chunks_exact(inter_dim) {
+                    hess_down.observe_prerotated(row);
+                }
+                hess_down.finalize(BIPOLAR_GPTQ_DAMP);
+                let down_w = get_f32_and_release(&format!("{pfx}.mlp.down_proj.weight"))?;
+                let dn_proj = compile_proj_spec(
+                    &down_w,
+                    h_dim,
+                    inter_dim,
+                    down_spec,
+                    Some(&hess_down),
+                    compile_threads,
+                );
+                drop(down_w);
+                drop(hess_down);
+
+                par_calib(
+                    &mut seq_hiddens,
+                    &mut all_swiglu,
+                    h_dim,
+                    inter_dim,
+                    |seq_h, sw_seq| {
+                        let mut proj_out = vec![0.0f32; h_dim];
+                        let mut blut_i = BipolarActivationLut::new_zeroed(inter_dim);
+                        let mut vlut_i = Vq2ActivationLut::new_zeroed(inter_dim);
+                        for (hid, sw_rot) in seq_h
+                            .chunks_exact_mut(h_dim)
+                            .zip(sw_seq.chunks_exact(inter_dim))
+                        {
+                            eval_proj_rot(&dn_proj, sw_rot, &mut blut_i, &mut vlut_i, &mut proj_out);
+                            add_inplace(hid, &proj_out);
+                        }
+                    },
+                );
+                (gu_proj, dn_proj, None)
+            };
+
+            compiled_layers.push(LlamaLayer {
+                input_norm,
+                post_attn_norm,
+                o_inv_scale: None,
+                down_inv_scale: None,
+                qkv_bias,
+                o_bias,
+                q_norm,
+                k_norm,
+                qkv_proj,
+                o_proj,
+                gate_up_proj,
+                gate_up_interleaved: false,
+                down_proj,
+                moe,
+            });
+            if cfg.num_hidden_layers >= 12 && ((l + 1) % 4 == 0 || l + 1 == cfg.num_hidden_layers) {
+                eprintln!(
+                    "  [MoE-GPTQ layer {:>2}/{}] {:.1}s",
+                    l + 1,
+                    cfg.num_hidden_layers,
+                    t_layer.elapsed().as_secs_f64()
+                );
+            }
+        }
+
+        drop(all_attn_out);
+        drop(lookahead_history);
+        k2tm_writer.finish()?;
+
+        let final_norm = get_f32_and_release("model.norm.weight")?;
+        let mut hess_head = FullRowGptqHessian::new(h_dim);
+        for seq_h in &seq_hiddens {
+            for hid in seq_h.chunks_exact(h_dim) {
+                rms_norm(hid, &final_norm, cfg.rms_norm_eps, &mut norm_buf);
+                fwht64_signed_inplace(&mut norm_buf);
+                hess_head.observe_prerotated(&norm_buf);
+            }
+        }
+        drop(seq_hiddens);
+        hess_head.finalize(BIPOLAR_GPTQ_DAMP);
+        let lm_head_w = if cfg.tie_word_embeddings {
+            get_f32_and_release("model.embed_tokens.weight")?
+        } else {
+            get_f32_and_release("lm_head.weight")?
+        };
+        let lm_head = compile_proj_spec(
+            &lm_head_w,
+            cfg.vocab_size,
+            h_dim,
+            head_spec,
+            Some(&hess_head),
+            compile_threads,
+        );
+        drop(lm_head_w);
+        drop(hess_head);
+
+        // Write `K2TKRONOS5\n` pinned core `.k2tb`.
+        fn w_u64(w: &mut impl Write, v: usize) -> io::Result<()> {
+            w.write_all(&(v as u64).to_le_bytes())
+        }
+        fn w_f32s(w: &mut impl Write, v: &[f32]) -> io::Result<()> {
+            w_u64(w, v.len())?;
+            v.iter().try_for_each(|x| w.write_all(&x.to_le_bytes()))
+        }
+        fn w_u16s(w: &mut impl Write, v: &[u16]) -> io::Result<()> {
+            w_u64(w, v.len())?;
+            v.iter().try_for_each(|x| w.write_all(&x.to_le_bytes()))
+        }
+        fn w_nf_mat(w: &mut impl Write, m: &NfSdotMatrix) -> io::Result<()> {
+            w_u64(w, 2)?;
+            w_u64(w, m.rows)?;
+            w_u64(w, m.cols)?;
+            w_u64(w, m.bits)?;
+            w_u64(w, m.scale_group_chunks)?;
+            let cb_bytes: [u8; 16] = std::array::from_fn(|i| m.codebook[i] as u8);
+            w.write_all(&cb_bytes)?;
+            w_u64(w, m.pair_stream.len())?;
+            w.write_all(&m.pair_stream)?;
+            w_u64(w, m.tail_stream.len())?;
+            w.write_all(&m.tail_stream)
+        }
+        fn w_mat_v2(w: &mut impl Write, b: &LinearBackend) -> io::Result<()> {
+            match b {
+                LinearBackend::FusedBipolar(m) => {
+                    w_u64(w, 0)?;
+                    w_u64(w, m.rows)?;
+                    w_u64(w, m.cols)?;
+                    w_u64(w, m.num_planes)?;
+                    w_u64(w, m.interleaved_data.len())?;
+                    w.write_all(&m.interleaved_data)?;
+                    w_u64(w, m.bf16_chunk_scales.len())?;
+                    m.bf16_chunk_scales
+                        .iter()
+                        .try_for_each(|x| w.write_all(&x.to_le_bytes()))
+                }
+                LinearBackend::Vq2(m) => {
+                    w_u64(w, 1)?;
+                    w_u64(w, m.rows)?;
+                    w_u64(w, m.cols)?;
+                    w_u64(w, m.scale_group_chunks)?;
+                    w_u64(w, m.packed_data.len())?;
+                    w.write_all(&m.packed_data)?;
+                    w_u64(w, m.bf16_chunk_scales.len())?;
+                    m.bf16_chunk_scales
+                        .iter()
+                        .try_for_each(|x| w.write_all(&x.to_le_bytes()))
+                }
+                LinearBackend::NfSdot(m) => w_nf_mat(w, m),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unexpected matrix backend in K2TKRONOS5",
+                )),
+            }
+        }
+
+        let mut w = io::BufWriter::new(fs::File::create(core_k2tb_path)?);
+        w.write_all(KRONOS5_CACHE_MAGIC)?;
+        mode_words.iter().try_for_each(|&v| w_u64(&mut w, v))?;
+        w_u64(&mut w, expert_bits)?;
+        w_u64(&mut w, expert_sgc)?;
+        w_u64(&mut w, compiled_layers.len())?;
+        for l in &compiled_layers {
+            w_f32s(&mut w, &l.input_norm)?;
+            w_f32s(&mut w, &l.post_attn_norm)?;
+            w_f32s(&mut w, l.qkv_bias.as_deref().unwrap_or(&[]))?;
+            w_f32s(&mut w, l.o_bias.as_deref().unwrap_or(&[]))?;
+            w_f32s(&mut w, l.q_norm.as_deref().unwrap_or(&[]))?;
+            w_f32s(&mut w, l.k_norm.as_deref().unwrap_or(&[]))?;
+            w_mat_v2(&mut w, &l.qkv_proj)?;
+            w_mat_v2(&mut w, &l.o_proj)?;
+            if let Some(ref moe) = l.moe {
+                w_u64(&mut w, 1)?;
+                w_u64(&mut w, moe.moe_slot_idx)?;
+                w_u64(&mut w, moe.router.num_experts)?;
+                w_u64(&mut w, moe.router.hidden_size)?;
+                w_f32s(&mut w, &moe.router.weights)?;
+                w_f32s(&mut w, moe.router.bias.as_deref().unwrap_or(&[]))?;
+                if let Some(ref sh) = moe.shared_expert {
+                    w_u64(&mut w, 1)?;
+                    w_u64(&mut w, sh.inter_dim)?;
+                    w_f32s(&mut w, sh.gate_weight.as_deref().unwrap_or(&[]))?;
+                    match &sh.backend {
+                        SharedExpertBackend::Nf { gate_up, down, .. } => {
+                            w_nf_mat(&mut w, gate_up)?;
+                            w_nf_mat(&mut w, down)?;
+                        }
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "shared expert in K2TKRONOS5 must be NfSdot",
+                            ));
+                        }
+                    }
+                } else {
+                    w_u64(&mut w, 0)?;
+                }
+                if let Some((future_l, ref proj)) = moe.lookahead {
+                    w_u64(&mut w, 1)?;
+                    w_u64(&mut w, future_l)?;
+                    w_u64(&mut w, proj.d_model)?;
+                    w_u64(&mut w, proj.rank)?;
+                    w_f32s(&mut w, &proj.u_proj)?;
+                    w_f32s(&mut w, &proj.v_proj)?;
+                } else {
+                    w_u64(&mut w, 0)?;
+                }
+            } else {
+                w_u64(&mut w, 0)?;
+                w_mat_v2(&mut w, &l.gate_up_proj)?;
+                w_mat_v2(&mut w, &l.down_proj)?;
+            }
+        }
+        w_f32s(&mut w, &final_norm)?;
+        w_mat_v2(&mut w, &lm_head)?;
+        w_f32s(&mut w, &[])?;
+        w_u16s(&mut w, &embed_bf16_rows)?;
+        if let Some(ref em) = embed_nf4 {
+            w_u64(&mut w, 1)?;
+            w_nf_mat(&mut w, em)?;
+        } else {
+            w_u64(&mut w, 0)?;
+        }
+        w.flush()
+    }
+
+    /// Loads a hybrid Sparse-MoE engine from its `K2TKRONOS5\n` pinned core (`.k2tb`) and
+    /// 16 KiB-aligned expert shard (`.k2tm`) under `policy` and the active [`MemoryBudgetProfile`].
+    pub fn load_moe_from_files(
+        model_dir: &Path,
+        core_k2tb_path: &Path,
+        experts_k2tm_path: &Path,
+        max_seq_len: usize,
+        policy: MoeExpertOpenPolicy,
+    ) -> io::Result<Self> {
+        let cfg = LlamaConfig::from_config_json(&model_dir.join("config.json"), max_seq_len)?;
+        let file = fs::File::open(core_k2tb_path)?;
+        let len = file.metadata()?.len() as usize;
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
+        if len < KRONOS5_CACHE_MAGIC.len() {
+            return Err(bad("empty K2TKRONOS5 cache"));
+        }
+        let mmap = RawMmap::map_read_only(&file, len)?;
+        let bytes = mmap.as_slice();
+        if !bytes.starts_with(KRONOS5_CACHE_MAGIC) {
+            return Err(bad("bad K2TKRONOS5 cache magic"));
+        }
+        let mut rd = CacheReader {
+            bytes,
+            pos: KRONOS5_CACHE_MAGIC.len(),
+        };
+        let r_mat = |rd: &mut CacheReader| -> io::Result<LinearBackend> {
+            match rd.u64()? {
+                0 => {
+                    let rows = rd.u64()?;
+                    let cols = rd.u64()?;
+                    let num_planes = rd.u64()?;
+                    let n = rd.u64()?;
+                    let interleaved_data = rd.take(n)?.to_vec();
+                    let n = rd.u64()?;
+                    let bf16_chunk_scales = rd
+                        .take(n * 2)?
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    Ok(LinearBackend::FusedBipolar(FusedBipolarLutMatrix {
+                        rows,
+                        cols,
+                        num_planes,
+                        octets_per_row: cols / 8,
+                        num_stripes: rows.div_ceil(SIMD_ROW_STRIPE),
+                        num_chunks: cols / 64,
+                        interleaved_data,
+                        bf16_chunk_scales,
+                    }))
+                }
+                1 => {
+                    let rows = rd.u64()?;
+                    let cols = rd.u64()?;
+                    let scale_group_chunks = rd.u64()?.max(1);
+                    let n = rd.u64()?;
+                    let packed_data = rd.take(n)?.to_vec();
+                    let n = rd.u64()?;
+                    let bf16_chunk_scales = rd
+                        .take(n * 2)?
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    let num_chunks = cols / 64;
+                    Ok(LinearBackend::Vq2(Vq2LutMatrix {
+                        rows,
+                        cols,
+                        scale_group_chunks,
+                        num_stripes: rows.div_ceil(SIMD_ROW_STRIPE),
+                        num_chunks,
+                        num_scale_groups: num_chunks.div_ceil(scale_group_chunks),
+                        packed_data,
+                        bf16_chunk_scales,
+                    }))
+                }
+                2 => {
+                    let rows = rd.u64()?;
+                    let cols = rd.u64()?;
+                    let bits = rd.u64()?;
+                    let scale_group_chunks = rd.u64()?.max(1);
+                    let cb_raw = rd.take(16)?;
+                    let codebook: [i8; 16] = std::array::from_fn(|i| cb_raw[i] as i8);
+                    let pair_len = rd.u64()?;
+                    let pair_stream =
+                        crate::simd_lut::PageAlignedBytes::from_slice(rd.take(pair_len)?);
+                    let tail_len = rd.u64()?;
+                    let tail_stream =
+                        crate::simd_lut::PageAlignedBytes::from_slice(rd.take(tail_len)?);
+                    let num_stripes = rows.div_ceil(SIMD_ROW_STRIPE);
+                    let num_chunks = cols / 64;
+                    Ok(LinearBackend::NfSdot(NfSdotMatrix {
+                        rows,
+                        cols,
+                        bits,
+                        scale_group_chunks,
+                        num_stripes,
+                        num_pairs: num_stripes / 2,
+                        num_chunks,
+                        num_scale_groups: num_chunks.div_ceil(scale_group_chunks),
+                        codebook,
+                        pair_stream,
+                        tail_stream,
+                    }))
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unknown matrix tag in K2TKRONOS5",
+                )),
+            }
+        };
+
+        let mut mw = [0usize; 6];
+        for v in mw.iter_mut() {
+            *v = rd.u64()?;
+        }
+        let mode = match mw[0] {
+            0 => RealWeightMode::KronosBipolarGptq { num_planes: mw[1] },
+            1 => RealWeightMode::KronosBipolarGptqMixedK,
+            2 => RealWeightMode::KronosBipolarGptqPlanes {
+                qkv: mw[1],
+                o: mw[2],
+                gate_up: mw[3],
+                down: mw[4],
+                head: mw[5],
+            },
+            3 => RealWeightMode::KronosVq2Gptq {
+                scale_group_chunks: mw[1].max(1),
+            },
+            4 => RealWeightMode::KronosVq2MixedGptq {
+                attn_head_planes: mw[1],
+                scale_group_chunks: mw[2].max(1),
+            },
+            5 => RealWeightMode::KronosNfGptq {
+                bits: mw[1],
+                scale_group_chunks: mw[2].max(1),
+            },
+            6 => RealWeightMode::KronosNfMixedGptq {
+                attn_head_bits: mw[1],
+                ffn_bits: mw[2],
+                scale_group_chunks: mw[3].max(1),
+            },
+            7 => RealWeightMode::KronosNfPlanesGptq {
+                qkv: mw[1] & 0xFF,
+                o: mw[2],
+                gate_up: mw[3],
+                down: mw[4],
+                head: mw[5],
+                scale_group_chunks: (mw[1] >> 8).max(1),
+            },
+            _ => return Err(bad("unknown mode tag in K2TKRONOS5")),
+        };
+        let expert_bits = rd.u64()?;
+        let expert_sgc = rd.u64()?.max(1);
+        let num_layers = rd.u64()?;
+        if num_layers != cfg.num_hidden_layers {
+            return Err(bad("K2TKRONOS5 layer count mismatch against config.json"));
+        }
+
+        let opt_f32s = |rd: &mut CacheReader| -> io::Result<Option<Vec<f32>>> {
+            let v = rd.f32s()?;
+            if v.is_empty() { Ok(None) } else { Ok(Some(v)) }
+        };
+
+        let mut layers = Vec::with_capacity(num_layers);
+        let mut max_shared_inter = 0usize;
+        for _ in 0..num_layers {
+            let input_norm = rd.f32s()?;
+            let post_attn_norm = rd.f32s()?;
+            let qkv_bias = opt_f32s(&mut rd)?;
+            let o_bias = opt_f32s(&mut rd)?;
+            let q_norm = opt_f32s(&mut rd)?;
+            let k_norm = opt_f32s(&mut rd)?;
+            let qkv_proj = r_mat(&mut rd)?;
+            let o_proj = r_mat(&mut rd)?;
+            let is_moe_layer = rd.u64()? != 0;
+            let (gate_up_proj, down_proj, moe) = if is_moe_layer {
+                let moe_slot_idx = rd.u64()?;
+                let r_exp = rd.u64()?;
+                let r_hid = rd.u64()?;
+                let r_weights = rd.f32s()?;
+                let r_bias = opt_f32s(&mut rd)?;
+                let router = DenseMoeRouter::new(r_exp, r_hid, r_weights, r_bias);
+
+                let shared_expert = if rd.u64()? != 0 {
+                    let s_inter = rd.u64()?;
+                    max_shared_inter = max_shared_inter.max(s_inter);
+                    let gate_weight = opt_f32s(&mut rd)?;
+                    let LinearBackend::NfSdot(gate_up) = r_mat(&mut rd)? else {
+                        return Err(bad("expected NfSdot shared gate_up"));
+                    };
+                    let LinearBackend::NfSdot(down) = r_mat(&mut rd)? else {
+                        return Err(bad("expected NfSdot shared down"));
+                    };
+                    Some(SharedMoeExpert {
+                        inter_dim: s_inter,
+                        backend: SharedExpertBackend::Nf {
+                            inter_dim: s_inter,
+                            gate_up,
+                            down,
+                        },
+                        gate_weight,
+                    })
+                } else {
+                    None
+                };
+
+                let lookahead = if rd.u64()? != 0 {
+                    let future_l = rd.u64()?;
+                    let d_model = rd.u64()?;
+                    let rank = rd.u64()?;
+                    let u_proj = rd.f32s()?;
+                    let v_proj = rd.f32s()?;
+                    Some((
+                        future_l,
+                        SubspaceProjector {
+                            d_model,
+                            rank,
+                            u_proj,
+                            v_proj,
+                        },
+                    ))
+                } else {
+                    None
+                };
+
+                (
+                    LinearBackend::Empty,
+                    LinearBackend::Empty,
+                    Some(MoeLayerCore {
+                        moe_slot_idx,
+                        router,
+                        shared_expert,
+                        lookahead,
+                    }),
+                )
+            } else {
+                (r_mat(&mut rd)?, r_mat(&mut rd)?, None)
+            };
+
+            layers.push(LlamaLayer {
+                input_norm,
+                post_attn_norm,
+                o_inv_scale: None,
+                down_inv_scale: None,
+                qkv_bias,
+                o_bias,
+                q_norm,
+                k_norm,
+                qkv_proj,
+                o_proj,
+                gate_up_proj,
+                gate_up_interleaved: false,
+                down_proj,
+                moe,
+            });
+        }
+
+        let final_norm = rd.f32s()?;
+        let lm_head = r_mat(&mut rd)?;
+        let embed_f32_rows = rd.f32s()?;
+        let n_u16 = rd.u64()?;
+        let raw_le = rd.take(n_u16 * 2)?;
+        let mut embed_bf16_rows: Vec<u16> = raw_le
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let mut embed_nf4 = None;
+        if rd.u64()? != 0 {
+            let LinearBackend::NfSdot(m) = r_mat(&mut rd)? else {
+                return Err(bad("expected NfSdot untied embedding matrix in K2TKRONOS5"));
+            };
+            embed_bf16_rows = Vec::new();
+            embed_nf4 = Some(m);
+        } else if !embed_bf16_rows.is_empty()
+            && crate::memory_budget::MemoryBudgetProfile::active().quantize_untied_embeddings
+            && cfg.hidden_size.is_multiple_of(64)
+        {
+            let workers = std::thread::available_parallelism()
+                .map_or(4, |p| p.get())
+                .clamp(1, 8);
+            embed_nf4 = Some(NfSdotMatrix::from_bf16_u16_embeddings_nf4(
+                &embed_bf16_rows,
+                cfg.vocab_size,
+                cfg.hidden_size,
+                2,
+                workers,
+            ));
+            embed_bf16_rows = Vec::new();
+        }
+        let page_aligned = len & !16_383usize;
+        if page_aligned > 0 {
+            mmap.advise_dontneed(0, page_aligned);
+        }
+        drop(mmap);
+
+        let budget = crate::memory_budget::MemoryBudgetProfile::active();
+        let constrained = matches!(
+            budget.tier,
+            crate::memory_budget::MemoryTier::Mobile5G | crate::memory_budget::MemoryTier::Edge8G
+        );
+        let (kv_window_pref, kv_sinks_pref) =
+            if cfg.sliding_window.is_none() && constrained && cfg.max_seq_len > 2048 {
+                (Some(2048), 4)
+            } else {
+                (cfg.sliding_window, cfg.sink_tokens)
+            };
+
+        let mut eng = Self {
+            #[cfg(target_os = "macos")]
+            metal: None,
+            kv_bits_pref: if budget.prefer_q4_kv { 4 } else { 8 },
+            kv_window_pref,
+            kv_sinks_pref,
+            rope_cos_sin: build_rope_table(&cfg),
+            ws: LlamaWorkspace::new(&cfg),
+            cfg,
+            mode,
+            mean_weight_rel_error: 0.0,
+            embed_f32_rows,
+            embed_bf16_rows,
+            embed_nf4,
+            layers,
+            final_norm,
+            lm_head,
+            pool: None,
+            moe_runtime: None,
+        };
+        eng.repack_sdot();
+        if matches!(eng.cfg.head_dim(), 64 | 128) {
+            eng.enable_q8_kv_cache(true);
+        }
+
+        let pinned_bytes = eng.pinned_core_bytes();
+        let kv_and_scratch_bytes = eng.kv_cache_bytes() + (24 << 20);
+        let moe_rt = SparseMoeRuntime::open_k2tm(
+            experts_k2tm_path,
+            eng.cfg.hidden_size,
+            eng.cfg.eff_moe_inter(),
+            eng.cfg.num_experts,
+            eng.cfg.num_experts_per_tok,
+            eng.cfg.norm_topk_prob,
+            eng.cfg.router_scoring,
+            max_shared_inter,
+            expert_bits,
+            expert_sgc,
+            pinned_bytes,
+            kv_and_scratch_bytes,
+            0,
+            policy,
+        )?;
+        eng.moe_runtime = Some(moe_rt);
+        Ok(eng)
+    }
+
+    /// Resident bytes occupied by the pinned transformer core (attention, norms, routers, shared experts,
+    /// lookahead projectors, embeddings, and `lm_head`), excluding `.k2tm` routed experts.
+    pub fn pinned_core_bytes(&self) -> usize {
+        let layer_bytes: usize = self
+            .layers
+            .iter()
+            .map(|l| {
+                l.qkv_proj.physical_bytes()
+                    + l.o_proj.physical_bytes()
+                    + l.gate_up_proj.physical_bytes()
+                    + l.down_proj.physical_bytes()
+                    + (l.input_norm.len() + l.post_attn_norm.len()) * 4
+                    + l.qkv_bias.as_ref().map_or(0, |b| b.len() * 4)
+                    + l.o_bias.as_ref().map_or(0, |b| b.len() * 4)
+                    + l.q_norm.as_ref().map_or(0, |b| b.len() * 4)
+                    + l.k_norm.as_ref().map_or(0, |b| b.len() * 4)
+                    + l.moe.as_ref().map_or(0, |m| m.physical_bytes())
+            })
+            .sum();
+        layer_bytes
+            + self.final_norm.len() * 4
+            + self.lm_head.physical_bytes()
+            + self.embed_f32_rows.len() * 4
+            + self.embed_bf16_rows.len() * 2
+            + self.embed_nf4.as_ref().map_or(0, |m| m.physical_bytes())
+    }
+
+    /// Resident DRAM bytes occupied by the Sparse-MoE expert arena (`0` on dense models).
+    pub fn moe_expert_arena_bytes(&self) -> usize {
+        self.moe_runtime
+            .as_ref()
+            .map_or(0, |r| r.resident_arena_bytes())
+    }
+
+    /// Total physical RAM occupied by all compiled linear projections (`layers` + `lm_head` + resident MoE arena).
     pub fn linear_weight_bytes(&self) -> usize {
         let layer_bytes: usize = self
             .layers
@@ -3317,17 +4963,21 @@ impl RealLlamaEngine {
                     + l.o_proj.physical_bytes()
                     + l.gate_up_proj.physical_bytes()
                     + l.down_proj.physical_bytes()
+                    + l.moe.as_ref().map_or(0, |m| m.physical_bytes())
             })
             .sum();
-        layer_bytes + self.lm_head.physical_bytes()
+        layer_bytes + self.lm_head.physical_bytes() + self.moe_expert_arena_bytes()
     }
 
-    /// Linear weights plus biases and any untied (`FP32`, `BF16`, or `NF4`) embedding table.
+    /// Linear weights plus biases, untied (`FP32`, `BF16`, or `NF4`) embeddings, and resident MoE SLRU/mmap arena.
     pub fn resident_weight_bytes(&self) -> usize {
         let bias_bytes: usize = self
             .layers
             .iter()
-            .map(|l| l.qkv_bias.as_ref().map_or(0, |b| b.len() * std::mem::size_of::<f32>()))
+            .map(|l| {
+                l.qkv_bias.as_ref().map_or(0, |b| b.len() * std::mem::size_of::<f32>())
+                    + l.o_bias.as_ref().map_or(0, |b| b.len() * std::mem::size_of::<f32>())
+            })
             .sum();
         self.linear_weight_bytes()
             + bias_bytes
@@ -3336,16 +4986,51 @@ impl RealLlamaEngine {
             + self.embed_nf4.as_ref().map_or(0, |m| m.physical_bytes())
     }
 
-    /// Physical bits per weight across all transformer layers + `lm_head`.
+    /// Physical bits per weight across all transformer layers + `lm_head` (including full `.k2tm` shard on MoE).
     pub fn physical_bits_per_weight(&self) -> f64 {
-        let qkv_rows = self.cfg.q_dim() + 2 * self.cfg.kv_dim();
-        let layer_params = qkv_rows * self.cfg.hidden_size
-            + self.cfg.hidden_size * self.cfg.q_dim()
-            + 2 * self.cfg.intermediate_size * self.cfg.hidden_size
-            + self.cfg.hidden_size * self.cfg.intermediate_size;
-        let total_params =
-            self.cfg.num_hidden_layers * layer_params + self.cfg.vocab_size * self.cfg.hidden_size;
-        (self.linear_weight_bytes() as f64 * 8.0) / (total_params as f64)
+        let q_dim = self.cfg.q_dim();
+        let qkv_rows = q_dim + 2 * self.cfg.kv_dim();
+        let h = self.cfg.hidden_size;
+        if !self.is_moe() {
+            let layer_params = qkv_rows * h
+                + h * q_dim
+                + 2 * self.cfg.intermediate_size * h
+                + h * self.cfg.intermediate_size;
+            let total_params =
+                self.cfg.num_hidden_layers * layer_params + self.cfg.vocab_size * h;
+            return (self.linear_weight_bytes() as f64 * 8.0) / (total_params as f64);
+        }
+
+        let mut total_params = self.cfg.vocab_size * h;
+        let mut core_linear_bytes = self.lm_head.physical_bytes();
+        if !self.cfg.tie_word_embeddings {
+            total_params += self.cfg.vocab_size * h;
+            core_linear_bytes += self.embed_f32_rows.len() * 4
+                + self.embed_bf16_rows.len() * 2
+                + self.embed_nf4.as_ref().map_or(0, |m| m.physical_bytes());
+        }
+        let moe_inter = self.cfg.eff_moe_inter();
+        for l in &self.layers {
+            total_params += qkv_rows * h + h * q_dim;
+            core_linear_bytes += l.qkv_proj.physical_bytes() + l.o_proj.physical_bytes();
+            if let Some(ref moe) = l.moe {
+                total_params += moe.router.num_experts * h;
+                total_params += self.cfg.num_experts * (3 * moe_inter * h);
+                if let Some(ref sh) = moe.shared_expert {
+                    total_params += 3 * sh.inter_dim * h;
+                }
+                core_linear_bytes += moe.physical_bytes();
+            } else {
+                total_params += 3 * self.cfg.intermediate_size * h;
+                core_linear_bytes +=
+                    l.gate_up_proj.physical_bytes() + l.down_proj.physical_bytes();
+            }
+        }
+        let expert_total_bytes = self
+            .moe_stats()
+            .filter(|s| s.shard_disk_bytes > 0)
+            .map_or_else(|| self.moe_expert_arena_bytes(), |s| s.shard_disk_bytes);
+        ((core_linear_bytes + expert_total_bytes) as f64 * 8.0) / (total_params as f64)
     }
 }
 
@@ -3637,21 +5322,37 @@ impl RealLlamaEngine {
                 LinearBackend::Nibble4(_) | LinearBackend::NfSdot(_) | LinearBackend::Vq2(_)
             )
         };
+        let has_dense_ffn = self.layers.iter().any(|l| l.moe.is_none());
+        let moe_is_sdot = self
+            .moe_runtime
+            .as_ref()
+            .is_none_or(|r| !r.is_fp32_reference());
         self.ws.blut_hidden.int8.is_some()
-            && self.ws.blut_inter.int8.is_some()
+            && self.ws.blut_q.int8.is_some()
+            && (!has_dense_ffn || self.ws.blut_inter.int8.is_some())
+            && moe_is_sdot
             && is_sdot(&self.lm_head)
             && self.layers.iter().all(|l| {
                 is_sdot(&l.qkv_proj)
                     && is_sdot(&l.o_proj)
-                    && is_sdot(&l.gate_up_proj)
-                    && is_sdot(&l.down_proj)
                     && l.o_inv_scale.is_none()
                     && l.down_inv_scale.is_none()
+                    && (l.moe.is_some()
+                        || (is_sdot(&l.gate_up_proj) && is_sdot(&l.down_proj)))
             })
     }
 
     #[inline]
     fn can_run_sdot_megakernel(&self) -> bool {
+        if self.is_moe()
+            || self.cfg.q_dim() != self.cfg.hidden_size
+            || self
+                .layers
+                .iter()
+                .any(|l| l.q_norm.is_some() || l.k_norm.is_some() || l.o_bias.is_some())
+        {
+            return false;
+        }
         let is_fast = |b: &LinearBackend| {
             matches!(
                 b,
@@ -3722,14 +5423,17 @@ impl RealLlamaEngine {
         }
         let pos = self.ws.pos;
         let h_dim = self.cfg.hidden_size;
+        let q_dim = self.cfg.q_dim();
         let inter_dim = self.cfg.intermediate_size;
         let head_dim = self.cfg.head_dim();
         let half_dim = head_dim / 2;
         let kv_dim = self.cfg.kv_dim();
+        let num_q_heads = self.cfg.num_attention_heads;
         let num_kv_heads = self.cfg.num_key_value_heads;
-        let kv_group = self.cfg.num_attention_heads / num_kv_heads;
+        let kv_group = num_q_heads / num_kv_heads;
         let attn_scale = 1.0 / (head_dim as f32).sqrt();
         let layer_kv_stride = self.cfg.max_seq_len * kv_dim;
+        let eps = self.cfg.rms_norm_eps;
 
         embed_token_into(
             &self.embed_f32_rows,
@@ -3741,82 +5445,118 @@ impl RealLlamaEngine {
             &mut self.ws.hidden,
         );
         let rope_row = &self.rope_cos_sin[pos * head_dim..(pos + 1) * head_dim];
+        let layers = &self.layers;
+        let final_norm = &self.final_norm;
+        let lm_head = &self.lm_head;
         let pool_ref = self.pool.as_ref();
+        let moe_rt = &mut self.moe_runtime;
+        let ws = &mut self.ws;
 
         macro_rules! exec_hidden_proj {
             ($proj:expr, $buf:expr, $out:expr) => {{
                 match &$proj {
                     LinearBackend::Vq2(_) => {
                         fwht64_signed_inplace($buf);
-                        self.ws.vqlut_hidden.populate($buf);
+                        ws.vqlut_hidden.populate($buf);
                     }
                     LinearBackend::FusedBipolar(_)
                     | LinearBackend::Nibble4(_)
                     | LinearBackend::NfSdot(_) => {
                         fwht64_signed_inplace($buf);
-                        self.ws.blut_hidden.populate($buf);
+                        ws.blut_hidden.populate($buf);
                     }
                     LinearBackend::FusedBase3(_) => {
                         fwht64_signed_inplace($buf);
-                        self.ws.qlut_hidden.populate($buf);
+                        ws.qlut_hidden.populate($buf);
                     }
                     LinearBackend::LutMultiPlane(_) => {
-                        self.ws.qlut_hidden.populate($buf);
+                        ws.qlut_hidden.populate($buf);
                     }
                     LinearBackend::GgufQ4_0(_) => {
                         GgufQ4_0Matrix::quantize_q8_0_activation(
                             $buf,
-                            &mut self.ws.q8_hidden_vals,
-                            &mut self.ws.q8_hidden_scales,
+                            &mut ws.q8_hidden_vals,
+                            &mut ws.q8_hidden_scales,
                         );
                     }
-                    LinearBackend::Fp32 { .. } => {}
+                    LinearBackend::Fp32 { .. } | LinearBackend::Empty => {}
                 }
                 $proj.forward_exec(
                     $buf,
-                    Some(&self.ws.qlut_hidden),
-                    Some(&self.ws.blut_hidden),
-                    Some(&self.ws.vqlut_hidden),
-                    &self.ws.q8_hidden_vals,
-                    &self.ws.q8_hidden_scales,
+                    Some(&ws.qlut_hidden),
+                    Some(&ws.blut_hidden),
+                    Some(&ws.vqlut_hidden),
+                    &ws.q8_hidden_vals,
+                    &ws.q8_hidden_scales,
                     pool_ref,
                     $out,
                 );
             }};
         }
 
-        for (l_idx, layer) in self.layers.iter().enumerate() {
-            // 1. Pre-Attention RMSNorm + Fused QKV Projection (+ optional Qwen2 QKV Bias)
-            rms_norm(
-                &self.ws.hidden,
-                &layer.input_norm,
-                self.cfg.rms_norm_eps,
-                &mut self.ws.norm_buf,
-            );
-            exec_hidden_proj!(layer.qkv_proj, &mut self.ws.norm_buf, &mut self.ws.qkv_buf);
+        macro_rules! exec_q_proj {
+            ($proj:expr, $buf:expr, $out:expr) => {{
+                match &$proj {
+                    LinearBackend::Vq2(_) => {
+                        fwht64_signed_inplace($buf);
+                        ws.vqlut_q.populate($buf);
+                    }
+                    LinearBackend::FusedBipolar(_)
+                    | LinearBackend::Nibble4(_)
+                    | LinearBackend::NfSdot(_) => {
+                        fwht64_signed_inplace($buf);
+                        ws.blut_q.populate($buf);
+                    }
+                    LinearBackend::FusedBase3(_) => {
+                        fwht64_signed_inplace($buf);
+                        ws.qlut_q.populate($buf);
+                    }
+                    LinearBackend::LutMultiPlane(_) => {
+                        ws.qlut_q.populate($buf);
+                    }
+                    LinearBackend::GgufQ4_0(_) => {
+                        GgufQ4_0Matrix::quantize_q8_0_activation(
+                            $buf,
+                            &mut ws.q8_q_vals,
+                            &mut ws.q8_q_scales,
+                        );
+                    }
+                    LinearBackend::Fp32 { .. } | LinearBackend::Empty => {}
+                }
+                $proj.forward_exec(
+                    $buf,
+                    Some(&ws.qlut_q),
+                    Some(&ws.blut_q),
+                    Some(&ws.vqlut_q),
+                    &ws.q8_q_vals,
+                    &ws.q8_q_scales,
+                    pool_ref,
+                    $out,
+                );
+            }};
+        }
+
+        for (l_idx, layer) in layers.iter().enumerate() {
+            // 1. Pre-Attention RMSNorm + Fused QKV Projection (+ optional QKV Bias)
+            rms_norm(&ws.hidden, &layer.input_norm, eps, &mut ws.norm_buf);
+            exec_hidden_proj!(layer.qkv_proj, &mut ws.norm_buf, &mut ws.qkv_buf);
             if let Some(bias) = &layer.qkv_bias {
-                add_inplace(&mut self.ws.qkv_buf, bias);
+                add_inplace(&mut ws.qkv_buf, bias);
             }
 
-            // 2. Precomputed RoPE + KV Cache Store + Causal GQA Attention
-            let (q_slice, kv_rest) = self.ws.qkv_buf.split_at_mut(h_dim);
+            // 2. Optional QK-Norm + Precomputed RoPE + KV Cache Store + Causal GQA Attention
+            let (q_slice, kv_rest) = ws.qkv_buf.split_at_mut(q_dim);
             let (k_slice, v_slice) = kv_rest.split_at_mut(kv_dim);
-            apply_llama_rope_precomp(
-                q_slice,
-                self.cfg.num_attention_heads,
-                head_dim,
-                half_dim,
-                rope_row,
-            );
-            apply_llama_rope_precomp(
-                k_slice,
-                num_kv_heads,
-                head_dim,
-                half_dim,
-                rope_row,
-            );
+            if let Some(ref qn) = layer.q_norm {
+                apply_per_head_rms_norm(q_slice, head_dim, qn, eps);
+            }
+            if let Some(ref kn) = layer.k_norm {
+                apply_per_head_rms_norm(k_slice, head_dim, kn, eps);
+            }
+            apply_llama_rope_precomp(q_slice, num_q_heads, head_dim, half_dim, rope_row);
+            apply_llama_rope_precomp(k_slice, num_kv_heads, head_dim, half_dim, rope_row);
 
-            if let Some(q8) = self.ws.q8_kv.as_mut() {
+            if let Some(q8) = ws.q8_kv.as_mut() {
                 for kvh in 0..num_kv_heads {
                     q8.store_k_head(
                         l_idx,
@@ -3835,9 +5575,9 @@ impl RealLlamaEngine {
                     q_slice,
                     q8,
                     l_idx,
-                    &mut self.ws.scores,
-                    &mut self.ws.attn_out,
-                    self.cfg.num_attention_heads,
+                    &mut ws.scores,
+                    &mut ws.attn_out,
+                    num_q_heads,
                     kv_group,
                     pos,
                     attn_scale,
@@ -3845,16 +5585,16 @@ impl RealLlamaEngine {
             } else {
                 let kv_base = l_idx * layer_kv_stride;
                 let step_off = kv_base + pos * kv_dim;
-                self.ws.k_cache[step_off..step_off + kv_dim].copy_from_slice(k_slice);
-                self.ws.v_cache[step_off..step_off + kv_dim].copy_from_slice(v_slice);
+                ws.k_cache[step_off..step_off + kv_dim].copy_from_slice(k_slice);
+                ws.v_cache[step_off..step_off + kv_dim].copy_from_slice(v_slice);
 
                 causal_gqa_attention(
                     q_slice,
-                    &self.ws.k_cache[kv_base..],
-                    &self.ws.v_cache[kv_base..],
-                    &mut self.ws.scores,
-                    &mut self.ws.attn_out,
-                    self.cfg.num_attention_heads,
+                    &ws.k_cache[kv_base..],
+                    &ws.v_cache[kv_base..],
+                    &mut ws.scores,
+                    &mut ws.attn_out,
+                    num_q_heads,
                     kv_group,
                     head_dim,
                     kv_dim,
@@ -3863,98 +5603,116 @@ impl RealLlamaEngine {
                 );
             }
 
-            // 3. Output Projection + Residual
+            // 3. Output Projection (+ optional `o_bias`) + Residual
             if let Some(inv_s) = &layer.o_inv_scale {
-                for (a, &is) in self.ws.attn_out.iter_mut().zip(inv_s.iter()) {
+                for (a, &is) in ws.attn_out.iter_mut().zip(inv_s.iter()) {
                     *a *= is;
                 }
             }
-            exec_hidden_proj!(layer.o_proj, &mut self.ws.attn_out, &mut self.ws.proj_out);
-            add_inplace(&mut self.ws.hidden, &self.ws.proj_out);
+            exec_q_proj!(layer.o_proj, &mut ws.attn_out, &mut ws.proj_out);
+            if let Some(ref ob) = layer.o_bias {
+                add_inplace(&mut ws.proj_out, ob);
+            }
+            add_inplace(&mut ws.hidden, &ws.proj_out);
 
-            // 4. Post-Attention RMSNorm + Fused Gate+Up SwiGLU Projection
-            rms_norm(
-                &self.ws.hidden,
-                &layer.post_attn_norm,
-                self.cfg.rms_norm_eps,
-                &mut self.ws.norm_buf,
-            );
-            exec_hidden_proj!(
-                layer.gate_up_proj,
-                &mut self.ws.norm_buf,
-                &mut self.ws.gate_up_buf
-            );
-
-            if layer.gate_up_interleaved {
-                for ic in 0..(inter_dim / 64) {
-                    swiglu_activate(
-                        &self.ws.gate_up_buf[ic * 128..ic * 128 + 64],
-                        &self.ws.gate_up_buf[ic * 128 + 64..ic * 128 + 128],
-                        &mut self.ws.swiglu_buf[ic * 64..(ic + 1) * 64],
-                    );
+            // 4. Sparse-MoE (with 3-layer-ahead async NVMe prefetch) or Dense SwiGLU FFN
+            if let Some(ref moe_core) = layer.moe {
+                if let (Some((future_l, ref projector)), Some(rt)) =
+                    (&moe_core.lookahead, moe_rt.as_mut())
+                {
+                    if let Some(future_layer) = layers.get(*future_l) {
+                        if let Some(ref future_moe) = future_layer.moe {
+                            rt.dispatch_lookahead_prefetch(
+                                &ws.hidden,
+                                projector,
+                                &future_layer.post_attn_norm,
+                                future_moe.moe_slot_idx,
+                                &future_moe.router,
+                                eps,
+                            );
+                        }
+                    }
                 }
+                rms_norm(&ws.hidden, &layer.post_attn_norm, eps, &mut ws.norm_buf);
+                moe_rt
+                    .as_mut()
+                    .expect("SparseMoeRuntime missing on MoE layer")
+                    .forward_layer_single(moe_core, &ws.norm_buf, pool_ref, &mut ws.proj_out);
+                add_inplace(&mut ws.hidden, &ws.proj_out);
             } else {
-                let (gate_s, up_s) = self.ws.gate_up_buf.split_at(inter_dim);
-                swiglu_activate(gate_s, up_s, &mut self.ws.swiglu_buf);
-            }
+                rms_norm(&ws.hidden, &layer.post_attn_norm, eps, &mut ws.norm_buf);
+                exec_hidden_proj!(
+                    layer.gate_up_proj,
+                    &mut ws.norm_buf,
+                    &mut ws.gate_up_buf
+                );
 
-            if let Some(inv_s) = &layer.down_inv_scale {
-                for (g, &is) in self.ws.swiglu_buf.iter_mut().zip(inv_s.iter()) {
-                    *g *= is;
+                if layer.gate_up_interleaved {
+                    for ic in 0..(inter_dim / 64) {
+                        swiglu_activate(
+                            &ws.gate_up_buf[ic * 128..ic * 128 + 64],
+                            &ws.gate_up_buf[ic * 128 + 64..ic * 128 + 128],
+                            &mut ws.swiglu_buf[ic * 64..(ic + 1) * 64],
+                        );
+                    }
+                } else {
+                    let (gate_s, up_s) = ws.gate_up_buf.split_at(inter_dim);
+                    swiglu_activate(gate_s, up_s, &mut ws.swiglu_buf);
                 }
+
+                if let Some(inv_s) = &layer.down_inv_scale {
+                    for (g, &is) in ws.swiglu_buf.iter_mut().zip(inv_s.iter()) {
+                        *g *= is;
+                    }
+                }
+                match &layer.down_proj {
+                    LinearBackend::Vq2(_) => {
+                        fwht64_signed_inplace(&mut ws.swiglu_buf);
+                        ws.vqlut_inter.populate(&ws.swiglu_buf);
+                    }
+                    LinearBackend::FusedBipolar(_)
+                    | LinearBackend::Nibble4(_)
+                    | LinearBackend::NfSdot(_) => {
+                        fwht64_signed_inplace(&mut ws.swiglu_buf);
+                        ws.blut_inter.populate(&ws.swiglu_buf);
+                    }
+                    LinearBackend::FusedBase3(_) => {
+                        fwht64_signed_inplace(&mut ws.swiglu_buf);
+                        ws.qlut_inter.populate(&ws.swiglu_buf);
+                    }
+                    LinearBackend::LutMultiPlane(_) => {
+                        ws.qlut_inter.populate(&ws.swiglu_buf);
+                    }
+                    LinearBackend::GgufQ4_0(_) => {
+                        GgufQ4_0Matrix::quantize_q8_0_activation(
+                            &ws.swiglu_buf,
+                            &mut ws.q8_inter_vals,
+                            &mut ws.q8_inter_scales,
+                        );
+                    }
+                    LinearBackend::Fp32 { .. } | LinearBackend::Empty => {}
+                }
+                layer.down_proj.forward_exec(
+                    &ws.swiglu_buf,
+                    Some(&ws.qlut_inter),
+                    Some(&ws.blut_inter),
+                    Some(&ws.vqlut_inter),
+                    &ws.q8_inter_vals,
+                    &ws.q8_inter_scales,
+                    pool_ref,
+                    &mut ws.proj_out,
+                );
+                add_inplace(&mut ws.hidden, &ws.proj_out);
             }
-            match &layer.down_proj {
-                LinearBackend::Vq2(_) => {
-                    fwht64_signed_inplace(&mut self.ws.swiglu_buf);
-                    self.ws.vqlut_inter.populate(&self.ws.swiglu_buf);
-                }
-                LinearBackend::FusedBipolar(_)
-                | LinearBackend::Nibble4(_)
-                | LinearBackend::NfSdot(_) => {
-                    fwht64_signed_inplace(&mut self.ws.swiglu_buf);
-                    self.ws.blut_inter.populate(&self.ws.swiglu_buf);
-                }
-                LinearBackend::FusedBase3(_) => {
-                    fwht64_signed_inplace(&mut self.ws.swiglu_buf);
-                    self.ws.qlut_inter.populate(&self.ws.swiglu_buf);
-                }
-                LinearBackend::LutMultiPlane(_) => {
-                    self.ws.qlut_inter.populate(&self.ws.swiglu_buf);
-                }
-                LinearBackend::GgufQ4_0(_) => {
-                    GgufQ4_0Matrix::quantize_q8_0_activation(
-                        &self.ws.swiglu_buf,
-                        &mut self.ws.q8_inter_vals,
-                        &mut self.ws.q8_inter_scales,
-                    );
-                }
-                LinearBackend::Fp32 { .. } => {}
-            }
-            layer.down_proj.forward_exec(
-                &self.ws.swiglu_buf,
-                Some(&self.ws.qlut_inter),
-                Some(&self.ws.blut_inter),
-                Some(&self.ws.vqlut_inter),
-                &self.ws.q8_inter_vals,
-                &self.ws.q8_inter_scales,
-                pool_ref,
-                &mut self.ws.proj_out,
-            );
-            add_inplace(&mut self.ws.hidden, &self.ws.proj_out);
         }
 
         // Final RMSNorm + LM Head
-        rms_norm(
-            &self.ws.hidden,
-            &self.final_norm,
-            self.cfg.rms_norm_eps,
-            &mut self.ws.norm_buf,
-        );
-        exec_hidden_proj!(self.lm_head, &mut self.ws.norm_buf, &mut self.ws.logits);
+        rms_norm(&ws.hidden, final_norm, eps, &mut ws.norm_buf);
+        exec_hidden_proj!(*lm_head, &mut ws.norm_buf, &mut ws.logits);
 
         let _ = SIMD_ROW_STRIPE;
-        self.ws.pos += 1;
-        &self.ws.logits
+        ws.pos += 1;
+        &ws.logits
     }
 
     /// Decodes one token for `SDOT`/VQ2 engines (`head_dim == 64` or `128`, `hidden_size <= 8192`)
@@ -4662,9 +6420,10 @@ impl RealLlamaEngine {
             self.ws.ensure_fp32_kv(&self.cfg);
         }
         let h = self.cfg.hidden_size;
-        let inter = self.cfg.intermediate_size;
+        let q_dim = self.cfg.q_dim();
+        let inter = self.cfg.intermediate_size.max(64);
         let kv_dim = self.cfg.kv_dim();
-        let qkv_rows = h + 2 * kv_dim;
+        let qkv_rows = q_dim + 2 * kv_dim;
         let head_dim = self.cfg.head_dim();
         let half_dim = head_dim / 2;
         let num_kv_heads = self.cfg.num_key_value_heads;
@@ -4674,13 +6433,25 @@ impl RealLlamaEngine {
         let layer_kv_stride = max_seq_len * kv_dim;
         let eps = self.cfg.rms_norm_eps;
         let lut_h = self.ws.blut_hidden.lut_enabled;
+        let lut_q = self.ws.blut_q.lut_enabled;
         let lut_i = self.ws.blut_inter.lut_enabled;
+        let has_dense_ffn = self.layers.iter().any(|l| l.moe.is_none());
+        let has_moe = self.cfg.is_moe();
 
-        self.ws
-            .prompt_scratch
-            .ensure_capacity(n, &self.cfg, qkv_rows, lut_h, lut_i, need_fp32_scores);
+        self.ws.prompt_scratch.ensure_capacity(
+            n,
+            &self.cfg,
+            has_dense_ffn,
+            qkv_rows,
+            lut_h,
+            lut_q,
+            lut_i,
+            need_fp32_scores,
+        );
 
         let pool = self.pool.as_ref();
+        let layers = &self.layers;
+        let moe_rt = &mut self.moe_runtime;
         let ps = &mut self.ws.prompt_scratch;
         let hidden = &mut ps.hidden[..n * h];
         for (t, &tok) in tokens.iter().enumerate() {
@@ -4695,12 +6466,30 @@ impl RealLlamaEngine {
             );
         }
         let acts_h = &mut ps.acts_h[..n];
-        let acts_i = &mut ps.acts_i[..n];
+        let acts_q = &mut ps.acts_q[..n];
+        let acts_i = if has_dense_ffn {
+            &mut ps.acts_i[..n]
+        } else {
+            &mut []
+        };
         let qkv = &mut ps.qkv[..n * qkv_rows];
-        let attn = &mut ps.attn[..n * h];
+        let attn = &mut ps.attn[..n * q_dim];
         let proj = &mut ps.proj[..n * h];
-        let gate_up = &mut ps.gate_up[..n * 2 * inter];
-        let sw = &mut ps.sw[..n * inter];
+        let gate_up = if has_dense_ffn {
+            &mut ps.gate_up[..n * 2 * inter]
+        } else {
+            &mut []
+        };
+        let sw = if has_dense_ffn {
+            &mut ps.sw[..n * inter]
+        } else {
+            &mut []
+        };
+        let moe_norm = if has_moe {
+            &mut ps.moe_norm[..n * h]
+        } else {
+            &mut []
+        };
         let score_stride = if head_dim == 64 {
             max_seq_len
         } else {
@@ -4712,13 +6501,15 @@ impl RealLlamaEngine {
             &mut []
         };
 
-        for (l_idx, layer) in self.layers.iter().enumerate() {
+        for (l_idx, layer) in layers.iter().enumerate() {
             let kv_base = l_idx * layer_kv_stride;
             prompt_populate(pool, hidden, h, Some((&layer.input_norm, eps)), acts_h);
             prompt_gemm(pool, &layer.qkv_proj, acts_h, qkv);
 
             let qkv_ptr = qkv.as_mut_ptr() as usize;
             let qkv_bias = layer.qkv_bias.as_deref();
+            let q_norm = layer.q_norm.as_deref();
+            let k_norm = layer.k_norm.as_deref();
             let rope = &self.rope_cos_sin;
             let cfg = &self.cfg;
             if let Some(q8) = self.ws.q8_kv.as_mut() {
@@ -4736,8 +6527,14 @@ impl RealLlamaEngine {
                                 add_inplace(row, bias);
                             }
                             let rope_row = &rope[pos * head_dim..(pos + 1) * head_dim];
-                            let (q, kv) = row.split_at_mut(h);
+                            let (q, kv) = row.split_at_mut(q_dim);
                             let (k, v) = kv.split_at_mut(kv_dim);
+                            if let Some(qn) = q_norm {
+                                apply_per_head_rms_norm(q, head_dim, qn, eps);
+                            }
+                            if let Some(kn) = k_norm {
+                                apply_per_head_rms_norm(k, head_dim, kn, eps);
+                            }
                             apply_llama_rope_precomp(q, cfg.num_attention_heads, head_dim, half_dim, rope_row);
                             apply_llama_rope_precomp(k, num_kv_heads, head_dim, half_dim, rope_row);
                             for kvh in 0..num_kv_heads {
@@ -4787,10 +6584,10 @@ impl RealLlamaEngine {
                                 let sc_len = active_kv_len(seq_len, raw.window_size);
                                 let (sc_head, next) = std::mem::take(&mut sc_rest).split_at_mut(sc_cap);
                                 sc_rest = next;
-                                // SAFETY: each `(t, qh)` owns disjoint `attn[t * h + qh * head_dim .. + head_dim]`.
+                                // SAFETY: each `(t, qh)` owns disjoint `attn[t * q_dim + qh * head_dim .. + head_dim]`.
                                 let dst = unsafe {
                                     std::slice::from_raw_parts_mut(
-                                        (attn_ptr as *mut f32).add(t * h + qh * head_dim),
+                                        (attn_ptr as *mut f32).add(t * q_dim + qh * head_dim),
                                         head_dim,
                                     )
                                 };
@@ -4829,8 +6626,14 @@ impl RealLlamaEngine {
                             add_inplace(row, bias);
                         }
                         let rope_row = &rope[pos * head_dim..(pos + 1) * head_dim];
-                        let (q, kv) = row.split_at_mut(h);
+                        let (q, kv) = row.split_at_mut(q_dim);
                         let (k, v) = kv.split_at_mut(kv_dim);
+                        if let Some(qn) = q_norm {
+                            apply_per_head_rms_norm(q, head_dim, qn, eps);
+                        }
+                        if let Some(kn) = k_norm {
+                            apply_per_head_rms_norm(k, head_dim, kn, eps);
+                        }
                         apply_llama_rope_precomp(q, cfg.num_attention_heads, head_dim, half_dim, rope_row);
                         apply_llama_rope_precomp(k, num_kv_heads, head_dim, half_dim, rope_row);
                         let off = kv_base + pos * kv_dim;
@@ -4849,12 +6652,14 @@ impl RealLlamaEngine {
                 par_range(pool, n, |a, b| {
                     for t in a..b {
                         // SAFETY: token `t` owns row `t` of `attn` and `scores_all`.
-                        let dst = unsafe { std::slice::from_raw_parts_mut((attn_ptr as *mut f32).add(t * h), h) };
+                        let dst = unsafe {
+                            std::slice::from_raw_parts_mut((attn_ptr as *mut f32).add(t * q_dim), q_dim)
+                        };
                         let sc = unsafe {
                             std::slice::from_raw_parts_mut((scores_ptr as *mut f32).add(t * score_stride), score_stride)
                         };
                         causal_gqa_attention(
-                            &qkv_ref[t * qkv_rows..t * qkv_rows + h],
+                            &qkv_ref[t * qkv_rows..t * qkv_rows + q_dim],
                             k_cache,
                             v_cache,
                             sc,
@@ -4870,37 +6675,80 @@ impl RealLlamaEngine {
                 });
             }
 
-            prompt_populate(pool, attn, h, None, acts_h);
-            prompt_gemm(pool, &layer.o_proj, acts_h, proj);
+            prompt_populate(pool, attn, q_dim, None, acts_q);
+            prompt_gemm(pool, &layer.o_proj, acts_q, proj);
+            if let Some(ref ob) = layer.o_bias {
+                for row in proj.chunks_exact_mut(h) {
+                    add_inplace(row, ob);
+                }
+            }
             add_inplace(hidden, proj);
 
-            prompt_populate(pool, hidden, h, Some((&layer.post_attn_norm, eps)), acts_h);
-            prompt_gemm(pool, &layer.gate_up_proj, acts_h, gate_up);
-            let gu_ref = &*gate_up;
-            let sw_ptr = sw.as_mut_ptr() as usize;
-            let gu_interleaved = layer.gate_up_interleaved;
-            par_range(pool, n, |a, b| {
-                for t in a..b {
-                    let gu = &gu_ref[t * 2 * inter..(t + 1) * 2 * inter];
-                    // SAFETY: token `t` owns row `t` of `sw`.
-                    let out = unsafe { std::slice::from_raw_parts_mut((sw_ptr as *mut f32).add(t * inter), inter) };
-                    if gu_interleaved {
-                        for ic in 0..(inter / 64) {
-                            swiglu_activate(
-                                &gu[ic * 128..ic * 128 + 64],
-                                &gu[ic * 128 + 64..ic * 128 + 128],
-                                &mut out[ic * 64..(ic + 1) * 64],
-                            );
+            if let Some(ref moe_core) = layer.moe {
+                if let (Some((future_l, ref projector)), Some(rt)) =
+                    (&moe_core.lookahead, moe_rt.as_mut())
+                {
+                    if let Some(future_layer) = layers.get(*future_l) {
+                        if let Some(ref future_moe) = future_layer.moe {
+                            let pf_start = n.saturating_sub(4);
+                            for t in pf_start..n {
+                                rt.dispatch_lookahead_prefetch(
+                                    &hidden[t * h..(t + 1) * h],
+                                    projector,
+                                    &future_layer.post_attn_norm,
+                                    future_moe.moe_slot_idx,
+                                    &future_moe.router,
+                                    eps,
+                                );
+                            }
                         }
-                    } else {
-                        let (g, u) = gu.split_at(inter);
-                        swiglu_activate(g, u, out);
                     }
                 }
-            });
-            prompt_populate(pool, sw, inter, None, acts_i);
-            prompt_gemm(pool, &layer.down_proj, acts_i, proj);
-            add_inplace(hidden, proj);
+                moe_rt
+                    .as_mut()
+                    .expect("SparseMoeRuntime missing on MoE layer")
+                    .forward_layer_coalesced_batch(
+                        moe_core,
+                        hidden,
+                        &layer.post_attn_norm,
+                        eps,
+                        n,
+                        pool,
+                        moe_norm,
+                        proj,
+                    );
+                add_inplace(hidden, proj);
+            } else {
+                prompt_populate(pool, hidden, h, Some((&layer.post_attn_norm, eps)), acts_h);
+                prompt_gemm(pool, &layer.gate_up_proj, acts_h, gate_up);
+                let gu_ref = &*gate_up;
+                let sw_ptr = sw.as_mut_ptr() as usize;
+                let gu_interleaved = layer.gate_up_interleaved;
+                par_range(pool, n, |a, b| {
+                    for t in a..b {
+                        let gu = &gu_ref[t * 2 * inter..(t + 1) * 2 * inter];
+                        // SAFETY: token `t` owns row `t` of `sw`.
+                        let out = unsafe {
+                            std::slice::from_raw_parts_mut((sw_ptr as *mut f32).add(t * inter), inter)
+                        };
+                        if gu_interleaved {
+                            for ic in 0..(inter / 64) {
+                                swiglu_activate(
+                                    &gu[ic * 128..ic * 128 + 64],
+                                    &gu[ic * 128 + 64..ic * 128 + 128],
+                                    &mut out[ic * 64..(ic + 1) * 64],
+                                );
+                            }
+                        } else {
+                            let (g, u) = gu.split_at(inter);
+                            swiglu_activate(g, u, out);
+                        }
+                    }
+                });
+                prompt_populate(pool, sw, inter, None, acts_i);
+                prompt_gemm(pool, &layer.down_proj, acts_i, proj);
+                add_inplace(hidden, proj);
+            }
         }
 
         if let Some(out_all) = all_logits_out {
@@ -5186,6 +7034,18 @@ where
             });
         }
     });
+}
+
+#[inline]
+fn apply_per_head_rms_norm(heads_buf: &mut [f32], head_dim: usize, weight: &[f32], eps: f32) {
+    debug_assert_eq!(weight.len(), head_dim);
+    let inv_hd = 1.0 / (head_dim as f32);
+    for head in heads_buf.chunks_exact_mut(head_dim) {
+        let inv_rms = 1.0 / (dot_f32_fast(head, head) * inv_hd + eps).sqrt();
+        for (v, &w) in head.iter_mut().zip(weight.iter()) {
+            *v = (*v * inv_rms) * w;
+        }
+    }
 }
 
 /// `f(a, b)` over `0..n`, split across `pool` when present.
@@ -7106,6 +8966,10 @@ mod tests {
                 moe_intermediate_size: 0,
                 shared_expert_intermediate_size: 0,
                 norm_topk_prob: true,
+                router_scoring: MoeRouterScoring::Softmax,
+                decoder_sparse_step: 1,
+                mlp_only_layers: Vec::new(),
+                sliding_layer_mask: Vec::new(),
             };
             let kv_dim = kv_heads * hd;
             let attn_scale = 1.0 / (hd as f32).sqrt();

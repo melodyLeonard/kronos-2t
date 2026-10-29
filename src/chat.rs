@@ -237,6 +237,36 @@ pub fn compile(model_dir: &Path, mode: RealWeightMode, calib_text: &str, calib_t
     .map_err(|e| format!("streaming GPTQ compile: {e}"))
 }
 
+/// Compiles a Sparse-MoE `model_dir` into a `K2TKRONOS5\n` pinned core (`.k2tb`) and `F_NOCACHE` expert shard (`.k2tm`).
+pub fn compile_moe(
+    model_dir: &Path,
+    core_k2tb_path: &Path,
+    experts_k2tm_path: &Path,
+    mode: RealWeightMode,
+    calib_text: &str,
+    calib_tokens: usize,
+) -> Result<(), String> {
+    const SEQ: usize = 512;
+    let tok = BpeTokenizer::from_model_dir(model_dir).map_err(|e| format!("tokenizer: {e}"))?;
+    let ids = tok.encode(calib_text);
+    if ids.len() < SEQ {
+        return Err("calibration text is too short (need at least 512 tokens)".to_string());
+    }
+    let seqs: Vec<Vec<usize>> = ids[..calib_tokens.min(ids.len())]
+        .chunks(SEQ)
+        .map(|c| c.to_vec())
+        .collect();
+    RealLlamaEngine::compile_streaming_moe_to_files(
+        model_dir,
+        core_k2tb_path,
+        experts_k2tm_path,
+        mode,
+        &seqs,
+        crate::thread_pool::physical_p_cores(),
+    )
+    .map_err(|e| format!("streaming Sparse-MoE GPTQ compile: {e}"))
+}
+
 fn load_or_compile_engine(
     model_dir: &Path,
     cache_dir: Option<&Path>,
@@ -246,6 +276,70 @@ fn load_or_compile_engine(
     calib: Option<(&Path, usize)>,
 ) -> Result<RealLlamaEngine, String> {
     let mode = parse_mode(mode_key)?;
+    let probe_cfg = crate::real_llm::LlamaConfig::from_config_json(
+        &model_dir.join("config.json"),
+        ctx.max(16),
+    )
+    .map_err(|e| format!("config.json: {e}"))?;
+
+    if probe_cfg.is_moe() {
+        let (core_cache, experts_cache) = match cache_dir {
+            Some(dir) => {
+                let tag = model_dir
+                    .file_name()
+                    .map_or_else(|| "model".to_string(), |s| s.to_string_lossy().into_owned());
+                (
+                    dir.join(format!("{tag}-kronos-moe-core-{mode_key}.k2tb")),
+                    dir.join(format!("{tag}-kronos-moe-experts-{mode_key}.k2tm")),
+                )
+            }
+            None => (
+                model_dir.join(format!("kronos-moe-core-{mode_key}.k2tb")),
+                model_dir.join(format!("kronos-moe-experts-{mode_key}.k2tm")),
+            ),
+        };
+        let policy = crate::sparse_moe::MoeExpertOpenPolicy::AutoBudget;
+        let mut engine = match RealLlamaEngine::load_moe_from_files(
+            model_dir,
+            &core_cache,
+            &experts_cache,
+            ctx,
+            policy,
+        ) {
+            Ok(e) => e,
+            Err(_) => {
+                let (path, n) = calib.ok_or_else(|| {
+                    format!(
+                        "no compiled Sparse-MoE cache at {} / {}; provide calibration text to compile it",
+                        core_cache.display(),
+                        experts_cache.display()
+                    )
+                })?;
+                let text = std::fs::read_to_string(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                eprintln!(
+                    "compiling Sparse-MoE {} ({mode_key}) to .k2tb + .k2tm...",
+                    model_dir.display()
+                );
+                if let Some(parent) = core_cache.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("{}: {e}", parent.display()))?;
+                }
+                compile_moe(model_dir, &core_cache, &experts_cache, mode, &text, n)?;
+                RealLlamaEngine::load_moe_from_files(
+                    model_dir,
+                    &core_cache,
+                    &experts_cache,
+                    ctx,
+                    policy,
+                )
+                .map_err(|e| e.to_string())?
+            }
+        };
+        engine.set_num_threads(threads);
+        return Ok(engine);
+    }
+
     let cache = match cache_dir {
         Some(dir) => {
             let tag = model_dir
@@ -430,6 +524,14 @@ impl ChatModel {
 
     pub fn kv_sliding_window(&self) -> Option<usize> {
         self.engine.kv_sliding_window().map(|(w, _)| w)
+    }
+
+    pub fn is_moe(&self) -> bool {
+        self.engine.is_moe()
+    }
+
+    pub fn moe_stats(&self) -> Option<crate::sparse_moe::MoeRuntimeStats> {
+        self.engine.moe_stats()
     }
 
     /// Enables zero-copy Metal GPU inference on the target model; small draft models stay on CPU.
