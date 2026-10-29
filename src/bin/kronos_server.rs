@@ -1,10 +1,11 @@
-//! OpenAI-compatible HTTP server and sandboxed workspace agent for compiled Kronos models.
+//! OpenAI-compatible HTTP server, persistent session store, and sandboxed workspace agent.
 //!
 //! Usage: `kronos_server <model_dir> [flags]`
 //!   `--host H`            bind address (default 127.0.0.1)
 //!   `--port P`            (default 18080)
 //!   `--api-key KEY`       require `Authorization: Bearer KEY`
 //!   `--workdir DIR`       workspace root for web agent tools and `/preview/*` (default temp dir)
+//!   `--state-dir DIR`     directory for persistent conversation and project state
 //!   `--cache-dir DIR`     optional directory to read/write compiled `.k2tb` caches
 //!   `--fp32-kv`           use an `FP32` KV cache instead of the default INT8 one
 //!   `--cpu`               force CPU inference (disables default Metal GPU backend for NF4)
@@ -13,16 +14,21 @@
 //!   `--ane`               prefill on the Neural Engine (`ane` feature, models in `<model_dir>/ane`)
 //!   `--mode M`, `--calib FILE`, `--calib-tokens N`, `--ctx N`, `--threads N` as in `kronos_chat`
 //!
-//! Endpoints: `POST /v1/chat/completions`, `POST /v1/agent/chat`, `GET /v1/agent/files`,
-//! `GET /v1/agent/file?path=...`, `POST /v1/agent/clear`, `GET /preview/<path>`, `GET /v1/models`,
-//! `GET /health`, and the web UI at `/`.
+//! Endpoints: `POST /v1/chat/completions`, `POST /v1/agent/chat`, `POST /v1/turn`,
+//! `POST /v1/compact`, `GET /v1/sessions`, `GET /v1/sessions/get?id=...`, `POST /v1/sessions/save`,
+//! `POST /v1/sessions/delete`, `POST /v1/projects/select`, `POST /v1/workspace/revert`,
+//! `POST /v1/screencapture`, `GET /v1/agent/files`, `GET /v1/agent/file?path=...`,
+//! `POST /v1/agent/clear`, `GET /preview/<path>`, `GET /v1/models`, `GET /health`,
+//! the workspace UI at `/`, and the floating quick-prompt UI at `/quick`.
 
 use kronos_2t::agent::{
     build_unified_system_prompt, classify_turn_intent, compact_conversation_history,
     list_workspace_files, mime_type_for_path, resolve_jailed_path, run_agent_turn,
     serialize_messages_json, tool_definitions_json, truncate_utf8, validate_file, AgentEvent,
-    AgentTurnConfig, TurnRoute, MAX_READ_BYTES,
+    AgentTurnConfig, FileChangeDiff, TurnRoute, AGENT_SYSTEM_PROMPT, MAX_READ_BYTES,
+    UNIFIED_SYSTEM_PROMPT,
 };
+use kronos_2t::attachments::{ingest_attachment, AttachmentIngestion};
 use kronos_2t::chat::{ChatModel, Completion, GenParams, Message, ToolCall};
 use kronos_2t::json::{quote, Json};
 use kronos_2t::vision::analyze_image_payload;
@@ -30,22 +36,51 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const MAX_BODY: usize = 24 << 20;
+const MAX_BODY: usize = 32 << 20;
 const CHAT_PAGE: &str = include_str!("chat.html");
+const QUICK_PAGE: &str = include_str!("quick.html");
 const MAX_HEADER: usize = 64 << 10;
+const MAX_REVERT_SNAPSHOT_BYTES: usize = 128 << 10;
+
+#[derive(Clone, Debug)]
+struct SessionSummary {
+    id: String,
+    title: String,
+    workdir: String,
+    created_at: u64,
+    updated_at: u64,
+    context_tokens: usize,
+    added_lines: usize,
+    removed_lines: usize,
+    changed_files: usize,
+}
+
+struct UiStateIndex {
+    projects: Vec<String>,
+    sessions: Vec<SessionSummary>,
+}
 
 struct Server {
     model: Mutex<ChatModel>,
     name: String,
     api_key: Option<String>,
-    workdir: PathBuf,
+    workdir: Mutex<PathBuf>,
+    state_dir: PathBuf,
+    ui_index: Mutex<UiStateIndex>,
     ctx_limit: usize,
     next_id: AtomicU64,
     media_seq: AtomicU64,
+}
+
+impl Server {
+    fn active_workdir(&self) -> PathBuf {
+        self.workdir.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
 }
 
 struct Request {
@@ -101,6 +136,29 @@ fn percent_decode(raw: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn encode_base64(bytes: &[u8]) -> String {
+    const LUT: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for ch in bytes.chunks(3) {
+        let b0 = ch[0];
+        let b1 = if ch.len() > 1 { ch[1] } else { 0 };
+        let b2 = if ch.len() > 2 { ch[2] } else { 0 };
+        s.push(LUT[(b0 >> 2) as usize] as char);
+        s.push(LUT[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        s.push(if ch.len() > 1 {
+            LUT[(((b1 & 0x0F) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        s.push(if ch.len() > 2 {
+            LUT[(b2 & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    s
+}
+
 fn read_request(stream: &mut TcpStream) -> Result<Request, (u16, String)> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -151,6 +209,7 @@ fn reason(status: u16) -> &'static str {
         204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
@@ -454,42 +513,92 @@ fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
     let _ = stream.write_all(tail.as_bytes()).and_then(|_| stream.write_all(b"data: [DONE]\n\n"));
 }
 
-fn attach_request_images(
+fn attach_request_media(
     body: &Json,
     history: &mut [Message],
     workdir: &Path,
     media_seq: &AtomicU64,
-) -> Result<(Vec<String>, f64), String> {
-    let Some(arr) = body.get("images").and_then(Json::as_arr) else {
-        return Ok((Vec::new(), 0.0));
-    };
-    if arr.is_empty() {
+) -> Result<(Vec<AttachmentIngestion>, f64), String> {
+    let mut raw_entries: Vec<(String, String, String)> = Vec::new();
+    if let Some(arr) = body.get("attachments").and_then(Json::as_arr) {
+        for item in arr {
+            if let Some(raw_str) = item.as_str() {
+                raw_entries.push((String::new(), String::new(), raw_str.to_string()));
+            } else {
+                let name = item.get("name").and_then(Json::as_str).unwrap_or("").to_string();
+                let mime = item.get("mime").and_then(Json::as_str).unwrap_or("").to_string();
+                let data = item
+                    .get("data")
+                    .or_else(|| item.get("data_url"))
+                    .or_else(|| item.get("url"))
+                    .and_then(Json::as_str)
+                    .ok_or("each entry in `attachments` requires a `data` string")?
+                    .to_string();
+                raw_entries.push((name, mime, data));
+            }
+        }
+    }
+    if let Some(arr) = body.get("images").and_then(Json::as_arr) {
+        for item in arr {
+            let raw = item
+                .as_str()
+                .or_else(|| item.get("data_url").and_then(Json::as_str))
+                .or_else(|| item.get("url").and_then(Json::as_str))
+                .ok_or("each entry in `images` must be a base64 string or `{data_url}` object")?;
+            let name = item.get("name").and_then(Json::as_str).unwrap_or("clipboard.png");
+            raw_entries.push((name.to_string(), "image/png".to_string(), raw.to_string()));
+        }
+    }
+    if raw_entries.is_empty() {
         return Ok((Vec::new(), 0.0));
     }
+
     let t0 = Instant::now();
-    let mut blocks = Vec::with_capacity(arr.len());
-    let mut badges = Vec::with_capacity(arr.len());
-    for (idx, item) in arr.iter().enumerate() {
-        let raw = item
-            .as_str()
-            .or_else(|| item.get("data_url").and_then(Json::as_str))
-            .or_else(|| item.get("url").and_then(Json::as_str))
-            .ok_or("each entry in `images` must be a base64 string or `{data_url}` object")?;
+    let mut ingested = Vec::with_capacity(raw_entries.len());
+    let mut blocks = Vec::with_capacity(raw_entries.len());
+    let mut all_images = true;
+    for (idx, (name, mime, payload)) in raw_entries.iter().enumerate() {
         let slot = media_seq.fetch_add(1, Ordering::Relaxed) as usize;
-        let perc = analyze_image_payload(raw, Some(workdir), slot)
-            .map_err(|e| format!("image #{}: {e}", idx + 1))?;
-        badges.push(perc.short_badge());
-        blocks.push(perc.to_prompt_context(idx + 1));
+        let item = ingest_attachment(name, mime, payload, Some(workdir), slot)
+            .map_err(|e| format!("attachment #{}: {e}", idx + 1))?;
+        if !item.is_image {
+            all_images = false;
+        }
+        blocks.push(item.prompt_context.clone());
+        ingested.push(item);
     }
+
     if let Some(last_user) = history.iter_mut().rev().find(|m| m.role == "user") {
-        let user_prompt = if last_user.content.trim().is_empty() {
+        let fallback_prompt = if all_images {
             "Analyze the attached image concisely, covering visible text, layout structure, and color palette."
+        } else {
+            "Summarize and analyze the attached file contents concisely."
+        };
+        let user_prompt = if last_user.content.trim().is_empty() {
+            fallback_prompt
         } else {
             last_user.content.as_str()
         };
         last_user.content = format!("{}\n{}", blocks.join("\n"), user_prompt);
     }
-    Ok((badges, t0.elapsed().as_secs_f64() * 1000.0))
+    Ok((ingested, t0.elapsed().as_secs_f64() * 1000.0))
+}
+
+fn format_diff_json(diff: Option<&FileChangeDiff>) -> String {
+    let Some(d) = diff else {
+        return "null".to_string();
+    };
+    let can_revert = d.before_content.len() <= MAX_REVERT_SNAPSHOT_BYTES;
+    let before = if can_revert { d.before_content.as_str() } else { "" };
+    format!(
+        r#"{{"path":{},"existed_before":{},"can_revert":{can_revert},"before_content":{},"added_lines":{},"removed_lines":{},"unified_diff":{}}}"#,
+        quote(&d.path),
+        d.existed_before,
+        quote(before),
+        d.added_lines,
+        d.removed_lines,
+        quote(&d.unified_diff),
+    )
 }
 
 struct StreamTurnSpec {
@@ -498,8 +607,9 @@ struct StreamTurnSpec {
     max_steps: usize,
     cmd_timeout: u64,
     initial_route: TurnRoute,
-    vision_badges: Vec<String>,
-    vision_ms: f64,
+    workdir: PathBuf,
+    attachments: Vec<AttachmentIngestion>,
+    media_ms: f64,
 }
 
 fn stream_agent_loop_sse(srv: &Server, stream: &mut TcpStream, spec: StreamTurnSpec) {
@@ -509,8 +619,9 @@ fn stream_agent_loop_sse(srv: &Server, stream: &mut TcpStream, spec: StreamTurnS
         max_steps,
         cmd_timeout,
         initial_route,
-        vision_badges,
-        vision_ms,
+        workdir,
+        attachments,
+        media_ms,
     } = spec;
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{CORS}Connection: close\r\n\r\n"
@@ -527,24 +638,59 @@ fn stream_agent_loop_sse(srv: &Server, stream: &mut TcpStream, spec: StreamTurnS
     let mut active_route = initial_route;
     let _ = write_sse(&format!(r#"{{"type":"route","mode":{}}}"#, quote(active_route.as_str())));
 
-    if !vision_badges.is_empty() {
-        let badge_items: Vec<String> = vision_badges.iter().map(|b| quote(b)).collect();
+    if !attachments.is_empty() {
+        let items_json: Vec<String> = attachments
+            .iter()
+            .map(|a| {
+                format!(
+                    r#"{{"kind":{},"name":{},"badge":{},"saved_path":{},"is_image":{},"elapsed_ms":{:.1}}}"#,
+                    quote(&a.kind),
+                    quote(&a.name),
+                    quote(&a.badge),
+                    quote(a.saved_rel_path.as_deref().unwrap_or("")),
+                    a.is_image,
+                    a.elapsed_ms,
+                )
+            })
+            .collect();
         let _ = write_sse(&format!(
-            r#"{{"type":"vision","count":{},"elapsed_ms":{:.1},"badges":[{}]}}"#,
-            vision_badges.len(),
-            vision_ms,
-            badge_items.join(",")
+            r#"{{"type":"attachments","count":{},"elapsed_ms":{:.1},"items":[{}]}}"#,
+            attachments.len(),
+            media_ms,
+            items_json.join(",")
         ));
+
+        let vision_badges: Vec<String> = attachments
+            .iter()
+            .filter(|a| a.is_image)
+            .map(|a| quote(a.badge.strip_prefix("vision · ").unwrap_or(&a.badge)))
+            .collect();
+        if !vision_badges.is_empty() {
+            let _ = write_sse(&format!(
+                r#"{{"type":"vision","count":{},"elapsed_ms":{:.1},"badges":[{}]}}"#,
+                vision_badges.len(),
+                media_ms,
+                vision_badges.join(",")
+            ));
+        }
     }
 
     if history.first().is_none_or(|m| m.role != "system") {
-        let sys = build_unified_system_prompt(&srv.workdir);
+        let sys = build_unified_system_prompt(&workdir);
         history.insert(0, Message::new("system", &sys));
+    } else if history[0].content.starts_with(UNIFIED_SYSTEM_PROMPT)
+        || history[0].content.starts_with(AGENT_SYSTEM_PROMPT)
+    {
+        history[0].content = build_unified_system_prompt(&workdir);
     }
 
-    let tools_json = tool_definitions_json();
+    let tools_json = if initial_route == TurnRoute::Chat {
+        Vec::new()
+    } else {
+        tool_definitions_json()
+    };
     let cfg = AgentTurnConfig {
-        workdir: srv.workdir.clone(),
+        workdir,
         params,
         max_steps,
         cmd_timeout_secs: cmd_timeout,
@@ -603,18 +749,29 @@ fn stream_agent_loop_sse(srv: &Server, stream: &mut TcpStream, spec: StreamTurnS
             ))
         }
         AgentEvent::ToolDone { step, call, outcome } => write_sse(&format!(
-            r#"{{"type":"tool_done","step":{step},"id":{},"name":{},"ok":{},"validation_ok":{},"validation_msg":{},"output":{}}}"#,
+            r#"{{"type":"tool_done","step":{step},"id":{},"name":{},"ok":{},"validation_ok":{},"validation_msg":{},"output":{},"diff":{}}}"#,
             quote(&call.id),
             quote(&call.name),
             outcome.ok,
             outcome.validation_ok,
             quote(&outcome.validation_msg),
             quote(&truncate_utf8(&outcome.output, 4096)),
+            format_diff_json(outcome.diff.as_ref()),
         )),
         AgentEvent::ValidationRepair { step, report } => write_sse(&format!(
             r#"{{"type":"validation_repair","step":{step},"report":{}}}"#,
             quote(report)
         )),
+        AgentEvent::Verified { step, report } => {
+            let details: Vec<String> = report.details.iter().map(|d| quote(d)).collect();
+            write_sse(&format!(
+                r#"{{"type":"verified","step":{step},"checks_run":{},"elapsed_ms":{:.1},"summary":{},"details":[{}]}}"#,
+                report.checks_run,
+                report.elapsed_ms,
+                quote(&report.summary),
+                details.join(",")
+            ))
+        }
         AgentEvent::Done { .. } => true,
     });
 
@@ -647,10 +804,12 @@ fn agent_chat_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
         Ok(m) => m,
         Err(e) => return error(stream, 400, &e),
     };
-    let (vision_badges, vision_ms) = match attach_request_images(&body, &mut history, &srv.workdir, &srv.media_seq) {
-        Ok(v) => v,
-        Err(e) => return error(stream, 400, &e),
-    };
+    let workdir = srv.active_workdir();
+    let (attachments, media_ms) =
+        match attach_request_media(&body, &mut history, &workdir, &srv.media_seq) {
+            Ok(v) => v,
+            Err(e) => return error(stream, 400, &e),
+        };
     let agent_defaults = GenParams {
         temperature: 0.0,
         top_k: 40,
@@ -677,8 +836,9 @@ fn agent_chat_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
             max_steps,
             cmd_timeout,
             initial_route: TurnRoute::Agent,
-            vision_badges,
-            vision_ms,
+            workdir,
+            attachments,
+            media_ms,
         },
     );
 }
@@ -698,18 +858,25 @@ fn unified_turn_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
         .find(|m| m.role == "user")
         .map(|m| m.content.clone())
         .unwrap_or_default();
-    let (vision_badges, vision_ms) = match attach_request_images(&body, &mut history, &srv.workdir, &srv.media_seq) {
-        Ok(v) => v,
-        Err(e) => return error(stream, 400, &e),
-    };
-    let workspace_has_files = !list_workspace_files(&srv.workdir).is_empty();
+    let workdir = srv.active_workdir();
+    let (attachments, media_ms) =
+        match attach_request_media(&body, &mut history, &workdir, &srv.media_seq) {
+            Ok(v) => v,
+            Err(e) => return error(stream, 400, &e),
+        };
+    let workspace_has_files = !list_workspace_files(&workdir)
+        .into_iter()
+        .filter(|e| !e.path.starts_with(".kronos_media/"))
+        .count()
+        .eq(&0);
     let history_used_tools = history.iter().any(|m| m.role == "tool" || !m.tool_calls.is_empty());
+    let has_images = attachments.iter().any(|a| a.is_image);
     let route = match body.get("route").and_then(Json::as_str).unwrap_or("auto") {
         "chat" => TurnRoute::Chat,
         "agent" => TurnRoute::Agent,
         _ => classify_turn_intent(
             &raw_user_text,
-            !vision_badges.is_empty(),
+            has_images,
             workspace_has_files,
             history_used_tools,
         ),
@@ -751,8 +918,9 @@ fn unified_turn_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
             max_steps,
             cmd_timeout,
             initial_route: route,
-            vision_badges,
-            vision_ms,
+            workdir,
+            attachments,
+            media_ms,
         },
     );
 }
@@ -805,13 +973,14 @@ fn compact_history_http(srv: &Server, stream: &mut TcpStream, req: &Request) {
             history.push(Message::new(role, &text));
         }
     }
+    let workdir = srv.active_workdir();
     if history.first().is_none_or(|m| m.role != "system") {
-        let sys = build_unified_system_prompt(&srv.workdir);
+        let sys = build_unified_system_prompt(&workdir);
         history.insert(0, Message::new("system", &sys));
     }
     let tools_json = tool_definitions_json();
     let model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
-    let rep = compact_conversation_history(&model, &mut history, &tools_json, &srv.workdir, true);
+    let rep = compact_conversation_history(&model, &mut history, &tools_json, &workdir, true);
     let ctx_limit = model.context_size();
     drop(model);
     respond(
@@ -829,13 +998,289 @@ fn compact_history_http(srv: &Server, stream: &mut TcpStream, req: &Request) {
     );
 }
 
+fn sanitize_session_id(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 80 {
+        return Err("session `id` must be 1..=80 characters".to_string());
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("session `id` may only contain ASCII alphanumeric, `_`, or `-`".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn parse_session_summary(j: &Json) -> Option<SessionSummary> {
+    let id = sanitize_session_id(j.get("id")?.as_str()?).ok()?;
+    let title = j
+        .get("title")
+        .and_then(Json::as_str)
+        .unwrap_or("Untitled Conversation")
+        .to_string();
+    let workdir = j
+        .get("workdir")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_string();
+    let created_at = j.get("created_at").and_then(Json::as_f64).unwrap_or(0.0) as u64;
+    let updated_at = j
+        .get("updated_at")
+        .and_then(Json::as_f64)
+        .map_or(created_at, |v| v as u64);
+    let context_tokens = j.get("context_tokens").and_then(Json::as_f64).unwrap_or(0.0) as usize;
+    let added_lines = j.get("added_lines").and_then(Json::as_f64).unwrap_or(0.0) as usize;
+    let removed_lines = j.get("removed_lines").and_then(Json::as_f64).unwrap_or(0.0) as usize;
+    let changed_files = j.get("changed_files").and_then(Json::as_f64).unwrap_or(0.0) as usize;
+    Some(SessionSummary {
+        id,
+        title,
+        workdir,
+        created_at,
+        updated_at,
+        context_tokens,
+        added_lines,
+        removed_lines,
+        changed_files,
+    })
+}
+
+fn persist_projects_file(state_dir: &Path, projects: &[String]) {
+    let items: Vec<String> = projects.iter().map(|p| quote(p)).collect();
+    let payload = format!("[{}]\n", items.join(","));
+    let _ = fs::write(state_dir.join("projects.json"), payload);
+}
+
+fn load_ui_state_index(state_dir: &Path, initial_workdir: &Path) -> UiStateIndex {
+    let _ = fs::create_dir_all(state_dir.join("sessions"));
+    let mut projects = Vec::new();
+    let init_str = initial_workdir.to_string_lossy().into_owned();
+    if !init_str.is_empty() {
+        projects.push(init_str);
+    }
+    if let Ok(raw) = fs::read_to_string(state_dir.join("projects.json")) {
+        if let Ok(parsed) = Json::parse(&raw) {
+            if let Some(arr) = parsed.as_arr() {
+                for item in arr {
+                    if let Some(p) = item.as_str() {
+                        if !p.is_empty() && !projects.iter().any(|x| x == p) {
+                            projects.push(p.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut sessions = Vec::new();
+    if let Ok(rd) = fs::read_dir(state_dir.join("sessions")) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(raw) = fs::read_to_string(&path) {
+                if let Ok(parsed) = Json::parse(&raw) {
+                    if let Some(sum) = parse_session_summary(&parsed) {
+                        if !sum.workdir.is_empty() && !projects.iter().any(|p| p == &sum.workdir) {
+                            projects.push(sum.workdir.clone());
+                        }
+                        sessions.push(sum);
+                    }
+                }
+            }
+        }
+    }
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    persist_projects_file(state_dir, &projects);
+    UiStateIndex { projects, sessions }
+}
+
+fn format_sessions_list_json(active_workdir: &Path, idx: &UiStateIndex) -> String {
+    let proj_items: Vec<String> = idx.projects.iter().map(|p| quote(p)).collect();
+    let sess_items: Vec<String> = idx
+        .sessions
+        .iter()
+        .map(|s| {
+            format!(
+                r#"{{"id":{},"title":{},"workdir":{},"created_at":{},"updated_at":{},"context_tokens":{},"added_lines":{},"removed_lines":{},"changed_files":{}}}"#,
+                quote(&s.id),
+                quote(&s.title),
+                quote(&s.workdir),
+                s.created_at,
+                s.updated_at,
+                s.context_tokens,
+                s.added_lines,
+                s.removed_lines,
+                s.changed_files,
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"active_workdir":{},"projects":[{}],"sessions":[{}]}}"#,
+        quote(&active_workdir.to_string_lossy()),
+        proj_items.join(","),
+        sess_items.join(","),
+    )
+}
+
+fn save_session_record(
+    state_dir: &Path,
+    idx: &mut UiStateIndex,
+    raw_body: &[u8],
+) -> Result<String, String> {
+    let body_str = std::str::from_utf8(raw_body).map_err(|e| format!("invalid UTF-8: {e}"))?;
+    let parsed = Json::parse(body_str).map_err(|e| format!("invalid JSON: {e}"))?;
+    let mut summary = parse_session_summary(&parsed)
+        .ok_or("session payload requires a valid `id` string")?;
+    if summary.updated_at == 0 {
+        summary.updated_at = now();
+    }
+    if summary.created_at == 0 {
+        summary.created_at = summary.updated_at;
+    }
+    let sess_dir = state_dir.join("sessions");
+    fs::create_dir_all(&sess_dir).map_err(|e| format!("create sessions dir: {e}"))?;
+    let tmp_path = sess_dir.join(format!("{}.json.tmp", summary.id));
+    let dst_path = sess_dir.join(format!("{}.json", summary.id));
+    fs::write(&tmp_path, raw_body).map_err(|e| format!("write session: {e}"))?;
+    fs::rename(&tmp_path, &dst_path).map_err(|e| format!("commit session: {e}"))?;
+
+    if !summary.workdir.is_empty() && !idx.projects.iter().any(|p| p == &summary.workdir) {
+        idx.projects.push(summary.workdir.clone());
+        persist_projects_file(state_dir, &idx.projects);
+    }
+    let saved_id = summary.id.clone();
+    if let Some(existing) = idx.sessions.iter_mut().find(|s| s.id == summary.id) {
+        *existing = summary;
+    } else {
+        idx.sessions.push(summary);
+    }
+    idx.sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    Ok(saved_id)
+}
+
+fn delete_session_record(
+    state_dir: &Path,
+    idx: &mut UiStateIndex,
+    raw_id: &str,
+) -> Result<(), String> {
+    let id = sanitize_session_id(raw_id)?;
+    let dst_path = state_dir.join("sessions").join(format!("{id}.json"));
+    let _ = fs::remove_file(dst_path);
+    idx.sessions.retain(|s| s.id != id);
+    Ok(())
+}
+
+fn expand_tilde_path(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    } else if trimmed == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from(trimmed)
+}
+
+fn revert_workspace_change(
+    workdir: &Path,
+    rel_path: &str,
+    existed_before: bool,
+    before_content: &str,
+) -> Result<String, (u16, String)> {
+    let target = resolve_jailed_path(workdir, rel_path).map_err(|e| (400, e))?;
+    if !existed_before {
+        if target.is_file() {
+            fs::remove_file(&target)
+                .map_err(|e| (500, format!("remove `{rel_path}`: {e}")))?;
+        }
+        return Ok(format!(
+            r#"{{"status":"ok","path":{},"action":"removed","validation_ok":true,"validation_msg":"removed"}}"#,
+            quote(rel_path)
+        ));
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|e| (500, e.to_string()))?;
+    }
+    fs::write(&target, before_content)
+        .map_err(|e| (500, format!("restore `{rel_path}`: {e}")))?;
+    let (v_ok, v_msg) = match validate_file(workdir, &target, true) {
+        Ok(note) => (true, if note.is_empty() { "ok".to_string() } else { note }),
+        Err(err) => (false, err),
+    };
+    Ok(format!(
+        r#"{{"status":"ok","path":{},"action":"restored","validation_ok":{v_ok},"validation_msg":{}}}"#,
+        quote(rel_path),
+        quote(&v_msg),
+    ))
+}
+
+fn handle_screencapture(stream: &mut TcpStream, req: &Request) {
+    let is_loopback = stream.peer_addr().map(|a| a.ip().is_loopback()).unwrap_or(false);
+    if !is_loopback {
+        return error(stream, 403, "screen capture is restricted to local loopback connections");
+    }
+    let mode = std::str::from_utf8(&req.body)
+        .ok()
+        .and_then(|s| Json::parse(s).ok())
+        .and_then(|j| j.get("mode").and_then(Json::as_str).map(str::to_string))
+        .unwrap_or_else(|| "interactive".to_string());
+    let stamp = now();
+    let tmp = std::env::temp_dir().join(format!(
+        "kronos_shot_{}_{}.png",
+        std::process::id(),
+        stamp
+    ));
+    let _ = fs::remove_file(&tmp);
+    let mut cmd = Command::new("/usr/sbin/screencapture");
+    if mode != "full" {
+        cmd.arg("-i");
+    }
+    cmd.arg("-x").arg(&tmp);
+    let status = match cmd.status() {
+        Ok(s) => s,
+        Err(e) => return error(stream, 500, &format!("screencapture failed: {e}")),
+    };
+    if !status.success() || !tmp.is_file() {
+        let _ = fs::remove_file(&tmp);
+        return respond(stream, 200, "application/json", r#"{"status":"cancelled"}"#);
+    }
+    let bytes = match fs::read(&tmp) {
+        Ok(b) if !b.is_empty() => b,
+        _ => {
+            let _ = fs::remove_file(&tmp);
+            return respond(stream, 200, "application/json", r#"{"status":"cancelled"}"#);
+        }
+    };
+    let _ = fs::remove_file(&tmp);
+    let data_url = format!("data:image/png;base64,{}", encode_base64(&bytes));
+    let fname = format!("screenshot_{stamp}.png");
+    respond(
+        stream,
+        200,
+        "application/json",
+        &format!(
+            r#"{{"status":"ok","name":{},"data":{}}}"#,
+            quote(&fname),
+            quote(&data_url)
+        ),
+    );
+}
+
 #[cfg(test)]
 fn format_agent_files_json(workdir: &Path) -> String {
     format_agent_files_with_ctx(workdir, 16384)
 }
 
 fn format_agent_files_with_ctx(workdir: &Path, ctx_limit: usize) -> String {
-    let entries = list_workspace_files(workdir);
+    let entries: Vec<_> = list_workspace_files(workdir)
+        .into_iter()
+        .filter(|e| !e.path.starts_with(".kronos_media/"))
+        .collect();
     let has_index = entries.iter().any(|e| e.path == "index.html")
         || entries.iter().any(|e| e.path.ends_with(".html"));
     let preview_entry = entries
@@ -951,8 +1396,12 @@ fn handle(srv: &Server, mut stream: TcpStream) {
     if req.method == "GET" && (req.path == "/" || req.path == "/index.html") {
         return respond(&mut stream, 200, "text/html; charset=utf-8", CHAT_PAGE);
     }
+    if req.method == "GET" && req.path == "/quick" {
+        return respond(&mut stream, 200, "text/html; charset=utf-8", QUICK_PAGE);
+    }
     if req.method == "GET" && (req.path == "/preview" || req.path.starts_with("/preview/")) {
-        return serve_preview(&srv.workdir, &mut stream, &req.path);
+        let wd = srv.active_workdir();
+        return serve_preview(&wd, &mut stream, &req.path);
     }
     if let Some(key) = &srv.api_key {
         let ok = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")) == Some(key.as_str());
@@ -975,39 +1424,168 @@ fn handle(srv: &Server, mut stream: TcpStream) {
         ("POST", "/v1/agent/chat") => agent_chat_sse(srv, &mut stream, &req),
         ("POST", "/v1/turn") => unified_turn_sse(srv, &mut stream, &req),
         ("POST", "/v1/compact") => compact_history_http(srv, &mut stream, &req),
-        ("GET", "/v1/agent/files") => respond(
-            &mut stream,
-            200,
-            "application/json",
-            &format_agent_files_with_ctx(&srv.workdir, srv.ctx_limit),
-        ),
-        ("GET", "/v1/agent/file") => {
-            let Some(rel) = req.query_param("path") else {
-                return error(&mut stream, 400, "missing `path` query parameter");
+        ("GET", "/v1/sessions") => {
+            let wd = srv.active_workdir();
+            let idx = srv.ui_index.lock().unwrap_or_else(|p| p.into_inner());
+            let body = format_sessions_list_json(&wd, &idx);
+            drop(idx);
+            respond(&mut stream, 200, "application/json", &body);
+        }
+        ("GET", "/v1/sessions/get") => {
+            let Some(raw_id) = req.query_param("id") else {
+                return error(&mut stream, 400, "missing `id` query parameter");
             };
-            match format_agent_file_detail_json(&srv.workdir, &rel) {
+            let id = match sanitize_session_id(&raw_id) {
+                Ok(v) => v,
+                Err(e) => return error(&mut stream, 400, &e),
+            };
+            let path = srv.state_dir.join("sessions").join(format!("{id}.json"));
+            match fs::read(&path) {
+                Ok(bytes) => respond_bytes(&mut stream, 200, "application/json", "", &bytes),
+                Err(_) => error(&mut stream, 404, "session not found"),
+            }
+        }
+        ("POST", "/v1/sessions/save") => {
+            let mut idx = srv.ui_index.lock().unwrap_or_else(|p| p.into_inner());
+            match save_session_record(&srv.state_dir, &mut idx, &req.body) {
+                Ok(id) => {
+                    drop(idx);
+                    respond(
+                        &mut stream,
+                        200,
+                        "application/json",
+                        &format!(r#"{{"status":"ok","id":{}}}"#, quote(&id)),
+                    );
+                }
+                Err(e) => error(&mut stream, 400, &e),
+            }
+        }
+        ("POST", "/v1/sessions/delete") => {
+            let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
+                Ok(b) => b,
+                Err(e) => return error(&mut stream, 400, &format!("invalid JSON: {e}")),
+            };
+            let Some(id) = body.get("id").and_then(Json::as_str) else {
+                return error(&mut stream, 400, "missing `id` field");
+            };
+            let mut idx = srv.ui_index.lock().unwrap_or_else(|p| p.into_inner());
+            match delete_session_record(&srv.state_dir, &mut idx, id) {
+                Ok(()) => {
+                    drop(idx);
+                    respond(&mut stream, 200, "application/json", r#"{"status":"ok"}"#);
+                }
+                Err(e) => error(&mut stream, 400, &e),
+            }
+        }
+        ("POST", "/v1/projects/select") => {
+            let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
+                Ok(b) => b,
+                Err(e) => return error(&mut stream, 400, &format!("invalid JSON: {e}")),
+            };
+            let Some(raw_wd) = body.get("workdir").and_then(Json::as_str) else {
+                return error(&mut stream, 400, "missing `workdir` field");
+            };
+            let create = body.get("create").and_then(Json::as_bool).unwrap_or(true);
+            let candidate = expand_tilde_path(raw_wd);
+            if candidate.as_os_str().is_empty() {
+                return error(&mut stream, 400, "`workdir` cannot be empty");
+            }
+            if create {
+                if let Err(e) = fs::create_dir_all(&candidate) {
+                    return error(&mut stream, 400, &format!("create workdir: {e}"));
+                }
+            } else if !candidate.is_dir() {
+                return error(&mut stream, 404, "project directory does not exist");
+            }
+            let canon = match candidate.canonicalize() {
+                Ok(c) if c.is_dir() => c,
+                _ => return error(&mut stream, 400, "workdir is not an accessible directory"),
+            };
+            {
+                let mut wd_guard = srv.workdir.lock().unwrap_or_else(|p| p.into_inner());
+                *wd_guard = canon.clone();
+            }
+            {
+                let mut idx = srv.ui_index.lock().unwrap_or_else(|p| p.into_inner());
+                let canon_str = canon.to_string_lossy().into_owned();
+                if !idx.projects.iter().any(|p| p == &canon_str) {
+                    idx.projects.push(canon_str);
+                    persist_projects_file(&srv.state_dir, &idx.projects);
+                }
+            }
+            respond(
+                &mut stream,
+                200,
+                "application/json",
+                &format_agent_files_with_ctx(&canon, srv.ctx_limit),
+            );
+        }
+        ("POST", "/v1/workspace/revert") => {
+            let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
+                Ok(b) => b,
+                Err(e) => return error(&mut stream, 400, &format!("invalid JSON: {e}")),
+            };
+            let Some(path) = body.get("path").and_then(Json::as_str) else {
+                return error(&mut stream, 400, "missing `path` field");
+            };
+            let existed_before = body.get("existed_before").and_then(Json::as_bool).unwrap_or(false);
+            let before_content = body.get("before_content").and_then(Json::as_str).unwrap_or("");
+            let wd = srv.active_workdir();
+            match revert_workspace_change(&wd, path, existed_before, before_content) {
                 Ok(json_body) => respond(&mut stream, 200, "application/json", &json_body),
                 Err((code, msg)) => error(&mut stream, code, &msg),
             }
         }
-        ("POST", "/v1/agent/clear") => match clear_workspace_dir(&srv.workdir) {
-            Ok(n) => respond(
+        ("POST", "/v1/screencapture") => handle_screencapture(&mut stream, &req),
+        ("GET", "/v1/agent/files") => {
+            let wd = srv.active_workdir();
+            respond(
                 &mut stream,
                 200,
                 "application/json",
-                &format!(r#"{{"status":"ok","removed":{n}}}"#),
-            ),
-            Err(e) => error(&mut stream, 500, &e),
-        },
+                &format_agent_files_with_ctx(&wd, srv.ctx_limit),
+            );
+        }
+        ("GET", "/v1/agent/file") => {
+            let Some(rel) = req.query_param("path") else {
+                return error(&mut stream, 400, "missing `path` query parameter");
+            };
+            let wd = srv.active_workdir();
+            match format_agent_file_detail_json(&wd, &rel) {
+                Ok(json_body) => respond(&mut stream, 200, "application/json", &json_body),
+                Err((code, msg)) => error(&mut stream, code, &msg),
+            }
+        }
+        ("POST", "/v1/agent/clear") => {
+            let wd = srv.active_workdir();
+            match clear_workspace_dir(&wd) {
+                Ok(n) => respond(
+                    &mut stream,
+                    200,
+                    "application/json",
+                    &format!(r#"{{"status":"ok","removed":{n}}}"#),
+                ),
+                Err(e) => error(&mut stream, 500, &e),
+            }
+        }
         _ => error(&mut stream, 404, &format!("no route for {} {}", req.method, req.path)),
     }
+}
+
+fn default_state_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".kronos").join("ui_state");
+        }
+    }
+    std::env::temp_dir().join("kronos_ui_state")
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args[1].starts_with("--") {
         eprintln!(
-            "usage: {} <model_dir> [--draft DIR] [--workdir DIR] [--cache-dir DIR] [--host 127.0.0.1] [--port 18080] [--api-key KEY] [--mode nf4g128] ...",
+            "usage: {} <model_dir> [--draft DIR] [--workdir DIR] [--state-dir DIR] [--cache-dir DIR] [--host 127.0.0.1] [--port 18080] [--api-key KEY] [--mode nf4g128] ...",
             args[0]
         );
         std::process::exit(2);
@@ -1075,7 +1653,7 @@ fn main() {
     }
 
     let raw_workdir = match flag("--workdir") {
-        Some(w) => PathBuf::from(w),
+        Some(w) => expand_tilde_path(&w),
         None => std::env::temp_dir().join("kronos_server_workspace"),
     };
     fs::create_dir_all(&raw_workdir).unwrap_or_else(|e| {
@@ -1083,6 +1661,16 @@ fn main() {
         std::process::exit(1);
     });
     let workdir = raw_workdir.canonicalize().unwrap_or(raw_workdir);
+
+    let state_dir = match flag("--state-dir") {
+        Some(s) => expand_tilde_path(&s),
+        None => default_state_dir(),
+    };
+    fs::create_dir_all(&state_dir).unwrap_or_else(|e| {
+        eprintln!("create state-dir {}: {e}", state_dir.display());
+        std::process::exit(1);
+    });
+    let ui_index = load_ui_state_index(&state_dir, &workdir);
 
     let t_warm = Instant::now();
     let warm_sys = build_unified_system_prompt(&workdir);
@@ -1121,13 +1709,15 @@ fn main() {
         name: model.name.clone(),
         model: Mutex::new(model),
         api_key: flag("--api-key"),
-        workdir: workdir.clone(),
+        workdir: Mutex::new(workdir.clone()),
+        state_dir,
+        ui_index: Mutex::new(ui_index),
         ctx_limit: ctx_sz,
         next_id: AtomicU64::new(1),
         media_seq: AtomicU64::new(1),
     });
     eprintln!(
-        "serving {} on http://{addr}/ (weights {weights_gib:.2} GiB + {kv_tag} {kv_gib:.2} GiB @ ctx={ctx_sz} · workdir={})",
+        "serving {} on http://{addr}/ (quick HUD http://{addr}/quick · weights {weights_gib:.2} GiB + {kv_tag} {kv_gib:.2} GiB @ ctx={ctx_sz} · workdir={})",
         srv.name,
         workdir.display()
     );
@@ -1225,7 +1815,7 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_workspace_endpoints_and_query_decoding() {
+    fn test_agent_workspace_sessions_revert_and_pages() {
         let html_check = kronos_2t::agent::validate_content_by_ext(
             Path::new("."),
             Path::new("chat.html"),
@@ -1234,6 +1824,15 @@ mod tests {
             false,
         );
         assert!(html_check.is_ok(), "chat.html validation failed: {html_check:?}");
+
+        let quick_check = kronos_2t::agent::validate_content_by_ext(
+            Path::new("."),
+            Path::new("quick.html"),
+            "html",
+            QUICK_PAGE,
+            false,
+        );
+        assert!(quick_check.is_ok(), "quick.html validation failed: {quick_check:?}");
 
         let req = Request {
             method: "GET".into(),
@@ -1246,7 +1845,9 @@ mod tests {
         assert_eq!(req.query_param("t").as_deref(), Some("123"));
 
         let dir = std::env::temp_dir().join(format!("kronos_srv_agent_test_{}", std::process::id()));
+        let state_dir = std::env::temp_dir().join(format!("kronos_srv_state_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&state_dir);
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::write(dir.join("index.html"), "<!doctype html><html><body><script src=\"src/app.js\"></script></body></html>").unwrap();
         fs::write(dir.join("src/app.js"), "const ok = 1;\n").unwrap();
@@ -1260,11 +1861,39 @@ mod tests {
         let detail = Json::parse(&format_agent_file_detail_json(&dir, "src/app.js").unwrap()).unwrap();
         assert_eq!(detail.get("validation_ok").and_then(Json::as_bool), Some(true));
         assert_eq!(detail.get("content").and_then(Json::as_str), Some("const ok = 1;\n"));
-
         assert!(format_agent_file_detail_json(&dir, "../escape.js").is_err());
+
+        // Revert check: restore older contents and remove newly created file.
+        fs::write(dir.join("src/app.js"), "const ok = 2;\n").unwrap();
+        let rev = Json::parse(&revert_workspace_change(&dir, "src/app.js", true, "const ok = 1;\n").unwrap()).unwrap();
+        assert_eq!(rev.get("action").and_then(Json::as_str), Some("restored"));
+        assert_eq!(fs::read_to_string(dir.join("src/app.js")).unwrap(), "const ok = 1;\n");
+
+        fs::write(dir.join("src/temp.js"), "const t = 1;\n").unwrap();
+        let rev_rm = Json::parse(&revert_workspace_change(&dir, "src/temp.js", false, "").unwrap()).unwrap();
+        assert_eq!(rev_rm.get("action").and_then(Json::as_str), Some("removed"));
+        assert!(!dir.join("src/temp.js").exists());
+
+        // Session store CRUD check.
+        let mut idx = load_ui_state_index(&state_dir, &dir);
+        assert!(sanitize_session_id("../bad").is_err());
+        let saved_id = save_session_record(
+            &state_dir,
+            &mut idx,
+            br#"{"id":"sess_unit_1","title":"Landing Page","workdir":"/tmp/demo","created_at":100,"updated_at":120,"context_tokens":512,"added_lines":14,"removed_lines":3,"changed_files":2,"messages":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(saved_id, "sess_unit_1");
+        assert_eq!(idx.sessions.len(), 1);
+        let reloaded = load_ui_state_index(&state_dir, &dir);
+        assert_eq!(reloaded.sessions.len(), 1);
+        assert_eq!(reloaded.sessions[0].added_lines, 14);
+        delete_session_record(&state_dir, &mut idx, "sess_unit_1").unwrap();
+        assert_eq!(idx.sessions.len(), 0);
 
         let removed = clear_workspace_dir(&dir).unwrap();
         assert_eq!(removed, 2);
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&state_dir);
     }
 }

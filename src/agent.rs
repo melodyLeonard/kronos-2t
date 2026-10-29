@@ -33,11 +33,30 @@ pub struct WorkspaceFileEntry {
 }
 
 #[derive(Clone, Debug)]
+pub struct FileChangeDiff {
+    pub path: String,
+    pub existed_before: bool,
+    pub before_content: String,
+    pub added_lines: usize,
+    pub removed_lines: usize,
+    pub unified_diff: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct VerificationReport {
+    pub checks_run: usize,
+    pub summary: String,
+    pub details: Vec<String>,
+    pub elapsed_ms: f64,
+}
+
+#[derive(Clone, Debug)]
 pub struct ToolExecOutcome {
     pub ok: bool,
     pub validation_ok: bool,
     pub validation_msg: String,
     pub output: String,
+    pub diff: Option<FileChangeDiff>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +115,10 @@ pub enum AgentEvent<'a> {
     ValidationRepair {
         step: usize,
         report: &'a str,
+    },
+    Verified {
+        step: usize,
+        report: &'a VerificationReport,
     },
     Done {
         steps: usize,
@@ -298,6 +321,7 @@ pub fn classify_turn_intent(
         "why does ",
         "compare ",
         "summarize ",
+        "analyze ",
         "translate ",
         "write a haiku",
         "write a poem",
@@ -388,6 +412,7 @@ fn should_skip_entry(name: &str) -> bool {
         || name == "__pycache__"
         || name == ".DS_Store"
         || name == ".kronos_media"
+        || name == ".kronos"
         || name.starts_with(".kronos_cmd_")
 }
 
@@ -1222,6 +1247,7 @@ pub fn execute_tool(
                 validation_ok: false,
                 validation_msg: "invalid tool JSON".to_string(),
                 output: format!("error: invalid JSON arguments `{}`: {e}", call.arguments),
+                diff: None,
             };
         }
     };
@@ -1239,6 +1265,7 @@ pub fn execute_tool(
                     validation_ok: true,
                     validation_msg: "ok".to_string(),
                     output: "error: `run_command` requires string argument `cmd`".to_string(),
+                    diff: None,
                 };
             };
             let out = run_shell_command_with_timeout(workdir, cmd, cmd_timeout_secs, step_tag);
@@ -1248,6 +1275,7 @@ pub fn execute_tool(
                 validation_ok: true,
                 validation_msg: "ok".to_string(),
                 output: out,
+                diff: None,
             }
         }
         other => ToolExecOutcome {
@@ -1255,11 +1283,146 @@ pub fn execute_tool(
             validation_ok: true,
             validation_msg: "ok".to_string(),
             output: format!("error: unknown tool `{other}`"),
+            diff: None,
         },
     }
 }
 
-fn attach_validation_status(workdir: &Path, target: &Path, rel: &str, base_msg: String) -> ToolExecOutcome {
+pub fn compute_unified_diff(path: &str, before: &str, after: &str) -> (usize, usize, String) {
+    if before == after {
+        return (0, 0, String::new());
+    }
+    let old_lines: Vec<&str> = before.lines().collect();
+    let new_lines: Vec<&str> = after.lines().collect();
+    let mut pre = 0usize;
+    while pre < old_lines.len() && pre < new_lines.len() && old_lines[pre] == new_lines[pre] {
+        pre += 1;
+    }
+    let mut suf = 0usize;
+    while pre + suf < old_lines.len()
+        && pre + suf < new_lines.len()
+        && old_lines[old_lines.len() - 1 - suf] == new_lines[new_lines.len() - 1 - suf]
+    {
+        suf += 1;
+    }
+    let old_mid = &old_lines[pre..old_lines.len() - suf];
+    let new_mid = &new_lines[pre..new_lines.len() - suf];
+
+    let mut ops: Vec<(char, &str)> = Vec::new();
+    let mut added = 0usize;
+    let mut removed = 0usize;
+
+    if old_mid.len() <= 320 && new_mid.len() <= 320 && old_mid.len() * new_mid.len() <= 64_000 {
+        let m = old_mid.len();
+        let n = new_mid.len();
+        let stride = n + 1;
+        let mut dp = vec![0u16; (m + 1) * stride];
+        for i in (0..m).rev() {
+            for j in (0..n).rev() {
+                dp[i * stride + j] = if old_mid[i] == new_mid[j] {
+                    dp[(i + 1) * stride + j + 1] + 1
+                } else {
+                    dp[(i + 1) * stride + j].max(dp[i * stride + j + 1])
+                };
+            }
+        }
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < m && j < n {
+            if old_mid[i] == new_mid[j] {
+                ops.push((' ', old_mid[i]));
+                i += 1;
+                j += 1;
+            } else if dp[(i + 1) * stride + j] >= dp[i * stride + j + 1] {
+                ops.push(('-', old_mid[i]));
+                removed += 1;
+                i += 1;
+            } else {
+                ops.push(('+', new_mid[j]));
+                added += 1;
+                j += 1;
+            }
+        }
+        while i < m {
+            ops.push(('-', old_mid[i]));
+            removed += 1;
+            i += 1;
+        }
+        while j < n {
+            ops.push(('+', new_mid[j]));
+            added += 1;
+            j += 1;
+        }
+    } else {
+        for &l in old_mid {
+            ops.push(('-', l));
+            removed += 1;
+        }
+        for &l in new_mid {
+            ops.push(('+', l));
+            added += 1;
+        }
+    }
+
+    let ctx_before_start = pre.saturating_sub(2);
+    let ctx_after_end = (new_lines.len() - suf + 2).min(new_lines.len());
+    let old_hunk_start = if old_lines.is_empty() { 0 } else { ctx_before_start + 1 };
+    let new_hunk_start = if new_lines.is_empty() { 0 } else { ctx_before_start + 1 };
+    let pre_ctx_count = pre - ctx_before_start;
+    let post_ctx_count = ctx_after_end.saturating_sub(new_lines.len() - suf);
+    let old_hunk_len = pre_ctx_count + old_mid.len() + post_ctx_count;
+    let new_hunk_len = pre_ctx_count + new_mid.len() + post_ctx_count;
+
+    let mut out = format!(
+        "--- a/{path}\n+++ b/{path}\n@@ -{old_hunk_start},{old_hunk_len} +{new_hunk_start},{new_hunk_len} @@\n"
+    );
+    for &l in &old_lines[ctx_before_start..pre] {
+        out.push(' ');
+        out.push_str(l);
+        out.push('\n');
+    }
+    let max_diff_lines = 180usize;
+    for (idx, &(tag, l)) in ops.iter().enumerate() {
+        if idx >= max_diff_lines {
+            out.push_str(&format!("... ({} more diff lines)\n", ops.len() - max_diff_lines));
+            break;
+        }
+        out.push(tag);
+        out.push_str(l);
+        out.push('\n');
+    }
+    for &l in &new_lines[new_lines.len() - suf..ctx_after_end] {
+        out.push(' ');
+        out.push_str(l);
+        out.push('\n');
+    }
+    (added, removed, out)
+}
+
+fn build_file_diff(rel: &str, prev_opt: Option<String>, after: &str) -> Option<FileChangeDiff> {
+    let existed_before = prev_opt.is_some();
+    let before_content = prev_opt.unwrap_or_default();
+    if existed_before && before_content == after {
+        return None;
+    }
+    let (added_lines, removed_lines, unified_diff) =
+        compute_unified_diff(rel, &before_content, after);
+    Some(FileChangeDiff {
+        path: rel.to_string(),
+        existed_before,
+        before_content,
+        added_lines,
+        removed_lines,
+        unified_diff,
+    })
+}
+
+fn attach_validation_status(
+    workdir: &Path,
+    target: &Path,
+    rel: &str,
+    base_msg: String,
+    diff: Option<FileChangeDiff>,
+) -> ToolExecOutcome {
     match validate_file(workdir, target, false) {
         Ok(note) => {
             let v_msg = if note.is_empty() { "ok".to_string() } else { note.clone() };
@@ -1273,6 +1436,7 @@ fn attach_validation_status(workdir: &Path, target: &Path, rel: &str, base_msg: 
                 validation_ok: true,
                 validation_msg: v_msg,
                 output: format!("{base_msg}{suffix}"),
+                diff,
             }
         }
         Err(err) => ToolExecOutcome {
@@ -1280,6 +1444,7 @@ fn attach_validation_status(workdir: &Path, target: &Path, rel: &str, base_msg: 
             validation_ok: false,
             validation_msg: err.clone(),
             output: format!("{base_msg}\n[validation error in `{rel}`: {err} — fix with `edit_file` or `write_file`]"),
+            diff,
         },
     }
 }
@@ -1319,14 +1484,15 @@ fn exec_write_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
             return err_outcome(&format!("error creating directory `{}`: {e}", parent.display()));
         }
     }
+    let prev_opt = fs::read_to_string(&target).ok();
     let mut final_content = content.to_string();
     let mut sync_note = String::new();
     let lower_rel = rel.to_ascii_lowercase();
     if lower_rel.ends_with(".html") || lower_rel.ends_with(".htm") {
-        if let Ok(prev) = fs::read_to_string(&target) {
+        if let Some(prev) = &prev_opt {
             if let (Some(old_t), Some(old_h1), Some(new_t), Some(new_h1)) = (
-                extract_plain_html_tag_inner(&prev, "title"),
-                extract_plain_html_tag_inner(&prev, "h1"),
+                extract_plain_html_tag_inner(prev, "title"),
+                extract_plain_html_tag_inner(prev, "h1"),
                 extract_plain_html_tag_inner(content, "title"),
                 extract_plain_html_tag_inner(content, "h1"),
             ) {
@@ -1344,12 +1510,13 @@ fn exec_write_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
     }
     match fs::write(&target, final_content.as_bytes()) {
         Ok(()) => {
+            let diff = build_file_diff(rel, prev_opt, &final_content);
             let msg = format!(
                 "ok: wrote {} bytes ({} lines{sync_note}) to `{rel}`",
                 final_content.len(),
                 final_content.lines().count()
             );
-            attach_validation_status(workdir, &target, rel, msg)
+            attach_validation_status(workdir, &target, rel, msg, diff)
         }
         Err(e) => err_outcome(&format!("error writing `{rel}`: {e}")),
     }
@@ -1479,9 +1646,11 @@ fn write_edited_content(
     new_text: &str,
     raw_updated: String,
 ) -> ToolExecOutcome {
+    let prev_opt = fs::read_to_string(target).ok();
     let (updated, h1_synced) = sync_html_title_and_h1(rel, old_text, new_text, raw_updated);
     match fs::write(target, updated.as_bytes()) {
         Ok(()) => {
+            let diff = build_file_diff(rel, prev_opt, &updated);
             let sync_note = match h1_synced {
                 Some(t) => format!("; synced visible <h1> to `{t}`"),
                 None => String::new(),
@@ -1491,7 +1660,7 @@ fn write_edited_content(
                 updated.len(),
                 updated.lines().count()
             );
-            attach_validation_status(workdir, target, rel, msg)
+            attach_validation_status(workdir, target, rel, msg, diff)
         }
         Err(e) => err_outcome(&format!("error writing `{rel}`: {e}")),
     }
@@ -1562,7 +1731,7 @@ fn exec_edit_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
         let norm_new_trim = norm_new_trim.trim();
         if !norm_new_trim.is_empty() && norm_existing.contains(norm_new_trim) {
             let msg = format!("ok: `{rel}` already contains the requested text");
-            return attach_validation_status(workdir, &target, rel, msg);
+            return attach_validation_status(workdir, &target, rel, msg, None);
         }
         let first_old_line = old_text
             .lines()
@@ -1795,6 +1964,7 @@ fn ok_outcome(output: String) -> ToolExecOutcome {
         validation_ok: true,
         validation_msg: "ok".to_string(),
         output,
+        diff: None,
     }
 }
 
@@ -1804,6 +1974,7 @@ fn err_outcome(msg: &str) -> ToolExecOutcome {
         validation_ok: true,
         validation_msg: "ok".to_string(),
         output: msg.to_string(),
+        diff: None,
     }
 }
 
@@ -2166,10 +2337,10 @@ fn extract_partial_json_str(haystack: &str, key: &str) -> Option<String> {
 
 pub const UNIFIED_SYSTEM_PROMPT: &str = concat!(
     "You are Kronos, a local multimodal software engineering and reasoning engine on Apple Silicon. ",
-    "For general questions, explanations, or image analysis that do not modify workspace files, reply directly and concisely in prose without calling tools. ",
+    "For general questions, explanations, or analysis of attached PDFs, documents, CSVs, code snippets, or images that do not modify workspace files, reply directly and concisely from the inline context without calling tools. ",
     "When asked to build, edit, style, fix, inspect, or run files in the workspace, use the workspace tools (write_file, edit_file, read_file, list_dir, search_files, run_command) directly on disk. ",
     "Do not paste file drafts or completion claims in prose before calling tools; emit <tool_call> invocations immediately, then summarize briefly after tool calls succeed. ",
-    "Use edit_file for small targeted edits to existing files, and use write_file for new files or when rewriting most of an existing file such as restyling a stylesheet. ",
+    "Check the Existing workspace files list below before calling edit_file: only call edit_file on files that exist on disk using exact existing lines, and use write_file for new files or full rewrites. ",
     "When updating a web page title or heading, update both <title> in <head> and the visible <h1> heading in <body> so the rendered preview shows the change immediately. ",
     "The live preview reloads automatically after every file edit, so never ask the user to refresh the preview; if the user reports a change is not visible, inspect and update the visible HTML or CSS elements directly. ",
     "If a tool response reports an error or validation failure, fix it with a tool call immediately before finishing."
@@ -2179,7 +2350,9 @@ pub fn build_unified_system_prompt(workdir: &Path) -> String {
     let dir_line = format!("Workspace directory on disk: {}", workdir.display());
     let snap = format_workspace_snapshot(workdir, 12 * 1024);
     if snap.is_empty() {
-        format!("{UNIFIED_SYSTEM_PROMPT}\n\n{dir_line}")
+        format!(
+            "{UNIFIED_SYSTEM_PROMPT}\n\n{dir_line}\n\nWorkspace status: currently empty (0 files on disk; use write_file to create new files)."
+        )
     } else {
         format!("{UNIFIED_SYSTEM_PROMPT}\n\n{dir_line}\n\n{snap}")
     }
@@ -2492,7 +2665,304 @@ pub fn compact_conversation_history(
     })
 }
 
-/// Runs an iterative tool-calling and validation repair loop while preserving the KV-cache prefix.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn normalize_css_color_token(raw: &str) -> Option<String> {
+    let v = raw
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match v.as_str() {
+        "#fff" | "#ffffff" | "white" | "rgb(255, 255, 255)" | "rgb(255,255,255)" => {
+            Some("#ffffff".to_string())
+        }
+        "#000" | "#000000" | "black" | "rgb(0, 0, 0)" | "rgb(0,0,0)" => {
+            Some("#000000".to_string())
+        }
+        s if s.starts_with('#') && (s.len() == 4 || s.len() == 7) => {
+            if s.len() == 4 {
+                let b = s.as_bytes();
+                let (r, g, bl) = (b[1] as char, b[2] as char, b[3] as char);
+                Some(format!("#{r}{r}{g}{g}{bl}{bl}"))
+            } else {
+                Some(s.to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extract_quoted_calls(src: &str, needle: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let code = line.split("//").next().unwrap_or("");
+        let mut cur = 0usize;
+        while let Some(pos) = code[cur..].find(needle) {
+            let after = cur + pos + needle.len();
+            let rest = code[after..].trim_start();
+            let Some(q) = rest.chars().next() else {
+                break;
+            };
+            if q == '"' || q == '\'' {
+                let body = &rest[1..];
+                if let Some(end_q) = body.find(q) {
+                    let val = body[..end_q].trim();
+                    if !val.is_empty() && !out.iter().any(|x| x == val) {
+                        out.push(val.to_string());
+                    }
+                    cur = after + 1 + end_q + 1;
+                    continue;
+                }
+            }
+            cur = after;
+        }
+    }
+    out
+}
+
+fn collect_html_ids(html: &str, ids: &mut Vec<String>) {
+    let lower = html.to_ascii_lowercase();
+    for pat in ["id=\"", "id='"] {
+        let q = pat.chars().last().unwrap();
+        let mut cur = 0usize;
+        while let Some(pos) = lower[cur..].find(pat) {
+            let start = cur + pos + pat.len();
+            if let Some(end_rel) = html[start..].find(q) {
+                let val = html[start..start + end_rel].trim();
+                if !val.is_empty() && !ids.iter().any(|x| x == val) {
+                    ids.push(val.to_string());
+                }
+                cur = start + end_rel + 1;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+fn verify_web_dom_and_css_semantics(workdir: &Path) -> Result<Option<String>, String> {
+    let entries = list_workspace_files(workdir);
+    let mut html_files = Vec::new();
+    let mut js_files = Vec::new();
+    let mut css_files = Vec::new();
+    for e in &entries {
+        let lower = e.path.to_ascii_lowercase();
+        if lower.ends_with(".html") || lower.ends_with(".htm") {
+            html_files.push(e.path.clone());
+        } else if lower.ends_with(".js") || lower.ends_with(".mjs") {
+            js_files.push(e.path.clone());
+        } else if lower.ends_with(".css") {
+            css_files.push(e.path.clone());
+        }
+    }
+    if html_files.is_empty() && css_files.is_empty() {
+        return Ok(None);
+    }
+
+    let mut issues = Vec::new();
+    let mut defined_ids = Vec::new();
+    let mut has_dynamic_template_ids = false;
+    for hp in &html_files {
+        if let Ok(full) = resolve_jailed_path(workdir, hp) {
+            if let Ok(src) = fs::read_to_string(&full) {
+                collect_html_ids(&src, &mut defined_ids);
+            }
+        }
+    }
+    for jp in &js_files {
+        if let Ok(full) = resolve_jailed_path(workdir, jp) {
+            if let Ok(src) = fs::read_to_string(&full) {
+                collect_html_ids(&src, &mut defined_ids);
+                if src.contains(".id =") || src.contains(".id=") || src.contains("setAttribute('id'") || src.contains("setAttribute(\"id\"") {
+                    has_dynamic_template_ids = true;
+                }
+            }
+        }
+    }
+
+    if !html_files.is_empty() && !has_dynamic_template_ids {
+        for jp in &js_files {
+            if let Ok(full) = resolve_jailed_path(workdir, jp) {
+                if let Ok(src) = fs::read_to_string(&full) {
+                    for id_ref in extract_quoted_calls(&src, "getElementById(") {
+                        if !defined_ids.iter().any(|d| d == &id_ref) {
+                            issues.push(format!(
+                                "`{jp}`: `getElementById(\"{id_ref}\")` has no matching `id=\"{id_ref}\"` in workspace HTML"
+                            ));
+                        }
+                    }
+                    for sel_ref in extract_quoted_calls(&src, "querySelector(") {
+                        if let Some(id_only) = sel_ref.strip_prefix('#') {
+                            if !id_only.is_empty()
+                                && id_only.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                                && !defined_ids.iter().any(|d| d == id_only)
+                            {
+                                issues.push(format!(
+                                    "`{jp}`: `querySelector(\"#{id_only}\")` has no matching `id=\"{id_only}\"` in workspace HTML"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for cp in &css_files {
+        if let Ok(full) = resolve_jailed_path(workdir, cp) {
+            if let Ok(src) = fs::read_to_string(&full) {
+                for block in src.split('{').skip(1) {
+                    let body = block.split('}').next().unwrap_or("");
+                    let mut fg: Option<String> = None;
+                    let mut bg: Option<String> = None;
+                    for decl in body.split(';') {
+                        if let Some((prop, val)) = decl.split_once(':') {
+                            let p = prop.trim().to_ascii_lowercase();
+                            if p == "color" {
+                                fg = normalize_css_color_token(val);
+                            } else if p == "background" || p == "background-color" {
+                                bg = normalize_css_color_token(val);
+                            }
+                        }
+                    }
+                    if let (Some(f), Some(b)) = (fg, bg) {
+                        if f == b {
+                            issues.push(format!(
+                                "`{cp}`: CSS rule sets identical foreground `color` and `background` ({f}), making text invisible"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if issues.is_empty() {
+        Ok(Some(format!(
+            "DOM/CSS cross-check ok ({} HTML, {} CSS, {} JS)",
+            html_files.len(),
+            css_files.len(),
+            js_files.len()
+        )))
+    } else {
+        Err(issues.join("\n"))
+    }
+}
+
+/// Runs post-edit structural, cross-file DOM/CSS, and runtime compiler smoke checks on the workspace.
+pub fn verify_workspace_work(
+    workdir: &Path,
+    modified_files: &[String],
+    timeout_secs: u64,
+) -> Result<VerificationReport, String> {
+    let t0 = Instant::now();
+    let mut details = Vec::new();
+    let mut errors = Vec::new();
+
+    match validate_workspace(workdir) {
+        Ok(()) => details.push("syntax & local asset integrity ok".to_string()),
+        Err(e) => errors.push(e),
+    }
+
+    match verify_web_dom_and_css_semantics(workdir) {
+        Ok(Some(note)) => details.push(note),
+        Ok(None) => {}
+        Err(e) => errors.push(e),
+    }
+
+    let mut js_checked = 0usize;
+    let mut py_checked = 0usize;
+    let mut sh_checked = 0usize;
+    let mut check_rust = false;
+
+    for rel in modified_files {
+        let lower = rel.to_ascii_lowercase();
+        let Ok(full) = resolve_jailed_path(workdir, rel) else {
+            continue;
+        };
+        if !full.is_file() {
+            continue;
+        }
+        if lower.ends_with(".js") || lower.ends_with(".mjs") {
+            let cmd = format!(
+                "if command -v node >/dev/null 2>&1; then node --check {}; fi",
+                shell_single_quote(rel)
+            );
+            let out = run_shell_command_with_timeout(workdir, &cmd, 5, 9100 + js_checked);
+            if !out.starts_with("exit_code=0") {
+                errors.push(format!("`{rel}` V8 syntax check failed:\n{out}"));
+            } else {
+                js_checked += 1;
+            }
+        } else if lower.ends_with(".py") {
+            let cmd = format!(
+                "if command -v python3 >/dev/null 2>&1; then python3 -m py_compile {}; fi",
+                shell_single_quote(rel)
+            );
+            let out = run_shell_command_with_timeout(workdir, &cmd, 5, 9200 + py_checked);
+            if !out.starts_with("exit_code=0") {
+                errors.push(format!("`{rel}` python3 compile check failed:\n{out}"));
+            } else {
+                py_checked += 1;
+            }
+        } else if lower.ends_with(".sh") {
+            let cmd = format!("sh -n {}", shell_single_quote(rel));
+            let out = run_shell_command_with_timeout(workdir, &cmd, 5, 9300 + sh_checked);
+            if !out.starts_with("exit_code=0") {
+                errors.push(format!("`{rel}` shell syntax check failed:\n{out}"));
+            } else {
+                sh_checked += 1;
+            }
+        } else if lower.ends_with(".rs") || lower == "cargo.toml" {
+            check_rust = true;
+        }
+    }
+
+    if js_checked > 0 {
+        details.push(format!("V8 `node --check` passed ({js_checked} file(s))"));
+    }
+    if py_checked > 0 {
+        details.push(format!("`python3 -m py_compile` passed ({py_checked} file(s))"));
+    }
+    if sh_checked > 0 {
+        details.push(format!("`sh -n` passed ({sh_checked} file(s))"));
+    }
+    if check_rust && workdir.join("Cargo.toml").is_file() {
+        let out = run_shell_command_with_timeout(
+            workdir,
+            "if command -v cargo >/dev/null 2>&1; then cargo check --quiet; fi",
+            timeout_secs.clamp(5, 30),
+            9400,
+        );
+        if !out.starts_with("exit_code=0") {
+            errors.push(format!("`cargo check` failed:\n{out}"));
+        } else {
+            details.push("`cargo check` passed".to_string());
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(errors.join("\n"));
+    }
+
+    let checks_run = details.len().max(1);
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let summary = format!(
+        "{checks_run} check(s) passed ({})",
+        details.join(" · ")
+    );
+    Ok(VerificationReport {
+        checks_run,
+        summary,
+        details,
+        elapsed_ms,
+    })
+}
+/// Runs an iterative tool-calling and post-work verification repair loop while preserving the KV-cache prefix.
 pub fn run_agent_turn(
     model: &mut ChatModel,
     history: &mut Vec<Message>,
@@ -2509,6 +2979,7 @@ pub fn run_agent_turn(
     let mut used_any_tools = false;
     let mut repair_attempts = 0usize;
     let mut unresolved_edits: Vec<(String, String)> = Vec::new();
+    let mut modified_files: Vec<String> = Vec::new();
 
     for step in 1..=cfg.max_steps {
         let comp_rep = compact_conversation_history(model, history, tools_json, &cfg.workdir, false);
@@ -2594,22 +3065,31 @@ pub fn run_agent_turn(
                 ));
                 continue;
             }
-            if touched_files && repair_attempts < 2 && step < cfg.max_steps {
-                if let Err(report) = validate_workspace(&cfg.workdir) {
-                    repair_attempts += 1;
-                    if !on_event(AgentEvent::ValidationRepair {
-                        step,
-                        report: &report,
-                    }) {
-                        return Err("cancelled".to_string());
+            if touched_files {
+                match verify_workspace_work(&cfg.workdir, &modified_files, cfg.cmd_timeout_secs) {
+                    Ok(v_rep) => {
+                        let _ = on_event(AgentEvent::Verified {
+                            step,
+                            report: &v_rep,
+                        });
                     }
-                    history.push(Message::new(
-                        "user",
-                        &format!(
-                            "Workspace validation failed:\n{report}\nFix every reported file using `edit_file` or `write_file` before finishing."
-                        ),
-                    ));
-                    continue;
+                    Err(report) if repair_attempts < 2 && step < cfg.max_steps => {
+                        repair_attempts += 1;
+                        if !on_event(AgentEvent::ValidationRepair {
+                            step,
+                            report: &report,
+                        }) {
+                            return Err("cancelled".to_string());
+                        }
+                        history.push(Message::new(
+                            "user",
+                            &format!(
+                                "Post-edit verification failed:\n{report}\nFix every reported issue using `edit_file` or `write_file` before finishing."
+                            ),
+                        ));
+                        continue;
+                    }
+                    Err(_) => {}
                 }
             }
             if cfg.expect_tool_call && !used_any_tools && repair_attempts < 2 && step < cfg.max_steps {
@@ -2652,6 +3132,9 @@ pub fn run_agent_turn(
                     .unwrap_or_default();
                 if outcome.ok {
                     unresolved_edits.retain(|(p, _)| p != &target_path);
+                    if !target_path.is_empty() && !modified_files.iter().any(|p| p == &target_path) {
+                        modified_files.push(target_path);
+                    }
                 } else {
                     let summary = outcome
                         .output
@@ -3099,6 +3582,44 @@ mod tests {
         assert!(hist[1].content.contains(".kronos_media/image_1.png"));
         assert!(hist[1].content.contains("--- theme.css"));
         assert_eq!(hist.last().unwrap().content, "Now polish button padding");
+
+        // 12. compute_unified_diff + verify_workspace_work catch DOM/CSS/V8 bugs and verify clean repair.
+        let (add_n, rem_n, udiff) =
+            compute_unified_diff("app.js", "const a = 1;\nconst b = 2;\n", "const a = 1;\nconst b = 3;\nconst c = 4;\n");
+        assert_eq!(add_n, 2);
+        assert_eq!(rem_n, 1);
+        assert!(udiff.contains("-const b = 2;"));
+        assert!(udiff.contains("+const b = 3;"));
+
+        let broken_dom_js = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "c12a".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"app.js","content":"const btn = document.getElementById('ghost-missing-id');\n"}"#.into(),
+            },
+            5,
+            14,
+        );
+        assert!(broken_dom_js.ok);
+        assert!(broken_dom_js.diff.is_some());
+        let dom_err = verify_workspace_work(&dir, &["app.js".to_string()], 5).unwrap_err();
+        assert!(dom_err.contains("ghost-missing-id"), "unexpected verify err: {dom_err}");
+
+        let fixed_dom_js = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "c12b".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"app.js","content":"const root = document.getElementById('app');\n"}"#.into(),
+            },
+            5,
+            15,
+        );
+        assert!(fixed_dom_js.ok);
+        let v_ok = verify_workspace_work(&dir, &["app.js".to_string()], 5).unwrap();
+        assert!(v_ok.checks_run >= 2);
+        assert!(v_ok.summary.contains("DOM/CSS cross-check ok"));
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -6,191 +6,621 @@
 <title>Kronos</title>
 <style>
   :root {
-    --bg:#fafaf9; --panel:#ffffff; --subtle:#f5f5f4; --text:#1c1917; --muted:#78716c;
-    --line:#e7e5e4; --me:#1c1917; --me-text:#fafaf9; --accent:#0d9488; --accent-ink:#ffffff;
+    --bg:#fafaf9; --panel:#ffffff; --subtle:#f4f4f2; --text:#18181b; --muted:#71717a;
+    --line:#e4e4e7; --me:#18181b; --me-text:#fafafa; --accent:#0d9488; --accent-ink:#ffffff;
     --ok-bg:#dcfce7; --ok-fg:#166534; --warn-bg:#fef3c7; --warn-fg:#92400e; --err-bg:#fee2e2; --err-fg:#991b1b;
     --info-bg:#ccfbf1; --info-fg:#115e59;
+    --diff-add-bg:#ecfdf5; --diff-add-fg:#065f46; --diff-del-bg:#fef2f2; --diff-del-fg:#991b1b;
+    --sb-bg:#131418; --sb-panel:#1c1e24; --sb-hover:#242730; --sb-active:#2a2d37;
+    --sb-text:#ececef; --sb-muted:#8e929f; --sb-line:rgba(255,255,255,0.08); --sb-dot:#3b82f6;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg:#0c0a09; --panel:#171513; --subtle:#1f1c19; --text:#f5f5f4; --muted:#a8a29e;
-      --line:#292524; --me:#f5f5f4; --me-text:#0c0a09; --accent:#14b8a6; --accent-ink:#042f2e;
+      --bg:#0d0e11; --panel:#15171c; --subtle:#1d2026; --text:#f4f4f5; --muted:#a1a1aa;
+      --line:#272a32; --me:#f4f4f5; --me-text:#0d0e11; --accent:#14b8a6; --accent-ink:#042f2e;
       --ok-bg:#052e16; --ok-fg:#86efac; --warn-bg:#451a03; --warn-fg:#fcd34d; --err-bg:#450a0a; --err-fg:#fca5a5;
       --info-bg:#134e4a; --info-fg:#99f6e4;
+      --diff-add-bg:rgba(16,185,129,0.14); --diff-add-fg:#6ee7b7;
+      --diff-del-bg:rgba(239,68,68,0.14); --diff-del-fg:#fca5a5;
     }
   }
   * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 -apple-system, BlinkMacSystemFont, "Inter", sans-serif; height:100dvh; display:flex; flex-direction:column; overflow:hidden; }
-  header { display:flex; align-items:center; gap:8px; padding:10px 14px; border-bottom:1px solid var(--line); background:var(--panel); z-index:3; flex-wrap:wrap; }
-  header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:-0.01em; }
-  header .model { color:var(--muted); font-size:12px; flex:1; min-width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  button, select, input { font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:5px 10px; }
-  button { cursor:pointer; transition:border-color .15s, background .15s; }
+  body {
+    margin:0; background:var(--bg); color:var(--text);
+    font:14px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+    height:100dvh; display:flex; overflow:hidden;
+  }
+  button, select, input, textarea {
+    font:inherit; color:var(--text); background:var(--panel);
+    border:1px solid var(--line); border-radius:8px; padding:5px 10px;
+  }
+  button { cursor:pointer; transition:border-color .14s, background .14s, opacity .14s; }
   button:hover:not(:disabled) { border-color:var(--muted); }
   button:disabled { opacity:.5; cursor:default; }
-  .seg { display:inline-flex; background:var(--subtle); border:1px solid var(--line); border-radius:9px; padding:2px; gap:2px; }
-  .seg button { border:none; background:transparent; padding:4px 11px; border-radius:7px; font-size:12.5px; color:var(--muted); }
-  .seg button.active { background:var(--panel); color:var(--text); font-weight:600; box-shadow:0 1px 2px rgba(0,0,0,0.08); }
-  .ctx-pill { font:11.5px ui-monospace, SFMono-Regular, Menlo, monospace; color:var(--muted); background:var(--subtle); border:1px solid var(--line); border-radius:999px; padding:3px 9px; white-space:nowrap; }
+
+  /* Left Sidebar (Reference Image 1 dark rail) */
+  #sidebar {
+    width:264px; min-width:264px; background:var(--sb-bg); color:var(--sb-text);
+    border-right:1px solid var(--sb-line); display:flex; flex-direction:column;
+    user-select:none; z-index:4; transition:margin-left .18s ease;
+  }
+  #sidebar.collapsed { display:none; }
+  .sb-top { padding:12px 12px 8px; display:flex; flex-direction:column; gap:6px; }
+  #btn-new-conv {
+    width:100%; display:flex; align-items:center; gap:9px; padding:8px 12px;
+    background:rgba(255,255,255,0.04); color:var(--sb-text);
+    border:1px solid var(--sb-line); border-radius:10px; font-weight:600; font-size:13.5px;
+    text-align:left;
+  }
+  #btn-new-conv:hover { background:var(--sb-hover); border-color:rgba(255,255,255,0.18); }
+  .sb-nav-btn {
+    width:100%; display:flex; align-items:center; justify-content:space-between; gap:9px;
+    padding:7px 10px; background:transparent; color:#c8cbd4; border:none; border-radius:8px;
+    font-size:13px; text-align:left;
+  }
+  .sb-nav-btn:hover, .sb-nav-btn.active { background:var(--sb-hover); color:#fff; }
+  .sb-nav-left { display:flex; align-items:center; gap:9px; min-width:0; }
+  .sb-badge {
+    font:11px ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding:1px 6px; border-radius:999px; background:var(--sb-panel); color:var(--sb-muted);
+  }
+  #sb-search-wrap { padding:0 12px 6px; display:none; }
+  #sb-search-wrap.open { display:block; }
+  #sess-search {
+    width:100%; background:var(--sb-panel); color:var(--sb-text);
+    border:1px solid var(--sb-line); border-radius:8px; padding:6px 9px; font-size:12.5px;
+    outline:none;
+  }
+  #sess-search::placeholder { color:var(--sb-muted); }
+
+  .sb-section-hdr {
+    display:flex; align-items:center; justify-content:space-between;
+    padding:10px 14px 5px; font-size:11.5px; font-weight:600; color:var(--sb-muted);
+    letter-spacing:0.01em;
+  }
+  .sb-hdr-actions { display:flex; align-items:center; gap:4px; }
+  .sb-icon-btn {
+    background:transparent; border:none; color:var(--sb-muted); padding:3px 6px;
+    border-radius:6px; font-size:13px; line-height:1;
+  }
+  .sb-icon-btn:hover { background:var(--sb-hover); color:var(--sb-text); }
+
+  #add-proj-box {
+    display:none; padding:4px 12px 8px; gap:5px; flex-direction:column;
+  }
+  #add-proj-box.open { display:flex; }
+  #add-proj-input {
+    width:100%; background:var(--sb-panel); color:var(--sb-text);
+    border:1px solid var(--sb-line); border-radius:7px; padding:5px 8px; font-size:12px;
+  }
+  .add-proj-btns { display:flex; gap:5px; justify-content:flex-end; }
+  .add-proj-btns button {
+    font-size:11.5px; padding:3px 9px; border-radius:6px;
+    background:var(--sb-panel); color:var(--sb-text); border:1px solid var(--sb-line);
+  }
+
+  #sb-scroll {
+    flex:1; overflow-y:auto; padding:2px 8px 12px; display:flex; flex-direction:column; gap:10px;
+  }
+  .proj-group { display:flex; flex-direction:column; gap:2px; }
+  .proj-hdr {
+    display:flex; align-items:center; gap:7px; padding:5px 8px; border-radius:7px;
+    color:var(--sb-muted); font-size:12.5px; cursor:pointer;
+  }
+  .proj-hdr:hover { background:var(--sb-hover); color:var(--sb-text); }
+  .proj-hdr.active-proj { color:#e4e6ec; font-weight:500; }
+  .proj-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .proj-empty { padding:3px 8px 4px 26px; font-size:12px; color:#676b78; }
+  .sess-row {
+    group:sess; display:flex; align-items:center; gap:7px; padding:6px 9px 6px 24px;
+    border-radius:8px; cursor:pointer; color:#d2d5dd; font-size:13px; position:relative;
+  }
+  .sess-row.top-pill { padding-left:11px; }
+  .sess-row:hover { background:var(--sb-hover); color:#fff; }
+  .sess-row.active { background:var(--sb-active); color:#fff; font-weight:500; }
+  .sess-title { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .sess-meta {
+    display:flex; align-items:center; gap:5px; font-size:11px; color:var(--sb-muted); flex-shrink:0;
+  }
+  .sess-diff {
+    font:10.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+    color:#34d399;
+  }
+  .sess-dot {
+    width:7px; height:7px; border-radius:999px; background:var(--sb-dot); display:inline-block;
+  }
+  .sess-del {
+    display:none; border:none; background:transparent; color:var(--sb-muted);
+    padding:0 4px; font-size:14px; line-height:1; border-radius:4px;
+  }
+  .sess-del:hover { color:#f87171; background:rgba(248,113,113,0.12); }
+  .sess-row:hover .sess-del { display:inline-block; }
+  .sess-row:hover .sess-time { display:none; }
+  .see-all-btn {
+    border:none; background:transparent; color:var(--sb-muted); font-size:12px;
+    text-align:left; padding:4px 8px 4px 24px; border-radius:6px;
+  }
+  .see-all-btn:hover { color:var(--sb-text); background:var(--sb-hover); }
+
+  .sb-footer {
+    border-top:1px solid var(--sb-line); padding:9px 10px;
+    display:flex; align-items:center; justify-content:space-between; gap:8px; position:relative;
+  }
+  #sb-settings-btn {
+    flex:1; display:flex; align-items:center; gap:8px; background:transparent;
+    border:none; color:#c8cbd4; padding:6px 8px; border-radius:8px; font-size:13px; text-align:left;
+  }
+  #sb-settings-btn:hover { background:var(--sb-hover); color:#fff; }
+  .sb-shortcut-hint {
+    font:11px ui-monospace, SFMono-Regular, Menlo, monospace;
+    color:var(--sb-muted); padding:2px 6px; border:1px solid var(--sb-line); border-radius:6px;
+  }
+
+  /* Settings popover */
+  #settings-popover {
+    display:none; position:fixed; left:14px; bottom:52px; width:292px;
+    background:var(--panel); color:var(--text); border:1px solid var(--line);
+    border-radius:12px; padding:12px 14px; z-index:30;
+    box-shadow:0 14px 36px rgba(0,0,0,0.32);
+  }
+  #settings-popover.open { display:block; }
+  .settings-hdr {
+    display:flex; align-items:center; justify-content:space-between;
+    font-weight:600; font-size:13px; margin-bottom:8px;
+  }
+  #settings-popover label {
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+    margin:7px 0; font-size:12px; color:var(--text);
+  }
+  #settings-popover input, #settings-popover select {
+    width:142px; font-size:12px; padding:4px 7px;
+  }
+  .settings-note {
+    margin-top:8px; padding-top:8px; border-top:1px solid var(--line);
+    font-size:11.5px; color:var(--muted); line-height:1.45;
+  }
+
+  /* Main content shell */
+  #main-shell { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
+  header {
+    display:flex; align-items:center; gap:8px; padding:9px 14px;
+    border-bottom:1px solid var(--line); background:var(--panel); z-index:3; flex-wrap:wrap;
+  }
+  #sidebar-toggle {
+    padding:5px 8px; display:inline-flex; align-items:center; justify-content:center;
+    color:var(--muted);
+  }
+  .hdr-title-wrap { display:flex; align-items:center; gap:8px; min-width:0; flex:1; }
+  header h1 {
+    font-size:14.5px; margin:0; font-weight:600; letter-spacing:-0.01em;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .proj-chip {
+    font:11.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+    color:var(--muted); background:var(--subtle); border:1px solid var(--line);
+    border-radius:7px; padding:2px 8px; max-width:220px; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap;
+  }
+  header .model {
+    color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .seg {
+    display:inline-flex; background:var(--subtle); border:1px solid var(--line);
+    border-radius:9px; padding:2px; gap:2px;
+  }
+  .seg button {
+    border:none; background:transparent; padding:4px 10px; border-radius:7px;
+    font-size:12px; color:var(--muted);
+  }
+  .seg button.active {
+    background:var(--panel); color:var(--text); font-weight:600;
+    box-shadow:0 1px 2px rgba(0,0,0,0.08);
+  }
+  .ctx-pill {
+    font:11.5px ui-monospace, SFMono-Regular, Menlo, monospace; color:var(--muted);
+    background:var(--subtle); border:1px solid var(--line); border-radius:999px;
+    padding:3px 9px; white-space:nowrap;
+  }
   .ctx-pill.high { background:var(--warn-bg); color:var(--warn-fg); border-color:transparent; }
   #ws-toggle.active { border-color:var(--accent); color:var(--accent); }
-  details.menu { position:relative; font-size:13px; color:var(--muted); }
-  details.menu > summary { list-style:none; cursor:pointer; padding:5px 10px; border:1px solid var(--line); border-radius:8px; background:var(--panel); color:var(--text); }
-  details.menu > summary::-webkit-details-marker { display:none; }
-  .settings { position:absolute; right:0; top:38px; width:270px; background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; z-index:5; box-shadow:0 8px 24px rgba(0,0,0,0.18); }
-  .settings label { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:6px 0; color:var(--text); font-size:12px; }
-  .settings input, .settings select { width:130px; font-size:12px; padding:4px 7px; }
 
-  #layout { flex:1; display:flex; min-height:0; overflow:hidden; }
-  #chat-col { flex:1; display:flex; flex-direction:column; min-width:320px; min-height:0; position:relative; }
-  #chat-col.drag-over { outline:2px dashed var(--accent); outline-offset:-6px; }
-  #log { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:10px; max-width:860px; width:100%; margin:0 auto; }
-  .msg { padding:10px 14px; border-radius:12px; white-space:pre-wrap; word-wrap:break-word; max-width:90%; }
-  .user { align-self:flex-end; background:var(--me); color:var(--me-text); display:flex; flex-direction:column; gap:8px; }
-  .user-imgs { display:flex; flex-wrap:wrap; gap:6px; }
-  .user-imgs img { max-height:130px; max-width:220px; border-radius:8px; object-fit:cover; border:1px solid rgba(128,128,128,0.3); }
-  .reply { align-self:flex-start; background:var(--panel); border:1px solid var(--line); width:100%; max-width:93%; white-space:normal; }
-  .reply-head { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:6px; }
-  .reply-prose { white-space:pre-wrap; word-wrap:break-word; }
-  .reply code { font:12.5px ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--subtle); padding:1px 4px; border-radius:4px; }
-  .reply pre { background:var(--subtle); border:1px solid var(--line); border-radius:8px; padding:10px; overflow-x:auto; white-space:pre; margin:6px 0; }
+  #layout { flex:1; display:flex; min-height:0; overflow:hidden; position:relative; }
+  #chat-col {
+    flex:1; display:flex; flex-direction:column; min-width:320px; min-height:0; position:relative;
+  }
+  #chat-col.drag-over::after {
+    content:"Drop PDF, code, CSV, DOCX, ZIP, or image files to attach";
+    position:absolute; inset:12px; border:2px dashed var(--accent); border-radius:14px;
+    background:rgba(13,148,136,0.08); color:var(--accent); font-weight:600;
+    display:flex; align-items:center; justify-content:center; pointer-events:none; z-index:10;
+  }
+  #log {
+    flex:1; overflow-y:auto; padding:18px 18px 12px; display:flex; flex-direction:column;
+    gap:12px; max-width:860px; width:100%; margin:0 auto;
+  }
+  .msg { padding:11px 14px; border-radius:12px; white-space:pre-wrap; word-wrap:break-word; max-width:92%; }
+  .user {
+    align-self:flex-end; background:var(--me); color:var(--me-text);
+    display:flex; flex-direction:column; gap:8px;
+  }
+  .user-atts { display:flex; flex-wrap:wrap; gap:6px; }
+  .user-atts img {
+    max-height:130px; max-width:220px; border-radius:8px; object-fit:cover;
+    border:1px solid rgba(128,128,128,0.3);
+  }
+  .user-file-pill {
+    display:inline-flex; align-items:center; gap:6px; padding:4px 9px;
+    border-radius:8px; background:rgba(128,128,128,0.22); font-size:12px;
+  }
+  .user-file-ext {
+    font:700 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+    text-transform:uppercase; padding:1px 5px; border-radius:4px;
+    background:rgba(20,184,166,0.28);
+  }
+  .reply {
+    align-self:flex-start; background:var(--panel); border:1px solid var(--line);
+    width:100%; max-width:95%; white-space:normal;
+  }
+  .reply-head { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:7px; }
+  .reply-prose { white-space:pre-wrap; word-wrap:break-word; line-height:1.56; }
+  .reply code {
+    font:12.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+    background:var(--subtle); padding:1px 5px; border-radius:4px;
+  }
+  .reply pre {
+    background:var(--subtle); border:1px solid var(--line); border-radius:8px;
+    padding:10px 12px; overflow-x:auto; white-space:pre; margin:7px 0;
+  }
   .reply pre code { background:none; padding:0; }
-  .stats { align-self:flex-start; color:var(--muted); font-size:12px; margin-top:-4px; }
-  .empty { margin:auto; color:var(--muted); text-align:center; max-width:440px; line-height:1.65; }
+  .stats { align-self:flex-start; color:var(--muted); font-size:11.5px; margin-top:-6px; }
+  .empty {
+    margin:auto; color:var(--muted); text-align:center; max-width:480px; line-height:1.65;
+    display:flex; flex-direction:column; gap:12px; align-items:center;
+  }
+  .empty-hints { display:flex; flex-wrap:wrap; gap:6px; justify-content:center; }
+  .hint-chip {
+    font-size:12px; padding:5px 10px; border-radius:999px; background:var(--panel);
+    border:1px solid var(--line); color:var(--text); cursor:pointer;
+  }
+  .hint-chip:hover { border-color:var(--accent); color:var(--accent); }
 
-  .agent-steps { display:flex; flex-direction:column; gap:6px; margin-bottom:8px; }
+  .agent-steps { display:flex; flex-direction:column; gap:6px; margin-bottom:9px; }
   .agent-steps:empty { display:none; }
-  .step-line { font-size:11.5px; color:var(--muted); display:flex; align-items:center; justify-content:space-between; gap:8px; padding:2px 0; }
+  .step-line {
+    font-size:11.5px; color:var(--muted); display:flex; align-items:center;
+    justify-content:space-between; gap:8px; padding:2px 0;
+  }
   .step-perf { font:11.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
-  details.tool-card { border:1px solid var(--line); background:var(--subtle); border-radius:8px; overflow:hidden; font-size:12.5px; }
-  details.tool-card > summary { cursor:pointer; padding:6px 10px; display:flex; align-items:center; gap:8px; user-select:none; }
+  details.tool-card, details.verify-card {
+    border:1px solid var(--line); background:var(--subtle); border-radius:8px;
+    overflow:hidden; font-size:12.5px;
+  }
+  details.verify-card { border-color:rgba(22,163,74,0.35); background:var(--ok-bg); color:var(--ok-fg); }
+  details.tool-card > summary, details.verify-card > summary {
+    cursor:pointer; padding:6px 10px; display:flex; align-items:center; gap:8px; user-select:none;
+  }
   .tool-name { font:600 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .tool-target { color:var(--muted); font:12px ui-monospace, SFMono-Regular, Menlo, monospace; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .tool-target {
+    color:var(--muted); font:12px ui-monospace, SFMono-Regular, Menlo, monospace;
+    flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .diff-stat { font:600 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; display:inline-flex; gap:5px; }
+  .diff-stat .add { color:#10b981; }
+  .diff-stat .del { color:#ef4444; }
   .pill { font-size:11px; padding:1px 7px; border-radius:999px; font-weight:500; white-space:nowrap; }
   .pill.run { background:var(--line); color:var(--muted); }
   .pill.ok { background:var(--ok-bg); color:var(--ok-fg); }
   .pill.warn { background:var(--warn-bg); color:var(--warn-fg); }
   .pill.err { background:var(--err-bg); color:var(--err-fg); }
   .pill.info { background:var(--info-bg); color:var(--info-fg); }
-  .tool-body { border-top:1px solid var(--line); padding:8px 10px; background:var(--panel); font:12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; max-height:220px; overflow:auto; color:var(--muted); }
-  .repair-banner { font-size:12px; padding:6px 10px; border-radius:8px; background:var(--warn-bg); color:var(--warn-fg); white-space:pre-wrap; }
-  .compact-banner { font-size:12px; padding:5px 10px; border-radius:8px; background:var(--info-bg); color:var(--info-fg); align-self:center; }
+  .tool-body {
+    border-top:1px solid var(--line); padding:8px 10px; background:var(--panel);
+    font:12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space:pre-wrap; max-height:250px; overflow:auto; color:var(--muted);
+  }
+  .verify-body {
+    border-top:1px solid rgba(22,163,74,0.25); padding:8px 10px; background:var(--panel);
+    color:var(--text); font:12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .diff-box {
+    border:1px solid var(--line); border-radius:7px; overflow:auto; max-height:240px;
+    background:var(--bg); font:11.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+    margin-top:6px;
+  }
+  .diff-line { padding:1px 8px; white-space:pre; }
+  .diff-line.add { background:var(--diff-add-bg); color:var(--diff-add-fg); }
+  .diff-line.del { background:var(--diff-del-bg); color:var(--diff-del-fg); }
+  .diff-line.hunk { color:var(--accent); font-weight:600; background:var(--subtle); }
+  .diff-actions {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:6px;
+  }
+  .mini-btn { font-size:11.5px; padding:2px 8px; border-radius:6px; }
+  .repair-banner {
+    font-size:12px; padding:6px 10px; border-radius:8px;
+    background:var(--warn-bg); color:var(--warn-fg); white-space:pre-wrap;
+  }
+  .compact-banner {
+    font-size:12px; padding:5px 10px; border-radius:8px;
+    background:var(--info-bg); color:var(--info-fg); align-self:center;
+  }
 
-  form { display:flex; flex-direction:column; gap:8px; padding:10px 16px 14px; border-top:1px solid var(--line); max-width:860px; width:100%; margin:0 auto; }
-  #img-tray { display:none; flex-wrap:wrap; gap:8px; }
-  #img-tray.has-items { display:flex; }
-  .img-chip { position:relative; display:inline-flex; align-items:center; gap:7px; padding:4px 8px 4px 4px; border:1px solid var(--line); border-radius:9px; background:var(--panel); font-size:11.5px; color:var(--muted); }
-  .img-chip img { width:40px; height:40px; object-fit:cover; border-radius:6px; }
-  .img-chip button { border:none; background:var(--subtle); color:var(--text); border-radius:999px; width:20px; height:20px; padding:0; line-height:1; font-size:13px; }
+  /* Composer */
+  form#form {
+    display:flex; flex-direction:column; gap:8px; padding:10px 18px 14px;
+    border-top:1px solid var(--line); max-width:860px; width:100%; margin:0 auto;
+  }
+  #att-tray { display:none; flex-wrap:wrap; gap:8px; }
+  #att-tray.has-items { display:flex; }
+  .att-chip {
+    display:inline-flex; align-items:center; gap:7px; padding:4px 8px 4px 5px;
+    border:1px solid var(--line); border-radius:9px; background:var(--panel);
+    font-size:12px; color:var(--text); max-width:260px;
+  }
+  .att-chip img { width:36px; height:36px; object-fit:cover; border-radius:6px; flex-shrink:0; }
+  .att-ext {
+    font:700 10px ui-monospace, SFMono-Regular, Menlo, monospace; text-transform:uppercase;
+    padding:3px 6px; border-radius:5px; background:var(--info-bg); color:var(--info-fg); flex-shrink:0;
+  }
+  .att-info { display:flex; flex-direction:column; min-width:0; line-height:1.25; }
+  .att-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+  .att-sub { font-size:10.5px; color:var(--muted); }
+  .att-chip button {
+    border:none; background:var(--subtle); color:var(--text); border-radius:999px;
+    width:20px; height:20px; padding:0; line-height:1; font-size:13px; flex-shrink:0;
+  }
   .composer-row { display:flex; gap:8px; align-items:flex-end; }
-  #attach-btn { height:42px; padding:0 11px; display:inline-flex; align-items:center; gap:5px; font-size:13px; color:var(--muted); }
-  textarea { flex:1; resize:none; font:inherit; color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; min-height:42px; max-height:200px; }
-  #send { background:var(--accent); color:var(--accent-ink); border:none; height:42px; padding:0 18px; font-weight:600; }
+  #attach-btn {
+    height:42px; padding:0 12px; display:inline-flex; align-items:center; gap:5px;
+    font-size:13px; color:var(--muted); flex-shrink:0;
+  }
+  textarea#input {
+    flex:1; resize:none; min-height:42px; max-height:200px; padding:10px 12px;
+    border-radius:10px; line-height:1.45;
+  }
+  #send {
+    background:var(--accent); color:var(--accent-ink); border:none;
+    height:42px; padding:0 18px; font-weight:600; flex-shrink:0;
+  }
 
-  #ws-pane { width:50%; min-width:340px; border-left:1px solid var(--line); background:var(--panel); display:flex; flex-direction:column; min-height:0; }
+  /* Drag Resizer & Closeable Adaptive Workspace Pane */
+  #ws-resizer {
+    width:5px; cursor:col-resize; background:transparent; border-left:1px solid var(--line);
+    transition:background .12s; flex-shrink:0;
+  }
+  #ws-resizer:hover, #ws-resizer.dragging { background:var(--accent); }
+  #ws-resizer.hidden { display:none; }
+
+  #ws-pane {
+    width:48%; min-width:320px; max-width:74%; background:var(--panel);
+    display:flex; flex-direction:column; min-height:0;
+  }
   #ws-pane.hidden { display:none; }
-  .ws-bar { display:flex; align-items:center; gap:8px; padding:8px 12px; border-bottom:1px solid var(--line); background:var(--subtle); flex-wrap:wrap; }
-  #file-select { flex:1; min-width:130px; font:12.5px ui-monospace, SFMono-Regular, Menlo, monospace; padding:4px 8px; }
-  .ws-link { font-size:12px; color:var(--text); text-decoration:none; padding:4px 9px; border:1px solid var(--line); border-radius:7px; background:var(--panel); }
+  .ws-bar {
+    display:flex; align-items:center; gap:5px; padding:7px 9px;
+    border-bottom:1px solid var(--line); background:var(--subtle); flex-wrap:nowrap; overflow-x:auto;
+  }
+  .ws-bar button, .ws-bar .ws-link { padding:4px 8px; font-size:12px; white-space:nowrap; flex-shrink:0; }
+  .ws-bar .seg { flex-shrink:0; }
+  .ws-bar .seg button { padding:3px 8px; font-size:12px; }
+  #file-select {
+    flex:1; min-width:76px; max-width:165px; font:11.5px ui-monospace, SFMono-Regular, Menlo, monospace; padding:3px 6px;
+  }
+  .ws-link {
+    font-size:12px; color:var(--text); text-decoration:none; padding:4px 8px;
+    border:1px solid var(--line); border-radius:7px; background:var(--panel);
+  }
+  #ws-close {
+    width:27px; height:27px; padding:0; margin-left:auto; display:inline-flex; align-items:center;
+    justify-content:center; font-size:16px; line-height:1; color:var(--muted);
+    border-radius:7px; flex-shrink:0;
+  }
+  #ws-close:hover { color:var(--text); background:var(--panel); }
+
   .ws-body { flex:1; position:relative; min-height:0; display:flex; flex-direction:column; }
   #preview-wrap { flex:1; display:flex; flex-direction:column; min-height:0; background:#fff; }
   #preview-frame { flex:1; width:100%; border:none; background:#fff; }
-  #preview-empty { flex:1; display:flex; align-items:center; justify-content:center; color:var(--muted); background:var(--bg); padding:24px; text-align:center; }
+  #preview-empty {
+    flex:1; display:flex; align-items:center; justify-content:center;
+    color:var(--muted); background:var(--bg); padding:24px; text-align:center;
+  }
   #code-wrap { flex:1; display:none; flex-direction:column; min-height:0; background:var(--bg); }
-  .code-meta { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 12px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); background:var(--panel); }
-  #code-view { flex:1; margin:0; padding:12px; overflow:auto; font:12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre; color:var(--text); }
-  @media (max-width: 900px) {
+  .code-meta {
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+    padding:6px 12px; border-bottom:1px solid var(--line); font-size:12px;
+    color:var(--muted); background:var(--panel);
+  }
+  #code-view {
+    flex:1; margin:0; padding:12px; overflow:auto;
+    font:12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space:pre; color:var(--text);
+  }
+  #changes-wrap {
+    flex:1; display:none; flex-direction:column; min-height:0; background:var(--bg);
+    overflow-y:auto; padding:12px; gap:10px;
+  }
+  .change-card {
+    border:1px solid var(--line); border-radius:10px; background:var(--panel); overflow:hidden;
+  }
+  .change-hdr {
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+    padding:8px 11px; background:var(--subtle); border-bottom:1px solid var(--line);
+    font-size:12px;
+  }
+  .change-path { font:600 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .change-sub { font-size:11px; color:var(--muted); padding:4px 11px 0; }
+  .change-body { padding:6px 11px 10px; }
+
+  @media (max-width: 960px) {
+    #sidebar { position:fixed; inset:0 auto 0 0; height:100dvh; box-shadow:12px 0 32px rgba(0,0,0,0.45); }
     #layout { flex-direction:column; }
-    #ws-pane { width:100%; height:48%; border-left:none; border-top:1px solid var(--line); }
+    #ws-resizer { display:none; }
+    #ws-pane { width:100%; max-width:100%; height:48%; border-top:1px solid var(--line); }
   }
 </style>
 </head>
 <body>
-<header>
-  <h1>Kronos</h1>
-  <span class="model" id="model">connecting…</span>
-  <span class="ctx-pill" id="ctx-meter" title="Active prompt tokens / context capacity">ctx 0 / 16.4k</span>
-  <button id="compact-btn" type="button" title="Compact older history while preserving workspace state">Compact</button>
-  <button id="ws-toggle" type="button">Workspace (<span id="ws-count">0</span>)</button>
-  <details class="menu">
-    <summary>Settings</summary>
-    <div class="settings">
-      <label>Routing
-        <select id="route-mode">
-          <option value="auto" selected>Auto (Chat + Agent)</option>
-          <option value="chat">Force Chat</option>
-          <option value="agent">Force Agent</option>
-        </select>
-      </label>
-      <label>Temperature <input id="temp" type="number" step="0.05" min="0" max="2" placeholder="auto"></label>
-      <label>Max tokens <input id="maxtok" type="number" min="1" max="16384" placeholder="auto"></label>
-      <label>Max steps <input id="maxsteps" type="number" min="1" max="24" value="10"></label>
-      <label>System <input id="system" placeholder="default"></label>
-      <label>API key <input id="key" type="password" placeholder="if required"></label>
-    </div>
-  </details>
-  <button id="new" type="button">New session</button>
-</header>
+<aside id="sidebar">
+  <div class="sb-top">
+    <button id="btn-new-conv" type="button" title="Start a new conversation (Cmd+N)">
+      <span>+</span><span>New Conversation</span>
+    </button>
+    <button id="nav-history" class="sb-nav-btn" type="button" title="Search and filter conversation history">
+      <span class="sb-nav-left">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></svg>
+        <span>Conversation History</span>
+      </span>
+      <span class="sb-badge" id="sb-total-sessions">0</span>
+    </button>
+    <button id="nav-changes" class="sb-nav-btn" type="button" title="Inspect historical diffs and revert file checkpoints">
+      <span class="sb-nav-left">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 15h6"/><path d="M12 12v6"/></svg>
+        <span>Historical Changes</span>
+      </span>
+      <span class="sb-badge" id="sb-total-changes">0</span>
+    </button>
+  </div>
 
-<div id="layout">
-  <section id="chat-col">
-    <main id="log">
-      <div class="empty" id="empty">Ask questions, paste or drop images (Cmd+V), or describe software to build and edit live in the workspace. Routing between direct chat and workspace tools happens automatically.</div>
-    </main>
-    <form id="form">
-      <div id="img-tray"></div>
-      <div class="composer-row">
-        <input id="file-input" type="file" accept="image/*" multiple hidden>
-        <button id="attach-btn" type="button" title="Attach image or paste with Cmd+V">+ Image</button>
-        <textarea id="input" rows="1" placeholder="Ask anything, build or style workspace files, or paste an image (Cmd+V)…" autofocus></textarea>
-        <button id="send" type="submit">Send</button>
-      </div>
-    </form>
-  </section>
+  <div id="sb-search-wrap">
+    <input id="sess-search" type="search" placeholder="Filter conversations or projects…">
+  </div>
 
-  <aside id="ws-pane" class="hidden">
-    <div class="ws-bar">
-      <div class="seg">
-        <button id="tab-preview" type="button" class="active">Preview</button>
-        <button id="tab-code" type="button">Code</button>
-      </div>
-      <select id="file-select" aria-label="Workspace file"></select>
-      <button id="ws-reload" type="button">Reload</button>
-      <a id="ws-open" class="ws-link" href="/preview/index.html" target="_blank" rel="noopener">Open</a>
-      <button id="ws-clear" type="button">Clear</button>
+  <div class="sb-section-hdr">
+    <span>Projects</span>
+    <div class="sb-hdr-actions">
+      <button id="btn-filter-proj" class="sb-icon-btn" type="button" title="Filter conversations">≡</button>
+      <button id="btn-add-proj" class="sb-icon-btn" type="button" title="Open or create project workspace folder">+</button>
     </div>
-    <div class="ws-body">
-      <div id="preview-wrap">
-        <div class="code-meta" id="preview-meta" style="display:none">
-          <span id="preview-title">preview</span>
-          <span id="preview-url"></span>
-        </div>
-        <div id="preview-empty">No HTML file in workspace yet.</div>
-        <iframe id="preview-frame" title="Workspace preview" style="display:none"></iframe>
-      </div>
-      <div id="code-wrap">
-        <div class="code-meta">
-          <span id="code-path">no file selected</span>
-          <span id="code-status" class="pill run">empty</span>
-        </div>
-        <pre id="code-view"></pre>
-      </div>
+  </div>
+
+  <div id="add-proj-box">
+    <input id="add-proj-input" type="text" placeholder="/path/to/project or ~/project">
+    <div class="add-proj-btns">
+      <button id="add-proj-cancel" type="button">Cancel</button>
+      <button id="add-proj-save" type="button">Open Folder</button>
     </div>
-  </aside>
+  </div>
+
+  <div id="sb-scroll"></div>
+
+  <div class="sb-footer">
+    <button id="sb-settings-btn" type="button">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      <span>Settings</span>
+    </button>
+    <span class="sb-shortcut-hint" title="Global macOS Quick Prompt shortcut">⌥Space</span>
+  </div>
+</aside>
+
+<div id="settings-popover">
+  <div class="settings-hdr">
+    <span>Kronos Engine Settings</span>
+    <button id="settings-close" class="mini-btn" type="button">Close</button>
+  </div>
+  <label>Routing
+    <select id="route-mode">
+      <option value="auto" selected>Auto (Chat + Agent)</option>
+      <option value="chat">Force Chat</option>
+      <option value="agent">Force Agent</option>
+    </select>
+  </label>
+  <label>Temperature <input id="temp" type="number" step="0.05" min="0" max="2" placeholder="auto"></label>
+  <label>Max tokens <input id="maxtok" type="number" min="1" max="16384" placeholder="auto"></label>
+  <label>Max steps <input id="maxsteps" type="number" min="1" max="24" value="10"></label>
+  <label>System <input id="system" placeholder="default"></label>
+  <label>API key <input id="key" type="password" placeholder="if required"></label>
+  <div class="settings-note">
+    Menu bar launcher: press <code>⌥Space</code> or <code>⌘⇧K</code> anywhere on macOS to open the floating Quick Prompt HUD.
+  </div>
+</div>
+
+<div id="main-shell">
+  <header>
+    <button id="sidebar-toggle" type="button" title="Toggle sidebar (Cmd+B)" aria-label="Toggle sidebar">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></svg>
+    </button>
+    <div class="hdr-title-wrap">
+      <h1 id="conv-heading">Kronos</h1>
+      <span class="proj-chip" id="proj-chip" title="Active workspace directory">workspace</span>
+      <span class="model" id="model">connecting…</span>
+    </div>
+    <span class="ctx-pill" id="ctx-meter" title="Active prompt tokens / context capacity">ctx 0 / 16.4k</span>
+    <button id="compact-btn" type="button" title="Compact older history while preserving workspace state">Compact</button>
+    <button id="ws-toggle" type="button" title="Open or close workspace preview and diff inspector">Workspace (<span id="ws-count">0</span>)</button>
+  </header>
+
+  <div id="layout">
+    <section id="chat-col">
+      <main id="log"></main>
+      <form id="form">
+        <div id="att-tray"></div>
+        <div class="composer-row">
+          <input id="file-input" type="file" multiple hidden>
+          <button id="attach-btn" type="button" title="Attach or paste PDF, code, CSV, DOCX, ZIP, or images (Cmd+V)">+ Attach</button>
+          <textarea id="input" rows="1" placeholder="Ask anything, build software, or paste files (⌘V)…" autofocus></textarea>
+          <button id="send" type="submit">Send</button>
+        </div>
+      </form>
+    </section>
+
+    <div id="ws-resizer" class="hidden" title="Drag to resize workspace pane"></div>
+
+    <aside id="ws-pane" class="hidden">
+      <div class="ws-bar">
+        <div class="seg">
+          <button id="tab-preview" type="button" class="active">Preview</button>
+          <button id="tab-code" type="button">Code</button>
+          <button id="tab-changes" type="button">Changes (<span id="changes-count">0</span>)</button>
+        </div>
+        <select id="file-select" aria-label="Workspace file"></select>
+        <button id="ws-reload" type="button" title="Reload workspace files and preview">Reload</button>
+        <a id="ws-open" class="ws-link" href="/preview/index.html" target="_blank" rel="noopener">Open ↗</a>
+        <button id="ws-clear" type="button" title="Clear workspace directory files">Clear</button>
+        <button id="ws-close" type="button" title="Close preview window" aria-label="Close preview window">×</button>
+      </div>
+      <div class="ws-body">
+        <div id="preview-wrap">
+          <div class="code-meta" id="preview-meta" style="display:none">
+            <span id="preview-title">preview</span>
+            <span id="preview-url"></span>
+          </div>
+          <div id="preview-empty">No HTML preview file in this workspace yet. Switch to Code or Changes to inspect files.</div>
+          <iframe id="preview-frame" title="Workspace preview" style="display:none"></iframe>
+        </div>
+        <div id="code-wrap">
+          <div class="code-meta">
+            <span id="code-path">no file selected</span>
+            <span id="code-status" class="pill run">empty</span>
+          </div>
+          <pre id="code-view"></pre>
+        </div>
+        <div id="changes-wrap"></div>
+      </div>
+    </aside>
+  </div>
 </div>
 
 <script>
 const $ = (id) => document.getElementById(id);
-const log = $("log"), input = $("input"), send = $("send"), imgTray = $("img-tray");
+const log = $("log"), input = $("input"), send = $("send"), attTray = $("att-tray");
+
+let currentSessionId = "";
+let currentSessionTitle = "";
+let currentCreatedAt = 0;
 let sessionHistory = [];
-let pendingImages = [];
+let sessionTurns = [];
+let sessionChanges = [];
+let allSessions = [];
+let allProjects = [];
+let expandedProjects = new Set();
+
+let pendingAttachments = [];
 let wsFiles = [];
 let wsWorkdir = "";
 let previewPath = "";
 let wsTab = "preview";
+let userClosedWs = false;
 let ctxUsed = 0;
 let ctxLimit = 16384;
-let autoOpenedInitialWs = false;
 
 const store = (k, v) => {
   try {
@@ -200,10 +630,25 @@ const store = (k, v) => {
   return v;
 };
 
-for (const [id, key] of [["system", "kronos-system"], ["key", "kronos-key"], ["maxsteps", "kronos-maxsteps"], ["temp", "kronos-u-temp"], ["maxtok", "kronos-u-maxtok"], ["route-mode", "kronos-route-mode"]]) {
+for (const [id, key] of [
+  ["system", "kronos-system"],
+  ["key", "kronos-key"],
+  ["maxsteps", "kronos-maxsteps"],
+  ["temp", "kronos-u-temp"],
+  ["maxtok", "kronos-u-maxtok"],
+  ["route-mode", "kronos-route-mode"]
+]) {
   const saved = store(key);
   if (saved !== null && saved !== undefined && saved !== "") $(id).value = saved;
   $(id).addEventListener("change", () => store(key, $(id).value));
+}
+
+if (store("kronos-sb-collapsed") === "1") {
+  $("sidebar").classList.add("collapsed");
+}
+const savedWsWidth = store("kronos-ws-width");
+if (savedWsWidth) {
+  $("ws-pane").style.width = savedWsWidth;
 }
 
 const headers = () => {
@@ -216,23 +661,34 @@ function fmtK(n) {
   return n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
 }
 
-function updateCtxMeter(used, limit) {
-  if (typeof used === "number") ctxUsed = used;
-  if (typeof limit === "number" && limit > 0) ctxLimit = limit;
-  const el = $("ctx-meter");
-  el.textContent = `ctx ${fmtK(ctxUsed)} / ${fmtK(ctxLimit)}`;
-  el.classList.toggle("high", ctxLimit > 0 && ctxUsed / ctxLimit >= 0.62);
+function fmtBytes(n) {
+  if (!n || n < 1024) return `${n || 0} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-fetch("/v1/models", { headers: headers() }).then(r => r.json())
-  .then(j => $("model").textContent = j.data ? j.data[0].id : (j.error?.message || "unavailable"))
-  .catch(() => $("model").textContent = "server unreachable");
+function fmtRelTime(sec) {
+  if (!sec) return "now";
+  const diff = Math.max(0, Math.floor(Date.now() / 1000) - sec);
+  if (diff < 60) return "now";
+  if (diff < 3600) return Math.floor(diff / 60) + "m";
+  if (diff < 86400) return Math.floor(diff / 3600) + "h";
+  if (diff < 86400 * 30) return Math.floor(diff / 86400) + "d";
+  return Math.floor(diff / (86400 * 30)) + "mo";
+}
+
+function baseName(p) {
+  if (!p) return "workspace";
+  const clean = p.replace(/\/+$/, "");
+  const parts = clean.split("/");
+  return parts[parts.length - 1] || clean;
+}
 
 function escHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function render(md) {
+function renderMd(md) {
   const esc = escHtml(md);
   return esc.split(/```/).map((part, i) => {
     if (i % 2) return "<pre><code>" + part.replace(/^[\w+-]*\n/, "") + "</code></pre>";
@@ -242,29 +698,293 @@ function render(md) {
   }).join("");
 }
 
+function updateCtxMeter(used, limit) {
+  if (typeof used === "number") ctxUsed = used;
+  if (typeof limit === "number" && limit > 0) ctxLimit = limit;
+  const el = $("ctx-meter");
+  el.textContent = `ctx ${fmtK(ctxUsed)} / ${fmtK(ctxLimit)}`;
+  el.classList.toggle("high", ctxLimit > 0 && ctxUsed / ctxLimit >= 0.62);
+}
+
+function renderEmptyState() {
+  log.innerHTML = "";
+  const wrap = document.createElement("div");
+  wrap.className = "empty";
+  wrap.id = "empty";
+  wrap.innerHTML = `
+    <div>Ask questions, paste or drag PDF, code, CSV, DOCX, or images (<code>Cmd+V</code>), or build and verify software live in your workspace.</div>
+    <div class="empty-hints">
+      <button type="button" class="hint-chip" data-prompt="Build a clean dark-mode Pomodoro timer app with sound toggle and task list">Build Pomodoro web app</button>
+      <button type="button" class="hint-chip" data-prompt="Inspect the files in this workspace and summarize the architecture">Summarize workspace</button>
+      <button type="button" class="hint-chip" data-prompt="Explain how speculative decoding accelerates local 14B inference on Apple Silicon">Explain speculative decoding</button>
+    </div>
+  `;
+  wrap.querySelectorAll(".hint-chip").forEach(btn => {
+    btn.onclick = () => {
+      input.value = btn.dataset.prompt || "";
+      input.focus();
+      input.dispatchEvent(new Event("input"));
+    };
+  });
+  log.appendChild(wrap);
+}
+
+/* Sidebar & Settings toggles */
+function toggleSidebar(force) {
+  const sb = $("sidebar");
+  const collapsed = force !== undefined ? !force : !sb.classList.contains("collapsed");
+  sb.classList.toggle("collapsed", collapsed);
+  store("kronos-sb-collapsed", collapsed ? "1" : "0");
+}
+$("sidebar-toggle").onclick = () => toggleSidebar();
+
+$("sb-settings-btn").onclick = (e) => {
+  e.stopPropagation();
+  $("settings-popover").classList.toggle("open");
+};
+$("settings-close").onclick = () => $("settings-popover").classList.remove("open");
+window.addEventListener("click", (e) => {
+  const pop = $("settings-popover");
+  if (pop.classList.contains("open") && !pop.contains(e.target) && e.target !== $("sb-settings-btn")) {
+    pop.classList.remove("open");
+  }
+});
+
+$("nav-history").onclick = () => {
+  const w = $("sb-search-wrap");
+  const open = !w.classList.contains("open");
+  w.classList.toggle("open", open);
+  $("nav-history").classList.toggle("active", open);
+  if (open) $("sess-search").focus();
+  else {
+    $("sess-search").value = "";
+    renderSidebar();
+  }
+};
+$("btn-filter-proj").onclick = () => $("nav-history").click();
+$("sess-search").addEventListener("input", () => renderSidebar());
+
+$("nav-changes").onclick = () => {
+  userClosedWs = false;
+  setWorkspaceOpen(true);
+  setWsTab("changes");
+};
+
+$("btn-add-proj").onclick = () => {
+  const box = $("add-proj-box");
+  box.classList.toggle("open");
+  if (box.classList.contains("open")) {
+    $("add-proj-input").value = wsWorkdir || "";
+    $("add-proj-input").focus();
+    $("add-proj-input").select();
+  }
+};
+$("add-proj-cancel").onclick = () => $("add-proj-box").classList.remove("open");
+$("add-proj-save").onclick = async () => {
+  const target = $("add-proj-input").value.trim();
+  if (!target) return;
+  await switchProjectWorkdir(target, true);
+  $("add-proj-box").classList.remove("open");
+};
+$("add-proj-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    $("add-proj-save").click();
+  } else if (e.key === "Escape") {
+    $("add-proj-box").classList.remove("open");
+  }
+});
+
+/* Closeable & Resizable Workspace Pane */
 function setWorkspaceOpen(open) {
   $("ws-pane").classList.toggle("hidden", !open);
+  $("ws-resizer").classList.toggle("hidden", !open);
   $("ws-toggle").classList.toggle("active", open);
 }
+
 $("ws-toggle").onclick = () => {
   const willOpen = $("ws-pane").classList.contains("hidden");
+  userClosedWs = !willOpen;
   setWorkspaceOpen(willOpen);
   if (willOpen) refreshWorkspace(true);
 };
+
+$("ws-close").onclick = () => {
+  userClosedWs = true;
+  setWorkspaceOpen(false);
+};
+
+(function initResizer() {
+  const resizer = $("ws-resizer");
+  const pane = $("ws-pane");
+  const layout = $("layout");
+  const frame = $("preview-frame");
+  let dragging = false;
+  resizer.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    dragging = true;
+    resizer.classList.add("dragging");
+    frame.style.pointerEvents = "none";
+    document.body.style.cursor = "col-resize";
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const rect = layout.getBoundingClientRect();
+    const rightWidth = rect.right - e.clientX;
+    const pct = Math.min(72, Math.max(26, (rightWidth / Math.max(rect.width, 1)) * 100));
+    pane.style.width = pct.toFixed(1) + "%";
+  });
+  window.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove("dragging");
+    frame.style.pointerEvents = "";
+    document.body.style.cursor = "";
+    store("kronos-ws-width", pane.style.width);
+  });
+})();
 
 function setWsTab(tab) {
   wsTab = tab;
   $("tab-preview").classList.toggle("active", tab === "preview");
   $("tab-code").classList.toggle("active", tab === "code");
+  $("tab-changes").classList.toggle("active", tab === "changes");
   $("preview-wrap").style.display = tab === "preview" ? "flex" : "none";
   $("code-wrap").style.display = tab === "code" ? "flex" : "none";
+  $("changes-wrap").style.display = tab === "changes" ? "flex" : "none";
   if (tab === "code" && $("file-select").value) {
     loadSelectedFile($("file-select").value);
+  } else if (tab === "changes") {
+    renderChangesTimeline();
   }
 }
 $("tab-preview").onclick = () => setWsTab("preview");
 $("tab-code").onclick = () => setWsTab("code");
+$("tab-changes").onclick = () => setWsTab("changes");
 
+/* Unified Diff Renderer & Revert Checkpoint Action */
+function renderUnifiedDiffEl(unifiedText) {
+  const box = document.createElement("div");
+  box.className = "diff-box";
+  const lines = String(unifiedText || "").split("\n");
+  for (const ln of lines) {
+    if (!ln && lines.length > 1) continue;
+    const row = document.createElement("div");
+    row.className = "diff-line";
+    if (ln.startsWith("@@")) row.classList.add("hunk");
+    else if (ln.startsWith("+") && !ln.startsWith("+++")) row.classList.add("add");
+    else if (ln.startsWith("-") && !ln.startsWith("---")) row.classList.add("del");
+    row.textContent = ln;
+    box.appendChild(row);
+  }
+  return box;
+}
+
+async function revertFileChange(diff, btnEl) {
+  if (!diff || !diff.path) return;
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.textContent = "Reverting…";
+  }
+  try {
+    const r = await fetch("/v1/workspace/revert", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({
+        path: diff.path,
+        existed_before: !!diff.existed_before,
+        before_content: diff.before_content || "",
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error?.message || "revert failed");
+    if (btnEl) btnEl.textContent = j.action === "removed" ? "Removed" : "Reverted";
+    await refreshWorkspace(true);
+  } catch (e) {
+    if (btnEl) {
+      btnEl.disabled = false;
+      btnEl.textContent = "Revert failed";
+    }
+  }
+}
+
+function rebuildSessionChanges() {
+  sessionChanges = [];
+  sessionTurns.forEach((t, tIdx) => {
+    for (const tool of (t.tools || [])) {
+      if (tool.diff && tool.diff.path) {
+        sessionChanges.push({
+          turnIndex: tIdx + 1,
+          prompt: t.userText || "Workspace edit",
+          ts: t.ts || currentCreatedAt,
+          toolName: tool.name,
+          diff: tool.diff,
+        });
+      }
+    }
+  });
+  $("changes-count").textContent = String(sessionChanges.length);
+  $("sb-total-changes").textContent = String(sessionChanges.length);
+  if (wsTab === "changes") renderChangesTimeline();
+}
+
+function renderChangesTimeline() {
+  const wrap = $("changes-wrap");
+  wrap.innerHTML = "";
+  if (sessionChanges.length === 0) {
+    const emp = document.createElement("div");
+    emp.style.cssText = "margin:auto;color:var(--muted);text-align:center;padding:28px;font-size:13px;";
+    emp.textContent = "No file modifications recorded in this conversation yet.";
+    wrap.appendChild(emp);
+    return;
+  }
+  for (const item of sessionChanges.slice().reverse()) {
+    const d = item.diff;
+    const card = document.createElement("div");
+    card.className = "change-card";
+    const hdr = document.createElement("div");
+    hdr.className = "change-hdr";
+    const left = document.createElement("div");
+    left.innerHTML = `<span class="change-path">${escHtml(d.path)}</span> <span class="diff-stat"><span class="add">+${d.added_lines || 0}</span><span class="del">-${d.removed_lines || 0}</span></span>`;
+    const right = document.createElement("div");
+    right.style.cssText = "display:flex;gap:6px;align-items:center;";
+    const viewBtn = document.createElement("button");
+    viewBtn.type = "button";
+    viewBtn.className = "mini-btn";
+    viewBtn.textContent = "View file";
+    viewBtn.onclick = () => {
+      $("file-select").value = d.path;
+      setWsTab("code");
+      loadSelectedFile(d.path);
+    };
+    right.appendChild(viewBtn);
+    if (d.can_revert !== false) {
+      const revBtn = document.createElement("button");
+      revBtn.type = "button";
+      revBtn.className = "mini-btn";
+      revBtn.textContent = "Revert";
+      revBtn.onclick = () => revertFileChange(d, revBtn);
+      right.appendChild(revBtn);
+    }
+    hdr.appendChild(left);
+    hdr.appendChild(right);
+
+    const sub = document.createElement("div");
+    sub.className = "change-sub";
+    sub.textContent = `Turn #${item.turnIndex} · ${item.toolName} · "${item.prompt.slice(0, 64)}"`;
+
+    const body = document.createElement("div");
+    body.className = "change-body";
+    body.appendChild(renderUnifiedDiffEl(d.unified_diff || ""));
+
+    card.appendChild(hdr);
+    card.appendChild(sub);
+    card.appendChild(body);
+    wrap.appendChild(card);
+  }
+}
+
+/* Workspace Files & Preview */
 async function loadSelectedFile(relPath) {
   if (!relPath) {
     $("code-path").textContent = "no file selected";
@@ -290,7 +1010,11 @@ $("file-select").onchange = () => {
     loadSelectedFile(v);
   } else if (v.endsWith(".html")) {
     previewPath = v;
+    setWsTab("preview");
     reloadPreviewFrame();
+  } else {
+    setWsTab("code");
+    loadSelectedFile(v);
   }
 };
 
@@ -323,8 +1047,6 @@ $("ws-clear").onclick = async () => {
     await fetch("/v1/agent/clear", { method: "POST", headers: headers() });
     wsFiles = [];
     previewPath = "";
-    sessionHistory = [];
-    updateCtxMeter(0, ctxLimit);
     await refreshWorkspace(true);
   } catch (e) {}
 };
@@ -337,6 +1059,8 @@ async function refreshWorkspace(reloadIframe) {
     if (j.context_limit) updateCtxMeter(ctxUsed, j.context_limit);
     if (j.workdir) {
       wsWorkdir = j.workdir;
+      $("proj-chip").textContent = baseName(wsWorkdir);
+      $("proj-chip").title = wsWorkdir;
       $("ws-toggle").title = `Workspace directory: ${wsWorkdir}`;
     }
     wsFiles = j.files || [];
@@ -359,48 +1083,470 @@ async function refreshWorkspace(reloadIframe) {
     } else if (wsFiles.length > 0) {
       sel.value = wsFiles[0].path;
     }
-    if (!autoOpenedInitialWs && wsFiles.length > 0) {
-      autoOpenedInitialWs = true;
-      setWorkspaceOpen(true);
-    }
     if (reloadIframe) reloadPreviewFrame();
     if (wsTab === "code") loadSelectedFile(sel.value);
   } catch (e) {}
 }
 
-refreshWorkspace(true);
+async function switchProjectWorkdir(targetDir, startFreshSession) {
+  try {
+    const r = await fetch("/v1/projects/select", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ workdir: targetDir, create: true }),
+    });
+    if (!r.ok) return false;
+    const j = await r.json();
+    wsWorkdir = j.workdir || targetDir;
+    $("proj-chip").textContent = baseName(wsWorkdir);
+    $("proj-chip").title = wsWorkdir;
+    await refreshWorkspace(true);
+    await fetchSessionsIndex();
+    if (startFreshSession) {
+      const matching = allSessions.find(s => s.workdir === wsWorkdir);
+      if (matching) {
+        await loadSessionById(matching.id, false);
+      } else {
+        startNewConversation(false);
+      }
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
 
-function renderImageTray() {
-  imgTray.innerHTML = "";
-  imgTray.classList.toggle("has-items", pendingImages.length > 0);
-  pendingImages.forEach((img, idx) => {
+/* Persistent Sessions & Multi-Project Sidebar Rendering */
+async function fetchSessionsIndex() {
+  try {
+    const r = await fetch("/v1/sessions", { headers: headers() });
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.active_workdir) {
+      wsWorkdir = j.active_workdir;
+      $("proj-chip").textContent = baseName(wsWorkdir);
+      $("proj-chip").title = wsWorkdir;
+    }
+    allProjects = Array.isArray(j.projects) ? j.projects : [];
+    allSessions = Array.isArray(j.sessions) ? j.sessions : [];
+    if (wsWorkdir && !allProjects.includes(wsWorkdir)) allProjects.unshift(wsWorkdir);
+    $("sb-total-sessions").textContent = String(allSessions.length);
+    renderSidebar();
+  } catch (e) {}
+}
+
+function buildSessionRow(s, isTopPill) {
+  const row = document.createElement("div");
+  row.className = "sess-row" + (isTopPill ? " top-pill" : "") + (s.id === currentSessionId ? " active" : "");
+  row.dataset.sessionId = s.id;
+
+  const title = document.createElement("span");
+  title.className = "sess-title";
+  title.textContent = s.title || "Untitled Conversation";
+  row.appendChild(title);
+
+  const meta = document.createElement("span");
+  meta.className = "sess-meta";
+  if ((s.added_lines || 0) + (s.removed_lines || 0) > 0) {
+    const df = document.createElement("span");
+    df.className = "sess-diff";
+    df.textContent = `+${s.added_lines || 0}`;
+    meta.appendChild(df);
+  } else if (s.id === currentSessionId) {
+    const dot = document.createElement("span");
+    dot.className = "sess-dot";
+    meta.appendChild(dot);
+  }
+  const tm = document.createElement("span");
+  tm.className = "sess-time";
+  tm.textContent = fmtRelTime(s.updated_at || s.created_at);
+  meta.appendChild(tm);
+
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "sess-del";
+  del.title = "Delete conversation";
+  del.textContent = "×";
+  del.onclick = async (e) => {
+    e.stopPropagation();
+    await deleteSessionById(s.id);
+  };
+  meta.appendChild(del);
+  row.appendChild(meta);
+
+  row.onclick = () => loadSessionById(s.id, true);
+  return row;
+}
+
+function renderSidebar() {
+  const container = $("sb-scroll");
+  container.innerHTML = "";
+  const q = $("sess-search").value.trim().toLowerCase();
+
+  const filteredSessions = q
+    ? allSessions.filter(s =>
+        (s.title || "").toLowerCase().includes(q) ||
+        (s.workdir || "").toLowerCase().includes(q)
+      )
+    : allSessions;
+
+  // Top 2 recent conversations quick-access pills (matches Reference Image 1)
+  if (!q && filteredSessions.length > 0) {
+    const topGroup = document.createElement("div");
+    topGroup.className = "proj-group";
+    for (const s of filteredSessions.slice(0, 2)) {
+      topGroup.appendChild(buildSessionRow(s, true));
+    }
+    container.appendChild(topGroup);
+  }
+
+  const projectsToShow = allProjects.length > 0 ? allProjects.slice() : (wsWorkdir ? [wsWorkdir] : []);
+  for (const s of filteredSessions) {
+    if (s.workdir && !projectsToShow.includes(s.workdir)) projectsToShow.push(s.workdir);
+  }
+
+  for (const proj of projectsToShow) {
+    const projSessions = filteredSessions.filter(s => (s.workdir || wsWorkdir) === proj);
+    if (q && projSessions.length === 0 && !proj.toLowerCase().includes(q)) continue;
+
+    const grp = document.createElement("div");
+    grp.className = "proj-group";
+
+    const hdr = document.createElement("div");
+    hdr.className = "proj-hdr" + (proj === wsWorkdir ? " active-proj" : "");
+    hdr.title = proj;
+    hdr.innerHTML = `
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+      <span class="proj-name">${escHtml(baseName(proj))}</span>
+    `;
+    hdr.onclick = () => switchProjectWorkdir(proj, true);
+    grp.appendChild(hdr);
+
+    if (projSessions.length === 0) {
+      const emp = document.createElement("div");
+      emp.className = "proj-empty";
+      emp.textContent = "No conversations yet";
+      grp.appendChild(emp);
+    } else {
+      const showAll = expandedProjects.has(proj) || !!q;
+      const visible = showAll ? projSessions : projSessions.slice(0, 6);
+      for (const s of visible) {
+        grp.appendChild(buildSessionRow(s, false));
+      }
+      if (!showAll && projSessions.length > 6) {
+        const more = document.createElement("button");
+        more.type = "button";
+        more.className = "see-all-btn";
+        more.textContent = `See all (${projSessions.length})`;
+        more.onclick = () => {
+          expandedProjects.add(proj);
+          renderSidebar();
+        };
+        grp.appendChild(more);
+      }
+    }
+    container.appendChild(grp);
+  }
+}
+
+async function persistCurrentSession() {
+  if (sessionTurns.length === 0 && sessionHistory.length === 0) return;
+  if (!currentSessionId) {
+    currentSessionId = "sess_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
+    currentCreatedAt = Math.floor(Date.now() / 1000);
+  }
+  if (!currentSessionTitle) {
+    const firstTurn = sessionTurns[0];
+    currentSessionTitle = (firstTurn?.userText || "Workspace Session").slice(0, 56);
+  }
+  $("conv-heading").textContent = currentSessionTitle || "Kronos";
+  store("kronos-active-session", currentSessionId);
+
+  let added = 0, removed = 0;
+  const touchedSet = new Set();
+  for (const c of sessionChanges) {
+    added += c.diff.added_lines || 0;
+    removed += c.diff.removed_lines || 0;
+    touchedSet.add(c.diff.path);
+  }
+  const nowSec = Math.floor(Date.now() / 1000);
+  try {
+    await fetch("/v1/sessions/save", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({
+        id: currentSessionId,
+        title: currentSessionTitle,
+        workdir: wsWorkdir,
+        created_at: currentCreatedAt || nowSec,
+        updated_at: nowSec,
+        context_tokens: ctxUsed,
+        added_lines: added,
+        removed_lines: removed,
+        changed_files: touchedSet.size,
+        messages: sessionHistory,
+        turns: sessionTurns,
+      }),
+    });
+    await fetchSessionsIndex();
+  } catch (e) {}
+}
+
+async function deleteSessionById(id) {
+  try {
+    await fetch("/v1/sessions/delete", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ id }),
+    });
+    if (id === currentSessionId) {
+      startNewConversation(false);
+    }
+    await fetchSessionsIndex();
+  } catch (e) {}
+}
+
+function startNewConversation(focusComposer = true) {
+  currentSessionId = "";
+  currentSessionTitle = "";
+  currentCreatedAt = 0;
+  sessionHistory = [];
+  sessionTurns = [];
+  sessionChanges = [];
+  pendingAttachments = [];
+  renderAttachmentTray();
+  updateCtxMeter(0, ctxLimit);
+  $("conv-heading").textContent = "Kronos";
+  $("changes-count").textContent = "0";
+  $("sb-total-changes").textContent = "0";
+  store("kronos-active-session", "");
+  if (location.hash.startsWith("#session=")) {
+    history.replaceState(null, "", location.pathname);
+  }
+  // Adaptive: collapse preview pane on fresh blank conversation
+  setWorkspaceOpen(false);
+  userClosedWs = false;
+  renderEmptyState();
+  renderSidebar();
+  if (focusComposer) input.focus();
+}
+$("btn-new-conv").onclick = () => startNewConversation(true);
+
+function buildToolCardDom(tool) {
+  const det = document.createElement("details");
+  det.className = "tool-card";
+  const target = summarizeArgs(tool.name, tool.arguments || "");
+  const okClass = !tool.ok ? "err" : (!tool.validation_ok ? "warn" : "ok");
+  const okLabel = !tool.ok ? "error" : (!tool.validation_ok ? "repair needed" : ((tool.name === "write_file" || tool.name === "edit_file") ? "valid" : "ok"));
+  const diffHtml = tool.diff
+    ? `<span class="diff-stat"><span class="add">+${tool.diff.added_lines || 0}</span><span class="del">-${tool.diff.removed_lines || 0}</span></span>`
+    : "";
+  det.innerHTML = `<summary><span class="tool-name">${escHtml(tool.name)}</span><span class="tool-target">${escHtml(target)}</span>${diffHtml}<span class="pill ${okClass}">${okLabel}</span></summary>`;
+  const body = document.createElement("div");
+  body.className = "tool-body";
+  body.textContent = (tool.output || "").trim() || (tool.arguments || "");
+  if (tool.diff && tool.diff.unified_diff) {
+    body.appendChild(renderUnifiedDiffEl(tool.diff.unified_diff));
+    if (tool.diff.can_revert !== false) {
+      const act = document.createElement("div");
+      act.className = "diff-actions";
+      const lbl = document.createElement("span");
+      lbl.textContent = tool.diff.existed_before ? "Checkpoint saved before edit" : "New file created in this step";
+      const revBtn = document.createElement("button");
+      revBtn.type = "button";
+      revBtn.className = "mini-btn";
+      revBtn.textContent = "Revert this change";
+      revBtn.onclick = () => revertFileChange(tool.diff, revBtn);
+      act.appendChild(lbl);
+      act.appendChild(revBtn);
+      body.appendChild(act);
+    }
+  }
+  det.appendChild(body);
+  return det;
+}
+
+function buildVerifyCardDom(ver) {
+  const det = document.createElement("details");
+  det.className = "verify-card";
+  const ms = typeof ver.elapsed_ms === "number" ? ` · ${ver.elapsed_ms.toFixed(0)} ms` : "";
+  det.innerHTML = `<summary><span class="tool-name">verified</span><span class="tool-target" style="color:inherit">${escHtml(ver.summary || `${ver.checks_run} checks passed`)}${ms}</span><span class="pill ok">pass</span></summary>`;
+  const body = document.createElement("div");
+  body.className = "verify-body";
+  body.textContent = (ver.details || []).map(d => "• " + d).join("\n");
+  det.appendChild(body);
+  return det;
+}
+
+function renderSavedTurnDom(t) {
+  $("empty")?.remove();
+  userBubble(t.userText || "", t.attachments || []);
+  const card = document.createElement("div");
+  card.className = "msg reply";
+  const headRow = document.createElement("div");
+  headRow.className = "reply-head";
+  const routePill = document.createElement("span");
+  const isAgent = t.route === "agent";
+  routePill.className = "pill " + (isAgent ? "info" : "run");
+  routePill.textContent = isAgent ? "agent · workspace" : "chat";
+  headRow.appendChild(routePill);
+
+  for (const b of (t.badges || [])) {
+    const bp = document.createElement("span");
+    bp.className = "pill info";
+    bp.textContent = b;
+    headRow.appendChild(bp);
+  }
+  if (t.verified) {
+    const vp = document.createElement("span");
+    vp.className = "pill ok";
+    vp.textContent = `verified · ${t.verified.checks_run || 1} checks`;
+    headRow.appendChild(vp);
+  }
+  card.appendChild(headRow);
+
+  if ((t.tools && t.tools.length > 0) || t.verified) {
+    const stepsBox = document.createElement("div");
+    stepsBox.className = "agent-steps";
+    for (const tool of (t.tools || [])) {
+      stepsBox.appendChild(buildToolCardDom(tool));
+    }
+    if (t.verified) {
+      stepsBox.appendChild(buildVerifyCardDom(t.verified));
+    }
+    card.appendChild(stepsBox);
+  }
+
+  const proseBox = document.createElement("div");
+  proseBox.className = "reply-prose";
+  proseBox.innerHTML = renderMd(t.prose || "");
+  card.appendChild(proseBox);
+  log.appendChild(card);
+
+  if (t.statsText) {
+    const s = document.createElement("div");
+    s.className = "stats";
+    s.textContent = t.statsText;
+    log.appendChild(s);
+  }
+}
+
+async function loadSessionById(id, switchProj = true) {
+  if (!id) return;
+  try {
+    const r = await fetch("/v1/sessions/get?id=" + encodeURIComponent(id), { headers: headers() });
+    if (!r.ok) return;
+    const s = await r.json();
+    currentSessionId = s.id;
+    currentSessionTitle = s.title || "Conversation";
+    currentCreatedAt = s.created_at || Math.floor(Date.now() / 1000);
+    sessionHistory = Array.isArray(s.messages) ? s.messages : [];
+    sessionTurns = Array.isArray(s.turns) ? s.turns : [];
+    $("conv-heading").textContent = currentSessionTitle;
+    updateCtxMeter(s.context_tokens || 0, ctxLimit);
+    store("kronos-active-session", currentSessionId);
+
+    if (switchProj && s.workdir && s.workdir !== wsWorkdir) {
+      await switchProjectWorkdir(s.workdir, false);
+    }
+
+    log.innerHTML = "";
+    if (sessionTurns.length > 0) {
+      for (const t of sessionTurns) renderSavedTurnDom(t);
+    } else if (sessionHistory.length > 0) {
+      for (const m of sessionHistory) {
+        if (m.role === "user") userBubble(m.content || "", []);
+        else if (m.role === "assistant" && m.content) {
+          const c = document.createElement("div");
+          c.className = "msg reply";
+          c.innerHTML = `<div class="reply-prose">${renderMd(m.content)}</div>`;
+          log.appendChild(c);
+        }
+      }
+    } else {
+      renderEmptyState();
+    }
+    rebuildSessionChanges();
+    renderSidebar();
+    log.scrollTop = log.scrollHeight;
+
+    // Adaptive workspace pane when restoring a session: open only if this session modified files
+    if (!userClosedWs && sessionChanges.length > 0) {
+      setWorkspaceOpen(true);
+      if (previewPath) setWsTab("preview");
+      else setWsTab("changes");
+    } else if (sessionChanges.length === 0) {
+      setWorkspaceOpen(false);
+    }
+  } catch (e) {}
+}
+
+/* Universal File Copy-Paste (Cmd+V) & Drag-and-Drop (PDF, Code, CSV, JSON, DOCX, ZIP, Images) */
+function renderAttachmentTray() {
+  attTray.innerHTML = "";
+  attTray.classList.toggle("has-items", pendingAttachments.length > 0);
+  pendingAttachments.forEach((att, idx) => {
     const chip = document.createElement("div");
-    chip.className = "img-chip";
-    const thumb = document.createElement("img");
-    thumb.src = img.dataUrl;
-    thumb.alt = img.name;
-    const meta = document.createElement("span");
-    meta.textContent = `${img.width}x${img.height}`;
+    chip.className = "att-chip";
+    if (att.isImage) {
+      const thumb = document.createElement("img");
+      thumb.src = att.dataUrl;
+      thumb.alt = att.name;
+      chip.appendChild(thumb);
+    } else {
+      const badge = document.createElement("span");
+      badge.className = "att-ext";
+      badge.textContent = (att.ext || "file").slice(0, 5);
+      chip.appendChild(badge);
+    }
+    const info = document.createElement("div");
+    info.className = "att-info";
+    const nm = document.createElement("span");
+    nm.className = "att-name";
+    nm.textContent = att.name;
+    const sub = document.createElement("span");
+    sub.className = "att-sub";
+    sub.textContent = att.isImage && att.width ? `${att.width}×${att.height}` : fmtBytes(att.size);
+    info.appendChild(nm);
+    info.appendChild(sub);
+    chip.appendChild(info);
+
     const rm = document.createElement("button");
     rm.type = "button";
     rm.textContent = "×";
-    rm.title = "Remove image";
+    rm.title = "Remove attachment";
     rm.onclick = () => {
-      pendingImages.splice(idx, 1);
-      renderImageTray();
+      pendingAttachments.splice(idx, 1);
+      renderAttachmentTray();
     };
-    chip.appendChild(thumb);
-    chip.appendChild(meta);
     chip.appendChild(rm);
-    imgTray.appendChild(chip);
+    attTray.appendChild(chip);
   });
 }
 
-function ingestImageBlob(blob, label) {
+function ingestAttachmentFile(file, fallbackLabel) {
   return new Promise((resolve) => {
+    if (!file) return resolve(false);
+    const name = file.name || fallbackLabel || "clipboard_attachment";
+    const mime = file.type || "application/octet-stream";
+    const ext = (name.includes(".") ? name.split(".").pop() : (mime.split("/")[1] || "txt")).toLowerCase();
+    const isImg = mime.startsWith("image/") || ["png", "jpg", "jpeg", "webp", "gif", "bmp"].includes(ext);
     const reader = new FileReader();
     reader.onload = () => {
       const rawUrl = String(reader.result || "");
+      if (!isImg) {
+        pendingAttachments.push({
+          name,
+          mime,
+          ext,
+          size: file.size || rawUrl.length,
+          dataUrl: rawUrl,
+          isImage: false,
+        });
+        renderAttachmentTray();
+        resolve(true);
+        return;
+      }
       const im = new Image();
       im.onload = () => {
         const maxSide = 1440;
@@ -414,58 +1560,98 @@ function ingestImageBlob(blob, label) {
           const cv = document.createElement("canvas");
           cv.width = w;
           cv.height = h;
-          const ctx = cv.getContext("2d");
-          ctx.drawImage(im, 0, 0, w, h);
+          cv.getContext("2d").drawImage(im, 0, 0, w, h);
           dataUrl = cv.toDataURL("image/png");
         }
-        pendingImages.push({ name: label || "pasted.png", dataUrl, width: w, height: h });
-        renderImageTray();
+        pendingAttachments.push({
+          name,
+          mime: "image/png",
+          ext: "png",
+          size: file.size || dataUrl.length,
+          dataUrl,
+          width: w,
+          height: h,
+          isImage: true,
+        });
+        renderAttachmentTray();
         resolve(true);
       };
-      im.onerror = () => resolve(false);
+      im.onerror = () => {
+        pendingAttachments.push({ name, mime, ext, size: file.size || 0, dataUrl: rawUrl, isImage: false });
+        renderAttachmentTray();
+        resolve(true);
+      };
       im.src = rawUrl;
     };
     reader.onerror = () => resolve(false);
-    reader.readAsDataURL(blob);
+    reader.readAsDataURL(file);
   });
 }
 
 $("attach-btn").onclick = () => $("file-input").click();
 $("file-input").onchange = async (e) => {
-  const files = Array.from(e.target.files || []);
-  for (const f of files) {
-    if (f.type.startsWith("image/")) await ingestImageBlob(f, f.name);
+  for (const f of Array.from(e.target.files || [])) {
+    await ingestAttachmentFile(f, f.name);
   }
   e.target.value = "";
   input.focus();
 };
 
 window.addEventListener("paste", async (e) => {
-  const items = Array.from(e.clipboardData?.items || []);
-  const imgItems = items.filter(it => it.type && it.type.startsWith("image/"));
-  if (imgItems.length === 0) return;
-  e.preventDefault();
-  for (const it of imgItems) {
-    const blob = it.getAsFile();
-    if (blob) await ingestImageBlob(blob, blob.name || "clipboard.png");
+  const directFiles = Array.from(e.clipboardData?.files || []);
+  if (directFiles.length > 0) {
+    e.preventDefault();
+    for (const f of directFiles) {
+      await ingestAttachmentFile(f, f.name || "pasted_file");
+    }
+    input.focus();
+    return;
   }
-  input.focus();
+  const fileItems = Array.from(e.clipboardData?.items || []).filter(it => it.kind === "file");
+  if (fileItems.length > 0) {
+    e.preventDefault();
+    for (const it of fileItems) {
+      const blob = it.getAsFile();
+      if (blob) await ingestAttachmentFile(blob, blob.name || "clipboard_file");
+    }
+    input.focus();
+  }
 });
 
 const chatCol = $("chat-col");
+let dragDepth = 0;
+chatCol.addEventListener("dragenter", (e) => {
+  e.preventDefault();
+  dragDepth++;
+  chatCol.classList.add("drag-over");
+});
 chatCol.addEventListener("dragover", (e) => {
   e.preventDefault();
   chatCol.classList.add("drag-over");
 });
-chatCol.addEventListener("dragleave", () => chatCol.classList.remove("drag-over"));
+chatCol.addEventListener("dragleave", () => {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) chatCol.classList.remove("drag-over");
+});
 chatCol.addEventListener("drop", async (e) => {
   e.preventDefault();
+  dragDepth = 0;
   chatCol.classList.remove("drag-over");
-  const files = Array.from(e.dataTransfer?.files || []);
-  for (const f of files) {
-    if (f.type.startsWith("image/")) await ingestImageBlob(f, f.name);
+  for (const f of Array.from(e.dataTransfer?.files || [])) {
+    await ingestAttachmentFile(f, f.name);
   }
   input.focus();
+});
+
+/* Keyboard shortcuts: Cmd+B sidebar, Cmd+N new conversation */
+window.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "b") {
+    e.preventDefault();
+    toggleSidebar();
+  } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "n" && !send.disabled) {
+    e.preventDefault();
+    startNewConversation(true);
+  }
 });
 
 function appendCompactionNotice(beforeTok, afterTok, count) {
@@ -492,6 +1678,7 @@ $("compact-btn").onclick = async () => {
     updateCtxMeter(j.after_tokens, j.context_limit);
     if (j.compacted) {
       appendCompactionNotice(j.before_tokens, j.after_tokens, j.compacted_messages);
+      await persistCurrentSession();
     } else {
       const b = document.createElement("div");
       b.className = "compact-banner";
@@ -505,18 +1692,25 @@ $("compact-btn").onclick = async () => {
   }
 };
 
-function userBubble(text, images) {
+function userBubble(text, attachments) {
   $("empty")?.remove();
   const d = document.createElement("div");
   d.className = "msg user";
-  if (images && images.length > 0) {
+  if (attachments && attachments.length > 0) {
     const row = document.createElement("div");
-    row.className = "user-imgs";
-    for (const im of images) {
-      const el = document.createElement("img");
-      el.src = im.dataUrl;
-      el.alt = im.name;
-      row.appendChild(el);
+    row.className = "user-atts";
+    for (const att of attachments) {
+      if (att.isImage && att.dataUrl) {
+        const el = document.createElement("img");
+        el.src = att.dataUrl;
+        el.alt = att.name || "image";
+        row.appendChild(el);
+      } else {
+        const pill = document.createElement("div");
+        pill.className = "user-file-pill";
+        pill.innerHTML = `<span class="user-file-ext">${escHtml((att.ext || "file").slice(0, 5))}</span><span>${escHtml(att.name || "attachment")}</span>`;
+        row.appendChild(pill);
+      }
     }
     d.appendChild(row);
   }
@@ -542,17 +1736,8 @@ function summarizeArgs(name, rawArgs) {
     if (a.pattern) return a.pattern;
     if (a.cmd) return a.cmd;
   } catch (e) {}
-  return rawArgs.slice(0, 60);
+  return String(rawArgs || "").slice(0, 60);
 }
-
-$("new").onclick = () => {
-  sessionHistory = [];
-  pendingImages = [];
-  renderImageTray();
-  updateCtxMeter(0, ctxLimit);
-  log.innerHTML = '<div class="empty" id="empty">Session history cleared.</div>';
-  input.focus();
-};
 
 input.addEventListener("input", () => {
   input.style.height = "auto";
@@ -565,13 +1750,17 @@ input.addEventListener("keydown", e => {
   }
 });
 
-async function runUnifiedTurn(text, attachedImages) {
+async function runUnifiedTurn(text, attachedItems) {
   if (sessionHistory.length === 0 && $("system").value.trim()) {
     sessionHistory.push({ role: "system", content: $("system").value.trim() });
   }
+  if (!currentSessionTitle) {
+    currentSessionTitle = (text || attachedItems[0]?.name || "New Conversation").slice(0, 56);
+    $("conv-heading").textContent = currentSessionTitle;
+  }
   const prevLen = sessionHistory.length;
   sessionHistory.push({ role: "user", content: text });
-  userBubble(text, attachedImages);
+  userBubble(text, attachedItems);
 
   const card = document.createElement("div");
   card.className = "msg reply";
@@ -597,10 +1786,16 @@ async function runUnifiedTurn(text, attachedImages) {
   log.scrollTop = log.scrollHeight;
 
   const toolEls = new Map();
+  const toolRecordsById = new Map();
+  const toolRecords = [];
+  const turnBadges = [];
   const stepLabels = new Map();
+  let verifyRecord = null;
   let activeRoute = "chat";
   let prose = "";
   let touchedFiles = false;
+  let touchedHtml = false;
+  let lastTouchedPath = "";
   let lastUsage = null;
   let firstTokenTime = null;
   const t0 = performance.now();
@@ -610,8 +1805,12 @@ async function runUnifiedTurn(text, attachedImages) {
     route: $("route-mode").value || "auto",
     max_steps: +($("maxsteps").value || 10),
   };
-  if (attachedImages.length > 0) {
-    payload.images = attachedImages.map(im => im.dataUrl);
+  if (attachedItems.length > 0) {
+    payload.attachments = attachedItems.map(a => ({
+      name: a.name,
+      mime: a.mime,
+      data: a.dataUrl,
+    }));
   }
   if ($("temp").value !== "") payload.temperature = +$("temp").value;
   if ($("maxtok").value !== "") payload.max_tokens = +$("maxtok").value;
@@ -655,12 +1854,13 @@ async function runUnifiedTurn(text, attachedImages) {
             routePill.className = "pill run";
             routePill.textContent = "chat";
           }
-        } else if (j.type === "vision") {
-          for (const b of (j.badges || [])) {
-            const vp = document.createElement("span");
-            vp.className = "pill info";
-            vp.textContent = `vision · ${b}`;
-            headRow.appendChild(vp);
+        } else if (j.type === "attachments") {
+          for (const item of (j.items || [])) {
+            turnBadges.push(item.badge);
+            const ap = document.createElement("span");
+            ap.className = "pill info";
+            ap.textContent = item.badge;
+            headRow.appendChild(ap);
           }
         } else if (j.type === "compacted") {
           appendCompactionNotice(j.before_tokens, j.after_tokens, j.compacted_messages);
@@ -675,7 +1875,7 @@ async function runUnifiedTurn(text, attachedImages) {
         } else if (j.type === "text") {
           firstTokenTime ??= performance.now();
           prose += j.delta;
-          proseBox.innerHTML = render(prose);
+          proseBox.innerHTML = renderMd(prose);
         } else if (j.type === "tool_progress") {
           firstTokenTime ??= performance.now();
           stepsBox.style.display = "flex";
@@ -701,14 +1901,25 @@ async function runUnifiedTurn(text, attachedImages) {
           const det = document.createElement("details");
           det.className = "tool-card";
           const target = summarizeArgs(j.name, j.arguments || "");
-          det.innerHTML = `<summary><span class="tool-name">${escHtml(j.name)}</span><span class="tool-target">${escHtml(target)}</span><span class="pill run">running</span></summary><div class="tool-body">args: ${escHtml(j.arguments || "")}</div>`;
+          det.innerHTML = `<summary><span class="tool-name">${escHtml(j.name)}</span><span class="tool-target">${escHtml(target)}</span><span class="diff-slot"></span><span class="pill run">running</span></summary><div class="tool-body">args: ${escHtml(j.arguments || "")}</div>`;
           stepsBox.appendChild(det);
           toolEls.set(j.id, det);
+          const rec = { id: j.id, name: j.name, arguments: j.arguments || "", ok: true, validation_ok: true, output: "", diff: null };
+          toolRecords.push(rec);
+          toolRecordsById.set(j.id, rec);
         } else if (j.type === "tool_done") {
+          const rec = toolRecordsById.get(j.id);
+          if (rec) {
+            rec.ok = !!j.ok;
+            rec.validation_ok = !!j.validation_ok;
+            rec.output = j.output || "";
+            rec.diff = j.diff || null;
+          }
           const det = toolEls.get(j.id);
           if (det) {
             const pill = det.querySelector(".pill");
             const body = det.querySelector(".tool-body");
+            const diffSlot = det.querySelector(".diff-slot");
             if (!j.ok) {
               pill.className = "pill err";
               pill.textContent = "error";
@@ -719,10 +1930,40 @@ async function runUnifiedTurn(text, attachedImages) {
               pill.className = "pill ok";
               pill.textContent = (j.name === "write_file" || j.name === "edit_file") ? "valid" : "ok";
             }
-            body.textContent += "\n\nresult: " + (j.output || "");
+            body.textContent = (j.output || "").trim();
+            if (j.diff && j.diff.path) {
+              if (diffSlot) {
+                diffSlot.className = "diff-stat";
+                diffSlot.innerHTML = `<span class="add">+${j.diff.added_lines || 0}</span><span class="del">-${j.diff.removed_lines || 0}</span>`;
+              }
+              if (j.diff.unified_diff) {
+                body.appendChild(renderUnifiedDiffEl(j.diff.unified_diff));
+              }
+              if (j.diff.can_revert !== false) {
+                const act = document.createElement("div");
+                act.className = "diff-actions";
+                const lbl = document.createElement("span");
+                lbl.textContent = j.diff.existed_before ? "Checkpoint saved before edit" : "New file created in this step";
+                const revBtn = document.createElement("button");
+                revBtn.type = "button";
+                revBtn.className = "mini-btn";
+                revBtn.textContent = "Revert this change";
+                revBtn.onclick = () => revertFileChange(j.diff, revBtn);
+                act.appendChild(lbl);
+                act.appendChild(revBtn);
+                body.appendChild(act);
+              }
+            }
           }
-          if (j.name === "write_file" || j.name === "edit_file") {
+          if ((j.name === "write_file" || j.name === "edit_file") && j.ok) {
             touchedFiles = true;
+            if (j.diff && j.diff.path) {
+              lastTouchedPath = j.diff.path;
+              if (j.diff.path.endsWith(".html") || j.diff.path.endsWith(".css") || j.diff.path.endsWith(".js")) {
+                touchedHtml = true;
+              }
+            }
+            userClosedWs = false;
             if ($("ws-pane").classList.contains("hidden")) setWorkspaceOpen(true);
             refreshWorkspace(true);
           }
@@ -730,17 +1971,25 @@ async function runUnifiedTurn(text, attachedImages) {
           stepsBox.style.display = "flex";
           const b = document.createElement("div");
           b.className = "repair-banner";
-          b.textContent = "Post-edit validation triggered repair:\n" + j.report;
+          b.textContent = "Post-work verification triggered self-repair:\n" + j.report;
           stepsBox.appendChild(b);
+        } else if (j.type === "verified") {
+          verifyRecord = j;
+          stepsBox.style.display = "flex";
+          stepsBox.appendChild(buildVerifyCardDom(j));
+          const vp = document.createElement("span");
+          vp.className = "pill ok";
+          vp.textContent = `verified · ${j.checks_run || 1} checks`;
+          headRow.appendChild(vp);
         } else if (j.type === "done") {
           gotDone = true;
           if (Array.isArray(j.messages)) sessionHistory = j.messages;
           if (j.context_tokens !== undefined) updateCtxMeter(j.context_tokens, j.context_limit);
           if (!prose && j.text) {
             prose = j.text;
-            proseBox.innerHTML = render(prose);
+            proseBox.innerHTML = renderMd(prose);
           } else if (!prose) {
-            proseBox.textContent = "Workspace updated.";
+            proseBox.textContent = "Workspace updated and verified.";
           }
         }
         log.scrollTop = log.scrollHeight;
@@ -756,13 +2005,19 @@ async function runUnifiedTurn(text, attachedImages) {
       }
       throw new Error("Stream closed before turn completed — retry prompt");
     }
+
     if (touchedFiles) {
       await refreshWorkspace(true);
-      if (!previewPath && wsFiles.length > 0) setWsTab("code");
+      if (previewPath && touchedHtml) {
+        setWsTab("preview");
+      } else if (lastTouchedPath) {
+        $("file-select").value = lastTouchedPath;
+        setWsTab("changes");
+      }
     }
-    const s = document.createElement("div");
-    s.className = "stats";
+
     const totalS = ((performance.now() - t0) / 1000).toFixed(2);
+    let statsText = `completed in ${totalS} s`;
     if (activeRoute === "chat" && lastUsage) {
       const dRate = (lastUsage.completion_tokens / Math.max(lastUsage.decode_secs || 1e-3, 1e-3)).toFixed(1);
       const pRate = (lastUsage.prefilled_tokens / Math.max(lastUsage.prefill_secs || 1e-3, 1e-3)).toFixed(0);
@@ -770,11 +2025,31 @@ async function runUnifiedTurn(text, attachedImages) {
         ? ` · accept ${(100 * lastUsage.accepted_tokens / lastUsage.drafted_tokens).toFixed(1)}%`
         : "";
       const ttft = firstTokenTime ? ((firstTokenTime - t0) / 1000).toFixed(2) : totalS;
-      s.textContent = `${lastUsage.prefilled_tokens} new @ ${pRate} tok/s · ${lastUsage.completion_tokens} gen @ ${dRate} tok/s${acc} · first token ${ttft} s`;
-    } else {
-      s.textContent = `completed in ${totalS} s`;
+      statsText = `${lastUsage.prefilled_tokens} new @ ${pRate} tok/s · ${lastUsage.completion_tokens} gen @ ${dRate} tok/s${acc} · first token ${ttft} s`;
     }
+    const s = document.createElement("div");
+    s.className = "stats";
+    s.textContent = statsText;
     log.appendChild(s);
+
+    sessionTurns.push({
+      ts: Math.floor(Date.now() / 1000),
+      userText: text,
+      attachments: attachedItems.map(a => ({
+        name: a.name,
+        ext: a.ext,
+        isImage: a.isImage,
+        dataUrl: a.isImage ? a.dataUrl : "",
+      })),
+      route: activeRoute,
+      badges: turnBadges,
+      tools: toolRecords,
+      verified: verifyRecord,
+      prose,
+      statsText,
+    });
+    rebuildSessionChanges();
+    await persistCurrentSession();
   } catch (err) {
     routePill.className = "pill err";
     routePill.textContent = "error";
@@ -782,9 +2057,9 @@ async function runUnifiedTurn(text, attachedImages) {
     sessionHistory.length = prevLen;
     if (!gotDone) {
       if (!input.value && text) input.value = text;
-      if (pendingImages.length === 0 && attachedImages.length > 0) {
-        pendingImages = attachedImages.slice();
-        renderImageTray();
+      if (pendingAttachments.length === 0 && attachedItems.length > 0) {
+        pendingAttachments = attachedItems.slice();
+        renderAttachmentTray();
       }
     }
   }
@@ -793,20 +2068,44 @@ async function runUnifiedTurn(text, attachedImages) {
 $("form").onsubmit = async (e) => {
   e.preventDefault();
   const text = input.value.trim();
-  if ((!text && pendingImages.length === 0) || send.disabled) return;
-  const imgs = pendingImages.slice();
-  pendingImages = [];
-  renderImageTray();
+  if ((!text && pendingAttachments.length === 0) || send.disabled) return;
+  const atts = pendingAttachments.slice();
+  pendingAttachments = [];
+  renderAttachmentTray();
   input.value = "";
   input.style.height = "auto";
   send.disabled = true;
   try {
-    await runUnifiedTurn(text, imgs);
+    await runUnifiedTurn(text, atts);
   } finally {
     send.disabled = false;
     input.focus();
   }
 };
+
+window.addEventListener("hashchange", () => {
+  const m = location.hash.match(/^#session=([A-Za-z0-9_-]+)/);
+  if (m && m[1] && m[1] !== currentSessionId) {
+    loadSessionById(m[1], true);
+  }
+});
+
+/* Initial Boot */
+(async function boot() {
+  renderEmptyState();
+  fetch("/v1/models", { headers: headers() }).then(r => r.json())
+    .then(j => $("model").textContent = j.data ? j.data[0].id : (j.error?.message || "unavailable"))
+    .catch(() => $("model").textContent = "server unreachable");
+
+  await refreshWorkspace(true);
+  await fetchSessionsIndex();
+
+  const hashMatch = location.hash.match(/^#session=([A-Za-z0-9_-]+)/);
+  const savedSess = hashMatch ? hashMatch[1] : store("kronos-active-session");
+  if (savedSess && allSessions.some(s => s.id === savedSess)) {
+    await loadSessionById(savedSess, false);
+  }
+})();
 </script>
 </body>
 </html>

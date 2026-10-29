@@ -1,0 +1,772 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kronos Quick Prompt</title>
+<style>
+  :root {
+    --bg: #191a1f;
+    --panel: #22242b;
+    --line: rgba(255, 255, 255, 0.11);
+    --text: #f3f4f6;
+    --muted: #9ca3af;
+    --accent: #0d9488;
+    --accent-warm: #d97757;
+    --code: #121317;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+    overflow: hidden;
+    user-select: none;
+  }
+  #shell {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    overflow: hidden;
+    box-shadow: 0 22px 54px rgba(0, 0, 0, 0.52);
+  }
+  #shell.drag-over {
+    border-color: var(--accent);
+  }
+  .top-row {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    padding: 13px 15px 10px;
+  }
+  .brand-mark {
+    width: 24px;
+    height: 24px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--accent-warm);
+  }
+  #q-input {
+    flex: 1;
+    min-width: 0;
+    border: none;
+    outline: none;
+    resize: none;
+    background: transparent;
+    color: var(--text);
+    font: 16px/1.38 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    max-height: 96px;
+    padding: 2px 0;
+    user-select: text;
+  }
+  #q-input::placeholder {
+    color: #8b909c;
+  }
+  #sess-select {
+    max-width: 150px;
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 4px 7px;
+    font: inherit;
+    font-size: 12.5px;
+    cursor: pointer;
+    outline: none;
+  }
+  #sess-select:hover {
+    background: var(--panel);
+    color: var(--text);
+  }
+  #q-send {
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+    border: none;
+    border-radius: 9px;
+    background: var(--accent-warm);
+    color: #fff;
+    font-size: 15px;
+    font-weight: 700;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #q-send:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  #tray {
+    display: none;
+    flex-wrap: wrap;
+    gap: 7px;
+    padding: 0 15px 9px;
+  }
+  #tray.has-items {
+    display: flex;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 3px 8px 3px 5px;
+    font-size: 11.5px;
+    color: var(--text);
+  }
+  .chip img {
+    width: 24px;
+    height: 24px;
+    object-fit: cover;
+    border-radius: 4px;
+  }
+  .chip-tag {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: rgba(13, 148, 136, 0.22);
+    color: #5eead4;
+  }
+  .chip button {
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 0 2px;
+    font-size: 13px;
+  }
+  #answer-wrap {
+    display: none;
+    flex-direction: column;
+    max-height: 310px;
+    overflow-y: auto;
+    border-top: 1px solid var(--line);
+    padding: 11px 16px;
+    gap: 9px;
+    background: rgba(16, 17, 21, 0.65);
+    user-select: text;
+  }
+  #answer-wrap.open {
+    display: flex;
+  }
+  .q-turn-user {
+    align-self: flex-end;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 6px 11px;
+    font-size: 12.5px;
+    color: #e5e7eb;
+    max-width: 86%;
+    white-space: pre-wrap;
+  }
+  .q-turn-reply {
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .q-turn-reply pre {
+    background: var(--code);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 9px 11px;
+    overflow-x: auto;
+    margin: 7px 0;
+  }
+  .q-turn-reply code {
+    font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .q-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-bottom: 4px;
+  }
+  .q-pill {
+    font-size: 10.5px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: rgba(13, 148, 136, 0.18);
+    color: #5eead4;
+    border: 1px solid rgba(94, 234, 212, 0.25);
+  }
+  .bar-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 15px 10px;
+    border-top: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.02);
+  }
+  .meta-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11.5px;
+    color: var(--muted);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .actions-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .act-btn {
+    background: transparent;
+    color: #d1d5db;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 4px 10px;
+    font: inherit;
+    font-size: 11.5px;
+    cursor: pointer;
+  }
+  .act-btn:hover {
+    background: var(--panel);
+    border-color: rgba(255, 255, 255, 0.24);
+  }
+</style>
+</head>
+<body>
+<div id="shell">
+  <form id="q-form">
+    <div class="top-row">
+      <div class="brand-mark" title="Kronos Quick Prompt">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round">
+          <path d="M12 2v20M4.9 4.9l14.2 14.2M2 12h20M4.9 19.1L19.1 4.9"/>
+        </svg>
+      </div>
+      <textarea id="q-input" rows="1" placeholder="What can Kronos help you with?" autofocus></textarea>
+      <select id="sess-select" title="Active conversation">
+        <option value="">New Chat</option>
+      </select>
+      <button id="q-send" type="submit" title="Send (Enter)">↑</button>
+    </div>
+    <div id="tray"></div>
+  </form>
+
+  <div id="answer-wrap"></div>
+
+  <div class="bar-footer">
+    <div class="meta-left">
+      <span id="q-status">⌥Space · local Metal engine ready</span>
+    </div>
+    <div class="actions-right">
+      <input id="q-file" type="file" multiple hidden>
+      <button id="btn-shot" class="act-btn" type="button" title="Drag to capture a screen region">Capture screen</button>
+      <button id="btn-attach" class="act-btn" type="button" title="Attach PDF, image, or code file">Attach file</button>
+      <button id="btn-copy" class="act-btn" type="button" style="display:none">Copy</button>
+      <button id="btn-open" class="act-btn" type="button" title="Continue in full Kronos Workspace">Open Workspace ↗</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const qInput = $("q-input"), qSend = $("q-send"), tray = $("tray"), ansWrap = $("answer-wrap");
+let quickSessionId = "";
+let quickTitle = "";
+let quickCreatedAt = 0;
+let quickMessages = [];
+let quickTurns = [];
+let pendingAttachments = [];
+let lastReplyText = "";
+let activeWorkdir = "";
+
+function postHost(msg) {
+  try {
+    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.kronos) {
+      window.webkit.messageHandlers.kronos.postMessage(msg);
+      return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
+function syncPanelHeight() {
+  requestAnimationFrame(() => {
+    const h = Math.min(Math.max($("shell").offsetHeight + 4, 108), 520);
+    postHost({ type: "resize", height: h });
+  });
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function renderMd(md) {
+  const esc = escHtml(md);
+  return esc.split(/```/).map((part, i) => {
+    if (i % 2) return "<pre><code>" + part.replace(/^[\w+-]*\n/, "") + "</code></pre>";
+    return part.replace(/`([^`\n]+)`/g, "<code>$1</code>")
+      .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  }).join("");
+}
+
+async function loadSessionsList() {
+  try {
+    const r = await fetch("/v1/sessions");
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.active_workdir) activeWorkdir = j.active_workdir;
+    const sel = $("sess-select");
+    const cur = quickSessionId;
+    sel.innerHTML = '<option value="">New Chat</option>';
+    for (const s of (j.sessions || []).slice(0, 15)) {
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      opt.textContent = (s.title || "Untitled").slice(0, 28);
+      sel.appendChild(opt);
+    }
+    sel.value = cur;
+  } catch (e) {}
+}
+
+function resetQuickChat() {
+  quickSessionId = "";
+  quickTitle = "";
+  quickCreatedAt = 0;
+  quickMessages = [];
+  quickTurns = [];
+  lastReplyText = "";
+  $("btn-copy").style.display = "none";
+  ansWrap.innerHTML = "";
+  ansWrap.classList.remove("open");
+  $("sess-select").value = "";
+  $("q-status").textContent = "⌥Space · New chat ready";
+  syncPanelHeight();
+  qInput.focus();
+}
+
+window.kronosFocusInput = () => {
+  loadSessionsList();
+  syncPanelHeight();
+  qInput.focus();
+};
+
+window.kronosNewChat = () => resetQuickChat();
+
+$("sess-select").onchange = async () => {
+  const id = $("sess-select").value;
+  if (!id) {
+    resetQuickChat();
+    return;
+  }
+  try {
+    const r = await fetch("/v1/sessions/get?id=" + encodeURIComponent(id));
+    if (!r.ok) return;
+    const s = await r.json();
+    quickSessionId = s.id;
+    quickTitle = s.title || "Conversation";
+    quickCreatedAt = s.created_at || Math.floor(Date.now() / 1000);
+    quickMessages = Array.isArray(s.messages) ? s.messages : [];
+    quickTurns = Array.isArray(s.turns) ? s.turns : [];
+    ansWrap.innerHTML = "";
+    for (const t of quickTurns.slice(-4)) {
+      if (t.userText) {
+        const u = document.createElement("div");
+        u.className = "q-turn-user";
+        u.textContent = t.userText;
+        ansWrap.appendChild(u);
+      }
+      if (t.prose) {
+        const a = document.createElement("div");
+        a.className = "q-turn-reply";
+        a.innerHTML = renderMd(t.prose);
+        ansWrap.appendChild(a);
+        lastReplyText = t.prose;
+      }
+    }
+    ansWrap.classList.toggle("open", ansWrap.children.length > 0);
+    ansWrap.scrollTop = ansWrap.scrollHeight;
+    syncPanelHeight();
+  } catch (e) {}
+};
+
+function renderTray() {
+  tray.innerHTML = "";
+  tray.classList.toggle("has-items", pendingAttachments.length > 0);
+  pendingAttachments.forEach((att, idx) => {
+    const c = document.createElement("div");
+    c.className = "chip";
+    if (att.isImage) {
+      const im = document.createElement("img");
+      im.src = att.dataUrl;
+      im.alt = att.name;
+      c.appendChild(im);
+    } else {
+      const tag = document.createElement("span");
+      tag.className = "chip-tag";
+      tag.textContent = att.ext || "file";
+      c.appendChild(tag);
+    }
+    const nm = document.createElement("span");
+    nm.textContent = att.name.slice(0, 26);
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.textContent = "×";
+    rm.onclick = () => {
+      pendingAttachments.splice(idx, 1);
+      renderTray();
+      syncPanelHeight();
+    };
+    c.appendChild(nm);
+    c.appendChild(rm);
+    tray.appendChild(c);
+  });
+  syncPanelHeight();
+}
+
+function ingestFileBlob(file, fallbackName) {
+  return new Promise((resolve) => {
+    const name = file.name || fallbackName || "attachment";
+    const mime = file.type || "application/octet-stream";
+    const ext = (name.includes(".") ? name.split(".").pop() : (mime.split("/")[1] || "file")).toLowerCase();
+    const isImg = mime.startsWith("image/") || ["png", "jpg", "jpeg", "webp", "gif"].includes(ext);
+    const reader = new FileReader();
+    reader.onload = () => {
+      const rawUrl = String(reader.result || "");
+      if (!isImg) {
+        pendingAttachments.push({ name, mime, ext, dataUrl: rawUrl, isImage: false });
+        renderTray();
+        resolve(true);
+        return;
+      }
+      const im = new Image();
+      im.onload = () => {
+        const maxSide = 1440;
+        let w = im.naturalWidth || 1, h = im.naturalHeight || 1, dataUrl = rawUrl;
+        if (Math.max(w, h) > maxSide) {
+          const sc = maxSide / Math.max(w, h);
+          w = Math.max(1, Math.round(w * sc));
+          h = Math.max(1, Math.round(h * sc));
+          const cv = document.createElement("canvas");
+          cv.width = w; cv.height = h;
+          cv.getContext("2d").drawImage(im, 0, 0, w, h);
+          dataUrl = cv.toDataURL("image/png");
+        }
+        pendingAttachments.push({ name, mime: "image/png", ext: "png", dataUrl, isImage: true });
+        renderTray();
+        resolve(true);
+      };
+      im.onerror = () => resolve(false);
+      im.src = rawUrl;
+    };
+    reader.onerror = () => resolve(false);
+    reader.readAsDataURL(file);
+  });
+}
+
+window.kronosReceiveNativeFile = (name, mime, dataUrl) => {
+  const safeName = name || "attachment";
+  const safeMime = mime || "application/octet-stream";
+  const ext = (safeName.includes(".") ? safeName.split(".").pop() : (safeMime.split("/")[1] || "file")).toLowerCase();
+  const isImage = safeMime.startsWith("image/") || ["png", "jpg", "jpeg", "webp", "gif"].includes(ext);
+  pendingAttachments.push({ name: safeName, mime: safeMime, ext, dataUrl, isImage });
+  renderTray();
+  qInput.focus();
+};
+
+$("btn-attach").onclick = () => {
+  if (!postHost({ type: "pick_file" })) $("q-file").click();
+};
+$("q-file").onchange = async (e) => {
+  for (const f of Array.from(e.target.files || [])) {
+    await ingestFileBlob(f, f.name);
+  }
+  e.target.value = "";
+  qInput.focus();
+};
+
+$("btn-shot").onclick = async () => {
+  $("q-status").textContent = "Select a screen region…";
+  try {
+    const r = await fetch("/v1/screencapture", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "interactive" }),
+    });
+    const j = await r.json();
+    if (j.status === "ok" && j.data) {
+      pendingAttachments.push({
+        name: j.name || "screenshot.png",
+        mime: "image/png",
+        ext: "png",
+        dataUrl: j.data,
+        isImage: true,
+      });
+      renderTray();
+      $("q-status").textContent = "Screenshot attached";
+    } else {
+      $("q-status").textContent = "Screen capture cancelled";
+    }
+  } catch (e) {
+    $("q-status").textContent = "Screen capture unavailable";
+  }
+  qInput.focus();
+};
+
+window.addEventListener("paste", async (e) => {
+  const files = Array.from(e.clipboardData?.files || []);
+  if (files.length > 0) {
+    e.preventDefault();
+    for (const f of files) await ingestFileBlob(f, f.name || "clipboard");
+    qInput.focus();
+    return;
+  }
+  const items = Array.from(e.clipboardData?.items || []).filter(it => it.kind === "file");
+  if (items.length > 0) {
+    e.preventDefault();
+    for (const it of items) {
+      const f = it.getAsFile();
+      if (f) await ingestFileBlob(f, f.name || "clipboard");
+    }
+    qInput.focus();
+  }
+});
+
+const shell = $("shell");
+shell.addEventListener("dragover", (e) => { e.preventDefault(); shell.classList.add("drag-over"); });
+shell.addEventListener("dragleave", () => shell.classList.remove("drag-over"));
+shell.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  shell.classList.remove("drag-over");
+  for (const f of Array.from(e.dataTransfer?.files || [])) {
+    await ingestFileBlob(f, f.name);
+  }
+  qInput.focus();
+});
+
+qInput.addEventListener("input", () => {
+  qInput.style.height = "auto";
+  qInput.style.height = Math.min(qInput.scrollHeight, 96) + "px";
+  syncPanelHeight();
+});
+
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    e.preventDefault();
+    if (!postHost({ type: "hide" })) resetQuickChat();
+  } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "n") {
+    e.preventDefault();
+    resetQuickChat();
+  }
+});
+
+qInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    $("q-form").requestSubmit();
+  }
+});
+
+$("btn-copy").onclick = async () => {
+  if (!lastReplyText) return;
+  try {
+    await navigator.clipboard.writeText(lastReplyText);
+    $("q-status").textContent = "Copied reply to clipboard";
+  } catch (e) {}
+};
+
+$("btn-open").onclick = () => {
+  const target = quickSessionId
+    ? `http://127.0.0.1:18080/#session=${encodeURIComponent(quickSessionId)}`
+    : "http://127.0.0.1:18080/";
+  if (!postHost({ type: "open_url", url: target })) {
+    window.open(target, "_blank");
+  }
+};
+
+async function persistQuickSession(ctxTokens) {
+  if (!quickSessionId) {
+    quickSessionId = "sess_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
+    quickCreatedAt = Math.floor(Date.now() / 1000);
+  }
+  const nowSec = Math.floor(Date.now() / 1000);
+  try {
+    await fetch("/v1/sessions/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: quickSessionId,
+        title: quickTitle || "Quick Prompt",
+        workdir: activeWorkdir,
+        created_at: quickCreatedAt,
+        updated_at: nowSec,
+        context_tokens: ctxTokens || 0,
+        added_lines: 0,
+        removed_lines: 0,
+        changed_files: 0,
+        messages: quickMessages,
+        turns: quickTurns,
+      }),
+    });
+    loadSessionsList();
+  } catch (e) {}
+}
+
+$("q-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const text = qInput.value.trim();
+  if ((!text && pendingAttachments.length === 0) || qSend.disabled) return;
+  const atts = pendingAttachments.slice();
+  pendingAttachments = [];
+  renderTray();
+  qInput.value = "";
+  qInput.style.height = "auto";
+  qSend.disabled = true;
+
+  if (!quickTitle) {
+    quickTitle = (text || (atts[0]?.name || "Quick Prompt")).slice(0, 48);
+  }
+
+  const prevLen = quickMessages.length;
+  quickMessages.push({ role: "user", content: text });
+
+  ansWrap.classList.add("open");
+  const uEl = document.createElement("div");
+  uEl.className = "q-turn-user";
+  uEl.textContent = text || atts.map(a => a.name).join(", ");
+  ansWrap.appendChild(uEl);
+
+  const badgeRow = document.createElement("div");
+  badgeRow.className = "q-badges";
+  ansWrap.appendChild(badgeRow);
+
+  const rEl = document.createElement("div");
+  rEl.className = "q-turn-reply";
+  rEl.textContent = "…";
+  ansWrap.appendChild(rEl);
+  ansWrap.scrollTop = ansWrap.scrollHeight;
+  syncPanelHeight();
+
+  $("q-status").textContent = "Generating…";
+  let prose = "";
+  let routeMode = "chat";
+  const badges = [];
+  const toolRecords = [];
+  let verifyRecord = null;
+  let ctxTokens = 0;
+
+  try {
+    const payload = {
+      messages: quickMessages,
+      route: "auto",
+      attachments: atts.map(a => ({ name: a.name, mime: a.mime, data: a.dataUrl })),
+    };
+    const r = await fetch("/v1/turn", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) throw new Error((await r.json()).error?.message || r.statusText);
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, idx).replace(/^data: /, "");
+        buf = buf.slice(idx + 2);
+        if (!line || line === "[DONE]") continue;
+        const j = JSON.parse(line);
+        if (j.type === "error") throw new Error(j.message || "turn failed");
+        if (j.type === "route") {
+          routeMode = j.mode || "chat";
+          const p = document.createElement("span");
+          p.className = "q-pill";
+          p.textContent = routeMode === "agent" ? "agent · workspace" : "chat";
+          badgeRow.appendChild(p);
+        } else if (j.type === "attachments") {
+          for (const item of (j.items || [])) {
+            badges.push(item.badge);
+            const p = document.createElement("span");
+            p.className = "q-pill";
+            p.textContent = item.badge;
+            badgeRow.appendChild(p);
+          }
+        } else if (j.type === "text") {
+          prose += j.delta;
+          rEl.innerHTML = renderMd(prose);
+          ansWrap.scrollTop = ansWrap.scrollHeight;
+          syncPanelHeight();
+        } else if (j.type === "tool_progress") {
+          $("q-status").textContent = `Drafting ${j.name} ${j.target || ""} (${j.bytes} B)…`;
+        } else if (j.type === "tool_done") {
+          toolRecords.push({
+            id: j.id,
+            name: j.name,
+            ok: j.ok,
+            validation_ok: j.validation_ok,
+            output: j.output,
+            diff: j.diff || null,
+          });
+        } else if (j.type === "verified") {
+          verifyRecord = j;
+          const p = document.createElement("span");
+          p.className = "q-pill";
+          p.textContent = `verified · ${j.checks_run} checks`;
+          badgeRow.appendChild(p);
+        } else if (j.type === "step_stats") {
+          const u = j.usage || {};
+          const rate = (u.completion_tokens / Math.max(u.decode_secs || 1e-3, 1e-3)).toFixed(1);
+          $("q-status").textContent = `${rate} tok/s · ${u.completion_tokens} tokens`;
+        } else if (j.type === "done") {
+          if (Array.isArray(j.messages)) quickMessages = j.messages;
+          ctxTokens = j.context_tokens || 0;
+          if (!prose && j.text) {
+            prose = j.text;
+            rEl.innerHTML = renderMd(prose);
+          }
+        }
+      }
+    }
+    lastReplyText = prose;
+    $("btn-copy").style.display = prose ? "inline-block" : "none";
+    quickTurns.push({
+      userText: text,
+      attachments: atts.map(a => ({ name: a.name, ext: a.ext, isImage: a.isImage, dataUrl: a.isImage ? a.dataUrl : "" })),
+      route: routeMode,
+      badges,
+      tools: toolRecords,
+      verified: verifyRecord,
+      prose,
+    });
+    await persistQuickSession(ctxTokens);
+    syncPanelHeight();
+  } catch (err) {
+    rEl.textContent = "Error: " + err.message;
+    quickMessages.length = prevLen;
+    syncPanelHeight();
+  } finally {
+    qSend.disabled = false;
+    qInput.focus();
+  }
+};
+
+loadSessionsList();
+syncPanelHeight();
+</script>
+</body>
+</html>

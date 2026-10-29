@@ -312,6 +312,12 @@ fn main() {
                     AgentEvent::ValidationRepair { step, report } => {
                         println!("  [step {step} validation repair]\n{report}");
                     }
+                    AgentEvent::Verified { step, report } => {
+                        println!(
+                            "  [step {step} verified in {:.1} ms: {}]",
+                            report.elapsed_ms, report.summary
+                        );
+                    }
                     AgentEvent::Done { steps, total_secs, .. } => {
                         println!("[completed in {steps} step(s), {total_secs:.2}s]");
                     }

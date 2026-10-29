@@ -209,6 +209,12 @@ fn run_agent_goal(
                     AgentEvent::ValidationRepair { step, report } => {
                         eprintln!("  [step {step} validation repair]\n{report}");
                     }
+                    AgentEvent::Verified { step, report } => {
+                        eprintln!(
+                            "  [step {step} verified in {:.1} ms: {}]",
+                            report.elapsed_ms, report.summary
+                        );
+                    }
                     AgentEvent::Done { steps, total_secs, .. } => {
                         eprintln!("=== [Completed in {steps} step(s), {total_secs:.2}s total] ===");
                     }

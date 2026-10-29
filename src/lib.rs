@@ -24,6 +24,7 @@
 
 pub mod accel;
 pub mod agent;
+pub mod attachments;
 pub mod bpe_tokenizer;
 pub mod chat;
 pub mod compiler;
