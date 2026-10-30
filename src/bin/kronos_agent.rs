@@ -149,6 +149,7 @@ fn run_agent_goal(
                 max_steps: cfg.max_steps,
                 cmd_timeout_secs: cfg.cmd_timeout_secs,
                 expect_tool_call: true,
+                prompt_tools: Vec::new(),
             };
             let mut printed_prose = false;
             run_agent_turn(model, history, tools_json, &turn_cfg, |ev| {

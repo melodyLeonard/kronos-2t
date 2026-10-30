@@ -1000,14 +1000,14 @@ fn execute_allocated_turn(
     }
 
     if history.first().is_none_or(|m| m.role != "system") {
-        let sys = build_unified_system_prompt(&workdir);
+        let sys = build_unified_system_prompt();
         history.insert(0, Message::new("system", &sys));
     } else if history[0].content.starts_with(UNIFIED_SYSTEM_PROMPT)
         || history[0].content.starts_with(AGENT_SYSTEM_PROMPT)
         || history[0].content.starts_with("You are Kronos")
         || history[0].content.starts_with("Your name is Kronos")
     {
-        history[0].content = build_unified_system_prompt(&workdir);
+        history[0].content = build_unified_system_prompt();
     }
 
     let mut effective_route = initial_route;
@@ -1080,6 +1080,11 @@ fn execute_allocated_turn(
         max_steps,
         cmd_timeout_secs: cmd_timeout,
         expect_tool_call: matches!(effective_route, TurnRoute::Agent | TurnRoute::Computer),
+        prompt_tools: if effective_route == TurnRoute::Chat {
+            tool_definitions_json()
+        } else {
+            Vec::new()
+        },
     };
 
     let srv_for_spawn = Arc::clone(srv);
@@ -1619,7 +1624,7 @@ fn compact_history_http(srv: &Server, stream: &mut TcpStream, req: &Request) {
     }
     let workdir = srv.active_workdir();
     if history.first().is_none_or(|m| m.role != "system") {
-        let sys = build_unified_system_prompt(&workdir);
+        let sys = build_unified_system_prompt();
         history.insert(0, Message::new("system", &sys));
     }
     let tools_json = tool_definitions_json();
@@ -2734,7 +2739,7 @@ fn main() {
 
     let enable_dev_ctx = args.iter().any(|a| a == "--device-context");
     let t_warm = Instant::now();
-    let warm_sys = build_unified_system_prompt(&workdir);
+    let warm_sys = build_unified_system_prompt();
     let warm_tools = tool_definitions_json();
     let mut prewarmed_tokens = 0usize;
     std::thread::scope(|s| {

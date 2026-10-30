@@ -139,6 +139,7 @@ pub struct AgentTurnConfig {
     pub max_steps: usize,
     pub cmd_timeout_secs: u64,
     pub expect_tool_call: bool,
+    pub prompt_tools: Vec<String>,
 }
 
 pub type SubAgentSpawner =
@@ -3720,20 +3721,26 @@ fn extract_partial_json_str(haystack: &str, key: &str) -> Option<String> {
 }
 
 
-pub fn build_unified_system_prompt(workdir: &Path) -> String {
-    let dir_line = format!("Workspace directory on disk: {}", workdir.display());
-    let snap = format_workspace_snapshot(workdir, 12 * 1024);
-    if snap.is_empty() {
-        format!(
-            "{UNIFIED_SYSTEM_PROMPT}\n\n{dir_line}\n\nWorkspace status: currently empty (0 files on disk; use write_file to create new files)."
-        )
-    } else {
-        format!("{UNIFIED_SYSTEM_PROMPT}\n\n{dir_line}\n\n{snap}")
-    }
+pub fn build_unified_system_prompt() -> String {
+    UNIFIED_SYSTEM_PROMPT.to_string()
 }
 
-fn build_initial_system_prompt(workdir: &Path) -> String {
-    format_system_with_workspace(AGENT_SYSTEM_PROMPT, workdir)
+const WORKSPACE_STATUS_OPEN: &str = "[Workspace Status]";
+const WORKSPACE_STATUS_CLOSE: &str = "[/Workspace Status]";
+
+pub fn build_workspace_context_block(workdir: &Path) -> String {
+    let dir_line = format!("Workspace directory on disk: {}", workdir.display());
+    let snap = format_workspace_snapshot(workdir, 12 * 1024);
+    let body = if snap.is_empty() {
+        "Workspace status: currently empty (0 files on disk; use write_file to create new files).".to_string()
+    } else {
+        snap
+    };
+    format!("{WORKSPACE_STATUS_OPEN}\n{dir_line}\n\n{}\n{WORKSPACE_STATUS_CLOSE}", body.trim_end())
+}
+
+fn build_initial_system_prompt() -> String {
+    AGENT_SYSTEM_PROMPT.to_string()
 }
 
 fn format_workspace_snapshot(workdir: &Path, max_inline_bytes: u64) -> String {
@@ -3773,15 +3780,6 @@ fn format_workspace_snapshot(workdir: &Path, max_inline_bytes: u64) -> String {
     listing
 }
 
-fn format_system_with_workspace(base_prompt: &str, workdir: &Path) -> String {
-    let snap = format_workspace_snapshot(workdir, 12 * 1024);
-    if snap.is_empty() {
-        base_prompt.to_string()
-    } else {
-        format!("{base_prompt}\n\n{snap}")
-    }
-}
-
 
 fn summarize_single_line(text: &str, max_chars: usize) -> String {
     let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -3793,7 +3791,8 @@ fn summarize_single_line(text: &str, max_chars: usize) -> String {
     }
 }
 
-fn extract_user_turn_digest(content: &str) -> String {
+fn extract_user_turn_digest(raw_content: &str) -> String {
+    let content = strip_injected_prompt_headers(raw_content);
     let mut img_notes = Vec::new();
     let mut plain_lines = Vec::new();
     let mut in_ocr_block = false;
@@ -4811,6 +4810,7 @@ fn strip_injected_prompt_headers(user_content: &str) -> &str {
     loop {
         let mut stripped_any = false;
         for (marker, closer) in [
+            (WORKSPACE_STATUS_OPEN, Some(WORKSPACE_STATUS_CLOSE)),
             ("[Device Context", Some("[/Device Context]")),
             ("[Workspace Context Snapshot", Some("[/Workspace Context Snapshot]")),
             ("[Attached Image", Some("[/Attached Image]")),
@@ -5023,8 +5023,16 @@ fn run_agent_turn_inner(
 ) -> Result<String, String> {
     let mut active_workdir = cfg.workdir.clone();
     if history.first().is_none_or(|m| m.role != "system") {
-        let sys_prompt = build_initial_system_prompt(&active_workdir);
+        let sys_prompt = build_initial_system_prompt();
         history.insert(0, Message::new("system", &sys_prompt));
+    }
+    if !tools_json.is_empty() {
+        if let Some(last_u) = history.iter_mut().rev().find(|m| m.role == "user") {
+            if !last_u.content.contains(WORKSPACE_STATUS_OPEN) {
+                let block = build_workspace_context_block(&active_workdir);
+                last_u.content = format!("{block}\n\n{}", last_u.content);
+            }
+        }
     }
     let sys_prompt_snapshot = history
         .first()
@@ -5086,6 +5094,11 @@ fn run_agent_turn_inner(
     } else {
         &jev_plan.active_tools_json
     };
+    let render_tools: &[String] = if active_tools.is_empty() && !cfg.prompt_tools.is_empty() {
+        &cfg.prompt_tools
+    } else {
+        active_tools
+    };
 
     use crate::config::limits::MAX_CONSECUTIVE_NO_TOOL_STEPS;
     let t_start = Instant::now();
@@ -5110,7 +5123,7 @@ fn run_agent_turn_inner(
             comp_rep_opt = Some(compact_conversation_history(
                 model,
                 history,
-                active_tools,
+                render_tools,
                 &active_workdir,
                 false,
             ));
@@ -5186,7 +5199,7 @@ fn run_agent_turn_inner(
         with_model(&mut |model| {
             comp_res = Some(model.generate_with_tools_prefixed(
                 history,
-                active_tools,
+                render_tools,
                 force_tool_prefix,
                 &step_params,
                 |piece| {
@@ -5913,13 +5926,16 @@ mod tests {
         assert!(!css_miss.ok);
         assert!(css_miss.output.contains("1 | body {"));
 
-        // 9. build_initial_system_prompt snapshots small populated workspace and stays bare when empty.
-        let populated_sys = build_initial_system_prompt(&dir);
-        assert!(populated_sys.contains("--- theme.css"));
+        // 9. System prompt stays static; the workspace snapshot lives in the user turn.
+        assert_eq!(build_initial_system_prompt(), AGENT_SYSTEM_PROMPT);
+        let populated_block = build_workspace_context_block(&dir);
+        assert!(populated_block.contains("--- theme.css"));
+        let wrapped = format!("{populated_block}\n\nfix the button");
+        assert_eq!(strip_injected_prompt_headers(&wrapped), "fix the button");
         let empty_dir = std::env::temp_dir().join(format!("kronos_empty_ws_{}", std::process::id()));
         let _ = fs::remove_dir_all(&empty_dir);
         fs::create_dir_all(&empty_dir).unwrap();
-        assert_eq!(build_initial_system_prompt(&empty_dir), AGENT_SYSTEM_PROMPT);
+        assert!(build_workspace_context_block(&empty_dir).contains("currently empty"));
         let _ = fs::remove_dir_all(&empty_dir);
 
         // 10. classify_turn_intent automatically distinguishes chat Q&A from workspace engineering.
@@ -5971,8 +5987,8 @@ mod tests {
             TurnRoute::Agent
         );
 
-        let unified_sys = build_unified_system_prompt(&dir);
-        assert!(unified_sys.contains(&format!("Workspace directory on disk: {}", dir.display())));
+        assert_eq!(build_unified_system_prompt(), UNIFIED_SYSTEM_PROMPT);
+        assert!(build_workspace_context_block(&dir).contains(&format!("Workspace directory on disk: {}", dir.display())));
 
         // 10b. edit_file with empty old_text overwrites file, and HTML <title> edits sync visible <h1>.
         let overwrite_css = execute_tool(

@@ -907,7 +907,7 @@ pub unsafe extern "C" fn kronos_session_run_agent_turn(
         let mut history = Vec::with_capacity(items.len() + 1);
         history.push(Message::new(
             "system",
-            &crate::runtime::agent::build_unified_system_prompt(workdir),
+            &crate::runtime::agent::build_unified_system_prompt(),
         ));
         for item in &items {
             let role = item
@@ -937,6 +937,7 @@ pub unsafe extern "C" fn kronos_session_run_agent_turn(
             max_steps: max_steps.clamp(1, 8),
             cmd_timeout_secs: 10,
             expect_tool_call: true,
+            prompt_tools: Vec::new(),
         };
         let mut steps_done = 1i32;
         let emit = |piece: &str| -> bool {

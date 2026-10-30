@@ -274,6 +274,7 @@ fn main() {
                 max_steps,
                 cmd_timeout_secs: cmd_timeout,
                 expect_tool_call: true,
+                prompt_tools: Vec::new(),
             };
             let mut printed_text = false;
             let mut next_workdir: Option<PathBuf> = None;
