@@ -602,6 +602,137 @@ pub unsafe extern "C" fn kronos_session_generate(
     res.unwrap_or(-1)
 }
 
+/// Disables Apple Metal GPU execution and restores ARM64 CPU execution (`0` on success, `-1` on error).
+///
+/// # Safety
+/// `session` must be a valid `KronosMobileSession` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn kronos_session_disable_metal(session: *mut KronosMobileSession) -> i32 {
+    if session.is_null() {
+        return -1;
+    }
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: Validated non-null exclusive session pointer.
+        let sess = unsafe { &mut *session };
+        sess.model.disable_metal();
+        sess.pending_token = None;
+        sess.clear_error();
+        0
+    }));
+    res.unwrap_or(-1)
+}
+
+/// Runs multi-turn streaming generation from a JSON array of `{"role":"...","content":"..."}`
+/// messages, reusing the session's cached KV prefix across turns and invoking `on_piece_cb` for
+/// each streamed UTF-8 piece (returning `false` from `on_piece_cb` cancels generation cleanly).
+///
+/// Optionally writes `prefill_ms`, `decode_ms`, and `prefilled_tokens` when the output pointers are
+/// non-null. Returns total generated tokens (`>= 0`), or `-1` on error.
+///
+/// # Safety
+/// `session` and `messages_json_utf8` must be valid non-null pointers. Output metric pointers,
+/// `on_piece_cb`, and `user_data` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn kronos_session_generate_chat_json(
+    session: *mut KronosMobileSession,
+    messages_json_utf8: *const c_char,
+    max_tokens: usize,
+    temperature: f32,
+    on_piece_cb: KronosStreamCallback,
+    user_data: *mut c_void,
+    out_prefill_ms: *mut f64,
+    out_decode_ms: *mut f64,
+    out_prefilled_tokens: *mut usize,
+) -> i32 {
+    if session.is_null() {
+        return -1;
+    }
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: Validated non-null exclusive session pointer.
+        let sess = unsafe { &mut *session };
+        // SAFETY: Validated non-null C string pointer per FFI contract.
+        let raw_json = match unsafe { cstr_to_str(messages_json_utf8) } {
+            Ok(v) => v,
+            Err(e) => {
+                sess.set_error(e);
+                return -1;
+            }
+        };
+        let items = match Json::parse(raw_json) {
+            Ok(Json::Arr(arr)) => arr,
+            Ok(_) => {
+                sess.set_error("messages_json_utf8 must be a JSON array of message objects");
+                return -1;
+            }
+            Err(e) => {
+                sess.set_error(format!("invalid messages_json_utf8: {e}"));
+                return -1;
+            }
+        };
+        let mut msgs = Vec::with_capacity(items.len());
+        for item in &items {
+            let role = item
+                .get("role")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .trim();
+            let content = item.get("content").and_then(Json::as_str).unwrap_or("");
+            if !role.is_empty() && !content.is_empty() {
+                msgs.push(Message::new(role, content));
+            }
+        }
+        if msgs.is_empty() {
+            sess.set_error("messages_json_utf8 contained zero non-empty messages");
+            return -1;
+        }
+        let params = GenParams {
+            temperature: temperature.max(0.0),
+            max_tokens: max_tokens.max(1),
+            ..GenParams::default()
+        };
+        sess.pending_token = None;
+        let gen = sess.model.generate(&msgs, &params, |piece| {
+            let Some(cb) = on_piece_cb else {
+                return true;
+            };
+            let Ok(cs) = CString::new(piece.replace('\0', "")) else {
+                return true;
+            };
+            // SAFETY: `cs` is a live NUL-terminated buffer for the duration of the callback.
+            unsafe { cb(cs.as_ptr(), cs.as_bytes().len(), user_data) }
+        });
+        match gen {
+            Ok(comp) => {
+                if !out_prefill_ms.is_null() {
+                    // SAFETY: Non-null aligned output `f64` pointer provided by caller.
+                    unsafe {
+                        *out_prefill_ms = comp.prefill_secs * 1000.0;
+                    }
+                }
+                if !out_decode_ms.is_null() {
+                    // SAFETY: Non-null aligned output `f64` pointer provided by caller.
+                    unsafe {
+                        *out_decode_ms = comp.decode_secs * 1000.0;
+                    }
+                }
+                if !out_prefilled_tokens.is_null() {
+                    // SAFETY: Non-null aligned output `usize` pointer provided by caller.
+                    unsafe {
+                        *out_prefilled_tokens = comp.prefilled_tokens;
+                    }
+                }
+                sess.clear_error();
+                comp.completion_tokens as i32
+            }
+            Err(e) => {
+                sess.set_error(e);
+                -1
+            }
+        }
+    }));
+    res.unwrap_or(-1)
+}
+
 /// Clears the target and draft KV caches on `session`.
 ///
 /// # Safety
@@ -620,6 +751,242 @@ pub unsafe extern "C" fn kronos_session_reset(session: *mut KronosMobileSession)
         sess.emitted_bytes = 0;
         sess.clear_error();
     }));
+}
+
+unsafe fn write_c_utf8_buf(s: &str, out_buf: *mut c_char, out_cap: usize) {
+    if out_buf.is_null() || out_cap == 0 {
+        return;
+    }
+    let clean = s.replace('\0', "");
+    let max_copy = clean.len().min(out_cap - 1);
+    let mut end = max_copy;
+    while end > 0 && !clean.is_char_boundary(end) {
+        end -= 1;
+    }
+    // SAFETY: Caller supplies writable buffer of at least `out_cap` bytes (`end + 1 <= out_cap`).
+    unsafe {
+        std::ptr::copy_nonoverlapping(clean.as_ptr().cast::<c_char>(), out_buf, end);
+        *out_buf.add(end) = 0;
+    }
+}
+
+/// Ingests raw file or image bytes (`PDF`, `DOCX`, `XLSX`, `ZIP`, `CSV`, `JSON`, code, `PNG`, `JPEG`)
+/// into an inline prompt context block and optional `.kronos_media/` workspace asset.
+/// Returns `0` on success, `-1` on error.
+///
+/// # Safety
+/// Pointer arguments must either be valid for their given lengths/capacities or null where optional.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn kronos_ingest_attachment_bytes(
+    filename_utf8: *const c_char,
+    mime_utf8: *const c_char,
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+    workdir_utf8: *const c_char,
+    slot: usize,
+    out_badge_utf8: *mut c_char,
+    out_badge_cap: usize,
+    out_context_utf8: *mut c_char,
+    out_context_cap: usize,
+    out_saved_rel_utf8: *mut c_char,
+    out_saved_rel_cap: usize,
+) -> i32 {
+    if bytes_ptr.is_null() && bytes_len > 0 {
+        return -1;
+    }
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        let name = if filename_utf8.is_null() {
+            "attachment"
+        } else {
+            // SAFETY: Validated non-null NUL-terminated string pointer.
+            unsafe { CStr::from_ptr(filename_utf8) }
+                .to_str()
+                .unwrap_or("attachment")
+        };
+        let mime = if mime_utf8.is_null() {
+            ""
+        } else {
+            // SAFETY: Validated non-null NUL-terminated string pointer.
+            unsafe { CStr::from_ptr(mime_utf8) }.to_str().unwrap_or("")
+        };
+        let bytes: &[u8] = if bytes_len == 0 {
+            &[]
+        } else {
+            // SAFETY: Validated non-null pointer with length `bytes_len`.
+            unsafe { std::slice::from_raw_parts(bytes_ptr, bytes_len) }
+        };
+        let workdir_opt = if workdir_utf8.is_null() {
+            None
+        } else {
+            // SAFETY: Validated non-null NUL-terminated string pointer.
+            unsafe { CStr::from_ptr(workdir_utf8) }
+                .to_str()
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(Path::new)
+        };
+        match crate::attachments::ingest_attachment_bytes(name, mime, bytes, workdir_opt, slot) {
+            Ok(ing) => {
+                // SAFETY: Caller-provided output buffers and capacities.
+                unsafe {
+                    write_c_utf8_buf(&ing.badge, out_badge_utf8, out_badge_cap);
+                    write_c_utf8_buf(&ing.prompt_context, out_context_utf8, out_context_cap);
+                    write_c_utf8_buf(
+                        ing.saved_rel_path.as_deref().unwrap_or(""),
+                        out_saved_rel_utf8,
+                        out_saved_rel_cap,
+                    );
+                }
+                0
+            }
+            Err(_) => -1,
+        }
+    }));
+    res.unwrap_or(-1)
+}
+
+/// Runs a sandboxed multi-step workspace agent turn (`write_file`, `edit_file`, `read_file`,
+/// `list_dir`, `search_files`) inside `workdir_utf8` with `Kronos-Jev` verification.
+/// Streams live prose and `[tool: ...]` status lines to `on_piece_cb` and writes the final
+/// response into `out_final_utf8`. Returns steps executed (`>= 1`), or `-1` on error.
+///
+/// # Safety
+/// `session`, `workdir_utf8`, and `messages_json_utf8` must be valid non-null pointers.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn kronos_session_run_agent_turn(
+    session: *mut KronosMobileSession,
+    workdir_utf8: *const c_char,
+    messages_json_utf8: *const c_char,
+    max_steps: usize,
+    max_tokens: usize,
+    temperature: f32,
+    on_piece_cb: KronosStreamCallback,
+    user_data: *mut c_void,
+    out_final_utf8: *mut c_char,
+    out_final_cap: usize,
+) -> i32 {
+    if session.is_null() {
+        return -1;
+    }
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: Validated non-null exclusive session pointer.
+        let sess = unsafe { &mut *session };
+        // SAFETY: Validated non-null C string pointers per FFI contract.
+        let workdir_str = match unsafe { cstr_to_str(workdir_utf8) } {
+            Ok(v) => v,
+            Err(e) => {
+                sess.set_error(e);
+                return -1;
+            }
+        };
+        let raw_json = match unsafe { cstr_to_str(messages_json_utf8) } {
+            Ok(v) => v,
+            Err(e) => {
+                sess.set_error(e);
+                return -1;
+            }
+        };
+        let workdir = Path::new(workdir_str);
+        if let Err(e) = std::fs::create_dir_all(workdir) {
+            sess.set_error(format!("failed to create workspace dir: {e}"));
+            return -1;
+        }
+        let items = match Json::parse(raw_json) {
+            Ok(Json::Arr(arr)) => arr,
+            Ok(_) => {
+                sess.set_error("messages_json_utf8 must be a JSON array");
+                return -1;
+            }
+            Err(e) => {
+                sess.set_error(format!("invalid messages_json_utf8: {e}"));
+                return -1;
+            }
+        };
+        let mut history = Vec::with_capacity(items.len() + 1);
+        history.push(Message::new(
+            "system",
+            &crate::agent::build_unified_system_prompt(workdir),
+        ));
+        for item in &items {
+            let role = item
+                .get("role")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .trim();
+            if role == "system" || role.is_empty() {
+                continue;
+            }
+            let content = item.get("content").and_then(Json::as_str).unwrap_or("");
+            if !content.is_empty() {
+                history.push(Message::new(role, content));
+            }
+        }
+        let tools: Vec<String> = crate::agent::tool_definitions_json()
+            .into_iter()
+            .filter(|t| !t.contains("\"run_command\"") && !t.contains("\"switch_workspace\""))
+            .collect();
+        let cfg = crate::agent::AgentTurnConfig {
+            workdir: workdir.to_path_buf(),
+            params: GenParams {
+                temperature: temperature.max(0.0),
+                max_tokens: max_tokens.max(128),
+                ..GenParams::default()
+            },
+            max_steps: max_steps.clamp(1, 8),
+            cmd_timeout_secs: 10,
+            expect_tool_call: true,
+        };
+        let mut steps_done = 1i32;
+        let emit = |piece: &str| -> bool {
+            let Some(cb) = on_piece_cb else {
+                return true;
+            };
+            let Ok(cs) = CString::new(piece.replace('\0', "")) else {
+                return true;
+            };
+            // SAFETY: `cs` is alive for the duration of the callback.
+            unsafe { cb(cs.as_ptr(), cs.as_bytes().len(), user_data) }
+        };
+        let turn_res =
+            crate::agent::run_agent_turn(&mut sess.model, &mut history, &tools, &cfg, |ev| {
+                match ev {
+                    crate::agent::AgentEvent::StepStart { step, .. } => {
+                        steps_done = step as i32;
+                        true
+                    }
+                    crate::agent::AgentEvent::TextDelta(d) => emit(d),
+                    crate::agent::AgentEvent::ToolStart { call, .. } => {
+                        emit(&format!("\n[tool {}]\n", call.name))
+                    }
+                    crate::agent::AgentEvent::ToolDone { call, outcome, .. } => {
+                        let first_line = outcome.output.lines().next().unwrap_or("done");
+                        emit(&format!("[{} -> {}]\n", call.name, first_line))
+                    }
+                    crate::agent::AgentEvent::Done { steps, .. } => {
+                        steps_done = steps as i32;
+                        true
+                    }
+                    _ => true,
+                }
+            });
+        match turn_res {
+            Ok(final_txt) => {
+                // SAFETY: Caller-provided output buffer and capacity.
+                unsafe {
+                    write_c_utf8_buf(&final_txt, out_final_utf8, out_final_cap);
+                }
+                sess.clear_error();
+                steps_done.max(1)
+            }
+            Err(e) => {
+                sess.set_error(e);
+                -1
+            }
+        }
+    }));
+    res.unwrap_or(-1)
 }
 
 /// Returns resident model weight + active KV-cache bytes for `session`.
@@ -693,7 +1060,7 @@ mod tests {
         // Enforce 4900 MiB iOS `Mobile5G` memory budget via C FFI.
         // SAFETY: Valid CStrings and exclusive session ownership throughout test.
         unsafe {
-            let sess = kronos_session_create(dir_c.as_ptr(), mode_c.as_ptr(), 512, 2, 4900);
+            let sess = kronos_session_create(dir_c.as_ptr(), mode_c.as_ptr(), 2048, 2, 4900);
             assert!(!sess.is_null(), "kronos_session_create returned null");
             assert_eq!(
                 MemoryBudgetProfile::active().tier,
@@ -773,6 +1140,213 @@ mod tests {
                 (&mut cb_text as *mut String).cast::<c_void>(),
             );
             assert!(n_gen > 0 && cb_text.contains('9'), "unexpected reply: {cb_text:?}");
+
+            // File/document byte ingestion FFI check.
+            let sample_csv = b"model,bits,tok_s\nkronos,4.16,119.2\n";
+            let mut badge_buf = [0 as c_char; 256];
+            let mut ctx_buf = [0 as c_char; 2048];
+            let mut rel_buf = [0 as c_char; 256];
+            let ing_rc = kronos_ingest_attachment_bytes(
+                c"bench.csv".as_ptr(),
+                c"text/csv".as_ptr(),
+                sample_csv.as_ptr(),
+                sample_csv.len(),
+                std::ptr::null(),
+                1,
+                badge_buf.as_mut_ptr(),
+                badge_buf.len(),
+                ctx_buf.as_mut_ptr(),
+                ctx_buf.len(),
+                rel_buf.as_mut_ptr(),
+                rel_buf.len(),
+            );
+            assert_eq!(ing_rc, 0);
+            let ing_ctx = CStr::from_ptr(ctx_buf.as_ptr()).to_string_lossy();
+            assert!(ing_ctx.contains("kronos") && ing_ctx.contains("119.2"));
+
+            let t1_json = CString::new(
+                r#"[{"role":"system","content":"Reply with only the number."},{"role":"user","content":"What is 3 * 3?"}]"#,
+            )
+            .unwrap();
+            let mut t1_cpu = String::new();
+            let mut pf_cpu = 0.0f64;
+            let mut dc_cpu = 0.0f64;
+            let mut pft_cpu = 0usize;
+            kronos_session_reset(sess);
+            let n1_cpu = kronos_session_generate_chat_json(
+                sess,
+                t1_json.as_ptr(),
+                16,
+                0.0,
+                Some(collect_stream_cb),
+                (&mut t1_cpu as *mut String).cast::<c_void>(),
+                &mut pf_cpu,
+                &mut dc_cpu,
+                &mut pft_cpu,
+            );
+            assert!(n1_cpu > 0 && t1_cpu.contains('9'), "cpu turn1: {t1_cpu:?}");
+
+            // Apple Metal GPU backend: verify `jev_decide` (cold + hot KV prefix) and
+            // multi-turn `generate_chat_json` deterministic prefill + KV reuse (`dim=896`).
+            #[cfg(all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+            if kronos_session_enable_metal(sess) == 0 {
+                kronos_session_reset(sess);
+                let mut m_probs = [0.0f32; 3];
+                let mut m_ent = 0.0f32;
+                let mut m_conf = 0.0f32;
+                let j_sys = c"Classify whether the user wants code editing (Agent), device control (Computer), or Q&A (Chat).";
+                let m_sel_cold = kronos_session_jev_decide(
+                    sess,
+                    j_sys.as_ptr(),
+                    c"Edit src/main.rs to fix the compiler error.".as_ptr(),
+                    c"[\"Chat\",\"Computer\",\"Agent\"]".as_ptr(),
+                    1.0,
+                    m_probs.as_mut_ptr(),
+                    3,
+                    &mut m_ent,
+                    &mut m_conf,
+                );
+                assert!(
+                    (0..3).contains(&m_sel_cold),
+                    "metal jev_decide cold failed: {}",
+                    CStr::from_ptr(kronos_session_last_error(sess)).to_string_lossy()
+                );
+                let m_sel_hot = kronos_session_jev_decide(
+                    sess,
+                    j_sys.as_ptr(),
+                    c"Explain Walsh-Hadamard rotation in 4-bit quantization.".as_ptr(),
+                    c"[\"Chat\",\"Computer\",\"Agent\"]".as_ptr(),
+                    1.0,
+                    m_probs.as_mut_ptr(),
+                    3,
+                    &mut m_ent,
+                    &mut m_conf,
+                );
+                assert!((0..3).contains(&m_sel_hot), "metal jev_decide hot failed");
+
+                let mut t1_out_a = String::new();
+                let mut pf1 = 0.0f64;
+                let mut dc1 = 0.0f64;
+                let mut pft1 = 0usize;
+                kronos_session_reset(sess);
+                let n1_a = kronos_session_generate_chat_json(
+                    sess,
+                    t1_json.as_ptr(),
+                    16,
+                    0.0,
+                    Some(collect_stream_cb),
+                    (&mut t1_out_a as *mut String).cast::<c_void>(),
+                    &mut pf1,
+                    &mut dc1,
+                    &mut pft1,
+                );
+                assert!(n1_a > 0 && t1_out_a.contains('9'), "metal turn1 a: {t1_out_a:?}");
+
+                // Repeat after reset to assert deterministic `rmsnorm_fwht64` prefill (no WAR race).
+                let mut t1_out_b = String::new();
+                kronos_session_reset(sess);
+                let n1_b = kronos_session_generate_chat_json(
+                    sess,
+                    t1_json.as_ptr(),
+                    16,
+                    0.0,
+                    Some(collect_stream_cb),
+                    (&mut t1_out_b as *mut String).cast::<c_void>(),
+                    &mut pf1,
+                    &mut dc1,
+                    &mut pft1,
+                );
+                assert_eq!(n1_a, n1_b);
+                assert_eq!(t1_out_a, t1_out_b, "non-deterministic Metal prefill");
+
+                // Turn 2 reuses the Turn 1 KV prefix (`pft2 < pft1`).
+                let t2_json = CString::new(format!(
+                    r#"[{{"role":"system","content":"Reply with only the number."}},{{"role":"user","content":"What is 3 * 3?"}},{{"role":"assistant","content":{}}},{{"role":"user","content":"What is 2 + 2?"}}]"#,
+                    crate::json::quote(t1_out_b.trim())
+                ))
+                .unwrap();
+                let mut t2_out = String::new();
+                let mut pf2 = 0.0f64;
+                let mut dc2 = 0.0f64;
+                let mut pft2 = 0usize;
+                let n2 = kronos_session_generate_chat_json(
+                    sess,
+                    t2_json.as_ptr(),
+                    16,
+                    0.0,
+                    Some(collect_stream_cb),
+                    (&mut t2_out as *mut String).cast::<c_void>(),
+                    &mut pf2,
+                    &mut dc2,
+                    &mut pft2,
+                );
+                assert!(n2 > 0 && t2_out.contains('4'), "metal turn2: {t2_out:?}");
+                assert!(
+                    pft2 > 0 && pft2 < pft1,
+                    "expected Turn 2 KV prefix reuse: pft1={pft1}, pft2={pft2}"
+                );
+
+                // Verify 0.5B mobile creator profile grounding (he/him, Software Engineer > 10 years, never musician).
+                assert_eq!(kronos_session_configure_kv(sess, 8, 0, 0), 0);
+                kronos_session_reset(sess);
+                let sys = crate::chat::DEFAULT_SYSTEM_QWEN;
+                let facts = crate::chat::CREATOR_PUBLIC_PROFILE;
+                let q1 = format!("{facts}\n\nUser question: Who is Melody?");
+                let q1_json = CString::new(format!(
+                    r#"[{{"role":"system","content":{}}},{{"role":"user","content":{}}}]"#,
+                    crate::json::quote(sys),
+                    crate::json::quote(&q1)
+                ))
+                .unwrap();
+                let mut prof_out = String::new();
+                let np1 = kronos_session_generate_chat_json(
+                    sess,
+                    q1_json.as_ptr(),
+                    140,
+                    0.0,
+                    Some(collect_stream_cb),
+                    (&mut prof_out as *mut String).cast::<c_void>(),
+                    &mut pf1,
+                    &mut dc1,
+                    &mut pft1,
+                );
+                let prof_low = prof_out.to_ascii_lowercase();
+                assert!(
+                    np1 > 0 && prof_low.contains("software engineer") && !prof_low.contains("musician") && !prof_low.contains(" she ") && !prof_low.contains(" her "),
+                    "unexpected 0.5B creator profile answer: {prof_out:?}"
+                );
+
+                let q2 = format!("{facts}\n\nUser question: What's his email and GitHub?");
+                let q2_json = CString::new(format!(
+                    r#"[{{"role":"system","content":{}}},{{"role":"user","content":{}}},{{"role":"assistant","content":{}}},{{"role":"user","content":{}}}]"#,
+                    crate::json::quote(sys),
+                    crate::json::quote(&q1),
+                    crate::json::quote(prof_out.trim()),
+                    crate::json::quote(&q2)
+                ))
+                .unwrap();
+                let mut contact_out = String::new();
+                let np2 = kronos_session_generate_chat_json(
+                    sess,
+                    q2_json.as_ptr(),
+                    120,
+                    0.0,
+                    Some(collect_stream_cb),
+                    (&mut contact_out as *mut String).cast::<c_void>(),
+                    &mut pf2,
+                    &mut dc2,
+                    &mut pft2,
+                );
+                let contact_low = contact_out.to_ascii_lowercase();
+                assert!(
+                    np2 > 0
+                        && contact_low.contains("melodyleonard7@gmail.com")
+                        && contact_low.contains("github.com/melodyleonard"),
+                    "unexpected 0.5B contact answer: {contact_out:?}"
+                );
+
+                assert_eq!(kronos_session_disable_metal(sess), 0);
+            }
 
             kronos_session_reset(sess);
             kronos_session_destroy(sess);

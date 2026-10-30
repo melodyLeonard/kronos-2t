@@ -126,14 +126,24 @@ pub fn ingest_attachment(
     workdir: Option<&Path>,
     slot: usize,
 ) -> Result<AttachmentIngestion, String> {
-    let t0 = Instant::now();
     let (url_mime, bytes) = decode_data_or_base64(payload)?;
     let mime = if !hint_mime.is_empty() {
         hint_mime
     } else {
         url_mime.as_str()
     };
-    let ext = ext_from_name_or_mime(raw_name, mime, &bytes);
+    ingest_attachment_bytes(raw_name, mime, &bytes, workdir, slot)
+}
+
+pub fn ingest_attachment_bytes(
+    raw_name: &str,
+    mime: &str,
+    bytes: &[u8],
+    workdir: Option<&Path>,
+    slot: usize,
+) -> Result<AttachmentIngestion, String> {
+    let t0 = Instant::now();
+    let ext = ext_from_name_or_mime(raw_name, mime, bytes);
     let default_name = format!("attachment_{slot}.{ext}");
     let safe_name = sanitize_filename(
         if raw_name.trim().is_empty() {
@@ -145,7 +155,7 @@ pub fn ingest_attachment(
     );
 
     if is_image_ext(&ext) {
-        let img = analyze_image_bytes(&bytes, &ext, workdir, slot)?;
+        let img = analyze_image_bytes(bytes, &ext, workdir, slot)?;
         return Ok(AttachmentIngestion {
             kind: "image".to_string(),
             name: safe_name,
@@ -162,7 +172,7 @@ pub fn ingest_attachment(
         if std::fs::create_dir_all(&media_dir).is_ok() {
             let fname = format!("file_{slot}_{safe_name}");
             let full = media_dir.join(&fname);
-            if std::fs::write(&full, &bytes).is_ok() {
+            if std::fs::write(&full, bytes).is_ok() {
                 Some(format!(".kronos_media/{fname}"))
             } else {
                 None
@@ -179,7 +189,7 @@ pub fn ingest_attachment(
     };
 
     if ext == "pdf" {
-        let (pages, ocr_pages, extracted) = extract_pdf_text(&bytes);
+        let (pages, ocr_pages, extracted) = extract_pdf_text(bytes);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let ocr_tag = if ocr_pages > 0 {
             format!(" ({ocr_pages} OCR)")
@@ -212,7 +222,7 @@ pub fn ingest_attachment(
     }
 
     if matches!(ext.as_str(), "rtf" | "docx" | "doc" | "odt") {
-        let extracted = extract_rich_document_text(&bytes, &ext);
+        let extracted = extract_rich_document_text(bytes, &ext);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let lines = extracted.lines().count();
         let badge = format!(
@@ -241,7 +251,7 @@ pub fn ingest_attachment(
     }
 
     if ext == "zip" {
-        let entries = list_zip_entries(&bytes);
+        let entries = list_zip_entries(bytes);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let badge = format!(
             "archive · {safe_name} · {} entries · {} B",
@@ -274,7 +284,7 @@ pub fn ingest_attachment(
         });
     }
 
-    if let Ok(utf8) = std::str::from_utf8(&bytes) {
+    if let Ok(utf8) = std::str::from_utf8(bytes) {
         let line_count = utf8.lines().count();
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let extra_meta = if ext == "csv" || ext == "tsv" {

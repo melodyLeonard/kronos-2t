@@ -40,7 +40,8 @@
 
   /* Left Sidebar (Reference Image 1 dark rail) */
   #sidebar {
-    width:264px; min-width:264px; background:var(--sb-bg); color:var(--sb-text);
+    width:264px; min-width:264px; min-height:0; overflow:hidden;
+    background:var(--sb-bg); color:var(--sb-text);
     border-right:1px solid var(--sb-line); display:flex; flex-direction:column;
     user-select:none; z-index:4; transition:margin-left .18s ease;
   }
@@ -100,8 +101,11 @@
   }
 
   #sb-scroll {
-    flex:1; overflow-y:auto; padding:2px 8px 12px; display:flex; flex-direction:column; gap:10px;
+    flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain;
+    -webkit-overflow-scrolling:touch; padding:2px 8px 12px;
+    display:flex; flex-direction:column; gap:10px;
   }
+  #sb-scroll > * { flex-shrink:0; }
   .proj-group { display:flex; flex-direction:column; gap:2px; }
   .proj-hdr {
     display:flex; align-items:center; gap:7px; padding:5px 8px; border-radius:7px;
@@ -220,7 +224,7 @@
   }
 
   /* Main content shell */
-  #main-shell { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; }
+  #main-shell { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; }
   header {
     display:flex; align-items:center; gap:8px; padding:9px 14px;
     border-bottom:1px solid var(--line); background:var(--panel); z-index:3; flex-wrap:wrap;
@@ -265,7 +269,7 @@
 
   #layout { flex:1; display:flex; min-height:0; overflow:hidden; position:relative; }
   #chat-col {
-    flex:1; display:flex; flex-direction:column; min-width:320px; min-height:0; position:relative;
+    flex:1; display:flex; flex-direction:column; min-width:320px; min-height:0; overflow:hidden; position:relative;
   }
   #chat-col.drag-over::after {
     content:"Drop PDF, code, CSV, DOCX, ZIP, or image files to attach";
@@ -274,9 +278,11 @@
     display:flex; align-items:center; justify-content:center; pointer-events:none; z-index:10;
   }
   #log {
-    flex:1; overflow-y:auto; padding:18px 18px 12px; display:flex; flex-direction:column;
-    gap:12px; max-width:860px; width:100%; margin:0 auto;
+    flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain;
+    -webkit-overflow-scrolling:touch; padding:18px 18px 12px;
+    display:flex; flex-direction:column; gap:12px; max-width:860px; width:100%; margin:0 auto;
   }
+  #log > * { flex-shrink:0; }
   .msg { padding:11px 14px; border-radius:12px; white-space:pre-wrap; word-wrap:break-word; max-width:92%; }
   .user {
     align-self:flex-end; background:var(--me); color:var(--me-text);
@@ -324,6 +330,7 @@
   .hint-chip:hover { border-color:var(--accent); color:var(--accent); }
 
   .agent-steps { display:flex; flex-direction:column; gap:6px; margin-bottom:9px; }
+  .agent-steps > * { flex-shrink:0; }
   .agent-steps:empty { display:none; }
   .step-line {
     font-size:11.5px; color:var(--muted); display:flex; align-items:center;
@@ -331,6 +338,7 @@
   }
   .step-perf { font:11.5px ui-monospace, SFMono-Regular, Menlo, monospace; }
   details.tool-card, details.verify-card {
+    flex-shrink:0;
     border:1px solid var(--line); background:var(--subtle); border-radius:8px;
     overflow:hidden; font-size:12.5px;
   }
@@ -382,6 +390,108 @@
     font-size:12px; padding:5px 10px; border-radius:8px;
     background:var(--info-bg); color:var(--info-fg); align-self:center;
   }
+
+  /* Live Multi-Agent Switcher Bar & Parallel Task Launcher */
+  #multi-agent-bar {
+    display:flex; align-items:center; gap:7px; padding:7px 14px;
+    border-bottom:1px solid var(--line); background:var(--subtle);
+    overflow-x:auto; flex-shrink:0;
+  }
+  #multi-agent-bar.hidden { display:none; }
+  .ma-summary {
+    font:600 11.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+    color:var(--muted); white-space:nowrap; padding-right:4px;
+  }
+  .agent-pill {
+    display:inline-flex; align-items:center; gap:7px; padding:4px 10px;
+    border-radius:999px; border:1px solid var(--line); background:var(--panel);
+    font-size:12px; color:var(--text); white-space:nowrap; flex-shrink:0;
+  }
+  .agent-pill:hover { border-color:var(--accent); }
+  .agent-pill.active-view {
+    border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); font-weight:600;
+  }
+  .agent-dot {
+    width:8px; height:8px; border-radius:999px; background:var(--muted); flex-shrink:0;
+  }
+  .agent-dot.running {
+    background:var(--accent);
+    animation:agentPulse 1.3s ease-in-out infinite;
+  }
+  .agent-dot.done { background:#10b981; }
+  .agent-dot.err { background:#ef4444; }
+  @keyframes agentPulse {
+    0%, 100% { transform:scale(1); opacity:1; }
+    50% { transform:scale(1.32); opacity:0.62; }
+  }
+  .agent-pill-meta {
+    font:11px ui-monospace, SFMono-Regular, Menlo, monospace; color:var(--muted);
+  }
+  .ma-spawn-btn {
+    margin-left:auto; font-size:11.5px; padding:4px 10px; border-radius:999px;
+    border:1px solid var(--line); background:var(--panel); color:var(--accent);
+    font-weight:600; white-space:nowrap; flex-shrink:0;
+  }
+  #parallel-task-box {
+    display:flex; flex-direction:column; gap:7px; padding:10px 16px;
+    border-bottom:1px solid var(--line); background:var(--panel); flex-shrink:0;
+  }
+  #parallel-task-box.hidden { display:none; }
+  .pt-row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .pt-row input { flex:1; min-width:190px; font-size:12.5px; padding:6px 9px; }
+  .pt-actions { display:flex; gap:7px; justify-content:flex-end; align-items:center; }
+  .pt-primary {
+    background:var(--accent); color:var(--accent-ink); border-color:var(--accent);
+    font-weight:600; font-size:12px; padding:5px 12px;
+  }
+  .proj-live-badge {
+    font:600 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding:1px 6px; border-radius:999px; background:rgba(20,184,166,0.2);
+    color:#2dd4bf; flex-shrink:0;
+  }
+
+  /* Inline Deliverables Card (Video Player, Live Website & Output Links) */
+  .deliverables-card {
+    margin-top:11px; padding:11px 12px; border-radius:10px;
+    border:1px solid var(--line); background:var(--subtle);
+    display:flex; flex-direction:column; gap:9px;
+  }
+  .deliv-hdr {
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+    flex-wrap:wrap; font-size:12px; font-weight:600;
+  }
+  .deliv-wd {
+    font:11px ui-monospace, SFMono-Regular, Menlo, monospace; color:var(--muted);
+  }
+  .deliv-actions { display:flex; flex-wrap:wrap; gap:7px; align-items:center; }
+  .deliv-primary-btn {
+    display:inline-flex; align-items:center; gap:6px; padding:6px 12px;
+    border-radius:8px; background:var(--accent); color:var(--accent-ink);
+    text-decoration:none; font-weight:600; font-size:12.5px; border:1px solid var(--accent);
+  }
+  .deliv-primary-btn:hover { opacity:0.92; }
+  .deliv-sec-link {
+    display:inline-flex; align-items:center; gap:5px; padding:5px 10px;
+    border-radius:8px; background:var(--panel); color:var(--text);
+    text-decoration:none; font-size:12px; border:1px solid var(--line);
+  }
+  .deliv-sec-link:hover { border-color:var(--accent); color:var(--accent); }
+  .deliv-video {
+    width:100%; max-height:380px; border-radius:8px; background:#000;
+    border:1px solid var(--line);
+  }
+  .deliv-thumb {
+    max-width:100%; max-height:260px; object-fit:contain; border-radius:8px;
+    border:1px solid var(--line); background:var(--panel); cursor:pointer;
+  }
+  .deliv-chips { display:flex; flex-wrap:wrap; gap:6px; }
+  .deliv-chip {
+    display:inline-flex; align-items:center; gap:5px; padding:3px 9px;
+    border-radius:999px; border:1px solid var(--line); background:var(--panel);
+    color:var(--text); font:11.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+    text-decoration:none; cursor:pointer;
+  }
+  .deliv-chip:hover { border-color:var(--accent); color:var(--accent); }
 
   /* Composer */
   form#form {
@@ -463,10 +573,11 @@
 
   #ws-pane {
     width:48%; min-width:320px; max-width:74%; background:var(--panel);
-    display:flex; flex-direction:column; min-height:0;
+    display:flex; flex-direction:column; min-height:0; overflow:hidden;
   }
   #ws-pane.hidden { display:none; }
   .ws-bar {
+    flex-shrink:0;
     display:flex; align-items:center; gap:5px; padding:7px 9px;
     border-bottom:1px solid var(--line); background:var(--subtle); flex-wrap:nowrap; overflow-x:auto;
   }
@@ -487,29 +598,34 @@
   }
   #ws-close:hover { color:var(--text); background:var(--panel); }
 
-  .ws-body { flex:1; position:relative; min-height:0; display:flex; flex-direction:column; }
-  #preview-wrap { flex:1; display:flex; flex-direction:column; min-height:0; background:#fff; }
+  .ws-body { flex:1; position:relative; min-height:0; overflow:hidden; display:flex; flex-direction:column; }
+  #preview-wrap { flex:1; display:flex; flex-direction:column; min-height:0; overflow:hidden; background:#fff; }
   #preview-frame { flex:1; width:100%; border:none; background:#fff; }
   #preview-empty {
     flex:1; display:flex; align-items:center; justify-content:center;
     color:var(--muted); background:var(--bg); padding:24px; text-align:center;
   }
-  #code-wrap { flex:1; display:none; flex-direction:column; min-height:0; background:var(--bg); }
+  #code-wrap { flex:1; display:none; flex-direction:column; min-height:0; overflow:hidden; background:var(--bg); }
   .code-meta {
+    flex-shrink:0;
     display:flex; align-items:center; justify-content:space-between; gap:8px;
     padding:6px 12px; border-bottom:1px solid var(--line); font-size:12px;
     color:var(--muted); background:var(--panel);
   }
   #code-view {
-    flex:1; margin:0; padding:12px; overflow:auto;
+    flex:1; min-height:0; margin:0; padding:12px; overflow:auto; overscroll-behavior:contain;
+    -webkit-overflow-scrolling:touch;
     font:12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
     white-space:pre; color:var(--text);
   }
   #changes-wrap {
     flex:1; display:none; flex-direction:column; min-height:0; background:var(--bg);
-    overflow-y:auto; padding:12px; gap:10px;
+    overflow-y:auto; overscroll-behavior:contain; -webkit-overflow-scrolling:touch;
+    padding:12px; gap:10px;
   }
+  #changes-wrap > * { flex-shrink:0; }
   .change-card {
+    flex-shrink:0;
     border:1px solid var(--line); border-radius:10px; background:var(--panel); overflow:hidden;
   }
   .change-hdr {
@@ -612,7 +728,7 @@
   </label>
   <label>Temperature <input id="temp" type="number" step="0.05" min="0" max="2" placeholder="auto"></label>
   <label>Max tokens <input id="maxtok" type="number" min="1" max="16384" placeholder="auto"></label>
-  <label>Max steps <input id="maxsteps" type="number" min="1" max="24" value="10"></label>
+  <label>Max steps <input id="maxsteps" type="number" min="1" max="32" value="16"></label>
   <label>System <input id="system" placeholder="default"></label>
   <label>API key <input id="key" type="password" placeholder="if required"></label>
   <div class="settings-note">
@@ -633,11 +749,27 @@
     <span class="ctx-pill" id="ctx-meter" title="Active prompt tokens / context capacity">ctx 0 / 16.4k</span>
     <button id="device-hdr-btn" type="button" title="Configure Device Context memory artifact and macOS Computer Use">Device: OFF</button>
     <button id="compact-btn" type="button" title="Compact older history while preserving workspace state">Compact</button>
+    <button id="parallel-hdr-btn" type="button" title="Spawn a parallel background Kronos agent in its own workspace">+ Parallel Task</button>
     <button id="ws-toggle" type="button" title="Open or close workspace preview and diff inspector">Workspace (<span id="ws-count">0</span>)</button>
   </header>
 
   <div id="layout">
     <section id="chat-col">
+      <div id="multi-agent-bar" class="hidden"></div>
+      <div id="parallel-task-box" class="hidden">
+        <div class="pt-row">
+          <input id="pt-workdir" type="text" placeholder="Workspace folder (e.g. ~/Documents/project/my-app)">
+          <input id="pt-label" type="text" placeholder="Agent label (optional, e.g. Web Agent)">
+        </div>
+        <div class="pt-row">
+          <input id="pt-prompt" type="text" placeholder="Task instructions for parallel Kronos agent…">
+        </div>
+        <div class="pt-actions">
+          <span id="pt-status" style="font-size:11.5px;color:var(--muted);margin-right:auto">Runs concurrently with per-step GPU sharing and isolated workspace</span>
+          <button id="pt-cancel" class="mini-btn" type="button">Cancel</button>
+          <button id="pt-launch" class="pt-primary" type="button">Launch Parallel Agent</button>
+        </div>
+      </div>
       <main id="log"></main>
       <form id="form">
         <div id="att-tray"></div>
@@ -691,7 +823,8 @@
             <span id="preview-title">preview</span>
             <span id="preview-url"></span>
           </div>
-          <div id="preview-empty">No HTML preview file in this workspace yet. Switch to Code or Changes to inspect files.</div>
+          <div id="preview-empty">No previewable HTML, video, audio, or image file in this workspace yet. Switch to Code or Changes to inspect files.</div>
+          <div id="preview-media" style="display:none;flex:1;align-items:center;justify-content:center;padding:18px;background:#141312;overflow:auto"></div>
           <iframe id="preview-frame" title="Workspace preview" style="display:none"></iframe>
         </div>
         <div id="code-wrap">
@@ -735,12 +868,50 @@ let pendingAttachments = [];
 let pendingVoiceBadge = "";
 let voiceSession = null;
 let wsFiles = [];
+let wsDeliverables = [];
 let wsWorkdir = "";
 let previewPath = "";
 let wsTab = "preview";
 let userClosedWs = false;
 let ctxUsed = 0;
 let ctxLimit = 16384;
+let previewMediaKey = "";
+const CLIENT_TAB_ID = "tab_" + Math.random().toString(36).slice(2, 10) + "_" + Date.now().toString(36);
+let localTurnInFlight = false;
+let livePollBusy = false;
+let livePollInitialized = false;
+let mirroredTurnId = 0;
+let mirroredNextIndex = 0;
+let mirroredCtx = null;
+let pinnedTurnId = 0;
+let liveAgents = [];
+let lastAgentsSig = "";
+
+function encodeWorkdirHex(wd) {
+  if (!wd) return "";
+  const bytes = new TextEncoder().encode(String(wd));
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    out += bytes[i].toString(16).padStart(2, "0");
+  }
+  return out;
+}
+
+function previewUrlFor(wd, relPath, cacheBust) {
+  const cleanRel = String(relPath || "index.html")
+    .replace(/^\/+/, "")
+    .split("/")
+    .map(seg => encodeURIComponent(seg))
+    .join("/");
+  const base = wd
+    ? `/preview/@ws/${encodeWorkdirHex(wd)}/${cleanRel}`
+    : `/preview/${cleanRel}`;
+  return cacheBust ? `${base}?t=${Date.now()}` : base;
+}
+
+function apiWorkdirQuery(wd, sep) {
+  return wd ? `${sep}workdir=${encodeURIComponent(wd)}` : "";
+}
 
 const store = (k, v) => {
   try {
@@ -772,7 +943,7 @@ if (savedWsWidth) {
 }
 
 const headers = () => {
-  const h = { "Content-Type": "application/json" };
+  const h = { "Content-Type": "application/json", "X-Kronos-Tab": CLIENT_TAB_ID };
   if ($("key").value) h.Authorization = "Bearer " + $("key").value;
   return h;
 };
@@ -1085,6 +1256,7 @@ async function revertFileChange(diff, btnEl) {
       method: "POST",
       headers: headers(),
       body: JSON.stringify({
+        workdir: wsWorkdir || undefined,
         path: diff.path,
         existed_before: !!diff.existed_before,
         before_content: diff.before_content || "",
@@ -1188,7 +1360,8 @@ async function loadSelectedFile(relPath) {
     return;
   }
   try {
-    const r = await fetch("/v1/agent/file?path=" + encodeURIComponent(relPath), { headers: headers() });
+    const url = "/v1/agent/file?path=" + encodeURIComponent(relPath) + apiWorkdirQuery(wsWorkdir, "&");
+    const r = await fetch(url, { headers: headers() });
     if (!r.ok) return;
     const j = await r.json();
     $("code-path").textContent = `${j.path} (${j.bytes} B)`;
@@ -1198,36 +1371,123 @@ async function loadSelectedFile(relPath) {
   } catch (e) {}
 }
 
+function pathExtLower(p) {
+  const idx = String(p || "").lastIndexOf(".");
+  return idx >= 0 ? String(p).slice(idx + 1).toLowerCase() : "";
+}
+
+function isBinaryMediaPath(p) {
+  const ext = pathExtLower(p);
+  return ["mp4", "webm", "mov", "wav", "m4a", "mp3", "png", "jpg", "jpeg"].includes(ext);
+}
+
+function isPreviewablePath(p) {
+  const ext = pathExtLower(p);
+  return ["html", "htm", "svg"].includes(ext) || isBinaryMediaPath(p);
+}
+
 $("file-select").onchange = () => {
   const v = $("file-select").value;
-  if (wsTab === "code") {
-    loadSelectedFile(v);
-  } else if (v.endsWith(".html")) {
+  if (isBinaryMediaPath(v)) {
     previewPath = v;
     setWsTab("preview");
-    reloadPreviewFrame();
+    reloadPreviewFrame(true);
+  } else if (wsTab === "code") {
+    loadSelectedFile(v);
+  } else if (isPreviewablePath(v)) {
+    previewPath = v;
+    setWsTab("preview");
+    reloadPreviewFrame(true);
   } else {
     setWsTab("code");
     loadSelectedFile(v);
   }
 };
 
-function reloadPreviewFrame() {
+function reloadPreviewFrame(forceReload) {
   const frame = $("preview-frame");
+  const mediaBox = $("preview-media");
   const empty = $("preview-empty");
   const meta = $("preview-meta");
   if (!previewPath) {
     frame.style.display = "none";
+    mediaBox.style.display = "none";
     meta.style.display = "none";
     empty.style.display = "flex";
+    previewMediaKey = "";
     return;
   }
   empty.style.display = "none";
   meta.style.display = "flex";
+  const ext = pathExtLower(previewPath);
+  const rawUrl = previewUrlFor(wsWorkdir, previewPath, false);
+  const url = previewUrlFor(wsWorkdir, previewPath, true);
+  const mediaKey = `${wsWorkdir}::${previewPath}`;
+  $("ws-open").href = rawUrl;
+  $("preview-url").textContent = wsWorkdir ? `${baseName(wsWorkdir)} · /preview/${previewPath}` : rawUrl;
+
+  if (["mp4", "webm", "mov"].includes(ext)) {
+    frame.style.display = "none";
+    mediaBox.style.display = "flex";
+    $("preview-title").textContent = `video · ${previewPath}`;
+    const activeVid = mediaBox.querySelector("video");
+    if (!forceReload && activeVid && previewMediaKey === mediaKey && !activeVid.paused) {
+      return;
+    }
+    previewMediaKey = mediaKey;
+    mediaBox.innerHTML = "";
+    const vid = document.createElement("video");
+    vid.controls = true;
+    vid.preload = "metadata";
+    vid.src = url;
+    vid.style.maxWidth = "100%";
+    vid.style.maxHeight = "100%";
+    vid.style.borderRadius = "8px";
+    vid.style.background = "#000";
+    mediaBox.appendChild(vid);
+    return;
+  }
+
+  if (["wav", "m4a", "mp3"].includes(ext)) {
+    frame.style.display = "none";
+    mediaBox.style.display = "flex";
+    $("preview-title").textContent = `audio · ${previewPath}`;
+    const activeAud = mediaBox.querySelector("audio");
+    if (!forceReload && activeAud && previewMediaKey === mediaKey && !activeAud.paused) {
+      return;
+    }
+    previewMediaKey = mediaKey;
+    mediaBox.innerHTML = "";
+    const aud = document.createElement("audio");
+    aud.controls = true;
+    aud.preload = "metadata";
+    aud.src = url;
+    aud.style.width = "min(520px, 92%)";
+    mediaBox.appendChild(aud);
+    return;
+  }
+
+  if (["png", "jpg", "jpeg", "svg"].includes(ext)) {
+    frame.style.display = "none";
+    mediaBox.style.display = "flex";
+    $("preview-title").textContent = `image · ${previewPath}`;
+    previewMediaKey = mediaKey;
+    mediaBox.innerHTML = "";
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = previewPath;
+    img.style.maxWidth = "100%";
+    img.style.maxHeight = "100%";
+    img.style.objectFit = "contain";
+    img.style.borderRadius = "6px";
+    mediaBox.appendChild(img);
+    return;
+  }
+
+  mediaBox.style.display = "none";
+  mediaBox.innerHTML = "";
+  previewMediaKey = "";
   frame.style.display = "block";
-  const url = "/preview/" + previewPath + "?t=" + Date.now();
-  $("ws-open").href = "/preview/" + previewPath;
-  $("preview-url").textContent = wsWorkdir ? `${wsWorkdir} · /preview/${previewPath}` : "/preview/" + previewPath;
   frame.onload = () => {
     const t = frame.contentDocument?.title?.trim();
     $("preview-title").textContent = t ? `title: ${t}` : previewPath;
@@ -1238,8 +1498,13 @@ $("ws-reload").onclick = () => refreshWorkspace(true);
 
 $("ws-clear").onclick = async () => {
   try {
-    await fetch("/v1/agent/clear", { method: "POST", headers: headers() });
+    await fetch("/v1/agent/clear" + apiWorkdirQuery(wsWorkdir, "?"), {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ workdir: wsWorkdir || undefined }),
+    });
     wsFiles = [];
+    wsDeliverables = [];
     previewPath = "";
     await refreshWorkspace(true);
   } catch (e) {}
@@ -1247,7 +1512,7 @@ $("ws-clear").onclick = async () => {
 
 async function refreshWorkspace(reloadIframe) {
   try {
-    const r = await fetch("/v1/agent/files", { headers: headers() });
+    const r = await fetch("/v1/agent/files" + apiWorkdirQuery(wsWorkdir, "?"), { headers: headers() });
     if (!r.ok) return;
     const j = await r.json();
     if (j.context_limit) updateCtxMeter(ctxUsed, j.context_limit);
@@ -1258,6 +1523,7 @@ async function refreshWorkspace(reloadIframe) {
       $("ws-toggle").title = `Workspace directory: ${wsWorkdir}`;
     }
     wsFiles = j.files || [];
+    wsDeliverables = Array.isArray(j.deliverables) ? j.deliverables : [];
     previewPath = j.preview_path || "";
     $("ws-count").textContent = String(wsFiles.length);
     const sel = $("file-select");
@@ -1395,12 +1661,17 @@ function renderSidebar() {
   }
 
   const projectsToShow = allProjects.length > 0 ? allProjects.slice() : (wsWorkdir ? [wsWorkdir] : []);
+  for (const ag of liveAgents) {
+    if (ag.workdir && !projectsToShow.includes(ag.workdir)) projectsToShow.unshift(ag.workdir);
+  }
   for (const s of filteredSessions) {
     if (s.workdir && !projectsToShow.includes(s.workdir)) projectsToShow.push(s.workdir);
   }
 
   for (const proj of projectsToShow) {
     const projSessions = filteredSessions.filter(s => (s.workdir || wsWorkdir) === proj);
+    const activeAg = liveAgents.find(a => a.workdir === proj && a.active);
+    const recentAg = activeAg || liveAgents.find(a => a.workdir === proj);
     if (q && projSessions.length === 0 && !proj.toLowerCase().includes(q)) continue;
 
     const grp = document.createElement("div");
@@ -1409,11 +1680,21 @@ function renderSidebar() {
     const hdr = document.createElement("div");
     hdr.className = "proj-hdr" + (proj === wsWorkdir ? " active-proj" : "");
     hdr.title = proj;
+    const liveHtml = activeAg
+      ? `<span class="proj-live-badge">live · ${activeAg.step || 1}/${activeAg.max_steps || 16}</span>`
+      : "";
     hdr.innerHTML = `
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-      <span class="proj-name">${escHtml(baseName(proj))}</span>
+      <span class="proj-name">${escHtml(baseName(proj))}</span>${liveHtml}
     `;
-    hdr.onclick = () => switchProjectWorkdir(proj, true);
+    hdr.onclick = () => {
+      if (recentAg) {
+        selectLiveAgentTurn(recentAg.turn_id);
+      } else {
+        pinnedTurnId = 0;
+        switchProjectWorkdir(proj, true);
+      }
+    };
     grp.appendChild(hdr);
 
     if (projSessions.length === 0) {
@@ -1572,6 +1853,135 @@ function buildVerifyCardDom(ver) {
   return det;
 }
 
+function openDeliverableInWorkspace(wd, relPath) {
+  if (wd && wd !== wsWorkdir) {
+    wsWorkdir = wd;
+    $("proj-chip").textContent = baseName(wsWorkdir);
+    $("proj-chip").title = wsWorkdir;
+  }
+  userClosedWs = false;
+  setWorkspaceOpen(true);
+  refreshWorkspace(false).then(() => {
+    $("file-select").value = relPath;
+    if (isPreviewablePath(relPath)) {
+      previewPath = relPath;
+      setWsTab("preview");
+      reloadPreviewFrame(true);
+    } else {
+      setWsTab("code");
+      loadSelectedFile(relPath);
+    }
+  });
+}
+
+function renderDeliverablesCard(cardEl, workdir, deliverables) {
+  if (!cardEl || !Array.isArray(deliverables) || deliverables.length === 0) return;
+  cardEl.querySelector(".deliverables-card")?.remove();
+  const wd = workdir || wsWorkdir || "";
+  const box = document.createElement("div");
+  box.className = "deliverables-card";
+
+  const hdr = document.createElement("div");
+  hdr.className = "deliv-hdr";
+  hdr.innerHTML = `<span>Verified Outputs &amp; Direct Links</span><span class="deliv-wd">${escHtml(wd ? baseName(wd) : "workspace")}</span>`;
+  box.appendChild(hdr);
+
+  const videoPath = deliverables.find(p => ["mp4", "webm", "mov"].includes(pathExtLower(p)));
+  const htmlPath = deliverables.find(p => ["html", "htm"].includes(pathExtLower(p)));
+  const imagePath = deliverables.find(p => ["png", "jpg", "jpeg"].includes(pathExtLower(p)));
+
+  const actions = document.createElement("div");
+  actions.className = "deliv-actions";
+
+  if (videoPath) {
+    const vUrl = previewUrlFor(wd, videoPath, false);
+    const openVid = document.createElement("a");
+    openVid.className = "deliv-primary-btn";
+    openVid.href = vUrl;
+    openVid.target = "_blank";
+    openVid.rel = "noopener";
+    openVid.textContent = `Open Video (${videoPath}) ↗`;
+    actions.appendChild(openVid);
+
+    const dlVid = document.createElement("a");
+    dlVid.className = "deliv-sec-link";
+    dlVid.href = vUrl;
+    dlVid.download = baseName(videoPath);
+    dlVid.textContent = "Download MP4";
+    actions.appendChild(dlVid);
+
+    const wsBtn = document.createElement("button");
+    wsBtn.type = "button";
+    wsBtn.className = "mini-btn";
+    wsBtn.textContent = "Preview in Workspace";
+    wsBtn.onclick = () => openDeliverableInWorkspace(wd, videoPath);
+    actions.appendChild(wsBtn);
+  }
+
+  if (htmlPath) {
+    const hUrl = previewUrlFor(wd, htmlPath, false);
+    const openWeb = document.createElement("a");
+    openWeb.className = videoPath ? "deliv-sec-link" : "deliv-primary-btn";
+    openWeb.href = hUrl;
+    openWeb.target = "_blank";
+    openWeb.rel = "noopener";
+    openWeb.textContent = `Open Live Website (${htmlPath}) ↗`;
+    actions.appendChild(openWeb);
+
+    const wsWebBtn = document.createElement("button");
+    wsWebBtn.type = "button";
+    wsWebBtn.className = "mini-btn";
+    wsWebBtn.textContent = "Preview Website Pane";
+    wsWebBtn.onclick = () => openDeliverableInWorkspace(wd, htmlPath);
+    actions.appendChild(wsWebBtn);
+  }
+
+  if (actions.childNodes.length > 0) {
+    box.appendChild(actions);
+  }
+
+  if (videoPath) {
+    const vid = document.createElement("video");
+    vid.className = "deliv-video";
+    vid.controls = true;
+    vid.preload = "metadata";
+    vid.playsInline = true;
+    vid.src = previewUrlFor(wd, videoPath, true);
+    box.appendChild(vid);
+  } else if (imagePath) {
+    const img = document.createElement("img");
+    img.className = "deliv-thumb";
+    img.src = previewUrlFor(wd, imagePath, true);
+    img.alt = imagePath;
+    img.title = `Click to open ${imagePath} in a new tab`;
+    img.onclick = () => window.open(previewUrlFor(wd, imagePath, false), "_blank", "noopener");
+    box.appendChild(img);
+  }
+
+  const chips = document.createElement("div");
+  chips.className = "deliv-chips";
+  for (const rel of deliverables) {
+    if (isPreviewablePath(rel)) {
+      const a = document.createElement("a");
+      a.className = "deliv-chip";
+      a.href = previewUrlFor(wd, rel, false);
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.textContent = `${rel} ↗`;
+      chips.appendChild(a);
+    } else {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "deliv-chip";
+      btn.textContent = rel;
+      btn.onclick = () => openDeliverableInWorkspace(wd, rel);
+      chips.appendChild(btn);
+    }
+  }
+  box.appendChild(chips);
+  cardEl.appendChild(box);
+}
+
 function renderSavedTurnDom(t) {
   $("empty")?.remove();
   userBubble(t.userText || "", t.attachments || []);
@@ -1615,6 +2025,9 @@ function renderSavedTurnDom(t) {
   proseBox.className = "reply-prose";
   proseBox.innerHTML = renderMd(t.prose || "");
   card.appendChild(proseBox);
+  if (Array.isArray(t.deliverables) && t.deliverables.length > 0) {
+    renderDeliverablesCard(card, t.workdir || wsWorkdir, t.deliverables);
+  }
   log.appendChild(card);
 
   if (t.statsText) {
@@ -1627,6 +2040,8 @@ function renderSavedTurnDom(t) {
 
 async function loadSessionById(id, switchProj = true) {
   if (!id) return;
+  pinnedTurnId = 0;
+  mirroredCtx = null;
   try {
     const r = await fetch("/v1/sessions/get?id=" + encodeURIComponent(id), { headers: headers() });
     if (!r.ok) return;
@@ -1642,6 +2057,17 @@ async function loadSessionById(id, switchProj = true) {
 
     if (switchProj && s.workdir && s.workdir !== wsWorkdir) {
       await switchProjectWorkdir(s.workdir, false);
+    } else if (s.workdir) {
+      wsWorkdir = s.workdir;
+      await refreshWorkspace(true);
+    }
+
+    if (sessionTurns.length > 0 && wsDeliverables.length > 0) {
+      const lastT = sessionTurns[sessionTurns.length - 1];
+      if ((!Array.isArray(lastT.deliverables) || lastT.deliverables.length === 0) && lastT.route === "agent") {
+        lastT.deliverables = wsDeliverables.slice();
+        lastT.workdir = lastT.workdir || s.workdir || wsWorkdir;
+      }
     }
 
     log.innerHTML = "";
@@ -2132,6 +2558,9 @@ function summarizeArgs(name, rawArgs) {
     if (name === "switch_workspace") {
       return a.subfolder ? `${a.path || ""}/${a.subfolder}` : (a.path || "");
     }
+    if (name === "spawn_agent") {
+      return `${a.label || "worker"} · ${a.workdir || ""}`;
+    }
     if (name === "edit_file" && a.path) {
       const o = String(a.old_text || "").replace(/\s+/g, " ").trim().slice(0, 22);
       const n = String(a.new_text || "").replace(/\s+/g, " ").trim().slice(0, 22);
@@ -2159,18 +2588,7 @@ input.addEventListener("keydown", e => {
   }
 });
 
-async function runUnifiedTurn(text, attachedItems) {
-  if (sessionHistory.length === 0 && $("system").value.trim()) {
-    sessionHistory.push({ role: "system", content: $("system").value.trim() });
-  }
-  if (!currentSessionTitle) {
-    currentSessionTitle = (text || attachedItems[0]?.name || "New Conversation").slice(0, 56);
-    $("conv-heading").textContent = currentSessionTitle;
-  }
-  const prevLen = sessionHistory.length;
-  sessionHistory.push({ role: "user", content: text });
-  userBubble(text, attachedItems);
-
+function createTurnStreamContext(text, attachedItems, isMirrored, liveTurnId, agentLabel, initWorkdir) {
   const card = document.createElement("div");
   card.className = "msg reply";
   const headRow = document.createElement("div");
@@ -2179,6 +2597,13 @@ async function runUnifiedTurn(text, attachedItems) {
   routePill.className = "pill run";
   routePill.textContent = "routing…";
   headRow.appendChild(routePill);
+
+  if (isMirrored) {
+    const livePill = document.createElement("span");
+    livePill.className = "pill info";
+    livePill.textContent = agentLabel ? `live · ${agentLabel}` : "live task stream";
+    headRow.appendChild(livePill);
+  }
 
   const stepsBox = document.createElement("div");
   stepsBox.className = "agent-steps";
@@ -2194,11 +2619,8 @@ async function runUnifiedTurn(text, attachedItems) {
   log.appendChild(card);
   log.scrollTop = log.scrollHeight;
 
-  const toolEls = new Map();
-  const toolRecordsById = new Map();
-  const toolRecords = [];
   const turnBadges = [];
-  if (pendingVoiceBadge) {
+  if (!isMirrored && pendingVoiceBadge) {
     turnBadges.push(pendingVoiceBadge);
     const vp = document.createElement("span");
     vp.className = "pill info";
@@ -2206,21 +2628,603 @@ async function runUnifiedTurn(text, attachedItems) {
     headRow.appendChild(vp);
     pendingVoiceBadge = "";
   }
-  const stepLabels = new Map();
-  let verifyRecord = null;
-  let activeRoute = "chat";
-  let prose = "";
-  let touchedFiles = false;
-  let touchedHtml = false;
-  let lastTouchedPath = "";
-  let lastUsage = null;
-  let firstTokenTime = null;
-  const t0 = performance.now();
+  if (isMirrored) {
+    turnBadges.push(agentLabel ? `live · ${agentLabel}` : "live task stream");
+  }
+
+  return {
+    text,
+    attachedItems: attachedItems || [],
+    isMirrored: !!isMirrored,
+    liveTurnId: liveTurnId || 0,
+    turnWorkdir: initWorkdir || wsWorkdir || "",
+    deliverables: [],
+    card,
+    headRow,
+    routePill,
+    stepsBox,
+    proseBox,
+    toolEls: new Map(),
+    toolRecordsById: new Map(),
+    toolRecords: [],
+    turnBadges,
+    stepLabels: new Map(),
+    verifyRecord: null,
+    activeRoute: "chat",
+    prose: "",
+    touchedFiles: false,
+    touchedPreviewable: false,
+    lastTouchedPath: "",
+    lastUsage: null,
+    firstTokenTime: null,
+    gotDone: false,
+    finalized: false,
+    t0: performance.now(),
+  };
+}
+
+function applyTurnStreamEvent(ctx, j) {
+  if (!ctx || !j) return;
+  if (j.type === "error") {
+    throw new Error(j.message || "turn failed");
+  }
+  if (j.type === "route") {
+    ctx.activeRoute = j.mode || "chat";
+    if (ctx.activeRoute === "agent") {
+      ctx.routePill.className = "pill info";
+      ctx.routePill.textContent = "agent · workspace";
+      ctx.stepsBox.style.display = "flex";
+    } else if (ctx.activeRoute === "computer") {
+      ctx.routePill.className = "pill info";
+      ctx.routePill.textContent = "computer · macOS";
+      ctx.stepsBox.style.display = "flex";
+    } else {
+      ctx.routePill.className = "pill run";
+      ctx.routePill.textContent = "chat";
+    }
+  } else if (j.type === "device_context") {
+    const badge = `device · ${j.hits || 0} matches · ${(j.elapsed_ms || 0).toFixed(2)} ms`;
+    ctx.turnBadges.push(badge);
+    const dp = document.createElement("span");
+    dp.className = "pill info";
+    dp.textContent = badge;
+    ctx.headRow.appendChild(dp);
+    const actionable = (j.items || []).filter(it => it.exists_on_disk && it.path).slice(0, 3);
+    if (actionable.length > 0) {
+      const bar = document.createElement("div");
+      bar.className = "dev-hit-bar";
+      for (const it of actionable) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "dev-open-chip";
+        const act = it.kind === "app" ? "open_app" : "open_file";
+        btn.textContent = `Open ${it.name.slice(0, 32)} ↗`;
+        btn.title = it.path;
+        btn.onclick = () => triggerDirectDeviceOpen(act, it.path);
+        bar.appendChild(btn);
+        if (it.kind !== "app") {
+          const rev = document.createElement("button");
+          rev.type = "button";
+          rev.className = "dev-open-chip";
+          rev.textContent = "Finder";
+          rev.title = `Reveal ${it.path} in Finder`;
+          rev.onclick = () => triggerDirectDeviceOpen("reveal_in_finder", it.path);
+          bar.appendChild(rev);
+        }
+      }
+      ctx.card.insertBefore(bar, ctx.proseBox);
+    }
+  } else if (j.type === "attachments") {
+    for (const item of (j.items || [])) {
+      ctx.turnBadges.push(item.badge);
+      const ap = document.createElement("span");
+      ap.className = "pill info";
+      ap.textContent = item.badge;
+      ctx.headRow.appendChild(ap);
+    }
+  } else if (j.type === "compacted") {
+    appendCompactionNotice(j.before_tokens, j.after_tokens, j.compacted_messages);
+  } else if (j.type === "step_start") {
+    const sl = document.createElement("div");
+    sl.className = "step-line";
+    sl.innerHTML = `<span>Step ${j.step}/${j.max_steps}</span><span class="step-perf">generating…</span>`;
+    ctx.stepsBox.appendChild(sl);
+    ctx.stepLabels.set(j.step, sl.querySelector(".step-perf"));
+    ctx.prose = "";
+    ctx.proseBox.textContent = ctx.activeRoute === "agent" ? "Drafting workspace actions…" : "…";
+  } else if (j.type === "text") {
+    ctx.firstTokenTime ??= performance.now();
+    ctx.prose += j.delta;
+    ctx.proseBox.innerHTML = renderMd(ctx.prose);
+  } else if (j.type === "tool_progress") {
+    ctx.firstTokenTime ??= performance.now();
+    ctx.stepsBox.style.display = "flex";
+    const el = ctx.stepLabels.get(j.step);
+    const tgt = j.target ? ` · ${j.target}` : "";
+    const msg = `drafting ${j.name}${tgt} (${j.bytes} B)…`;
+    if (el) el.textContent = msg;
+    if (!ctx.prose) ctx.proseBox.textContent = msg;
+  } else if (j.type === "workspace_changed") {
+    if (j.workdir) {
+      ctx.turnWorkdir = j.workdir;
+      wsWorkdir = j.workdir;
+      $("proj-chip").textContent = baseName(wsWorkdir);
+      $("proj-chip").title = wsWorkdir;
+      $("ws-toggle").title = `Workspace directory: ${wsWorkdir}`;
+      if (!allProjects.includes(wsWorkdir)) allProjects.unshift(wsWorkdir);
+      expandedProjects.add(wsWorkdir);
+      renderSidebar();
+      const wb = `workspace · ${baseName(wsWorkdir)}`;
+      ctx.turnBadges.push(wb);
+      const wp = document.createElement("span");
+      wp.className = "pill info";
+      wp.textContent = wb;
+      wp.title = wsWorkdir;
+      ctx.headRow.appendChild(wp);
+      userClosedWs = false;
+      if ($("ws-pane").classList.contains("hidden")) setWorkspaceOpen(true);
+      refreshWorkspace(true);
+    }
+  } else if (j.type === "step_stats") {
+    const u = j.usage || {};
+    ctx.lastUsage = u;
+    const el = ctx.stepLabels.get(j.step);
+    if (el) {
+      const pRate = (u.prefilled_tokens / Math.max(u.prefill_secs || 1e-3, 1e-3)).toFixed(0);
+      const dRate = (u.completion_tokens / Math.max(u.decode_secs || 1e-3, 1e-3)).toFixed(1);
+      const acc = u.drafted_tokens > 0
+        ? ` · accept ${(100 * u.accepted_tokens / u.drafted_tokens).toFixed(1)}%`
+        : "";
+      el.textContent = `${u.prefilled_tokens} new @ ${pRate} tok/s · ${u.completion_tokens} gen @ ${dRate} tok/s${acc}`;
+    }
+  } else if (j.type === "tool_start") {
+    ctx.stepsBox.style.display = "flex";
+    const det = document.createElement("details");
+    det.className = "tool-card";
+    const target = summarizeArgs(j.name, j.arguments || "");
+    det.innerHTML = `<summary><span class="tool-name">${escHtml(j.name)}</span><span class="tool-target">${escHtml(target)}</span><span class="diff-slot"></span><span class="pill run">running</span></summary><div class="tool-body">args: ${escHtml(j.arguments || "")}</div>`;
+    ctx.stepsBox.appendChild(det);
+    ctx.toolEls.set(j.id, det);
+    const rec = { id: j.id, name: j.name, arguments: j.arguments || "", ok: true, validation_ok: true, output: "", diff: null };
+    ctx.toolRecords.push(rec);
+    ctx.toolRecordsById.set(j.id, rec);
+  } else if (j.type === "tool_done") {
+    const rec = ctx.toolRecordsById.get(j.id);
+    if (rec) {
+      rec.ok = !!j.ok;
+      rec.validation_ok = !!j.validation_ok;
+      rec.output = j.output || "";
+      rec.diff = j.diff || null;
+    }
+    const det = ctx.toolEls.get(j.id);
+    if (det) {
+      const pill = det.querySelector(".pill");
+      const body = det.querySelector(".tool-body");
+      const diffSlot = det.querySelector(".diff-slot");
+      if (!j.ok) {
+        pill.className = "pill err";
+        pill.textContent = "error";
+      } else if (!j.validation_ok) {
+        pill.className = "pill warn";
+        pill.textContent = "repair needed";
+      } else {
+        pill.className = "pill ok";
+        pill.textContent = (j.name === "write_file" || j.name === "edit_file") ? "valid" : "ok";
+      }
+      body.textContent = (j.output || "").trim();
+      if (j.diff && j.diff.path) {
+        if (diffSlot) {
+          diffSlot.className = "diff-stat";
+          diffSlot.innerHTML = `<span class="add">+${j.diff.added_lines || 0}</span><span class="del">-${j.diff.removed_lines || 0}</span>`;
+        }
+        if (j.diff.unified_diff) {
+          body.appendChild(renderUnifiedDiffEl(j.diff.unified_diff));
+        }
+        if (j.diff.can_revert !== false) {
+          const act = document.createElement("div");
+          act.className = "diff-actions";
+          const lbl = document.createElement("span");
+          lbl.textContent = j.diff.existed_before ? "Checkpoint saved before edit" : "New file created in this step";
+          const revBtn = document.createElement("button");
+          revBtn.type = "button";
+          revBtn.className = "mini-btn";
+          revBtn.textContent = "Revert this change";
+          revBtn.onclick = () => revertFileChange(j.diff, revBtn);
+          act.appendChild(lbl);
+          act.appendChild(revBtn);
+          body.appendChild(act);
+        }
+      }
+    }
+    if ((j.name === "write_file" || j.name === "edit_file") && j.ok) {
+      ctx.touchedFiles = true;
+      if (j.diff && j.diff.path) {
+        ctx.lastTouchedPath = j.diff.path;
+        if (j.diff.path.endsWith(".html") || j.diff.path.endsWith(".css") || j.diff.path.endsWith(".js") || isPreviewablePath(j.diff.path)) {
+          ctx.touchedPreviewable = true;
+        }
+      }
+      userClosedWs = false;
+      if ($("ws-pane").classList.contains("hidden")) setWorkspaceOpen(true);
+      refreshWorkspace(true);
+    } else if ((j.name === "run_command" || j.name === "spawn_agent") && j.ok) {
+      ctx.touchedFiles = true;
+      userClosedWs = false;
+      if ($("ws-pane").classList.contains("hidden")) setWorkspaceOpen(true);
+      refreshWorkspace(true);
+    }
+  } else if (j.type === "validation_repair") {
+    ctx.stepsBox.style.display = "flex";
+    const b = document.createElement("div");
+    b.className = "repair-banner";
+    b.textContent = "Post-work verification triggered self-repair:\n" + j.report;
+    ctx.stepsBox.appendChild(b);
+  } else if (j.type === "verified") {
+    ctx.verifyRecord = j;
+    ctx.stepsBox.style.display = "flex";
+    ctx.stepsBox.appendChild(buildVerifyCardDom(j));
+    const vp = document.createElement("span");
+    vp.className = "pill ok";
+    vp.textContent = `verified · ${j.checks_run || 1} checks`;
+    ctx.headRow.appendChild(vp);
+  } else if (j.type === "jev_decision") {
+    if ((j.prefetched_files || 0) > 0 || (j.pruned_tools || 0) > 0) {
+      const jp = document.createElement("span");
+      jp.className = "pill";
+      const parts = [];
+      if (j.prefetched_files > 0) parts.push(`${j.prefetched_files} ctx`);
+      if (j.pruned_tools > 0) parts.push(`-${j.pruned_tools} tools`);
+      jp.textContent = `jev · ${parts.join(" · ")}`;
+      ctx.headRow.appendChild(jp);
+    }
+  } else if (j.type === "jev_verification") {
+    if (j.passed || j.rolled_back) {
+      const jp = document.createElement("span");
+      jp.className = j.passed ? "pill ok" : "pill";
+      const pct = Math.round((j.score || 0) * 100);
+      jp.textContent = j.rolled_back ? `jev ${pct}% · restored` : `jev ${pct}%`;
+      ctx.headRow.appendChild(jp);
+    }
+  } else if (j.type === "done") {
+    ctx.gotDone = true;
+    if (j.workdir) ctx.turnWorkdir = j.workdir;
+    if (Array.isArray(j.deliverables) && j.deliverables.length > 0) {
+      ctx.deliverables = j.deliverables.slice();
+    }
+    if (Array.isArray(j.messages)) sessionHistory = j.messages;
+    if (j.context_tokens !== undefined) updateCtxMeter(j.context_tokens, j.context_limit);
+    if (!ctx.prose && j.text) {
+      ctx.prose = j.text;
+      ctx.proseBox.innerHTML = renderMd(ctx.prose);
+    } else if (!ctx.prose) {
+      ctx.proseBox.textContent = "Workspace updated and verified.";
+    }
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+async function finalizeTurnStreamContext(ctx) {
+  if (!ctx || ctx.finalized) return;
+  ctx.finalized = true;
+  if (ctx.turnWorkdir && ctx.turnWorkdir !== wsWorkdir) {
+    wsWorkdir = ctx.turnWorkdir;
+    $("proj-chip").textContent = baseName(wsWorkdir);
+    $("proj-chip").title = wsWorkdir;
+  }
+  if (ctx.touchedFiles || ctx.activeRoute === "agent") {
+    await refreshWorkspace(true);
+    if (ctx.deliverables.length === 0 && wsDeliverables.length > 0) {
+      ctx.deliverables = wsDeliverables.slice();
+    }
+    if (previewPath && (ctx.touchedPreviewable || isPreviewablePath(previewPath))) {
+      setWsTab("preview");
+      reloadPreviewFrame(false);
+    } else if (ctx.lastTouchedPath) {
+      $("file-select").value = ctx.lastTouchedPath;
+      setWsTab("changes");
+    }
+  }
+
+  if (ctx.deliverables.length > 0 && (ctx.activeRoute === "agent" || ctx.touchedFiles)) {
+    renderDeliverablesCard(ctx.card, ctx.turnWorkdir || wsWorkdir, ctx.deliverables);
+  }
+
+  const totalS = ((performance.now() - ctx.t0) / 1000).toFixed(2);
+  let statsText = `completed in ${totalS} s`;
+  if (ctx.activeRoute === "chat" && ctx.lastUsage) {
+    const dRate = (ctx.lastUsage.completion_tokens / Math.max(ctx.lastUsage.decode_secs || 1e-3, 1e-3)).toFixed(1);
+    const pRate = (ctx.lastUsage.prefilled_tokens / Math.max(ctx.lastUsage.prefill_secs || 1e-3, 1e-3)).toFixed(0);
+    const acc = ctx.lastUsage.drafted_tokens > 0
+      ? ` · accept ${(100 * ctx.lastUsage.accepted_tokens / ctx.lastUsage.drafted_tokens).toFixed(1)}%`
+      : "";
+    const ttft = ctx.firstTokenTime ? ((ctx.firstTokenTime - ctx.t0) / 1000).toFixed(2) : totalS;
+    statsText = `${ctx.lastUsage.prefilled_tokens} new @ ${pRate} tok/s · ${ctx.lastUsage.completion_tokens} gen @ ${dRate} tok/s${acc} · first token ${ttft} s`;
+  }
+  const s = document.createElement("div");
+  s.className = "stats";
+  s.textContent = statsText;
+  log.appendChild(s);
+  log.scrollTop = log.scrollHeight;
+
+  if (ctx.liveTurnId && !currentSessionId) {
+    currentSessionId = "sess_live_" + ctx.liveTurnId;
+  }
+
+  sessionTurns.push({
+    ts: Math.floor(Date.now() / 1000),
+    userText: ctx.text,
+    workdir: ctx.turnWorkdir || wsWorkdir,
+    deliverables: ctx.deliverables,
+    attachments: ctx.attachedItems.map(a => ({
+      name: a.name,
+      ext: a.ext,
+      isImage: a.isImage,
+      dataUrl: a.isImage ? a.dataUrl : "",
+    })),
+    route: ctx.activeRoute,
+    badges: ctx.turnBadges,
+    tools: ctx.toolRecords,
+    verified: ctx.verifyRecord,
+    prose: ctx.prose,
+    statsText,
+  });
+  rebuildSessionChanges();
+  await persistCurrentSession();
+}
+
+function toggleParallelTaskBox(forceOpen) {
+  const box = $("parallel-task-box");
+  const willOpen = forceOpen !== undefined ? forceOpen : box.classList.contains("hidden");
+  box.classList.toggle("hidden", !willOpen);
+  if (willOpen) {
+    if (!$("pt-workdir").value) $("pt-workdir").value = wsWorkdir || "";
+    $("pt-prompt").focus();
+  }
+}
+$("parallel-hdr-btn").onclick = () => toggleParallelTaskBox();
+$("pt-cancel").onclick = () => toggleParallelTaskBox(false);
+$("pt-launch").onclick = async () => {
+  const wd = $("pt-workdir").value.trim();
+  const label = $("pt-label").value.trim();
+  const prompt = $("pt-prompt").value.trim();
+  if (!prompt) {
+    $("pt-prompt").focus();
+    return;
+  }
+  $("pt-launch").disabled = true;
+  $("pt-status").textContent = "Spawning parallel Kronos agent…";
+  try {
+    const r = await fetch("/v1/agents/spawn", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({
+        workdir: wd || wsWorkdir || undefined,
+        agent_label: label || undefined,
+        prompt,
+        max_steps: +($("maxsteps").value || 20),
+      }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error?.message || "spawn failed");
+    $("pt-prompt").value = "";
+    $("pt-label").value = "";
+    $("pt-status").textContent = `Launched ${j.agent_label || "parallel agent"}`;
+    toggleParallelTaskBox(false);
+    if (j.turn_id && !localTurnInFlight) {
+      selectLiveAgentTurn(j.turn_id);
+    } else {
+      pollLiveTurn();
+    }
+  } catch (err) {
+    $("pt-status").textContent = "Spawn error: " + err.message;
+  } finally {
+    $("pt-launch").disabled = false;
+  }
+};
+
+function selectLiveAgentTurn(turnId) {
+  if (!turnId) return;
+  pinnedTurnId = turnId;
+  mirroredTurnId = 0;
+  mirroredNextIndex = 0;
+  mirroredCtx = null;
+  pollLiveTurn();
+}
+
+function renderMultiAgentBar(agents) {
+  const bar = $("multi-agent-bar");
+  const list = Array.isArray(agents) ? agents : [];
+  const sig = JSON.stringify(list.map(a => [
+    a.turn_id, a.active, a.step, a.status_detail, (a.deliverables || []).length, mirroredTurnId, pinnedTurnId
+  ]));
+  if (sig === lastAgentsSig) return;
+  lastAgentsSig = sig;
+  liveAgents = list;
+
+  if (list.length === 0) {
+    bar.classList.add("hidden");
+    bar.innerHTML = "";
+    return;
+  }
+  bar.classList.remove("hidden");
+  bar.innerHTML = "";
+
+  const activeCount = list.filter(a => a.active).length;
+  const sum = document.createElement("span");
+  sum.className = "ma-summary";
+  sum.textContent = activeCount > 0
+    ? `${activeCount} active · ${list.length} task${list.length === 1 ? "" : "s"}`
+    : `${list.length} completed task${list.length === 1 ? "" : "s"}`;
+  bar.appendChild(sum);
+
+  const viewedTid = pinnedTurnId || mirroredTurnId;
+  for (const ag of list) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "agent-pill" + (ag.turn_id === viewedTid ? " active-view" : "");
+    btn.title = `${ag.workdir || ""}\n${(ag.user_text || "").slice(0, 140)}`;
+
+    const dot = document.createElement("span");
+    const isErr = !ag.active && String(ag.status_detail || "").startsWith("error");
+    dot.className = "agent-dot " + (ag.active ? "running" : (isErr ? "err" : "done"));
+    btn.appendChild(dot);
+
+    const lbl = document.createElement("span");
+    lbl.textContent = ag.agent_label || baseName(ag.workdir) || `Task #${ag.agent_ord || 1}`;
+    btn.appendChild(lbl);
+
+    const meta = document.createElement("span");
+    meta.className = "agent-pill-meta";
+    if (ag.active) {
+      const st = ag.step > 0 ? `step ${ag.step}/${ag.max_steps || 16}` : "starting";
+      const det = ag.status_detail ? ` · ${String(ag.status_detail).slice(0, 26)}` : "";
+      meta.textContent = `${st}${det}`;
+    } else if (isErr) {
+      meta.textContent = "error";
+    } else {
+      const dc = Array.isArray(ag.deliverables) ? ag.deliverables.length : 0;
+      meta.textContent = dc > 0 ? `done · ${dc} file${dc === 1 ? "" : "s"}` : "done";
+    }
+    btn.appendChild(meta);
+
+    btn.onclick = () => selectLiveAgentTurn(ag.turn_id);
+    bar.appendChild(btn);
+  }
+
+  const spawnBtn = document.createElement("button");
+  spawnBtn.type = "button";
+  spawnBtn.className = "ma-spawn-btn";
+  spawnBtn.textContent = "+ Parallel Task";
+  spawnBtn.onclick = () => toggleParallelTaskBox();
+  bar.appendChild(spawnBtn);
+
+  renderSidebar();
+}
+
+async function pollLiveTurn() {
+  if (livePollBusy) return;
+  livePollBusy = true;
+  try {
+    if (localTurnInFlight) {
+      const ar = await fetch("/v1/agents", { headers: headers() });
+      if (ar.ok) {
+        const aj = await ar.json();
+        renderMultiAgentBar(aj.agents || []);
+      }
+      return;
+    }
+
+    const reqTid = pinnedTurnId || mirroredTurnId || 0;
+    const reqSince = (reqTid && reqTid === mirroredTurnId) ? mirroredNextIndex : 0;
+    const r = await fetch(`/v1/turn/live?turn_id=${reqTid}&since=${reqSince}`, { headers: headers() });
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j && Array.isArray(j.agents)) {
+      renderMultiAgentBar(j.agents);
+    }
+    if (!j || !j.turn_id) {
+      livePollInitialized = true;
+      return;
+    }
+    if (j.origin === CLIENT_TAB_ID && !pinnedTurnId) {
+      mirroredTurnId = j.turn_id;
+      mirroredNextIndex = j.next_index || 0;
+      livePollInitialized = true;
+      return;
+    }
+    if (!livePollInitialized && !j.active && !pinnedTurnId && (currentSessionId || sessionTurns.length > 0)) {
+      mirroredTurnId = j.turn_id;
+      mirroredNextIndex = j.next_index || 0;
+      livePollInitialized = true;
+      return;
+    }
+    livePollInitialized = true;
+
+    if (j.turn_id !== mirroredTurnId) {
+      mirroredTurnId = j.turn_id;
+      mirroredNextIndex = 0;
+      if (j.workdir && j.workdir !== wsWorkdir) {
+        wsWorkdir = j.workdir;
+        $("proj-chip").textContent = baseName(wsWorkdir);
+        $("proj-chip").title = wsWorkdir;
+        $("ws-toggle").title = `Workspace directory: ${wsWorkdir}`;
+        if (!allProjects.includes(wsWorkdir)) allProjects.unshift(wsWorkdir);
+        expandedProjects.add(wsWorkdir);
+      }
+      currentSessionId = "sess_live_" + j.turn_id;
+      currentSessionTitle = (j.agent_label ? `${j.agent_label} — ` : "") + (j.user_text || "Live Task").slice(0, 48);
+      currentCreatedAt = j.started_at || Math.floor(Date.now() / 1000);
+      sessionHistory = [{ role: "user", content: j.user_text || "" }];
+      sessionTurns = [];
+      sessionChanges = [];
+      $("conv-heading").textContent = currentSessionTitle;
+      log.innerHTML = "";
+      userClosedWs = false;
+      setWorkspaceOpen(true);
+      refreshWorkspace(true);
+      renderSidebar();
+      renderMultiAgentBar(j.agents || liveAgents);
+      userBubble(j.user_text || "", []);
+      mirroredCtx = createTurnStreamContext(
+        j.user_text || "",
+        [],
+        true,
+        j.turn_id,
+        j.agent_label || "",
+        j.workdir || wsWorkdir
+      );
+    }
+
+    if (mirroredCtx && Array.isArray(j.events) && j.events.length > 0) {
+      for (const ev of j.events) {
+        try {
+          applyTurnStreamEvent(mirroredCtx, ev);
+        } catch (err) {
+          mirroredCtx.routePill.className = "pill err";
+          mirroredCtx.routePill.textContent = "error";
+          mirroredCtx.proseBox.textContent = "Error: " + err.message;
+        }
+      }
+      mirroredNextIndex = j.next_index || mirroredNextIndex;
+    }
+
+    if (mirroredCtx && Array.isArray(j.deliverables) && j.deliverables.length > 0 && mirroredCtx.deliverables.length === 0) {
+      mirroredCtx.deliverables = j.deliverables.slice();
+    }
+
+    if (mirroredCtx && (mirroredCtx.gotDone || !j.active)) {
+      if (mirroredCtx.gotDone || mirroredCtx.toolRecords.length > 0 || mirroredCtx.prose) {
+        await finalizeTurnStreamContext(mirroredCtx);
+      }
+      mirroredCtx = null;
+    }
+  } catch (e) {
+  } finally {
+    livePollBusy = false;
+  }
+}
+
+async function runUnifiedTurn(text, attachedItems) {
+  localTurnInFlight = true;
+  pinnedTurnId = 0;
+  if (sessionHistory.length === 0 && $("system").value.trim()) {
+    sessionHistory.push({ role: "system", content: $("system").value.trim() });
+  }
+  if (!currentSessionTitle) {
+    currentSessionTitle = (text || attachedItems[0]?.name || "New Conversation").slice(0, 56);
+    $("conv-heading").textContent = currentSessionTitle;
+  }
+  const prevLen = sessionHistory.length;
+  sessionHistory.push({ role: "user", content: text });
+  userBubble(text, attachedItems);
+
+  const ctx = createTurnStreamContext(text, attachedItems, false, 0, "", wsWorkdir);
 
   const payload = {
+    workdir: wsWorkdir || undefined,
     messages: sessionHistory,
     route: $("route-mode").value || "auto",
-    max_steps: +($("maxsteps").value || 10),
+    max_steps: +($("maxsteps").value || 16),
   };
   if (attachedItems.length > 0) {
     payload.attachments = attachedItems.map(a => ({
@@ -2232,7 +3236,6 @@ async function runUnifiedTurn(text, attachedItems) {
   if ($("temp").value !== "") payload.temperature = +$("temp").value;
   if ($("maxtok").value !== "") payload.max_tokens = +$("maxtok").value;
 
-  let gotDone = false;
   try {
     const reqInit = {
       method: "POST",
@@ -2259,300 +3262,35 @@ async function runUnifiedTurn(text, attachedItems) {
         buf = buf.slice(i + 2);
         if (!line || line === "[DONE]") continue;
         const j = JSON.parse(line);
-        if (j.type === "error") throw new Error(j.message || "turn failed");
-
-        if (j.type === "route") {
-          activeRoute = j.mode || "chat";
-          if (activeRoute === "agent") {
-            routePill.className = "pill info";
-            routePill.textContent = "agent · workspace";
-            stepsBox.style.display = "flex";
-          } else if (activeRoute === "computer") {
-            routePill.className = "pill info";
-            routePill.textContent = "computer · macOS";
-            stepsBox.style.display = "flex";
-          } else {
-            routePill.className = "pill run";
-            routePill.textContent = "chat";
-          }
-        } else if (j.type === "device_context") {
-          const badge = `device · ${j.hits || 0} matches · ${(j.elapsed_ms || 0).toFixed(2)} ms`;
-          turnBadges.push(badge);
-          const dp = document.createElement("span");
-          dp.className = "pill info";
-          dp.textContent = badge;
-          headRow.appendChild(dp);
-          const actionable = (j.items || []).filter(it => it.exists_on_disk && it.path).slice(0, 3);
-          if (actionable.length > 0) {
-            const bar = document.createElement("div");
-            bar.className = "dev-hit-bar";
-            for (const it of actionable) {
-              const btn = document.createElement("button");
-              btn.type = "button";
-              btn.className = "dev-open-chip";
-              const act = it.kind === "app" ? "open_app" : "open_file";
-              btn.textContent = `Open ${it.name.slice(0, 32)} ↗`;
-              btn.title = it.path;
-              btn.onclick = () => triggerDirectDeviceOpen(act, it.path);
-              bar.appendChild(btn);
-              if (it.kind !== "app") {
-                const rev = document.createElement("button");
-                rev.type = "button";
-                rev.className = "dev-open-chip";
-                rev.textContent = "Finder";
-                rev.title = `Reveal ${it.path} in Finder`;
-                rev.onclick = () => triggerDirectDeviceOpen("reveal_in_finder", it.path);
-                bar.appendChild(rev);
-              }
-            }
-            card.insertBefore(bar, proseBox);
-          }
-        } else if (j.type === "attachments") {
-          for (const item of (j.items || [])) {
-            turnBadges.push(item.badge);
-            const ap = document.createElement("span");
-            ap.className = "pill info";
-            ap.textContent = item.badge;
-            headRow.appendChild(ap);
-          }
-        } else if (j.type === "compacted") {
-          appendCompactionNotice(j.before_tokens, j.after_tokens, j.compacted_messages);
-        } else if (j.type === "step_start") {
-          const sl = document.createElement("div");
-          sl.className = "step-line";
-          sl.innerHTML = `<span>Step ${j.step}/${j.max_steps}</span><span class="step-perf">generating…</span>`;
-          stepsBox.appendChild(sl);
-          stepLabels.set(j.step, sl.querySelector(".step-perf"));
-          prose = "";
-          proseBox.textContent = activeRoute === "agent" ? "Drafting workspace actions…" : "…";
-        } else if (j.type === "text") {
-          firstTokenTime ??= performance.now();
-          prose += j.delta;
-          proseBox.innerHTML = renderMd(prose);
-        } else if (j.type === "tool_progress") {
-          firstTokenTime ??= performance.now();
-          stepsBox.style.display = "flex";
-          const el = stepLabels.get(j.step);
-          const tgt = j.target ? ` · ${j.target}` : "";
-          const msg = `drafting ${j.name}${tgt} (${j.bytes} B)…`;
-          if (el) el.textContent = msg;
-          if (!prose) proseBox.textContent = msg;
-        } else if (j.type === "workspace_changed") {
-          if (j.workdir) {
-            wsWorkdir = j.workdir;
-            $("proj-chip").textContent = baseName(wsWorkdir);
-            $("proj-chip").title = wsWorkdir;
-            $("ws-toggle").title = `Workspace directory: ${wsWorkdir}`;
-            if (!allProjects.includes(wsWorkdir)) allProjects.unshift(wsWorkdir);
-            expandedProjects.add(wsWorkdir);
-            renderSidebar();
-            const wb = `workspace · ${baseName(wsWorkdir)}`;
-            turnBadges.push(wb);
-            const wp = document.createElement("span");
-            wp.className = "pill info";
-            wp.textContent = wb;
-            wp.title = wsWorkdir;
-            headRow.appendChild(wp);
-            userClosedWs = false;
-            if ($("ws-pane").classList.contains("hidden")) setWorkspaceOpen(true);
-            refreshWorkspace(true);
-          }
-        } else if (j.type === "step_stats") {
-          const u = j.usage || {};
-          lastUsage = u;
-          const el = stepLabels.get(j.step);
-          if (el) {
-            const pRate = (u.prefilled_tokens / Math.max(u.prefill_secs || 1e-3, 1e-3)).toFixed(0);
-            const dRate = (u.completion_tokens / Math.max(u.decode_secs || 1e-3, 1e-3)).toFixed(1);
-            const acc = u.drafted_tokens > 0
-              ? ` · accept ${(100 * u.accepted_tokens / u.drafted_tokens).toFixed(1)}%`
-              : "";
-            el.textContent = `${u.prefilled_tokens} new @ ${pRate} tok/s · ${u.completion_tokens} gen @ ${dRate} tok/s${acc}`;
-          }
-        } else if (j.type === "tool_start") {
-          stepsBox.style.display = "flex";
-          const det = document.createElement("details");
-          det.className = "tool-card";
-          const target = summarizeArgs(j.name, j.arguments || "");
-          det.innerHTML = `<summary><span class="tool-name">${escHtml(j.name)}</span><span class="tool-target">${escHtml(target)}</span><span class="diff-slot"></span><span class="pill run">running</span></summary><div class="tool-body">args: ${escHtml(j.arguments || "")}</div>`;
-          stepsBox.appendChild(det);
-          toolEls.set(j.id, det);
-          const rec = { id: j.id, name: j.name, arguments: j.arguments || "", ok: true, validation_ok: true, output: "", diff: null };
-          toolRecords.push(rec);
-          toolRecordsById.set(j.id, rec);
-        } else if (j.type === "tool_done") {
-          const rec = toolRecordsById.get(j.id);
-          if (rec) {
-            rec.ok = !!j.ok;
-            rec.validation_ok = !!j.validation_ok;
-            rec.output = j.output || "";
-            rec.diff = j.diff || null;
-          }
-          const det = toolEls.get(j.id);
-          if (det) {
-            const pill = det.querySelector(".pill");
-            const body = det.querySelector(".tool-body");
-            const diffSlot = det.querySelector(".diff-slot");
-            if (!j.ok) {
-              pill.className = "pill err";
-              pill.textContent = "error";
-            } else if (!j.validation_ok) {
-              pill.className = "pill warn";
-              pill.textContent = "repair needed";
-            } else {
-              pill.className = "pill ok";
-              pill.textContent = (j.name === "write_file" || j.name === "edit_file") ? "valid" : "ok";
-            }
-            body.textContent = (j.output || "").trim();
-            if (j.diff && j.diff.path) {
-              if (diffSlot) {
-                diffSlot.className = "diff-stat";
-                diffSlot.innerHTML = `<span class="add">+${j.diff.added_lines || 0}</span><span class="del">-${j.diff.removed_lines || 0}</span>`;
-              }
-              if (j.diff.unified_diff) {
-                body.appendChild(renderUnifiedDiffEl(j.diff.unified_diff));
-              }
-              if (j.diff.can_revert !== false) {
-                const act = document.createElement("div");
-                act.className = "diff-actions";
-                const lbl = document.createElement("span");
-                lbl.textContent = j.diff.existed_before ? "Checkpoint saved before edit" : "New file created in this step";
-                const revBtn = document.createElement("button");
-                revBtn.type = "button";
-                revBtn.className = "mini-btn";
-                revBtn.textContent = "Revert this change";
-                revBtn.onclick = () => revertFileChange(j.diff, revBtn);
-                act.appendChild(lbl);
-                act.appendChild(revBtn);
-                body.appendChild(act);
-              }
-            }
-          }
-          if ((j.name === "write_file" || j.name === "edit_file") && j.ok) {
-            touchedFiles = true;
-            if (j.diff && j.diff.path) {
-              lastTouchedPath = j.diff.path;
-              if (j.diff.path.endsWith(".html") || j.diff.path.endsWith(".css") || j.diff.path.endsWith(".js")) {
-                touchedHtml = true;
-              }
-            }
-            userClosedWs = false;
-            if ($("ws-pane").classList.contains("hidden")) setWorkspaceOpen(true);
-            refreshWorkspace(true);
-          }
-        } else if (j.type === "validation_repair") {
-          stepsBox.style.display = "flex";
-          const b = document.createElement("div");
-          b.className = "repair-banner";
-          b.textContent = "Post-work verification triggered self-repair:\n" + j.report;
-          stepsBox.appendChild(b);
-        } else if (j.type === "verified") {
-          verifyRecord = j;
-          stepsBox.style.display = "flex";
-          stepsBox.appendChild(buildVerifyCardDom(j));
-          const vp = document.createElement("span");
-          vp.className = "pill ok";
-          vp.textContent = `verified · ${j.checks_run || 1} checks`;
-          headRow.appendChild(vp);
-        } else if (j.type === "jev_decision") {
-          if ((j.prefetched_files || 0) > 0 || (j.pruned_tools || 0) > 0) {
-            const jp = document.createElement("span");
-            jp.className = "pill";
-            const parts = [];
-            if (j.prefetched_files > 0) parts.push(`${j.prefetched_files} ctx`);
-            if (j.pruned_tools > 0) parts.push(`-${j.pruned_tools} tools`);
-            jp.textContent = `jev · ${parts.join(" · ")}`;
-            headRow.appendChild(jp);
-          }
-        } else if (j.type === "jev_verification") {
-          if (j.passed || j.rolled_back) {
-            const jp = document.createElement("span");
-            jp.className = j.passed ? "pill ok" : "pill";
-            const pct = Math.round((j.score || 0) * 100);
-            jp.textContent = j.rolled_back ? `jev ${pct}% · restored` : `jev ${pct}%`;
-            headRow.appendChild(jp);
-          }
-        } else if (j.type === "done") {
-          gotDone = true;
-          if (Array.isArray(j.messages)) sessionHistory = j.messages;
-          if (j.context_tokens !== undefined) updateCtxMeter(j.context_tokens, j.context_limit);
-          if (!prose && j.text) {
-            prose = j.text;
-            proseBox.innerHTML = renderMd(prose);
-          } else if (!prose) {
-            proseBox.textContent = "Workspace updated and verified.";
-          }
-        }
-        log.scrollTop = log.scrollHeight;
+        applyTurnStreamEvent(ctx, j);
       }
     }
-    if (!gotDone) {
-      for (const el of stepLabels.values()) {
+    if (!ctx.gotDone) {
+      for (const el of ctx.stepLabels.values()) {
         if (el.textContent.endsWith("…")) el.textContent = "interrupted";
       }
-      for (const det of toolEls.values()) {
+      for (const det of ctx.toolEls.values()) {
         const pill = det.querySelector(".pill.run");
         if (pill) { pill.className = "pill err"; pill.textContent = "interrupted"; }
       }
       throw new Error("Stream closed before turn completed — retry prompt");
     }
 
-    if (touchedFiles) {
-      await refreshWorkspace(true);
-      if (previewPath && touchedHtml) {
-        setWsTab("preview");
-      } else if (lastTouchedPath) {
-        $("file-select").value = lastTouchedPath;
-        setWsTab("changes");
-      }
-    }
-
-    const totalS = ((performance.now() - t0) / 1000).toFixed(2);
-    let statsText = `completed in ${totalS} s`;
-    if (activeRoute === "chat" && lastUsage) {
-      const dRate = (lastUsage.completion_tokens / Math.max(lastUsage.decode_secs || 1e-3, 1e-3)).toFixed(1);
-      const pRate = (lastUsage.prefilled_tokens / Math.max(lastUsage.prefill_secs || 1e-3, 1e-3)).toFixed(0);
-      const acc = lastUsage.drafted_tokens > 0
-        ? ` · accept ${(100 * lastUsage.accepted_tokens / lastUsage.drafted_tokens).toFixed(1)}%`
-        : "";
-      const ttft = firstTokenTime ? ((firstTokenTime - t0) / 1000).toFixed(2) : totalS;
-      statsText = `${lastUsage.prefilled_tokens} new @ ${pRate} tok/s · ${lastUsage.completion_tokens} gen @ ${dRate} tok/s${acc} · first token ${ttft} s`;
-    }
-    const s = document.createElement("div");
-    s.className = "stats";
-    s.textContent = statsText;
-    log.appendChild(s);
-
-    sessionTurns.push({
-      ts: Math.floor(Date.now() / 1000),
-      userText: text,
-      attachments: attachedItems.map(a => ({
-        name: a.name,
-        ext: a.ext,
-        isImage: a.isImage,
-        dataUrl: a.isImage ? a.dataUrl : "",
-      })),
-      route: activeRoute,
-      badges: turnBadges,
-      tools: toolRecords,
-      verified: verifyRecord,
-      prose,
-      statsText,
-    });
-    rebuildSessionChanges();
-    await persistCurrentSession();
+    await finalizeTurnStreamContext(ctx);
   } catch (err) {
-    routePill.className = "pill err";
-    routePill.textContent = "error";
-    proseBox.textContent = "Error: " + err.message;
+    ctx.routePill.className = "pill err";
+    ctx.routePill.textContent = "error";
+    ctx.proseBox.textContent = "Error: " + err.message;
     sessionHistory.length = prevLen;
-    if (!gotDone) {
+    if (!ctx.gotDone) {
       if (!input.value && text) input.value = text;
       if (pendingAttachments.length === 0 && attachedItems.length > 0) {
         pendingAttachments = attachedItems.slice();
         renderAttachmentTray();
       }
     }
+  } finally {
+    localTurnInFlight = false;
   }
 }
 
@@ -2597,6 +3335,8 @@ window.addEventListener("hashchange", () => {
   if (savedSess && allSessions.some(s => s.id === savedSess)) {
     await loadSessionById(savedSess, false);
   }
+  await pollLiveTurn();
+  setInterval(pollLiveTurn, 450);
 })();
 </script>
 </body>

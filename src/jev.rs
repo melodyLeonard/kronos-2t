@@ -247,6 +247,7 @@ impl WorkspaceSymbolIndex {
         let Ok(rd) = fs::read_dir(cur) else {
             return;
         };
+        let mut subdirs = Vec::new();
         for entry in rd.flatten() {
             if out.len() >= limit {
                 break;
@@ -260,7 +261,7 @@ impl WorkspaceSymbolIndex {
             };
             let path = entry.path();
             if meta.is_dir() {
-                Self::walk(root, &path, limit, out);
+                subdirs.push(path);
             } else if meta.is_file() {
                 let Ok(rel) = path.strip_prefix(root) else {
                     continue;
@@ -282,6 +283,12 @@ impl WorkspaceSymbolIndex {
                     symbols,
                 });
             }
+        }
+        for sub in subdirs {
+            if out.len() >= limit {
+                break;
+            }
+            Self::walk(root, &sub, limit, out);
         }
     }
 
@@ -428,6 +435,7 @@ fn is_indexable_text_ext(path: &Path) -> bool {
             | "json"
             | "toml"
             | "md"
+            | "txt"
             | "sh"
     )
 }
@@ -572,6 +580,9 @@ pub enum ArtifactKind {
     PythonScript,
     RustCode,
     JsModule,
+    ReadableScript,
+    AudioMedia,
+    VideoMedia,
 }
 
 impl ArtifactKind {
@@ -581,6 +592,9 @@ impl ArtifactKind {
             ArtifactKind::PythonScript => "Python script (.py)",
             ArtifactKind::RustCode => "Rust source (.rs)",
             ArtifactKind::JsModule => "JavaScript/TypeScript module (.js/.ts)",
+            ArtifactKind::ReadableScript => "full narration script (.md/.txt, >= 3.2 KB spoken prose)",
+            ArtifactKind::AudioMedia => "synthesized audio file (.wav/.m4a/.mp3/.flac) on disk",
+            ArtifactKind::VideoMedia => "rendered video file (.mp4/.mov/.webm) on disk",
         }
     }
 }
@@ -592,6 +606,8 @@ pub enum PredicateKind {
     ExpectedArtifact { kind: ArtifactKind },
     TargetFilePresent { name_hint: String },
     DomainConceptsPresent { terms: Vec<String> },
+    ModularWebArchitecture,
+    SelfTestedAfterEdits,
     DeterministicOraclesClean,
 }
 
@@ -708,11 +724,17 @@ pub fn structural_route_logits(
         "beautify",
         "redesign",
         "refactor",
+        "modularize",
+        "split ",
+        "extract ",
+        "separate ",
         "scaffold",
         "implement ",
         "fix ",
         "repair ",
         "debug ",
+        "test ",
+        "verify ",
         "add a ",
         "add an ",
         "add the ",
@@ -881,6 +903,39 @@ pub fn structural_route_logits(
     [chat_z, agent_z, comp_z]
 }
 
+/// Strips system-injected `[Device Context ...][/Device Context]` and `[Attached Image ...][/Attached Image]`
+/// blocks so route classification, tool pruning, and rubric filename extraction inspect only the user's own prompt.
+fn extract_raw_user_goal(s: &str) -> &str {
+    let mut cur = s.trim();
+    loop {
+        if cur.starts_with("[Device Context") {
+            if let Some(end) = cur.find("[/Device Context]") {
+                cur = cur[end + "[/Device Context]".len()..].trim_start();
+                continue;
+            }
+        }
+        if cur.starts_with("[Attached Image") {
+            if let Some(end) = cur.find("[/Attached Image]") {
+                cur = cur[end + "[/Attached Image]".len()..].trim_start();
+                continue;
+            }
+        }
+        break;
+    }
+    for tail_marker in ["\n\n[Device Context", "\n[Device Context", "\n\n[Local Conversations", "\n[Local Conversations"] {
+        if let Some(pos) = cur.find(tail_marker) {
+            if pos > 0 {
+                cur = cur[..pos].trim_end();
+            }
+        }
+    }
+    if cur.is_empty() {
+        s.trim()
+    } else {
+        cur
+    }
+}
+
 /// Runs the Turn-1 single-pass Jev pre-planner: calibrated route selection, KV-aware tool schema
 /// selection, workspace file/symbol pre-fetching, and atomic requirement rubric decomposition.
 #[allow(clippy::too_many_arguments)]
@@ -896,6 +951,7 @@ pub fn plan_turn_with_jev(
     allow_computer_control: bool,
     recent_history_has_prefetch: bool,
 ) -> JevPrepassPlan {
+    let user_text = extract_raw_user_goal(user_text);
     let t0 = Instant::now();
     let ws_index = WorkspaceSymbolIndex::build(workdir, 192);
     let workspace_has_files = !ws_index.files.is_empty();
@@ -1027,11 +1083,18 @@ fn select_tools_kv_aware(
         }
     }
 
-    // Preserve a pre-warmed target KV prefix on large-context sessions (`0 ms` reuse);
-    // prune unneeded schemas when the KV prefix is cold or context budget is tight (`<= 4096`).
-    let hot_prefix = model.is_some_and(|m| {
-        m.context_size() > 4096 && m.has_hot_prefix(system_prompt, full_tools_json)
-    });
+    let lower = user_text.to_ascii_lowercase();
+    let wants_computer = crate::device::is_computer_control_prompt(&lower);
+
+    // Preserve a pre-warmed target KV prefix on large-context sessions (`0 ms` reuse)
+    // when no extraneous computer-control schema would pollute a workspace turn.
+    let has_computer_schema = full_tools_json
+        .iter()
+        .any(|s| tool_name_from_schema(s).as_deref() == Some("use_computer"));
+    let hot_prefix = (!has_computer_schema || wants_computer)
+        && model.is_some_and(|m| {
+            m.context_size() > 4096 && m.has_hot_prefix(system_prompt, full_tools_json)
+        });
     if hot_prefix {
         let names = full_tools_json
             .iter()
@@ -1040,27 +1103,28 @@ fn select_tools_kv_aware(
         return (names, full_tools_json.to_vec(), 0);
     }
 
-    let lower = user_text.to_ascii_lowercase();
     let wants_switch = crate::device::is_workspace_folder_target_query(&lower)
-        || has_any(
-            &lower,
-            &[
-                "folder",
-                "directory",
-                "documents/",
-                "desktop/",
-                "downloads/",
-                "orgproj",
-                "new project",
-                "switch workspace",
-            ],
-        );
+        || (has_any(&lower, &["new folder", "new directory", "new project", "switch workspace", "orgproj"]));
     let wants_cmd = has_any(
         &lower,
         &[
             "run ",
             "execute",
             "test",
+            "verify",
+            "verification",
+            "check ",
+            "validate",
+            "assert",
+            "modular",
+            "refactor",
+            "split ",
+            "screenshot",
+            "headless",
+            "browser",
+            "smoke",
+            "suite",
+            "iterate",
             "cargo",
             "pytest",
             "npm ",
@@ -1073,15 +1137,36 @@ fn select_tools_kv_aware(
             "git ",
             "command",
             "script",
+            "video",
+            "audio",
+            "voice",
+            "ffmpeg",
+            "mlx",
+            "tts",
+            "render",
+            "use tools",
+            "venv",
         ],
     );
     let wants_search = workspace_has_files
         && has_any(
             &lower,
-            &["find", "search", "where", "grep", "locate", "across"],
+            &[
+                "find",
+                "search",
+                "where",
+                "grep",
+                "locate",
+                "across",
+                "modular",
+                "refactor",
+                "split ",
+                "monolith",
+                "inspect",
+                "audit",
+                "structure",
+            ],
         );
-    let wants_computer = crate::device::is_computer_control_prompt(&lower)
-        || has_any(&lower, &["open ", "launch ", "whatsapp", "safari", "finder"]);
 
     let mut names = Vec::new();
     let mut kept = Vec::new();
@@ -1092,8 +1177,8 @@ fn select_tools_kv_aware(
         };
         let keep = match name.as_str() {
             "write_file" => true,
-            "edit_file" | "read_file" => workspace_has_files || wants_switch,
-            "list_dir" => workspace_has_files && wants_search,
+            "edit_file" | "read_file" => workspace_has_files || wants_switch || wants_cmd,
+            "list_dir" => (workspace_has_files && wants_search) || wants_cmd,
             "search_files" => wants_search,
             "switch_workspace" => wants_switch,
             "run_command" => wants_cmd,
@@ -1115,7 +1200,7 @@ pub fn extract_requirement_rubric(
     route: TurnRoute,
     workspace_has_files: bool,
 ) -> Vec<RequirementPredicate> {
-    let trimmed = user_text.trim();
+    let trimmed = extract_raw_user_goal(user_text);
     if trimmed.is_empty() || route == TurnRoute::Chat {
         return Vec::new();
     }
@@ -1137,7 +1222,8 @@ pub fn extract_requirement_rubric(
         &[
             "create", "build", "make", "write", "edit", "update", "modify", "change", "fix",
             "repair", "add", "remove", "delete", "style", "restyle", "redesign", "implement",
-            "refactor", "run", "execute", "center", "align",
+            "refactor", "modularize", "split", "extract", "separate", "run", "execute", "center",
+            "align", "test", "verify",
         ],
     );
     if is_action {
@@ -1161,12 +1247,85 @@ pub fn extract_requirement_rubric(
         });
     }
 
-    if let Some(kind) = detect_expected_artifact_kind(&lower, workspace_has_files) {
+    for (idx, kind) in detect_expected_artifact_kinds(&lower, workspace_has_files)
+        .into_iter()
+        .enumerate()
+    {
         preds.push(RequirementPredicate {
-            id: "artifact_kind".to_string(),
+            id: format!("artifact_kind_{idx}"),
             description: format!("produce complete {}", kind.label()),
             threshold: 0.65,
             kind: PredicateKind::ExpectedArtifact { kind },
+        });
+    }
+
+    let wants_modular_web = has_any(
+        &lower,
+        &[
+            "modularize",
+            "modular",
+            "split into",
+            "separate css",
+            "separate js",
+            "separate files",
+            "es module",
+            "es modules",
+            "break up the monolith",
+            "refactor the monolith",
+        ],
+    ) && has_any(
+        &lower,
+        &[
+            "website",
+            "web page",
+            "webpage",
+            "web app",
+            "dashboard",
+            "portal",
+            "html",
+            "css",
+            "index.html",
+            "monolith",
+            "page",
+        ],
+    );
+    if wants_modular_web {
+        preds.push(RequirementPredicate {
+            id: "modular_web".to_string(),
+            description: "extract inline monolith code into modular external `.css` stylesheets and `.js` modules linked from clean HTML".to_string(),
+            threshold: 0.70,
+            kind: PredicateKind::ModularWebArchitecture,
+        });
+    }
+
+    let wants_self_test = is_action
+        && has_any(
+            &lower,
+            &[
+                "test its own",
+                "test your own",
+                "test your work",
+                "test the work",
+                "test afterwards",
+                "write tests",
+                "write a test",
+                "run tests",
+                "run a test",
+                "test suite",
+                "test script",
+                "verification script",
+                "automated test",
+                "self-test",
+                "and test it",
+                "then test",
+            ],
+        );
+    if wants_self_test {
+        preds.push(RequirementPredicate {
+            id: "self_tested".to_string(),
+            description: "execute an automated test or verification command via `run_command` (`exit_code=0`) after the latest file edit".to_string(),
+            threshold: 0.75,
+            kind: PredicateKind::SelfTestedAfterEdits,
         });
     }
 
@@ -1191,6 +1350,37 @@ pub fn extract_requirement_rubric(
             ),
             threshold: 0.55,
             kind: PredicateKind::DomainConceptsPresent { terms: domain_terms },
+        });
+    }
+
+    let asks_kronos_technical_architecture = lower.contains("kronos")
+        && has_any(
+            &lower,
+            &[
+                "iteration",
+                "math",
+                "maths",
+                "technical",
+                "architecture",
+                "compares",
+                "compare",
+            ],
+        );
+    if asks_kronos_technical_architecture && is_action {
+        preds.push(RequirementPredicate {
+            id: "kronos_grounded_math".to_string(),
+            description: "ground technical explanation in real Kronos engine mathematics and benchmarks (Hadamard rotation, Cholesky GPTQ, NF4/E8Q2, Four-Russians LUT-GEMV, Kronos-Jev, and llama.cpp comparisons)".to_string(),
+            threshold: 0.72,
+            kind: PredicateKind::DomainConceptsPresent {
+                terms: vec![
+                    "hadamard".to_string(),
+                    "gptq".to_string(),
+                    "nf4".to_string(),
+                    "lut".to_string(),
+                    "jev".to_string(),
+                    "llama.cpp".to_string(),
+                ],
+            },
         });
     }
 
@@ -1234,12 +1424,38 @@ pub fn detect_ungrounded_action_claim(reply_text: &str, used_any_tools: bool) ->
 /// Evaluates all atomic requirement predicates against physical workspace state and deterministic oracles.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_rubric(
+    model: Option<&mut ChatModel>,
+    user_goal: &str,
+    rubric: &[RequirementPredicate],
+    workdir: &Path,
+    modified_files: &[String],
+    used_any_tools: bool,
+    oracle_error: Option<&str>,
+    reply_text: &str,
+) -> JevRubricEvaluation {
+    evaluate_rubric_with_telemetry(
+        model,
+        user_goal,
+        rubric,
+        workdir,
+        modified_files,
+        used_any_tools,
+        true,
+        oracle_error,
+        reply_text,
+    )
+}
+
+/// Evaluates all atomic requirement predicates with turn-level command verification telemetry.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_rubric_with_telemetry(
     mut model: Option<&mut ChatModel>,
     user_goal: &str,
     rubric: &[RequirementPredicate],
     workdir: &Path,
     modified_files: &[String],
     used_any_tools: bool,
+    tested_after_last_edit: bool,
     oracle_error: Option<&str>,
     reply_text: &str,
 ) -> JevRubricEvaluation {
@@ -1273,6 +1489,7 @@ pub fn evaluate_rubric(
         });
     }
 
+    let mut artifact_notes: Vec<String> = Vec::new();
     for pred in rubric {
         let p_t0 = Instant::now();
         let eval_bool = match &pred.kind {
@@ -1297,7 +1514,20 @@ pub fn evaluate_rubric(
                 )
             }
             PredicateKind::ExpectedArtifact { kind } => {
-                let sat = check_artifact_kind_satisfied(*kind, &ws_index, &combined_corpus);
+                let sat = match check_artifact_kind_with_note(
+                    workdir,
+                    *kind,
+                    &ws_index,
+                    &combined_corpus,
+                ) {
+                    Ok(()) => true,
+                    Err(note) => {
+                        if !note.is_empty() {
+                            artifact_notes.push(format!("{}: {note}", pred.description));
+                        }
+                        false
+                    }
+                };
                 let lo = if sat { 3.8 } else { -3.8 };
                 CalibratedBool::from_log_odds(
                     lo,
@@ -1368,6 +1598,29 @@ pub fn evaluate_rubric(
                     p_t0.elapsed().as_secs_f64() * 1000.0,
                 )
             }
+            PredicateKind::ModularWebArchitecture => {
+                let sat = check_modular_web_architecture_satisfied(workdir, &ws_index);
+                let lo = if sat { 4.2 } else { -4.2 };
+                CalibratedBool::from_log_odds(
+                    lo,
+                    pred.threshold,
+                    false,
+                    p_t0.elapsed().as_secs_f64() * 1000.0,
+                )
+            }
+            PredicateKind::SelfTestedAfterEdits => {
+                let lo = if used_any_tools && tested_after_last_edit {
+                    4.4
+                } else {
+                    -4.4
+                };
+                CalibratedBool::from_log_odds(
+                    lo,
+                    pred.threshold,
+                    false,
+                    p_t0.elapsed().as_secs_f64() * 1000.0,
+                )
+            }
             PredicateKind::DeterministicOraclesClean => {
                 let lo = if oracle_error.is_none() { 4.6 } else { -4.6 };
                 CalibratedBool::from_log_odds(
@@ -1403,6 +1656,9 @@ pub fn evaluate_rubric(
         min_margin_ok = false;
         unmet_lines.push(format!("- deterministic verification error:\n{}", truncate_utf8(err, 900)));
     }
+    for note in &artifact_notes {
+        unmet_lines.push(format!("- {note}"));
+    }
 
     let mean_p = if evaluated.is_empty() {
         if oracle_error.is_none() { 0.96 } else { 0.25 }
@@ -1429,11 +1685,447 @@ pub fn evaluate_rubric(
     }
 }
 
-fn check_artifact_kind_satisfied(
+fn measure_inline_tag_bytes(html: &str, tag_name: &str) -> usize {
+    let lower = html.to_ascii_lowercase();
+    let open_pat = format!("<{tag_name}");
+    let close_pat = format!("</{tag_name}>");
+    let mut total = 0usize;
+    let mut cur = 0usize;
+    while let Some(pos) = lower[cur..].find(&open_pat) {
+        let open_start = cur + pos;
+        let Some(gt_rel) = lower[open_start..].find('>') else {
+            break;
+        };
+        let tag_header = &lower[open_start..open_start + gt_rel + 1];
+        let body_start = open_start + gt_rel + 1;
+        let Some(end_rel) = lower[body_start..].find(&close_pat) else {
+            break;
+        };
+        if !(tag_name == "script" && tag_header.contains("src=")) {
+            total += html[body_start..body_start + end_rel].trim().len();
+        }
+        cur = body_start + end_rel + close_pat.len();
+    }
+    total
+}
+
+fn check_modular_web_architecture_satisfied(
+    workdir: &Path,
+    ws_index: &WorkspaceSymbolIndex,
+) -> bool {
+    let mut html_paths = Vec::new();
+    let mut css_count = 0usize;
+    let mut app_js_count = 0usize;
+    for f in &ws_index.files {
+        let p = f.rel_path.to_ascii_lowercase();
+        if (p.ends_with(".html") || p.ends_with(".htm")) && f.bytes >= 180 {
+            html_paths.push(f.rel_path.as_str());
+        } else if p.ends_with(".css") && f.bytes >= 100 {
+            css_count += 1;
+        } else if (p.ends_with(".js") || p.ends_with(".mjs")) && f.bytes >= 60 {
+            let fname = Path::new(&p)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&p);
+            let is_test_helper = p.starts_with("test")
+                || p.contains("/test")
+                || fname.contains("test")
+                || fname.contains("verify")
+                || fname.contains("spec")
+                || fname.contains("check");
+            if !is_test_helper {
+                app_js_count += 1;
+            }
+        }
+    }
+    if html_paths.is_empty() || css_count == 0 || app_js_count == 0 || (css_count + app_js_count) < 3 {
+        return false;
+    }
+    let primary_html = html_paths
+        .iter()
+        .copied()
+        .find(|p| p.eq_ignore_ascii_case("index.html"))
+        .unwrap_or(html_paths[0]);
+    let Ok(html_src) = fs::read_to_string(workdir.join(primary_html)) else {
+        return false;
+    };
+    let html_lower = html_src.to_ascii_lowercase();
+    let links_css = html_lower.contains(".css");
+    let links_js = html_lower.contains("<script") && html_lower.contains("src=");
+    let inline_style_bytes = measure_inline_tag_bytes(&html_src, "style");
+    let inline_script_bytes = measure_inline_tag_bytes(&html_src, "script");
+    links_css && links_js && inline_style_bytes <= 1200 && inline_script_bytes <= 1200
+}
+
+fn verify_wav_pcm_signal(path: &Path) -> Result<f64, String> {
+    let bytes = fs::read(path).map_err(|e| format!("cannot read `{}`: {e}", path.display()))?;
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err(format!("`{}` is not a valid RIFF/WAVE file", path.display()));
+    }
+    let mut pos = 12usize;
+    let mut channels = 1u16;
+    let mut sample_rate = 24000u32;
+    let mut bits_per_sample = 16u16;
+    let mut audio_format = 1u16;
+    let mut data_slice: Option<&[u8]> = None;
+    while pos + 8 <= bytes.len() {
+        let tag = &bytes[pos..pos + 4];
+        let sz = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        let body_start = pos + 8;
+        let body_end = body_start.saturating_add(sz).min(bytes.len());
+        if tag == b"fmt " && body_end >= body_start + 16 {
+            let b = &bytes[body_start..body_end];
+            audio_format = u16::from_le_bytes([b[0], b[1]]);
+            channels = u16::from_le_bytes([b[2], b[3]]).max(1);
+            sample_rate = u32::from_le_bytes([b[4], b[5], b[6], b[7]]).max(1);
+            bits_per_sample = u16::from_le_bytes([b[14], b[15]]);
+        } else if tag == b"data" {
+            data_slice = Some(&bytes[body_start..body_end]);
+            break;
+        }
+        pos = body_start.saturating_add(sz + (sz & 1));
+    }
+    let Some(pcm) = data_slice else {
+        return Err(format!("`{}` is missing a WAVE `data` chunk", path.display()));
+    };
+    let bytes_per_sample = ((bits_per_sample as usize) / 8).max(2);
+    let frame_bytes = bytes_per_sample * (channels as usize);
+    let total_frames = pcm.len() / frame_bytes;
+    let dur = (total_frames as f64) / (sample_rate as f64);
+    if dur < 1.5 {
+        return Err(format!(
+            "`{}` duration is too short ({dur:.2}s < 1.50s)",
+            path.display()
+        ));
+    }
+    if (audio_format == 1 && bits_per_sample == 16) || (audio_format == 3 && bits_per_sample == 32)
+    {
+        let mid_frame = total_frames / 2;
+        let mut sum_sq_first = 0.0f64;
+        let mut sum_sq_second = 0.0f64;
+        let mut clipped = 0usize;
+        let win_frames = ((sample_rate as usize) / 10).max(1);
+        let mut active_wins = 0usize;
+        let mut total_wins = 0usize;
+        let mut win_sq = 0.0f64;
+        let mut win_count = 0usize;
+
+        for f_idx in 0..total_frames {
+            let off = f_idx * frame_bytes;
+            let s: f64 = if audio_format == 3 && bits_per_sample == 32 {
+                let v = f32::from_le_bytes([pcm[off], pcm[off + 1], pcm[off + 2], pcm[off + 3]]);
+                if v.is_finite() { v as f64 } else { 0.0 }
+            } else {
+                let v = i16::from_le_bytes([pcm[off], pcm[off + 1]]);
+                (v as f64) / 32768.0
+            };
+            if s.abs() >= 0.998 {
+                clipped += 1;
+            }
+            let sq = s * s;
+            if f_idx < mid_frame {
+                sum_sq_first += sq;
+            } else {
+                sum_sq_second += sq;
+            }
+            win_sq += sq;
+            win_count += 1;
+            if win_count >= win_frames {
+                total_wins += 1;
+                if (win_sq / (win_count as f64)).sqrt() >= 0.0035 {
+                    active_wins += 1;
+                }
+                win_sq = 0.0;
+                win_count = 0;
+            }
+        }
+        let rms_first = (sum_sq_first / (mid_frame.max(1) as f64)).sqrt();
+        let rms_second =
+            (sum_sq_second / ((total_frames.saturating_sub(mid_frame)).max(1) as f64)).sqrt();
+        let clip_ratio = (clipped as f64) / (total_frames.max(1) as f64);
+        let active_ratio = (active_wins as f64) / (total_wins.max(1) as f64);
+
+        if rms_first < 0.0025 || rms_second < 0.0025 {
+            return Err(format!(
+                "`{}` has silent or collapsed speech energy (first_half_rms={rms_first:.4}, second_half_rms={rms_second:.4})",
+                path.display()
+            ));
+        }
+        if rms_second < 0.12 * rms_first || rms_first < 0.12 * rms_second {
+            return Err(format!(
+                "`{}` has unbalanced half-clip energy collapse (first_half_rms={rms_first:.4}, second_half_rms={rms_second:.4})",
+                path.display()
+            ));
+        }
+        if active_ratio < 0.22 {
+            return Err(format!(
+                "`{}` is mostly dead silence (active_speech_ratio={active_ratio:.2} < 0.22)",
+                path.display()
+            ));
+        }
+        if clip_ratio > 0.15 {
+            return Err(format!(
+                "`{}` has severe clipping distortion (clip_ratio={clip_ratio:.2})",
+                path.display()
+            ));
+        }
+    }
+    Ok(dur)
+}
+
+fn is_reference_only_audio_stem(p_lower: &str) -> bool {
+    let fname = Path::new(p_lower)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(p_lower);
+    fname == "ref"
+        || fname.starts_with("ref_")
+        || fname.starts_with("raw_ref")
+        || fname.ends_with("_ref")
+        || fname.contains("voice_ref")
+        || fname.contains("ref_voice")
+        || fname.contains("reference")
+}
+
+fn verify_workspace_audio_coherence(
+    workdir: &Path,
+    ws_index: &WorkspaceSymbolIndex,
+) -> Result<(), String> {
+    let mut non_ref_audio_paths = Vec::new();
+    let mut has_voice_clone_ref = false;
+    for f in &ws_index.files {
+        let p = f.rel_path.to_ascii_lowercase();
+        let is_audio = p.ends_with(".wav")
+            || p.ends_with(".m4a")
+            || p.ends_with(".mp3")
+            || p.ends_with(".flac")
+            || p.ends_with(".aac");
+        if !is_audio || f.bytes < 24 * 1024 {
+            continue;
+        }
+        if is_reference_only_audio_stem(&p) {
+            has_voice_clone_ref = true;
+        } else {
+            non_ref_audio_paths.push(f.rel_path.clone());
+        }
+    }
+    if non_ref_audio_paths.is_empty() {
+        let incomplete_py = ws_index
+            .files
+            .iter()
+            .find(|f| f.rel_path.ends_with(".py"))
+            .and_then(|f| {
+                let src = fs::read_to_string(workdir.join(&f.rel_path)).ok()?;
+                if !src.contains("generate_audio") {
+                    Some(format!(
+                        " (`{}` on disk currently omits `mlx_audio` `generate_audio(...)` voice-cloning synthesis — update `{}` to synthesize `audio/seg_XX.wav`, verify with `faster_whisper`, and mux `kronos_explained.mp4`, then run it via `run_command`)",
+                        f.rel_path, f.rel_path
+                    ))
+                } else {
+                    Some(format!(
+                        " (run `{}` via `run_command` so it generates `audio/seg_XX.wav`, `audio/coherence_report.json`, and `kronos_explained.mp4`)",
+                        f.rel_path
+                    ))
+                }
+            })
+            .unwrap_or_default();
+        return Err(format!(
+            "no synthesized narration audio file (outside `ref_*.wav`) exists on disk yet{incomplete_py}"
+        ));
+    }
+
+    for rel in &non_ref_audio_paths {
+        if rel.to_ascii_lowercase().ends_with(".wav") {
+            let _ = verify_wav_pcm_signal(&workdir.join(rel))?;
+        }
+    }
+
+    if has_voice_clone_ref {
+        let report_path = if workdir.join("audio/coherence_report.json").is_file() {
+            workdir.join("audio/coherence_report.json")
+        } else if workdir.join("coherence_report.json").is_file() {
+            workdir.join("coherence_report.json")
+        } else {
+            return Err(
+                "voice-cloned WAVs exist on disk, but `audio/coherence_report.json` is missing — verify every `audio/seg_XX.wav` with `faster_whisper` ASR checking non-empty `ref_text` and `word_recall >= 0.70` across both first half and second half, then write `audio/coherence_report.json`"
+                    .to_string(),
+            );
+        };
+        let raw = fs::read_to_string(&report_path)
+            .map_err(|e| format!("failed to read `{}`: {e}", report_path.display()))?;
+        let parsed = crate::json::Json::parse(&raw)
+            .map_err(|e| format!("invalid JSON in `{}`: {e}", report_path.display()))?;
+        let ref_text = parsed
+            .get("ref_text")
+            .and_then(crate::json::Json::as_str)
+            .unwrap_or("")
+            .trim();
+        if ref_text.split_whitespace().count() < 5 {
+            return Err(
+                "`ref_text` in `audio/coherence_report.json` is empty or < 5 words — trim `ref_24k.wav` to a complete Whisper sentence (4.0..8.5s) and pass its exact non-empty `ref_text` to `generate_audio` so voice cloning does not garble the opening half"
+                    .to_string(),
+            );
+        }
+        if parsed.get("verified").and_then(crate::json::Json::as_bool) == Some(false) {
+            return Err(
+                "`audio/coherence_report.json` has `verified: false` — regenerate incoherent segments with clean single-line symbol-free spoken prose"
+                    .to_string(),
+            );
+        }
+        let Some(segs) = parsed.get("segments").and_then(crate::json::Json::as_arr) else {
+            return Err(
+                "`audio/coherence_report.json` must contain a non-empty `segments` array"
+                    .to_string(),
+            );
+        };
+        if segs.is_empty() {
+            return Err("`audio/coherence_report.json` `segments` array is empty".to_string());
+        }
+        let expected_seg_files: Vec<&String> = non_ref_audio_paths
+            .iter()
+            .filter(|p| {
+                Path::new(p.as_str())
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|n| n.to_ascii_lowercase().starts_with("seg_"))
+            })
+            .collect();
+        for exp in &expected_seg_files {
+            let covered = segs.iter().any(|s| {
+                s.get("path")
+                    .and_then(crate::json::Json::as_str)
+                    .is_some_and(|sp| sp == exp.as_str())
+            });
+            if !covered {
+                return Err(format!(
+                    "synthesized segment `{exp}` on disk is missing from `audio/coherence_report.json` — every `seg_*.wav` must be ASR-verified across both halves"
+                ));
+            }
+        }
+        for (idx, seg) in segs.iter().enumerate() {
+            let seg_rel = seg
+                .get("path")
+                .and_then(crate::json::Json::as_str)
+                .unwrap_or("");
+            if seg_rel.is_empty() || !workdir.join(seg_rel).is_file() {
+                return Err(format!(
+                    "segment #{idx} `{seg_rel}` in `coherence_report.json` is missing on disk"
+                ));
+            }
+            let dur = verify_wav_pcm_signal(&workdir.join(seg_rel))?;
+            if dur > 26.0 {
+                return Err(format!(
+                    "segment `{seg_rel}` is {dur:.1}s (> 26.0s zero-shot voice-cloning coherence window) — split into shorter 120-230 char per-slide segments"
+                ));
+            }
+            let recall = seg
+                .get("word_recall")
+                .and_then(crate::json::Json::as_f64)
+                .unwrap_or(0.0);
+            let h1 = seg
+                .get("first_half_recall")
+                .and_then(crate::json::Json::as_f64)
+                .unwrap_or(recall);
+            let h2 = seg
+                .get("second_half_recall")
+                .and_then(crate::json::Json::as_f64)
+                .unwrap_or(recall);
+            if recall < 0.68 || h1 < 0.60 || h2 < 0.60 {
+                return Err(format!(
+                    "segment `{seg_rel}` failed ASR coherence gate (word_recall={recall:.2}, first_half={h1:.2}, second_half={h2:.2}; need >= 0.68 overall and >= 0.60 on both halves) — remove Markdown/LaTeX symbols and newlines from spoken text and regenerate"
+                ));
+            }
+            let asr_text = seg
+                .get("asr_text")
+                .and_then(crate::json::Json::as_str)
+                .unwrap_or("")
+                .trim();
+            let asr_words = asr_text.split_whitespace().count();
+            let wps = (asr_words as f64) / dur.max(0.1);
+            if asr_words < 5 || !(0.9..=5.2).contains(&wps) {
+                return Err(format!(
+                    "segment `{seg_rel}` has abnormal ASR speech rate ({asr_words} words in {dur:.1}s = {wps:.2} words/s) indicating babble or silence collapse"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn verify_workspace_video_container(
+    workdir: &Path,
+    ws_index: &WorkspaceSymbolIndex,
+) -> Result<(), String> {
+    let mut root_videos = Vec::new();
+    let mut segment_videos = Vec::new();
+    let mut has_any_audio = false;
+    for f in &ws_index.files {
+        let p = f.rel_path.to_ascii_lowercase();
+        if p.ends_with(".wav") || p.ends_with(".m4a") || p.ends_with(".mp3") {
+            has_any_audio = true;
+        }
+        if (p.ends_with(".mp4") || p.ends_with(".mov") || p.ends_with(".webm"))
+            && f.bytes >= 64 * 1024
+        {
+            if p.starts_with("segments/") || p.contains("/segments/") {
+                segment_videos.push(f.rel_path.clone());
+            } else {
+                root_videos.push(f.rel_path.clone());
+            }
+        }
+    }
+    if root_videos.is_empty() {
+        if !segment_videos.is_empty() {
+            return Err(
+                "segment MP4 clips exist in `segments/`, but the final concatenated `.mp4` video has not been created at the workspace root yet — run `ffmpeg -y -f concat -safe 0 -i concat.txt -c copy kronos_explained.mp4`"
+                    .to_string(),
+            );
+        }
+        return Err("no rendered `.mp4`/`.mov`/`.webm` video (>= 64 KB) exists on disk yet".to_string());
+    }
+    let candidates = if !root_videos.is_empty() {
+        &root_videos
+    } else {
+        &segment_videos
+    };
+    for rel in candidates {
+        let lower = rel.to_ascii_lowercase();
+        if lower.ends_with(".mp4") || lower.ends_with(".mov") {
+            let bytes = fs::read(workdir.join(rel))
+                .map_err(|e| format!("cannot read video `{rel}`: {e}"))?;
+            if !contains_subslice(&bytes, b"moov") || !contains_subslice(&bytes, b"mdat") {
+                return Err(format!(
+                    "video `{rel}` is missing ISO-BMFF `moov`/`mdat` atoms (incomplete or corrupted mux)"
+                ));
+            }
+            if !contains_subslice(&bytes, b"vide") {
+                return Err(format!("video `{rel}` has no `vide` video track"));
+            }
+            if has_any_audio && !contains_subslice(&bytes, b"soun") {
+                return Err(format!(
+                    "video `{rel}` has no `soun` audio track — mux the verified voice narration WAVs into the video"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_artifact_kind_with_note(
+    workdir: &Path,
     kind: ArtifactKind,
     ws_index: &WorkspaceSymbolIndex,
     corpus: &str,
-) -> bool {
+) -> Result<(), String> {
     match kind {
         ArtifactKind::WebApp => {
             let has_html = ws_index.files.iter().any(|f| {
@@ -1445,20 +2137,59 @@ fn check_artifact_kind_satisfied(
                 .iter()
                 .any(|f| f.rel_path.to_ascii_lowercase().ends_with(".css") && f.bytes >= 80)
                 || corpus.to_ascii_lowercase().contains("<style");
-            has_html && has_styles
+            if has_html && has_styles {
+                Ok(())
+            } else {
+                Err("missing complete HTML document or CSS styles".to_string())
+            }
         }
-        ArtifactKind::PythonScript => ws_index
-            .files
-            .iter()
-            .any(|f| f.rel_path.to_ascii_lowercase().ends_with(".py") && f.bytes >= 16),
-        ArtifactKind::RustCode => ws_index
-            .files
-            .iter()
-            .any(|f| f.rel_path.to_ascii_lowercase().ends_with(".rs") && f.bytes >= 16),
-        ArtifactKind::JsModule => ws_index.files.iter().any(|f| {
-            let p = f.rel_path.to_ascii_lowercase();
-            (p.ends_with(".js") || p.ends_with(".mjs") || p.ends_with(".ts")) && f.bytes >= 16
-        }),
+        ArtifactKind::PythonScript => {
+            if ws_index
+                .files
+                .iter()
+                .any(|f| f.rel_path.to_ascii_lowercase().ends_with(".py") && f.bytes >= 16)
+            {
+                Ok(())
+            } else {
+                Err("no `.py` script written on disk yet".to_string())
+            }
+        }
+        ArtifactKind::RustCode => {
+            if ws_index
+                .files
+                .iter()
+                .any(|f| f.rel_path.to_ascii_lowercase().ends_with(".rs") && f.bytes >= 16)
+            {
+                Ok(())
+            } else {
+                Err("no `.rs` source file written on disk yet".to_string())
+            }
+        }
+        ArtifactKind::JsModule => {
+            if ws_index.files.iter().any(|f| {
+                let p = f.rel_path.to_ascii_lowercase();
+                (p.ends_with(".js") || p.ends_with(".mjs") || p.ends_with(".ts")) && f.bytes >= 16
+            }) {
+                Ok(())
+            } else {
+                Err("no `.js`/`.mjs`/`.ts` module written on disk yet".to_string())
+            }
+        }
+        ArtifactKind::ReadableScript => {
+            if ws_index.files.iter().any(|f| {
+                let p = f.rel_path.to_ascii_lowercase();
+                (p.ends_with(".md") || p.ends_with(".txt")) && f.bytes >= 3200
+            }) {
+                Ok(())
+            } else {
+                Err(
+                    "narration script `.md`/`.txt` is missing or shorter than 3.2 KB — write the full technical script explaining every Kronos iteration, equation, and benchmark comparison"
+                        .to_string(),
+                )
+            }
+        }
+        ArtifactKind::AudioMedia => verify_workspace_audio_coherence(workdir, ws_index),
+        ArtifactKind::VideoMedia => verify_workspace_video_container(workdir, ws_index),
     }
 }
 
@@ -1521,12 +2252,20 @@ fn term_matches_corpus(term: &str, corpus_lower: &str, workdir_lower: &str) -> b
 }
 
 fn extract_target_folder_hint(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    if !crate::device::is_workspace_folder_target_query(&lower) {
+        return None;
+    }
     for raw_tok in text.split_whitespace() {
         let clean = raw_tok.trim_matches(|c: char| {
             matches!(c, '"' | '\'' | '`' | ',' | '.' | ';' | ':' | '(' | ')')
         });
         if (clean.starts_with("~/") || clean.starts_with("/Users/")) && clean.len() > 4 {
-            if let Some(seg) = Path::new(clean).file_name().and_then(|s| s.to_str()) {
+            let p = Path::new(clean);
+            if p.is_file() {
+                continue;
+            }
+            if let Some(seg) = p.file_name().and_then(|s| s.to_str()) {
                 if !seg.contains('.') && seg.len() >= 2 {
                     return Some(seg.to_string());
                 }
@@ -1550,7 +2289,69 @@ fn extract_target_folder_hint(text: &str) -> Option<String> {
     None
 }
 
-fn detect_expected_artifact_kind(lower: &str, workspace_has_files: bool) -> Option<ArtifactKind> {
+fn detect_expected_artifact_kinds(lower: &str, workspace_has_files: bool) -> Vec<ArtifactKind> {
+    let mut kinds = Vec::new();
+    let wants_video = has_any(
+        lower,
+        &[
+            "make a video",
+            "create a video",
+            "build a video",
+            "render a video",
+            "generate a video",
+        ],
+    );
+    let wants_audio = has_any(
+        lower,
+        &[
+            "use my voice",
+            "mlx audio",
+            "mlx-audio",
+            "mlx_audio",
+            "voice clone",
+            "voice-clone",
+            "generate audio",
+            "synthesize audio",
+        ],
+    );
+    let wants_readable_script = has_any(
+        lower,
+        &[
+            "script i can read",
+            "make a script",
+            "write a script",
+            "narration script",
+            "video script",
+        ],
+    ) && !lower.contains("python script")
+        && !lower.contains("shell script")
+        && !lower.contains("bash script");
+
+    if wants_readable_script {
+        kinds.push(ArtifactKind::ReadableScript);
+    }
+    if wants_audio {
+        kinds.push(ArtifactKind::AudioMedia);
+    }
+    if wants_video {
+        kinds.push(ArtifactKind::VideoMedia);
+    }
+    if !kinds.is_empty() {
+        return kinds;
+    }
+
+    let wants_web_overhaul = has_any(
+        lower,
+        &[
+            "modularize",
+            "redesign",
+            "restyle",
+            "rebuild",
+            "match the screenshot",
+            "match this screenshot",
+            "matching the screenshot",
+        ],
+    );
     if has_any(
         lower,
         &[
@@ -1562,20 +2363,23 @@ fn detect_expected_artifact_kind(lower: &str, workspace_has_files: bool) -> Opti
             "dashboard",
             "portal",
         ],
-    ) && !workspace_has_files
+    ) && (!workspace_has_files || wants_web_overhaul)
     {
-        return Some(ArtifactKind::WebApp);
+        kinds.push(ArtifactKind::WebApp);
+        return kinds;
     }
     if lower.contains("python script") || lower.contains(".py") {
-        return Some(ArtifactKind::PythonScript);
+        kinds.push(ArtifactKind::PythonScript);
+        return kinds;
     }
     if lower.contains("rust ") && (lower.contains(".rs") || lower.contains("crate")) {
-        return Some(ArtifactKind::RustCode);
+        kinds.push(ArtifactKind::RustCode);
+        return kinds;
     }
     if lower.contains(".js") || lower.contains(".ts") {
-        return Some(ArtifactKind::JsModule);
+        kinds.push(ArtifactKind::JsModule);
     }
-    None
+    kinds
 }
 
 fn extract_explicit_filenames(text: &str) -> Vec<String> {
@@ -1589,6 +2393,12 @@ fn extract_explicit_filenames(text: &str) -> Vec<String> {
         let lower = tok.to_ascii_lowercase();
         if exts.iter().any(|e| lower.ends_with(e))
             && !tok.contains("://")
+            && !tok.contains('*')
+            && !tok.contains('?')
+            && !tok.contains('<')
+            && !tok.contains('>')
+            && !tok.starts_with('/')
+            && !tok.starts_with("~/")
             && !tok.starts_with('.')
             && tok.len() <= 64
             && !out.iter().any(|x: &String| x.eq_ignore_ascii_case(tok))
@@ -1608,6 +2418,18 @@ fn extract_domain_requirement_terms(lower: &str) -> Vec<String> {
         "downloads", "users", "orgproj", "using", "should", "have", "would", "could", "like",
         "also", "more", "some", "clean", "modern", "good", "nice", "fast", "full", "working",
         "complete", "html", "css", "javascript", "python", "rust", "index", "style", "main",
+        "want", "help", "explain", "ensure", "behind", "everything", "every", "step", "why",
+        "done", "whats", "what", "there", "out", "use", "tools", "tool", "too", "requires",
+        "require", "open", "source", "already", "exist", "exists", "computer", "read", "can",
+        "how", "all", "its", "compares", "compare", "https", "http", "github", "com", "m4a",
+        "modularize", "modular", "monolith", "monolithic", "refactor", "split", "separate",
+        "extract", "module", "modules", "attached", "attachment", "screenshot", "image",
+        "picture", "reference", "match", "matching", "styles", "styled", "styling", "responsive",
+        "test", "tests", "testing", "verify", "verification", "check", "checks", "suite",
+        "script", "scripts", "headless", "browser", "iterate", "iterating", "until", "afterwards",
+        "afterward", "work", "works", "own", "your", "our", "result", "results", "pass", "passes",
+        "passing", "broken", "legacy", "single", "single-file", "multi", "multi-file", "multiple",
+        "existing", "current", "target", "design", "visual", "layout", "automated",
     ];
     let mut terms = Vec::new();
     for raw in lower.split(|c: char| !c.is_ascii_alphanumeric() && c != '-') {
@@ -1770,6 +2592,151 @@ mod tests {
         assert!(real_eval.passed, "expected pass, unmet:\n{}", real_eval.unmet_summary);
         assert!(real_eval.score.expected > 0.85);
 
+        // 3. Multi-deliverable script + audio + video prompt with spaced input path and "open source tools"
+        //    must not synthesize a bogus folder switch or keep `use_computer`.
+        let media_prompt = "make a script I can read and make a video with this use tools and use my voice (/Users/melodyleonard/Downloads/James Iroha Close 4.m4a), use open source tools like MLX Audio";
+        let mut tools_with_comp = tool_definitions_json();
+        tools_with_comp.push(crate::device::use_computer_tool_definition_json());
+        let media_plan = plan_turn_with_jev(
+            None,
+            "sys",
+            media_prompt,
+            Some(TurnRoute::Agent),
+            false,
+            &dir,
+            false,
+            &tools_with_comp,
+            true,
+            false,
+        );
+        assert!(!media_plan.selected_tool_names.iter().any(|n| n == "use_computer"));
+        assert!(media_plan.selected_tool_names.iter().any(|n| n == "run_command"));
+        assert!(!media_plan
+            .rubric
+            .iter()
+            .any(|p| matches!(p.kind, PredicateKind::WorkspaceSwitched { .. })));
+        assert!(media_plan.rubric.iter().any(|p| matches!(
+            p.kind,
+            PredicateKind::ExpectedArtifact {
+                kind: ArtifactKind::ReadableScript
+            }
+        )));
+        assert!(media_plan.rubric.iter().any(|p| matches!(
+            p.kind,
+            PredicateKind::ExpectedArtifact {
+                kind: ArtifactKind::AudioMedia
+            }
+        )));
+        assert!(media_plan.rubric.iter().any(|p| matches!(
+            p.kind,
+            PredicateKind::ExpectedArtifact {
+                kind: ArtifactKind::VideoMedia
+            }
+        )));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_modular_web_architecture_and_self_test_rubric() {
+        let dir = std::env::temp_dir().join(format!("kronos_jev_modweb_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("styles")).unwrap();
+        fs::create_dir_all(dir.join("js")).unwrap();
+
+        let prompt = "Modularize this monolithic website into styles/*.css and js/*.js modules, match the attached screenshot styles, and test your work afterwards.";
+        let rubric = extract_requirement_rubric(prompt, TurnRoute::Agent, true);
+        assert!(rubric.iter().any(|p| p.kind == PredicateKind::ModularWebArchitecture));
+        assert!(rubric.iter().any(|p| p.kind == PredicateKind::SelfTestedAfterEdits));
+        assert!(!rubric.iter().any(|p| matches!(&p.kind, PredicateKind::TargetFilePresent { name_hint } if name_hint.contains('*'))));
+
+        // 1. Monolithic index.html with giant inline style/script fails ModularWebArchitecture.
+        let big_css = "body { color: #e2e8f0; background: #0f172a; }\n".repeat(40);
+        let big_js = "function renderAll() { return 42; }\n".repeat(50);
+        fs::write(
+            dir.join("index.html"),
+            format!("<!doctype html><html><head><style>{big_css}</style></head><body><h1>Ops</h1><script>{big_js}</script></body></html>"),
+        )
+        .unwrap();
+        let eval_monolith = evaluate_rubric_with_telemetry(
+            None,
+            prompt,
+            &rubric,
+            &dir,
+            &["index.html".to_string()],
+            true,
+            true,
+            None,
+            "Updated index.html",
+        );
+        assert!(!eval_monolith.passed);
+
+        // 2. Extracted modular CSS + JS passes ModularWebArchitecture, fails if self-test did not run after edits, passes once tested.
+        fs::write(
+            dir.join("index.html"),
+            "<!doctype html><html><head><title>Ops Telemetry</title><link rel=\"stylesheet\" href=\"styles/tokens.css\"><link rel=\"stylesheet\" href=\"styles/layout.css\"></head><body><main id=\"app\"><h1>Ops Telemetry</h1></main><script type=\"module\" src=\"js/app.js\"></script></body></html>",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("styles/tokens.css"),
+            ":root { --bg: #0b1120; --panel: #111827; --accent: #14b8a6; --text: #f8fafc; }\nbody { background: var(--bg); color: var(--text); margin: 0; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("styles/layout.css"),
+            ".shell { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; gap: 1.25rem; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("js/data.js"),
+            "export const SERVICES = [{ id: 'auth', status: 'healthy', latencyMs: 14 }];\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("js/app.js"),
+            "import { SERVICES } from './data.js';\nconsole.log(SERVICES.length);\n",
+        )
+        .unwrap();
+
+        let eval_untested = evaluate_rubric_with_telemetry(
+            None,
+            prompt,
+            &rubric,
+            &dir,
+            &[
+                "index.html".to_string(),
+                "styles/tokens.css".to_string(),
+                "styles/layout.css".to_string(),
+                "js/data.js".to_string(),
+                "js/app.js".to_string(),
+            ],
+            true,
+            false,
+            None,
+            "Modularized into styles and js modules.",
+        );
+        assert!(!eval_untested.passed);
+        assert!(eval_untested.unmet_summary.contains("run_command"));
+
+        let eval_tested = evaluate_rubric_with_telemetry(
+            None,
+            prompt,
+            &rubric,
+            &dir,
+            &[
+                "index.html".to_string(),
+                "styles/tokens.css".to_string(),
+                "styles/layout.css".to_string(),
+                "js/data.js".to_string(),
+                "js/app.js".to_string(),
+            ],
+            true,
+            true,
+            None,
+            "Modularized and verified all tests pass.",
+        );
+        assert!(eval_tested.passed, "expected pass, unmet:\n{}", eval_tested.unmet_summary);
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1843,5 +2810,112 @@ mod tests {
             after.token_ids, baseline.token_ids,
             "expected bit-exact greedy continuation after KV-restored Jev pass"
         );
+    }
+
+    fn write_test_wav(path: &Path, sr: u32, first_half_amp: i16, second_half_amp: i16, secs: usize) {
+        let total_samples = (sr as usize) * secs;
+        let data_bytes = (total_samples * 2) as u32;
+        let mut buf = Vec::with_capacity(44 + data_bytes as usize);
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        buf.extend_from_slice(b"WAVEfmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&sr.to_le_bytes());
+        buf.extend_from_slice(&(sr * 2).to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&data_bytes.to_le_bytes());
+        let mid = total_samples / 2;
+        for i in 0..total_samples {
+            let amp = if i < mid { first_half_amp } else { second_half_amp };
+            let s = if (i / 40) % 2 == 0 { amp } else { -amp };
+            buf.extend_from_slice(&s.to_le_bytes());
+        }
+        fs::write(path, buf).unwrap();
+    }
+
+    #[test]
+    fn test_audio_coherence_first_and_second_half_and_mp4_dual_stream_verification() {
+        let dir = std::env::temp_dir().join(format!("kronos_jev_audio_video_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("audio")).unwrap();
+        fs::create_dir_all(dir.join("segments")).unwrap();
+
+        let prompt = "make a script I can read and make a video with this use tools and use my voice, use open source tools like MLX Audio";
+        let rubric = extract_requirement_rubric(prompt, TurnRoute::Agent, false);
+        fs::write(dir.join("script.md"), "Kronos technical math narration. ".repeat(130)).unwrap();
+        write_test_wav(&dir.join("ref_24k.wav"), 24000, 4200, 4200, 5);
+
+        // 1. Half-collapsed audio (second half silent) must fail AudioMedia verification.
+        write_test_wav(&dir.join("audio/seg_01.wav"), 24000, 4500, 20, 6);
+        let eval_collapsed = evaluate_rubric_with_telemetry(
+            None,
+            prompt,
+            &rubric,
+            &dir,
+            &["script.md".to_string()],
+            true,
+            true,
+            None,
+            "Generated audio.",
+        );
+        assert!(!eval_collapsed.passed);
+        assert!(
+            eval_collapsed.unmet_summary.contains("collapsed")
+                || eval_collapsed.unmet_summary.contains("energy"),
+            "unexpected unmet_summary: {}",
+            eval_collapsed.unmet_summary
+        );
+
+        // 2. Balanced waveform with incoherent second-half ASR recall (< 0.60) must fail.
+        write_test_wav(&dir.join("audio/seg_01.wav"), 24000, 4500, 4100, 6);
+        fs::write(
+            dir.join("audio/coherence_report.json"),
+            r#"{"ref_text":"So I am building Kronos to run locally on your hardware","verified":true,"segments":[{"path":"audio/seg_01.wav","duration_secs":6.0,"word_count":14,"word_recall":0.55,"first_half_recall":0.86,"second_half_recall":0.28,"asr_text":"Kronos uses Cartesian product key routing and pre remotes babble"}]}"#,
+        )
+        .unwrap();
+        let eval_bad_asr = evaluate_rubric_with_telemetry(
+            None,
+            prompt,
+            &rubric,
+            &dir,
+            &["script.md".to_string()],
+            true,
+            true,
+            None,
+            "Generated audio.",
+        );
+        assert!(!eval_bad_asr.passed);
+        assert!(eval_bad_asr.unmet_summary.contains("ASR coherence gate"));
+
+        // 3. Coherent first-half and second-half ASR + merged dual-track MP4 passes.
+        fs::write(
+            dir.join("audio/coherence_report.json"),
+            r#"{"ref_text":"So I am building Kronos to run locally on your hardware","verified":true,"segments":[{"path":"audio/seg_01.wav","duration_secs":6.0,"word_count":15,"word_recall":0.93,"first_half_recall":0.92,"second_half_recall":0.94,"asr_text":"Kronos uses Cartesian product key routing and four bit NormalFloat quantization for fast local inference"}]}"#,
+        )
+        .unwrap();
+        let mut fake_mp4 = vec![0u8; 72 * 1024];
+        fake_mp4[0..16].copy_from_slice(b"ftypisommoovmdat");
+        fake_mp4[32..40].copy_from_slice(b"hdlrvide");
+        fake_mp4[64..72].copy_from_slice(b"hdlrsoun");
+        fs::write(dir.join("kronos_explained.mp4"), fake_mp4).unwrap();
+
+        let eval_ok = evaluate_rubric_with_telemetry(
+            None,
+            prompt,
+            &rubric,
+            &dir,
+            &["script.md".to_string()],
+            true,
+            true,
+            None,
+            "Completed coherent audio and video.",
+        );
+        assert!(eval_ok.passed, "expected pass, got unmet: {}", eval_ok.unmet_summary);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

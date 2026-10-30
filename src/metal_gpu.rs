@@ -1843,6 +1843,9 @@ kernel void rmsnorm_fwht64(
         float tot = (lane < 8u) ? sg_buf[lane] : 0.0f;
         tot = simd_sum(tot);
         inv_rms = rsqrt(tot / float(dim) + p.eps);
+        if (p.write_f16 != 0u) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 
     device float* dst32 = x_rot_f32 + ulong(tg_id) * ulong(dim);

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const K2DI_MAGIC: [u8; 8] = *b"K2DI\x01\x00\x00\x00";
+const K2DI_MAGIC: [u8; 8] = *b"K2DI\x02\x00\x00\x00";
 const HEADER_BYTES: usize = 32;
 const PACKED_ENTRY_BYTES: usize = 44;
 const MAX_LEARNED_FACTS: usize = 256;
@@ -443,9 +443,25 @@ impl DeviceIndex {
                     continue;
                 }
             }
+            let entry_name = self.str_slice(m.name_off, m.name_len);
+            let entry_detail = self.str_slice(m.detail_off, m.detail_len);
+            if query_tokens.iter().any(|t| t == "kronos") && entry_name.starts_with("Kronos (") {
+                sc += 140.0;
+            }
+            if m.kind == EntryKind::Project
+                && query_tokens
+                    .iter()
+                    .any(|t| matches!(t.as_str(), "mlx" | "audio" | "voice" | "tts" | "video"))
+                && (entry_detail.contains("mlx_audio")
+                    || entry_detail.contains("faster-whisper")
+                    || entry_name == "ffmpeg"
+                    || entry_name == "ffprobe")
+            {
+                sc += 85.0;
+            }
             if wants_app && m.kind == EntryKind::App {
                 sc += 48.0;
-                let app_name = self.str_slice(m.name_off, m.name_len).to_ascii_lowercase();
+                let app_name = entry_name.to_ascii_lowercase();
                 if query_tokens.contains(&app_name) {
                     sc += 65.0;
                 } else if query_tokens.iter().any(|t| app_name.starts_with(t.as_str())) {
@@ -863,6 +879,56 @@ impl DeviceContextManager {
         idx.speech_contextual_hints(&facts, limit)
     }
 
+    /// Finds an indexed local `.venv/bin/python3` interpreter whose `packages=[...]` list
+    /// satisfies the third-party imports (`mlx_audio`, `faster_whisper`, `PIL`, etc.) of a script.
+    pub fn find_venv_python_for_packages(&self, required_pkgs: &[String]) -> Option<String> {
+        if required_pkgs.is_empty() {
+            return None;
+        }
+        if self.current_index().is_empty() && self.current_config().enabled {
+            self.rebuild_index_sync();
+        }
+        let idx = self.current_index();
+        let mut best: Option<(usize, String)> = None;
+        for m in &idx.entries {
+            if m.kind != EntryKind::Project {
+                continue;
+            }
+            let path = idx.str_slice(m.path_off, m.path_len);
+            if !path.ends_with("/bin/python3") && !path.ends_with("/bin/python") {
+                continue;
+            }
+            if !Path::new(path).is_file() {
+                continue;
+            }
+            let detail = idx.str_slice(m.detail_off, m.detail_len);
+            let Some(pkg_start) = detail.find("packages=[") else {
+                continue;
+            };
+            let after = &detail[pkg_start + "packages=[".len()..];
+            let Some(pkg_end) = after.find(']') else {
+                continue;
+            };
+            let avail: Vec<String> = after[..pkg_end]
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let mut matched = 0usize;
+            for req in required_pkgs {
+                let r = req.to_ascii_lowercase();
+                let alt = if r == "pil" { "pillow" } else { r.as_str() };
+                if avail.iter().any(|a| a == &r || a == alt) {
+                    matched += 1;
+                }
+            }
+            if matched > 0 && best.as_ref().is_none_or(|(prev, _)| matched > *prev) {
+                best = Some((matched, path.to_string()));
+            }
+        }
+        best.map(|(_, p)| p)
+    }
+
     /// Evaluates a user turn in sub-millisecond time and returns a compact context block only when relevant.
     pub fn query_for_turn(&self, user_prompt: &str) -> Option<DeviceTurnContext> {
         let trimmed = user_prompt.trim();
@@ -875,13 +941,16 @@ impl DeviceContextManager {
         let wants_computer_action =
             cfg.allow_computer_control && !wants_folder_target && is_computer_control_prompt(&lower);
         let wants_media = !wants_folder_target && is_media_history_query(&lower);
+        let wants_conversations = !wants_folder_target
+            && !wants_computer_action
+            && crate::conversations::is_conversation_or_memory_query(&lower);
         let wants_device_lookup = wants_folder_target || is_device_lookup_query(&lower);
 
-        if !wants_computer_action && !wants_media && !wants_device_lookup {
+        if !wants_computer_action && !wants_media && !wants_device_lookup && !wants_conversations {
             return None;
         }
 
-        if !cfg.enabled && !wants_computer_action && !wants_folder_target {
+        if !cfg.enabled && !wants_computer_action && !wants_folder_target && !wants_conversations {
             return Some(DeviceTurnContext {
                 prompt_block: "[Device Context: currently turned OFF in Kronos Settings. Tell the user they can enable 'Develop Device Context' in Settings or the Quick Prompt footer so Kronos indexes local documents, certificates, apps, and watched media history.]".to_string(),
                 hits: Vec::new(),
@@ -900,6 +969,45 @@ impl DeviceContextManager {
         let facts = self.current_facts();
         let mut lines = Vec::new();
         let mut collected_hits = Vec::new();
+
+        if wants_conversations {
+            if let Some(conv_ctx) = crate::conversations::retrieve_local_conversation_context(trimmed) {
+                lines.push(conv_ctx.prompt_block);
+                for src in conv_ctx.sources_matched {
+                    let src_low = src.to_ascii_lowercase();
+                    let (kind, label, path_str, on_disk) = if src_low.contains("whatsapp") {
+                        let p = "/Applications/WhatsApp.app";
+                        (EntryKind::App, "WhatsApp".to_string(), p.to_string(), Path::new(p).exists())
+                    } else if src_low.contains("messages") {
+                        let p = "/System/Applications/Messages.app";
+                        (EntryKind::App, "Messages".to_string(), p.to_string(), Path::new(p).exists())
+                    } else if src_low.contains("notes") {
+                        let p = "/System/Applications/Notes.app";
+                        (EntryKind::App, "Notes".to_string(), p.to_string(), Path::new(p).exists())
+                    } else {
+                        (
+                            EntryKind::Document,
+                            src.clone(),
+                            format!("local://{}", src_low.replace(' ', "_")),
+                            false,
+                        )
+                    };
+                    collected_hits.push(DeviceHit {
+                        kind,
+                        name: label,
+                        path: path_str,
+                        detail: "local conversation source".to_string(),
+                        exists_on_disk: on_disk,
+                        watched_history: false,
+                        is_series_episode: false,
+                        mru_rank: 0,
+                        modified_epoch: 0,
+                        size_bytes: 0,
+                        score: 950.0,
+                    });
+                }
+            }
+        }
 
         if wants_media && cfg.enabled {
             let recent = idx.recent_watched_media(10);
@@ -934,11 +1042,112 @@ impl DeviceContextManager {
             }
         }
 
+        let asks_creator_or_user_profile = [
+            "melody",
+            "leonard",
+            "oparaugo",
+            "ipmscoutek",
+            "about me",
+            "who am i",
+            "know about me",
+            "my github",
+            "my linkedin",
+            "my email",
+            "his email",
+            "her email",
+            "creator",
+            "who built you",
+            "who created you",
+            "my experience",
+            "years of experience",
+            "my tech stack",
+            "my profile",
+            "my repos",
+        ]
+        .iter()
+        .any(|k| lower.contains(k));
+        if asks_creator_or_user_profile {
+            lines.push(crate::chat::CREATOR_PUBLIC_PROFILE.to_string());
+        }
+
+        let explicit_paths = extract_explicit_local_paths(trimmed);
+        if !explicit_paths.is_empty() {
+            lines.push("Explicit local paths referenced in request:".to_string());
+            for p in &explicit_paths {
+                let meta = fs::metadata(p).ok();
+                let exists = meta.is_some();
+                let size = meta.as_ref().map_or(0, |m| m.len());
+                let kind = if meta.as_ref().is_some_and(|m| m.is_dir()) {
+                    EntryKind::Directory
+                } else {
+                    EntryKind::Media
+                };
+                let name = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("file")
+                    .to_string();
+                let path_str = p.display().to_string();
+                let status = if exists {
+                    format!("on disk · {}", format_human_bytes(size))
+                } else {
+                    "not found on disk".to_string()
+                };
+                lines.push(format!(
+                    "  - [{}] {} -> {} ({})",
+                    kind.label(),
+                    name,
+                    format_shell_ready_path(&path_str),
+                    status
+                ));
+                collected_hits.push(DeviceHit {
+                    kind,
+                    name,
+                    path: path_str,
+                    detail: status,
+                    exists_on_disk: exists,
+                    watched_history: false,
+                    is_series_episode: false,
+                    mru_rank: 0,
+                    modified_epoch: 0,
+                    size_bytes: size,
+                    score: 999.0,
+                });
+            }
+        }
+
+        let wants_kronos_technical_docs = [
+            "explain",
+            "iteration",
+            "math",
+            "compare",
+            "benchmark",
+            "architecture",
+            "how it works",
+            "technical",
+            "video",
+        ]
+        .iter()
+        .any(|k| lower.contains(k));
+
         let kind_filter = None;
-        let search_hits = idx.search(trimmed, &facts, kind_filter, 8);
+        let search_hits = if wants_conversations && !wants_device_lookup {
+            Vec::new()
+        } else {
+            idx.search(trimmed, &facts, kind_filter, 8)
+        };
+        let has_explicit_media = collected_hits
+            .iter()
+            .any(|c| c.kind == EntryKind::Media && c.exists_on_disk);
         if !search_hits.is_empty() {
             lines.push("Matched local Mac items from Kronos Device Index:".to_string());
             for h in &search_hits {
+                if collected_hits.iter().any(|c| c.path == h.path) {
+                    continue;
+                }
+                if has_explicit_media && !wants_media && h.kind == EntryKind::Media {
+                    continue;
+                }
                 let status = if h.exists_on_disk { "on disk" } else { "history record" };
                 let detail_part = if h.detail.is_empty() {
                     String::new()
@@ -949,13 +1158,54 @@ impl DeviceContextManager {
                     "  - [{}] {} -> {} ({}{})",
                     h.kind.label(),
                     h.name,
-                    h.path,
+                    format_shell_ready_path(&h.path),
                     status,
                     detail_part
                 ));
-                if !collected_hits.iter().any(|c| c.path == h.path) {
-                    collected_hits.push(h.clone());
+                if h.name.starts_with("Kronos (") {
+                    if wants_kronos_technical_docs {
+                        let brief = load_kronos_repo_technical_brief(Path::new(&h.path));
+                        if !brief.is_empty() {
+                            lines.push(brief);
+                        }
+                    } else {
+                        lines.push(format!(
+                            "    docs: {0}/README.md and {0}/BENCHMARKS.md (read both paths for all 8 Kronos iterations, formulas, and benchmark comparisons)",
+                            h.path
+                        ));
+                    }
                 }
+                collected_hits.push(h.clone());
+            }
+        }
+
+        if lower.contains("kronos")
+            && wants_kronos_technical_docs
+            && !collected_hits.iter().any(|c| c.name.starts_with("Kronos ("))
+        {
+            if let Some(repo) = find_self_source_repo() {
+                let repo_str = repo.display().to_string();
+                lines.push(format!(
+                    "  - [project] Kronos (kronos-2t engine source) -> {} (on disk · Kronos Rust source repository)",
+                    format_shell_ready_path(&repo_str)
+                ));
+                let brief = load_kronos_repo_technical_brief(&repo);
+                if !brief.is_empty() {
+                    lines.push(brief);
+                }
+                collected_hits.push(DeviceHit {
+                    kind: EntryKind::Project,
+                    name: "Kronos (kronos-2t engine source)".to_string(),
+                    path: repo_str,
+                    detail: "Kronos Rust source repository (README.md, BENCHMARKS.md)".to_string(),
+                    exists_on_disk: true,
+                    watched_history: false,
+                    is_series_episode: false,
+                    mru_rank: 0,
+                    modified_epoch: 0,
+                    size_bytes: 0,
+                    score: 980.0,
+                });
             }
         }
 
@@ -975,15 +1225,31 @@ impl DeviceContextManager {
             return None;
         }
 
+        let is_workspace_build_turn = [
+            "make a ",
+            "make an ",
+            "build ",
+            "create ",
+            "write ",
+            "script",
+            "use tools",
+            "run ",
+            "render ",
+        ]
+        .iter()
+        .any(|m| lower.contains(m));
+
         let action_hint = if wants_computer_action {
             "\nCall `use_computer` immediately with the exact path or application name above to carry out the action on macOS."
         } else if wants_folder_target {
             "\nTo create and work inside a new project folder under one of the matched directories above, call `switch_workspace` in step 1 with the full new child directory path (for example `<matched_folder_path>/<new-folder-name>`), and in the next step call `write_file` to build complete, styled, responsive project files (modern CSS layout, navigation, domain-specific sections, and interactive UI) inside that new workspace."
+        } else if is_workspace_build_turn {
+            "\nUse workspace tools (`read_file`, `write_file`, `edit_file`, `run_command`) to read any matched local repository documentation (`README.md`, `BENCHMARKS.md`) first, then invoke matched `.venv` Python APIs and CLI tools (`ffmpeg`, `ffprobe`) directly, saving all generated deliverables inside the active workspace."
         } else {
             "\nAnswer directly and concisely using the exact local paths and details above."
         };
         let prompt_block = format!(
-            "[Device Context · retrieved in {:.2} ms]\n{}{}",
+            "[Device Context · retrieved in {:.2} ms]\n{}{}\n[/Device Context]",
             elapsed_ms,
             lines.join("\n"),
             action_hint
@@ -1023,6 +1289,11 @@ impl DeviceContextManager {
                 }
                 let idx = self.current_index();
                 let facts = self.current_facts();
+                let req_words: Vec<String> = target
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .map(|w| w.to_ascii_lowercase())
+                    .filter(|w| w.len() >= 3 && w != "app")
+                    .collect();
                 let resolved_bundle = if target.ends_with(".app") && Path::new(target).exists() {
                     Some((
                         Path::new(target)
@@ -1033,9 +1304,15 @@ impl DeviceContextManager {
                         target.to_string(),
                     ))
                 } else {
-                    idx.search(target, &facts, Some(EntryKind::App), 3)
+                    idx.search(target, &facts, Some(EntryKind::App), 5)
                         .into_iter()
-                        .find(|h| h.exists_on_disk)
+                        .find(|h| {
+                            if !h.exists_on_disk {
+                                return false;
+                            }
+                            let app_low = h.name.to_ascii_lowercase();
+                            req_words.is_empty() || req_words.iter().all(|w| app_low.contains(w))
+                        })
                         .map(|h| (h.name, h.path))
                 };
 
@@ -1044,7 +1321,11 @@ impl DeviceContextManager {
                     self.record_learned_fact(&format!("app:{target}"), &app_name, &bundle_path);
                     Ok(format!("opened application {app_name} ({bundle_path})"))
                 } else {
-                    run_macos_open(&["-a", target])?;
+                    run_macos_open(&["-a", target]).map_err(|e| {
+                        format!(
+                            "no installed macOS .app matched `{target}` ({e}); if `{target}` is a CLI tool or Python library, run it via `run_command`"
+                        )
+                    })?;
                     self.record_learned_fact(&format!("app:{target}"), target, target);
                     Ok(format!("opened application {target}"))
                 }
@@ -1158,6 +1439,10 @@ impl DeviceContextManager {
                 let val = if note.is_empty() { target } else { note };
                 self.record_learned_fact(target, val, "");
                 Ok(format!("saved learned device fact: {target} -> {val}"))
+            }
+            "open_full_disk_access" => {
+                run_macos_open(&["x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"])?;
+                Ok("opened macOS Full Disk Access settings".to_string())
             }
             other => Err(format!(
                 "unknown `use_computer` action `{other}`; expected open_app, open_file, reveal_in_finder, open_url, search_device, recent_media, system_info, set_volume, or remember_fact"
@@ -1342,8 +1627,22 @@ pub fn is_device_lookup_query(lower: &str) -> bool {
         "documents",
         "applications",
         "installed",
+        "/users/",
+        "~/",
+        "mlx",
+        "ffmpeg",
     ];
     if personal_doc_terms.iter().any(|w| lower.contains(w)) {
+        return true;
+    }
+    if contains_word(lower, "kronos")
+        && (lower.contains("explain")
+            || lower.contains("iteration")
+            || lower.contains("compare")
+            || lower.contains("architecture")
+            || lower.contains("math")
+            || lower.contains("how "))
+    {
         return true;
     }
     if (lower.starts_with("where is my ")
@@ -1352,6 +1651,8 @@ pub fn is_device_lookup_query(lower: &str) -> bool {
         || lower.starts_with("find my ")
         || lower.starts_with("locate my ")
         || lower.contains("on my computer")
+        || lower.contains("in my computer")
+        || lower.contains("already exist")
         || lower.contains("on my mac")
         || lower.contains("on this mac")
         || lower.contains("on my device"))
@@ -1450,6 +1751,9 @@ pub fn build_live_device_index() -> DeviceIndex {
         scan_personal_dir(&docs_root, "Documents", 0, 3, true, &mut b);
     }
 
+    // 5. Kronos self-source repository, local CLI media binaries, and cached HF models.
+    scan_local_toolchains_and_self_repo(&home, &mut b);
+
     let build_micros = t0.elapsed().as_micros() as u64;
     b.finish(build_micros)
 }
@@ -1527,6 +1831,9 @@ fn scan_personal_dir(
         let size = meta.as_ref().map_or(0, |m| m.len());
 
         if ft.is_dir() {
+            if detect_code_repos && depth <= 2 {
+                scan_project_venv_and_models(&path, fname, mtime, b);
+            }
             if detect_code_repos && is_software_repo_root(&path) {
                 b.add_entry(
                     EntryKind::Project,
@@ -1601,6 +1908,8 @@ fn scan_personal_dir(
 fn is_software_repo_root(dir: &Path) -> bool {
     [
         ".git",
+        ".venv",
+        "venv",
         "Cargo.toml",
         "package.json",
         "mix.exs",
@@ -2038,18 +2347,318 @@ fn is_standalone_acronym_after_article(joined: &str) -> bool {
     )
 }
 
+fn extract_explicit_local_paths(raw: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < raw.len() {
+        let rest = &raw[cursor..];
+        let next_abs = rest.find("/Users/");
+        let next_tilde = rest.find("~/");
+        let Some(rel) = [next_abs, next_tilde].into_iter().flatten().min() else {
+            break;
+        };
+        let start = cursor + rel;
+        let prev_byte = if start > 0 { raw.as_bytes()[start - 1] } else { b' ' };
+        let end_delim: &[char] = match prev_byte {
+            b'(' => &[')', '\n', '\r'],
+            b'"' => &['"', '\n', '\r'],
+            b'\'' => &['\'', '\n', '\r'],
+            b'`' => &['`', '\n', '\r'],
+            _ => &[' ', '\t', '\n', '\r', ')', '"', '\'', '`', ',', ';'],
+        };
+        let slice = &raw[start..];
+        let end_rel = slice.find(end_delim).unwrap_or(slice.len());
+        let candidate_str = slice[..end_rel].trim().trim_end_matches(['.', ',', ';']);
+        if candidate_str.len() > 3 {
+            let expanded = expand_tilde_path(candidate_str);
+            if !out.iter().any(|p: &PathBuf| p == &expanded) {
+                out.push(expanded);
+            }
+        }
+        cursor = start + end_rel.max(2);
+    }
+    out
+}
+
+fn scan_project_venv_and_models(project_dir: &Path, project_name: &str, mtime: u64, b: &mut IndexBuilder) {
+    let venv_py = project_dir.join(".venv/bin/python3");
+    if !venv_py.is_file() {
+        return;
+    }
+    let venv_bin = project_dir.join(".venv/bin");
+    let mut cli_scripts = Vec::new();
+    if let Ok(rd) = fs::read_dir(&venv_bin) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with("mlx_audio")
+                || n.starts_with("mlx-audio")
+                || n == "whisper"
+                || n == "manim"
+                || n == "ffmpeg"
+            {
+                cli_scripts.push(venv_bin.join(&n).display().to_string());
+            }
+        }
+    }
+    cli_scripts.sort();
+
+    let mut pkgs = Vec::new();
+    let lib_dir = project_dir.join(".venv/lib");
+    if let Ok(rd) = fs::read_dir(&lib_dir) {
+        for py_e in rd.flatten() {
+            let sp = py_e.path().join("site-packages");
+            if sp.is_dir() {
+                for probe in [
+                    "mlx_audio",
+                    "faster_whisper",
+                    "soundfile",
+                    "scipy",
+                    "PIL",
+                    "numpy",
+                    "mlx",
+                ] {
+                    if sp.join(probe).exists() && !pkgs.contains(&probe) {
+                        pkgs.push(probe);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut local_models = Vec::new();
+    if let Ok(rd) = fs::read_dir(project_dir) {
+        for sub in rd.flatten() {
+            let sp = sub.path();
+            if !sp.is_dir() {
+                continue;
+            }
+            let cfg_p = sp.join("config.json");
+            if cfg_p.is_file() && sp.join("model.safetensors").is_file() {
+                let model_type = fs::read_to_string(&cfg_p)
+                    .ok()
+                    .and_then(|s| Json::parse(&s).ok())
+                    .and_then(|j| {
+                        j.get("model_type")
+                            .and_then(Json::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| "safetensors".to_string());
+                local_models.push(format!("{} (model_type={model_type})", sp.display()));
+            }
+        }
+    }
+
+    let mut detail = format!("python3 venv ({})", venv_py.display());
+    if !cli_scripts.is_empty() {
+        detail.push_str(&format!(", cli=[{}]", cli_scripts.join(", ")));
+    }
+    if !pkgs.is_empty() {
+        detail.push_str(&format!(", packages=[{}]", pkgs.join(", ")));
+    }
+    if !local_models.is_empty() {
+        detail.push_str(&format!(", local_models=[{}]", local_models.join(", ")));
+    }
+    if pkgs.contains(&"mlx_audio") {
+        let model_hint = local_models
+            .first()
+            .and_then(|s| s.split(" (").next())
+            .unwrap_or("<local_model_dir>");
+        detail.push_str(&format!(
+            ", python_api=`from mlx_audio.tts.utils import load_model; from mlx_audio.tts.generate import generate_audio; m = load_model('{model_hint}'); generate_audio(model=m, text=spoken, ref_audio='ref_24k.wav', ref_text=ref_text, lang_code='en', temperature=0.55, top_p=0.9, repetition_penalty=1.05, output_path='audio', file_prefix=f'seg_{{idx:02d}}', audio_format='wav', join_audio=True, verbose=False)` (coherent Qwen3-TTS voice cloning rules: load `m = load_model('{model_hint}')` and `wm = WhisperModel(...)` ONCE at top level before the `for` loop rather than inside the loop, call `subprocess.run(['/opt/homebrew/bin/ffmpeg', ...], check=True)` for ffmpeg CLI calls rather than `run_command`, define an explicit `SLIDES` list of 8 grounded Kronos tuples `(title_str, bullets_list, spoken_sentence_str)` covering Iterations 1..8 and llama.cpp/Ollama benchmarks where each `bullets_list` has 3 concise ASCII-math bullet strings with zero `$`/LaTeX backslashes and each `spoken_sentence_str` is a distinct 150 to 250 char single-line pure spoken English narration explaining that iteration's equations and numbers in plain words with zero `$`, backticks, backslashes, or `<`/`>`/`||` operators, loop `for idx, (title, bullets, spoken) in enumerate(SLIDES, 1):`, and verify `os.path.isfile(f'audio/seg_{{idx:02d}}.wav')` after each `generate_audio` call)"
+        ));
+    }
+    if pkgs.contains(&"faster_whisper") {
+        detail.push_str(
+            ", stt_api=`import os, re, json, wave, textwrap, subprocess, numpy as np; from faster_whisper import WhisperModel; wm = WhisperModel('Systran/faster-whisper-small', device='cpu', compute_type='int8', local_files_only=True); wf = wave.open('raw_ref_16k.wav', 'rb'); pcm16 = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0; wf.close(); ref_segs = list(wm.transcribe(pcm16)[0])` (extract `raw_ref_16k.wav` and `raw_ref_24k.wav` via `subprocess.run(['/opt/homebrew/bin/ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-i', voice_m4a, '-t', '12', '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', 'raw_ref_16k.wav'], check=True)`; pick consecutive `ref_segs` from `0.0` ending in `4.0..8.5s` via `chosen = []; [chosen.append(s) for s in ref_segs if not chosen or chosen[-1].end < 4.0]; end_sec = chosen[-1].end; ref_text = ' '.join(s.text.strip() for s in chosen)` so `ref_24k.wav` starts at `0.0s` and ends at `end_sec`, slice `raw_ref_24k.wav` or run ffmpeg `-t str(end_sec) -ar 24000 -ac 1 -c:a pcm_s16le ref_24k.wav` so `ref_24k.wav` matches `ref_text` word-for-word; for each generated 24kHz `audio/seg_XX.wav`, load `p24` (`int16 -> float32 / 32768.0`) via `wave` + `np.frombuffer`, MUST resample 24kHz -> 16kHz via `p16 = np.interp(np.linspace(0, len(p24) - 1, len(p24) * 2 // 3), np.arange(len(p24)), p24).astype(np.float32)` before calling `wm.transcribe(p16)` because `wm.transcribe` expects 16kHz numpy PCM and fails on string paths, tokenize `toks = lambda s: [w for w in re.findall(r'[a-z0-9]+', s.lower().replace('chronos', 'kronos')) if len(w) >= 3]`, compute `t_words = toks(spoken); h_words = toks(hyp); hit = lambda w, hs: any(w == h or (len(w) >= 5 and w[:4] == h[:4]) for h in hs); mid = max(1, len(t_words) // 2); r_all = sum(hit(x, h_words) for x in t_words) / max(1, len(t_words)); r_h1 = sum(hit(x, h_words) for x in t_words[:mid]) / mid; r_h2 = sum(hit(x, h_words) for x in t_words[mid:]) / max(1, len(t_words) - mid)`, retry `generate_audio` with `temperature=0.4` if `r_all < 0.72` or `r_h1 < 0.65` or `r_h2 < 0.65`, append `{'path': f'audio/seg_{idx:02d}.wav', 'word_recall': r_all, 'first_half_recall': r_h1, 'second_half_recall': r_h2, 'asr_text': hyp}` to `seg_reports`, and dump `json.dump({'verified': True, 'ref_text': ref_text, 'segments': seg_reports}, f, indent=2)` to `audio/coherence_report.json`)",
+        );
+    }
+    if pkgs.contains(&"PIL") {
+        detail.push_str(
+            ", slide_api=`import os, textwrap, subprocess; from PIL import Image, ImageDraw, ImageFont; os.makedirs('slides', exist_ok=True); os.makedirs('audio', exist_ok=True); os.makedirs('segments', exist_ok=True); font_h1 = ImageFont.truetype('/System/Library/Fonts/Helvetica.ttc', 44); font_body = ImageFont.truetype('/System/Library/Fonts/Helvetica.ttc', 30)` (render 1920x1080 dark-slate `#0f172a` PNG slides `slides/slide_01.png`..`slides/slide_0N.png` drawing wrapped title lines in teal `#14b8a6` at `x=80, y=56` and looping `for b in bullets:` then `for wl in textwrap.wrap('- ' + b, width=76): draw.text((96, y), wl, font=font_body, fill='#f8fafc'); y += 44` followed by `y += 18` so wrapped lines never overlap, using clean ASCII math like `3^4 = 81`, `O(sqrt(M))`, `G(E8) = 929/12960` without `$` or LaTeX backslashes; mux each verified PNG+WAV via `subprocess.run(['/opt/homebrew/bin/ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-loop', '1', '-i', slide_path, '-i', audio_path, '-c:v', 'libx264', '-tune', 'stillimage', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-shortest', seg_mp4], check=True)`, write `concat.txt` via `f.write(\"file '\" + seg_mp4 + \"'\\n\")`, and concatenate into workspace-root `kronos_explained.mp4` via `subprocess.run(['/opt/homebrew/bin/ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c', 'copy', 'kronos_explained.mp4'], check=True)`)",
+        );
+    }
+    let label_name = if pkgs.contains(&"mlx_audio") {
+        format!("{project_name} MLX Audio Python venv")
+    } else {
+        format!("{project_name} Python venv")
+    };
+    b.add_entry(
+        EntryKind::Project,
+        &label_name,
+        &venv_py.display().to_string(),
+        &detail,
+        FLAG_EXISTS_ON_DISK,
+        0,
+        mtime,
+        0,
+    );
+}
+
+fn format_shell_ready_path(p: &str) -> String {
+    if p.contains(' ') {
+        format!("'{}'", p.replace('\'', "'\\''"))
+    } else {
+        p.to_string()
+    }
+}
+
+fn load_kronos_repo_technical_brief(repo_dir: &Path) -> String {
+    let mut out = String::new();
+    if let Ok(readme) = fs::read_to_string(repo_dir.join("README.md")) {
+        let cut = readme
+            .find("\n### Current constraints")
+            .unwrap_or(readme.len().min(6600));
+        let slice = readme[..cut].trim();
+        if !slice.is_empty() {
+            out.push_str("    [Grounded Kronos README.md architecture, 8 iterations, and equations]\n");
+            out.push_str(slice);
+            out.push('\n');
+        }
+    }
+    if let Ok(bench) = fs::read_to_string(repo_dir.join("BENCHMARKS.md")) {
+        let top_cut = bench
+            .find("\n## Prompt processing")
+            .unwrap_or(bench.len().min(3600));
+        let top_raw = bench[..top_cut].trim();
+        let mut bench_combined = String::new();
+        if let (Some(cal_start), Some(dec_start)) = (
+            top_raw.find("\n### Calibration domain"),
+            top_raw.find("\n## Decode"),
+        ) {
+            if cal_start < dec_start {
+                bench_combined.push_str(top_raw[..cal_start].trim_end());
+                bench_combined.push('\n');
+                bench_combined.push_str(&top_raw[dec_start..]);
+            } else {
+                bench_combined.push_str(top_raw);
+            }
+        } else if !top_raw.is_empty() {
+            bench_combined.push_str(top_raw);
+        }
+        if let Some(qwen_start) = bench.find("\n## Qwen2.5-Coder-14B-Instruct") {
+            let tail = &bench[qwen_start..];
+            let tail_cut = tail
+                .find("\n## Remaining limitations")
+                .unwrap_or(tail.len().min(3400));
+            bench_combined.push_str(tail[..tail_cut].trim_end());
+        }
+        if !bench_combined.is_empty() {
+            out.push_str("    [Grounded Kronos BENCHMARKS.md vs llama.cpp and Ollama]\n");
+            out.push_str(&bench_combined);
+        }
+    }
+    out
+}
+
+fn find_self_source_repo() -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        roots.push(exe);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    for start in roots {
+        let mut cur = start.as_path();
+        loop {
+            let cargo = cur.join("Cargo.toml");
+            if cargo.is_file() {
+                if let Ok(txt) = fs::read_to_string(&cargo) {
+                    if txt.contains("name = \"kronos-2t\"") {
+                        return Some(cur.to_path_buf());
+                    }
+                }
+            }
+            let Some(parent) = cur.parent() else { break };
+            cur = parent;
+        }
+    }
+    None
+}
+
+fn scan_local_toolchains_and_self_repo(home: &Path, b: &mut IndexBuilder) {
+    if let Some(repo) = find_self_source_repo() {
+        let mtime = fs::metadata(&repo)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        b.add_entry(
+            EntryKind::Project,
+            "Kronos (kronos-2t engine source)",
+            &repo.display().to_string(),
+            "Kronos Rust source repository (README.md, BENCHMARKS.md, src/lib.rs, src/jev.rs, src/hadamard.rs, src/moe_800b.rs)",
+            FLAG_EXISTS_ON_DISK,
+            0,
+            mtime,
+            0,
+        );
+    }
+
+    for bin_dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        for tool in ["ffmpeg", "ffprobe", "sox"] {
+            let p = Path::new(bin_dir).join(tool);
+            if p.is_file() {
+                b.add_entry(
+                    EntryKind::Project,
+                    tool,
+                    &p.display().to_string(),
+                    "installed local CLI media tool",
+                    FLAG_EXISTS_ON_DISK,
+                    0,
+                    0,
+                    0,
+                );
+            }
+        }
+    }
+
+    let hf_hub = home.join(".cache/huggingface/hub");
+    if let Ok(rd) = fs::read_dir(&hf_hub) {
+        for e in rd.flatten() {
+            let fname = e.file_name().to_string_lossy().into_owned();
+            if let Some(rest) = fname.strip_prefix("models--") {
+                let model_id = rest.replacen("--", "/", 1);
+                b.add_entry(
+                    EntryKind::Project,
+                    &format!("HuggingFace cached model {model_id}"),
+                    &e.path().display().to_string(),
+                    &format!("offline cached speech/ML model `{model_id}`"),
+                    FLAG_EXISTS_ON_DISK,
+                    0,
+                    0,
+                    0,
+                );
+            }
+        }
+    }
+}
+
 fn extract_meaningful_query_tokens(raw_text: &str) -> Vec<String> {
     const STOPWORDS: &[&str] = &[
         "a", "an", "the", "teh", "my", "me", "i", "you", "your", "is", "are", "was", "were", "did",
-        "do", "does", "where", "wheres", "what", "which", "who", "how", "can", "could", "would",
-        "please", "find", "locate", "show", "open", "launch", "start", "reveal", "in", "into",
-        "inside", "under", "on", "at", "to", "for", "of", "it", "this", "that", "last", "recent",
-        "recently", "computer", "mac", "device", "kronos", "hey", "hi", "ok", "okay", "and", "or",
-        "then", "file", "app", "application", "create", "make", "build", "new", "folder",
-        "directory", "about", "website", "software",
+        "do", "does", "where", "wheres", "what", "whats", "which", "who", "how", "why", "can",
+        "could", "would", "should", "please", "find", "locate", "show", "open", "launch", "start",
+        "reveal", "in", "into", "inside", "under", "on", "at", "to", "for", "of", "it", "its",
+        "this", "that", "last", "recent", "recently", "computer", "mac", "device", "hey", "hi",
+        "ok", "okay", "and", "or", "then", "file", "app", "application", "create", "make",
+        "build", "new", "folder", "directory", "about", "website", "software", "want", "help",
+        "explain", "all", "iterations", "done", "compares", "compare", "out", "there", "ensure",
+        "be", "technical", "maths", "math", "behind", "everything", "every", "step", "script",
+        "read", "with", "use", "tools", "tool", "too", "requires", "require", "source", "like",
+        "already", "exist", "exists", "https", "http", "github", "com", "users", "downloads",
     ];
 
-    let raw_words: Vec<&str> = raw_text
+    let mut cleaned = raw_text.trim();
+    for wake in ["hey kronos", "hi kronos", "okay kronos", "ok kronos"] {
+        if cleaned.len() >= wake.len() && cleaned[..wake.len()].eq_ignore_ascii_case(wake) {
+            cleaned = cleaned[wake.len()..]
+                .trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ',' || c == '.');
+            break;
+        }
+    }
+
+    let raw_words: Vec<&str> = cleaned
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|s| !s.is_empty())
         .collect();

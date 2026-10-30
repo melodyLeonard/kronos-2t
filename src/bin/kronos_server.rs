@@ -23,9 +23,10 @@
 
 use kronos_2t::agent::{
     build_unified_system_prompt, classify_turn_intent, compact_conversation_history,
-    list_workspace_files, mime_type_for_path, resolve_jailed_path, run_agent_turn,
-    serialize_messages_json, tool_definitions_json, truncate_utf8, validate_file, AgentEvent,
-    AgentTurnConfig, FileChangeDiff, TurnRoute, AGENT_SYSTEM_PROMPT, MAX_READ_BYTES,
+    is_multi_agent_prompt, list_workspace_files, mime_type_for_path, resolve_jailed_path,
+    run_agent_turn_shared_with_spawner, serialize_messages_json, spawn_agent_tool_definition_json,
+    tool_definitions_json, truncate_utf8, validate_file, AgentEvent, AgentTurnConfig,
+    FileChangeDiff, SubAgentSpawner, TurnRoute, AGENT_SYSTEM_PROMPT, MAX_READ_BYTES,
     UNIFIED_SYSTEM_PROMPT,
 };
 use kronos_2t::attachments::{ingest_attachment, AttachmentIngestion};
@@ -66,6 +67,25 @@ struct UiStateIndex {
     sessions: Vec<SessionSummary>,
 }
 
+#[derive(Clone)]
+struct LiveTurnBroadcast {
+    turn_id: u64,
+    agent_ord: u64,
+    agent_label: String,
+    parent_turn_id: u64,
+    origin: String,
+    active: bool,
+    started_at: u64,
+    finished_at: u64,
+    step: usize,
+    max_steps: usize,
+    status_detail: String,
+    workdir: String,
+    user_text: String,
+    deliverables: Vec<String>,
+    events: Vec<String>,
+}
+
 struct Server {
     model: Mutex<ChatModel>,
     name: String,
@@ -73,14 +93,44 @@ struct Server {
     workdir: Mutex<PathBuf>,
     state_dir: PathBuf,
     ui_index: Mutex<UiStateIndex>,
+    live_turns: Mutex<Vec<LiveTurnBroadcast>>,
     ctx_limit: usize,
     next_id: AtomicU64,
+    turn_seq: AtomicU64,
+    agent_seq: AtomicU64,
     media_seq: AtomicU64,
 }
 
 impl Server {
     fn active_workdir(&self) -> PathBuf {
         self.workdir.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    fn register_project_path(&self, dir: &Path) {
+        let dir_str = dir.to_string_lossy().into_owned();
+        if dir_str.is_empty() {
+            return;
+        }
+        let mut idx = self.ui_index.lock().unwrap_or_else(|p| p.into_inner());
+        if !idx.projects.iter().any(|p| p == &dir_str) {
+            idx.projects.push(dir_str);
+            persist_projects_file(&self.state_dir, &idx.projects);
+        }
+    }
+
+    fn is_known_project_path(&self, dir: &Path) -> bool {
+        if dir == self.active_workdir() {
+            return true;
+        }
+        let dir_str = dir.to_string_lossy();
+        {
+            let idx = self.ui_index.lock().unwrap_or_else(|p| p.into_inner());
+            if idx.projects.iter().any(|p| p == dir_str.as_ref()) {
+                return true;
+            }
+        }
+        let turns = self.live_turns.lock().unwrap_or_else(|p| p.into_inner());
+        turns.iter().any(|t| t.workdir == dir_str.as_ref())
     }
 }
 
@@ -208,17 +258,19 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         204 => "No Content",
+        206 => "Partial Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         413 => "Payload Too Large",
+        416 => "Range Not Satisfiable",
         431 => "Request Header Fields Too Large",
         _ => "Internal Server Error",
     }
 }
 
-const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
+const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, X-Kronos-Tab, Range\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
 
 fn respond_bytes(
     stream: &mut TcpStream,
@@ -386,6 +438,139 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(1, |d| (d.as_millis() as u64).max(1))
+}
+
+fn decode_hex_utf8(hex: &str) -> Option<String> {
+    if hex.is_empty() || !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    let raw = hex.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        let hi = (raw[i] as char).to_digit(16)?;
+        let lo = (raw[i + 1] as char).to_digit(16)?;
+        bytes.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn resolve_request_workdir(
+    srv: &Server,
+    raw_opt: Option<&str>,
+    create: bool,
+) -> Result<PathBuf, (u16, String)> {
+    let Some(raw) = raw_opt.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(srv.active_workdir());
+    };
+    let candidate = expand_tilde_path(raw);
+    if candidate.as_os_str().is_empty() {
+        return Err((400, "`workdir` cannot be empty".to_string()));
+    }
+    if create {
+        fs::create_dir_all(&candidate)
+            .map_err(|e| (400, format!("create workdir `{}`: {e}", candidate.display())))?;
+    } else if !candidate.is_dir() {
+        return Err((404, format!("workdir `{}` does not exist", candidate.display())));
+    }
+    let canon = candidate
+        .canonicalize()
+        .map_err(|e| (400, format!("workdir `{}`: {e}", candidate.display())))?;
+    if !canon.is_dir() {
+        return Err((400, "workdir is not a directory".to_string()));
+    }
+    if create {
+        srv.register_project_path(&canon);
+    }
+    Ok(canon)
+}
+
+fn collect_workspace_deliverables(workdir: &Path) -> Vec<String> {
+    let entries: Vec<_> = list_workspace_files(workdir)
+        .into_iter()
+        .filter(|e| {
+            !e.path.starts_with(".kronos_media/")
+                && !e.path.starts_with("__pycache__/")
+                && !e.path.ends_with(".pyc")
+                && e.bytes > 0
+        })
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut push_unique = |p: &str| {
+        if !p.is_empty() && !out.iter().any(|x| x == p) && out.len() < 8 {
+            out.push(p.to_string());
+        }
+    };
+    for e in &entries {
+        if !e.path.contains('/')
+            && (e.path.ends_with(".mp4") || e.path.ends_with(".webm") || e.path.ends_with(".mov"))
+        {
+            push_unique(&e.path);
+        }
+    }
+    for e in &entries {
+        if e.path == "index.html" {
+            push_unique(&e.path);
+        }
+    }
+    for e in &entries {
+        if e.path == "rendered_after.png" {
+            push_unique(&e.path);
+        }
+    }
+    for e in &entries {
+        if e.path == "script.md" || e.path == "audio/coherence_report.json" {
+            push_unique(&e.path);
+        }
+    }
+    for e in &entries {
+        if e.path.ends_with(".mp4") || e.path.ends_with(".html") {
+            push_unique(&e.path);
+        }
+    }
+    for e in &entries {
+        if e.path.ends_with(".png") {
+            push_unique(&e.path);
+        }
+    }
+    for e in &entries {
+        if (e.path.ends_with(".wav") || e.path.ends_with(".m4a") || e.path.ends_with(".mp3"))
+            && !e.path.contains("raw_ref")
+            && !e.path.starts_with("ref_")
+        {
+            push_unique(&e.path);
+        }
+    }
+    out
+}
+
+fn format_live_turn_summary_json(lt: &LiveTurnBroadcast) -> String {
+    let deliv_json: Vec<String> = lt.deliverables.iter().map(|d| quote(d)).collect();
+    format!(
+        r#"{{"turn_id":{},"agent_ord":{},"agent_label":{},"parent_turn_id":{},"origin":{},"active":{},"started_at":{},"finished_at":{},"step":{},"max_steps":{},"status_detail":{},"workdir":{},"user_text":{},"deliverables":[{}],"event_count":{}}}"#,
+        lt.turn_id,
+        lt.agent_ord,
+        quote(&lt.agent_label),
+        lt.parent_turn_id,
+        quote(&lt.origin),
+        lt.active,
+        lt.started_at,
+        lt.finished_at,
+        lt.step,
+        lt.max_steps,
+        quote(&lt.status_detail),
+        quote(&lt.workdir),
+        quote(&lt.user_text),
+        deliv_json.join(","),
+        lt.events.len(),
+    )
+}
+
 fn usage(c: &Completion) -> String {
     format!(
         r#"{{"prompt_tokens":{},"prefilled_tokens":{},"completion_tokens":{},"total_tokens":{},"drafted_tokens":{},"accepted_tokens":{},"prefill_secs":{:.6},"decode_secs":{:.6},"prefill_unit":{}}}"#,
@@ -438,22 +623,48 @@ fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
         Ok(b) => b,
         Err(e) => return error(stream, 400, &format!("invalid JSON: {e}")),
     };
-    let (messages, tools_json, params, streaming) = match parse_chat(&body, &GenParams::default()) {
+    let (mut messages, tools_json, params, streaming) = match parse_chat(&body, &GenParams::default()) {
         Ok(v) => v,
         Err(e) => return error(stream, 400, &e),
     };
+    let raw_user_text = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    if !raw_user_text.is_empty()
+        && !raw_user_text.contains("[Device Context")
+        && !raw_user_text.contains("[Local Conversations")
+        && global_device_manager().current_config().enabled
+    {
+        if let Some(dev_ctx) = global_device_manager().query_for_turn(&raw_user_text) {
+            if let Some(last_u) = messages.iter_mut().rev().find(|m| m.role == "user") {
+                last_u.content = format!("{}\n\n{}", dev_ctx.prompt_block, last_u.content);
+            }
+        }
+    }
     let id = format!("chatcmpl-{}-{}", now(), srv.next_id.fetch_add(1, Ordering::Relaxed));
     let created = now();
     let mut model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
 
     if !streaming {
         match model.generate_with_tools(&messages, &tools_json, &params, |_| true) {
-            Ok(c) => respond(
-                stream,
-                200,
-                "application/json",
-                &format_completion_response(&id, created, &srv.name, &c),
-            ),
+            Ok(c) => {
+                if c.tool_calls.is_empty() && !c.text.trim().is_empty() {
+                    kronos_2t::conversations::record_conversation_exchange(
+                        &raw_user_text,
+                        &c.text,
+                        "chat",
+                    );
+                }
+                respond(
+                    stream,
+                    200,
+                    "application/json",
+                    &format_completion_response(&id, created, &srv.name, &c),
+                );
+            }
             Err(e) => error(stream, 400, &e),
         }
         return;
@@ -508,7 +719,16 @@ fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
         ok
     });
     let tail = match result {
-        Ok(c) => chunk("{}", &quote(c.finish.as_str()), &format!(r#","usage":{}"#, usage(&c))),
+        Ok(c) => {
+            if !c.text.trim().is_empty() {
+                kronos_2t::conversations::record_conversation_exchange(
+                    &raw_user_text,
+                    &c.text,
+                    "chat",
+                );
+            }
+            chunk("{}", &quote(c.finish.as_str()), &format!(r#","usage":{}"#, usage(&c)))
+        }
         Err(e) => format!("data: {{\"error\":{{\"message\":{}}}}}\n\n", quote(&e)),
     };
     let _ = stream.write_all(tail.as_bytes()).and_then(|_| stream.write_all(b"data: [DONE]\n\n"));
@@ -611,9 +831,72 @@ struct StreamTurnSpec {
     workdir: PathBuf,
     attachments: Vec<AttachmentIngestion>,
     media_ms: f64,
+    origin: String,
+    raw_user_text: String,
+    agent_label: String,
+    parent_turn_id: u64,
 }
 
-fn stream_agent_loop_sse(srv: &Server, stream: &mut TcpStream, spec: StreamTurnSpec) {
+fn allocate_live_turn(srv: &Server, spec: &StreamTurnSpec) -> (u64, u64, String) {
+    let tid = srv.turn_seq.fetch_add(1, Ordering::Relaxed);
+    let ord = srv.agent_seq.fetch_add(1, Ordering::Relaxed);
+    let folder_name = spec
+        .workdir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("workspace");
+    let label = if spec.agent_label.trim().is_empty() {
+        format!("Task #{ord} · {folder_name}")
+    } else {
+        spec.agent_label.trim().to_string()
+    };
+    srv.register_project_path(&spec.workdir);
+    let rec = LiveTurnBroadcast {
+        turn_id: tid,
+        agent_ord: ord,
+        agent_label: label.clone(),
+        parent_turn_id: spec.parent_turn_id,
+        origin: spec.origin.clone(),
+        active: true,
+        started_at: now(),
+        finished_at: 0,
+        step: 0,
+        max_steps: spec.max_steps,
+        status_detail: "initializing".to_string(),
+        workdir: spec.workdir.to_string_lossy().into_owned(),
+        user_text: spec.raw_user_text.clone(),
+        deliverables: Vec::new(),
+        events: Vec::new(),
+    };
+    let mut turns = srv.live_turns.lock().unwrap_or_else(|p| p.into_inner());
+    while turns.len() >= 24 {
+        if let Some(pos) = turns.iter().position(|t| !t.active) {
+            turns.remove(pos);
+        } else {
+            break;
+        }
+    }
+    turns.push(rec);
+    (tid, ord, label)
+}
+
+fn stream_agent_loop_sse(srv: &Arc<Server>, stream: &mut TcpStream, spec: StreamTurnSpec) {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{CORS}Connection: close\r\n\r\n"
+    );
+    if stream.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let (live_turn_id, _, _) = allocate_live_turn(srv, &spec);
+    let _ = execute_allocated_turn(srv, live_turn_id, Some(stream), spec);
+}
+
+fn execute_allocated_turn(
+    srv: &Arc<Server>,
+    live_turn_id: u64,
+    mut stream_opt: Option<&mut TcpStream>,
+    spec: StreamTurnSpec,
+) -> Result<String, String> {
     let StreamTurnSpec {
         mut history,
         params,
@@ -623,17 +906,59 @@ fn stream_agent_loop_sse(srv: &Server, stream: &mut TcpStream, spec: StreamTurnS
         workdir,
         attachments,
         media_ms,
+        origin: _,
+        raw_user_text: _,
+        agent_label: _,
+        parent_turn_id: _,
     } = spec;
-    let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{CORS}Connection: close\r\n\r\n"
-    );
-    if stream.write_all(head.as_bytes()).is_err() {
-        return;
-    }
+
+    let tracked_workdir = Mutex::new(workdir.clone());
 
     let mut write_sse = |payload: &str| -> bool {
-        let frame = format!("data: {payload}\n\n");
-        stream.write_all(frame.as_bytes()).and_then(|_| stream.flush()).is_ok()
+        {
+            let mut turns = srv.live_turns.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(lt) = turns.iter_mut().find(|t| t.turn_id == live_turn_id) {
+                if payload.starts_with(r#"{"type":"workspace_changed""#) {
+                    if let Ok(j) = Json::parse(payload) {
+                        if let Some(wd) = j.get("workdir").and_then(Json::as_str) {
+                            lt.workdir = wd.to_string();
+                            let mut cur = tracked_workdir.lock().unwrap_or_else(|p| p.into_inner());
+                            *cur = PathBuf::from(wd);
+                        }
+                    }
+                } else if payload.starts_with(r#"{"type":"step_start""#) {
+                    if let Ok(j) = Json::parse(payload) {
+                        let st = j.get("step").and_then(Json::as_f64).unwrap_or(0.0) as usize;
+                        let ms = j.get("max_steps").and_then(Json::as_f64).unwrap_or(lt.max_steps as f64) as usize;
+                        lt.step = st;
+                        lt.max_steps = ms;
+                        lt.status_detail = format!("step {st}/{ms} · reasoning");
+                    }
+                } else if payload.starts_with(r#"{"type":"tool_progress""#) {
+                    if let Ok(j) = Json::parse(payload) {
+                        let nm = j.get("name").and_then(Json::as_str).unwrap_or("tool");
+                        let tg = j.get("target").and_then(Json::as_str).unwrap_or("");
+                        lt.status_detail = if tg.is_empty() {
+                            format!("step {}/{} · {nm}", lt.step, lt.max_steps)
+                        } else {
+                            format!("step {}/{} · {nm} {tg}", lt.step, lt.max_steps)
+                        };
+                    }
+                } else if payload.starts_with(r#"{"type":"tool_start""#) {
+                    if let Ok(j) = Json::parse(payload) {
+                        let nm = j.get("name").and_then(Json::as_str).unwrap_or("tool");
+                        lt.status_detail = format!("step {}/{} · running {nm}", lt.step, lt.max_steps);
+                    }
+                }
+                lt.events.push(payload.to_string());
+            }
+        }
+        if let Some(ref mut s) = stream_opt {
+            let frame = format!("data: {payload}\n\n");
+            s.write_all(frame.as_bytes()).and_then(|_| s.flush()).is_ok()
+        } else {
+            true
+        }
     };
 
     let mut active_route = initial_route;
@@ -740,220 +1065,251 @@ fn stream_agent_loop_sse(srv: &Server, stream: &mut TcpStream, spec: StreamTurnS
         TurnRoute::Computer => vec![use_computer_tool_definition_json()],
         TurnRoute::Agent => {
             let mut t = tool_definitions_json();
-            if global_device_manager().current_config().allow_computer_control {
+            if global_device_manager().current_config().allow_computer_control
+                && kronos_2t::device::is_computer_control_prompt(&last_user_text.to_ascii_lowercase())
+            {
                 t.push(use_computer_tool_definition_json());
+            }
+            if is_multi_agent_prompt(&last_user_text) {
+                t.push(spawn_agent_tool_definition_json());
             }
             t
         }
     };
     let cfg = AgentTurnConfig {
         workdir,
-        params,
+        params: params.clone(),
         max_steps,
         cmd_timeout_secs: cmd_timeout,
         expect_tool_call: matches!(effective_route, TurnRoute::Agent | TurnRoute::Computer),
     };
 
-    let mut model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
-    let run_res = run_agent_turn(&mut model, &mut history, &tools_json, &cfg, |ev| match ev {
-        AgentEvent::JevDecision { plan } => write_sse(&format!(
-            r#"{{"type":"jev_decision","route":{},"confidence":{:.3},"margin":{:.3},"used_neural":{},"pruned_tools":{},"prefetched_files":{},"rubric_items":{},"elapsed_ms":{:.2}}}"#,
-            quote(plan.route.as_str()),
-            plan.route_choice.confidence,
-            plan.route_choice.margin,
-            plan.route_choice.used_neural,
-            plan.pruned_tool_count,
-            plan.prefetched_files.len(),
-            plan.rubric.len(),
-            plan.elapsed_ms,
-        )),
-        AgentEvent::ContextCompacted {
-            before_tokens,
-            after_tokens,
-            compacted_messages,
-        } => write_sse(&format!(
-            r#"{{"type":"compacted","before_tokens":{before_tokens},"after_tokens":{after_tokens},"compacted_messages":{compacted_messages}}}"#
-        )),
-        AgentEvent::StepStart { step, max_steps } => write_sse(&format!(
-            r#"{{"type":"step_start","step":{step},"max_steps":{max_steps}}}"#
-        )),
-        AgentEvent::TextDelta(delta) => {
-            if delta.is_empty() {
-                true
-            } else {
-                write_sse(&format!(r#"{{"type":"text","delta":{}}}"#, quote(delta)))
-            }
-        }
-        AgentEvent::ToolProgress {
-            step,
-            name,
-            target,
-            bytes,
-        } => {
-            let next_r = if name == "use_computer" {
-                TurnRoute::Computer
-            } else {
-                TurnRoute::Agent
-            };
-            if active_route == TurnRoute::Chat {
-                active_route = next_r;
-                let _ = write_sse(&format!(r#"{{"type":"route","mode":{}}}"#, quote(active_route.as_str())));
-            }
-            write_sse(&format!(
-                r#"{{"type":"tool_progress","step":{step},"name":{},"target":{},"bytes":{bytes}}}"#,
-                quote(name),
-                quote(target),
-            ))
-        }
-        AgentEvent::StepStats { step, completion } => write_sse(&format!(
-            r#"{{"type":"step_stats","step":{step},"usage":{}}}"#,
-            usage(completion)
-        )),
-        AgentEvent::ToolStart { step, call } => {
-            let next_r = if call.name == "use_computer" {
-                TurnRoute::Computer
-            } else {
-                TurnRoute::Agent
-            };
-            if active_route == TurnRoute::Chat {
-                active_route = next_r;
-                let _ = write_sse(&format!(r#"{{"type":"route","mode":{}}}"#, quote(active_route.as_str())));
-            }
-            write_sse(&format!(
-                r#"{{"type":"tool_start","step":{step},"id":{},"name":{},"arguments":{}}}"#,
-                quote(&call.id),
-                quote(&call.name),
-                quote(&call.arguments),
-            ))
-        }
-        AgentEvent::ToolDone { step, call, outcome } => write_sse(&format!(
-            r#"{{"type":"tool_done","step":{step},"id":{},"name":{},"ok":{},"validation_ok":{},"validation_msg":{},"output":{},"diff":{}}}"#,
-            quote(&call.id),
-            quote(&call.name),
-            outcome.ok,
-            outcome.validation_ok,
-            quote(&outcome.validation_msg),
-            quote(&truncate_utf8(&outcome.output, 4096)),
-            format_diff_json(outcome.diff.as_ref()),
-        )),
-        AgentEvent::WorkspaceChanged { workdir: new_wd } => {
-            let canon = new_wd.to_path_buf();
-            {
-                let mut wd_guard = srv.workdir.lock().unwrap_or_else(|p| p.into_inner());
-                *wd_guard = canon.clone();
-            }
-            {
-                let mut idx = srv.ui_index.lock().unwrap_or_else(|p| p.into_inner());
-                let canon_str = canon.to_string_lossy().into_owned();
-                if !idx.projects.iter().any(|p| p == &canon_str) {
-                    idx.projects.push(canon_str);
-                    persist_projects_file(&srv.state_dir, &idx.projects);
+    let srv_for_spawn = Arc::clone(srv);
+    let spawner_box: Box<SubAgentSpawner> = Box::new(move |sub_wd: &Path, sub_label: &str, sub_task: &str, wait: bool| {
+        let sub_spec = StreamTurnSpec {
+            history: vec![Message::new("user", sub_task)],
+            params: GenParams {
+                temperature: 0.0,
+                top_k: 40,
+                top_p: 0.9,
+                repeat_penalty: 1.02,
+                max_tokens: 4096,
+                seed: 0,
+            },
+            max_steps: 24,
+            cmd_timeout: 360,
+            initial_route: TurnRoute::Agent,
+            workdir: sub_wd.to_path_buf(),
+            attachments: Vec::new(),
+            media_ms: 0.0,
+            origin: "subagent".to_string(),
+            raw_user_text: sub_task.to_string(),
+            agent_label: sub_label.to_string(),
+            parent_turn_id: live_turn_id,
+        };
+        let (child_tid, child_ord, child_lbl) = allocate_live_turn(&srv_for_spawn, &sub_spec);
+        let srv_child = Arc::clone(&srv_for_spawn);
+        let wd_disp = sub_wd.display().to_string();
+        let handle = std::thread::spawn(move || execute_allocated_turn(&srv_child, child_tid, None, sub_spec));
+        if wait {
+            match handle.join() {
+                Ok(Ok(summary)) => {
+                    let delivs = collect_workspace_deliverables(Path::new(&wd_disp));
+                    Ok(format!(
+                        "ok: worker agent #{child_ord} (`{child_lbl}`) finished in `{wd_disp}` (turn_id={child_tid}, deliverables={delivs:?}):\n{summary}"
+                    ))
                 }
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err("worker agent thread panicked".to_string()),
             }
-            write_sse(&format!(
-                r#"{{"type":"workspace_changed","workdir":{}}}"#,
-                quote(&canon.to_string_lossy())
+        } else {
+            Ok(format!(
+                "ok: spawned concurrent worker agent #{child_ord} (`{child_lbl}`) running live in `{wd_disp}` (turn_id={child_tid})"
             ))
         }
-        AgentEvent::ValidationRepair { step, report } => write_sse(&format!(
-            r#"{{"type":"validation_repair","step":{step},"report":{}}}"#,
-            quote(report)
-        )),
-        AgentEvent::Verified { step, report } => {
-            let details: Vec<String> = report.details.iter().map(|d| quote(d)).collect();
-            write_sse(&format!(
-                r#"{{"type":"verified","step":{step},"checks_run":{},"elapsed_ms":{:.1},"summary":{},"details":[{}]}}"#,
-                report.checks_run,
-                report.elapsed_ms,
-                quote(&report.summary),
-                details.join(",")
-            ))
-        }
-        AgentEvent::JevVerification {
-            step,
-            eval,
-            rolled_back,
-        } => write_sse(&format!(
-            r#"{{"type":"jev_verification","step":{step},"passed":{},"score":{:.3},"confidence":{:.3},"predicates":{},"rolled_back":{},"elapsed_ms":{:.2}}}"#,
-            eval.passed,
-            eval.score.expected,
-            eval.score.confidence,
-            eval.predicates.len(),
-            rolled_back,
-            eval.elapsed_ms,
-        )),
-        AgentEvent::Done { .. } => true,
     });
 
-    match run_res {
+    let run_res = run_agent_turn_shared_with_spawner(
+        &srv.model,
+        &mut history,
+        &tools_json,
+        &cfg,
+        Some(&*spawner_box),
+        |ev| match ev {
+            AgentEvent::JevDecision { plan } => write_sse(&format!(
+                r#"{{"type":"jev_decision","route":{},"confidence":{:.3},"margin":{:.3},"used_neural":{},"pruned_tools":{},"prefetched_files":{},"rubric_items":{},"elapsed_ms":{:.2}}}"#,
+                quote(plan.route.as_str()),
+                plan.route_choice.confidence,
+                plan.route_choice.margin,
+                plan.route_choice.used_neural,
+                plan.pruned_tool_count,
+                plan.prefetched_files.len(),
+                plan.rubric.len(),
+                plan.elapsed_ms,
+            )),
+            AgentEvent::ContextCompacted {
+                before_tokens,
+                after_tokens,
+                compacted_messages,
+            } => write_sse(&format!(
+                r#"{{"type":"compacted","before_tokens":{before_tokens},"after_tokens":{after_tokens},"compacted_messages":{compacted_messages}}}"#
+            )),
+            AgentEvent::StepStart { step, max_steps } => write_sse(&format!(
+                r#"{{"type":"step_start","step":{step},"max_steps":{max_steps}}}"#
+            )),
+            AgentEvent::TextDelta(delta) => {
+                if delta.is_empty() {
+                    true
+                } else {
+                    write_sse(&format!(r#"{{"type":"text","delta":{}}}"#, quote(delta)))
+                }
+            }
+            AgentEvent::ToolProgress {
+                step,
+                name,
+                target,
+                bytes,
+            } => {
+                let next_r = if name == "use_computer" {
+                    TurnRoute::Computer
+                } else {
+                    TurnRoute::Agent
+                };
+                if active_route == TurnRoute::Chat {
+                    active_route = next_r;
+                    let _ = write_sse(&format!(r#"{{"type":"route","mode":{}}}"#, quote(active_route.as_str())));
+                }
+                write_sse(&format!(
+                    r#"{{"type":"tool_progress","step":{step},"name":{},"target":{},"bytes":{bytes}}}"#,
+                    quote(name),
+                    quote(target),
+                ))
+            }
+            AgentEvent::StepStats { step, completion } => write_sse(&format!(
+                r#"{{"type":"step_stats","step":{step},"usage":{}}}"#,
+                usage(completion)
+            )),
+            AgentEvent::ToolStart { step, call } => {
+                let next_r = if call.name == "use_computer" {
+                    TurnRoute::Computer
+                } else {
+                    TurnRoute::Agent
+                };
+                if active_route == TurnRoute::Chat {
+                    active_route = next_r;
+                    let _ = write_sse(&format!(r#"{{"type":"route","mode":{}}}"#, quote(active_route.as_str())));
+                }
+                write_sse(&format!(
+                    r#"{{"type":"tool_start","step":{step},"id":{},"name":{},"arguments":{}}}"#,
+                    quote(&call.id),
+                    quote(&call.name),
+                    quote(&call.arguments),
+                ))
+            }
+            AgentEvent::ToolDone { step, call, outcome } => write_sse(&format!(
+                r#"{{"type":"tool_done","step":{step},"id":{},"name":{},"ok":{},"validation_ok":{},"validation_msg":{},"output":{},"diff":{}}}"#,
+                quote(&call.id),
+                quote(&call.name),
+                outcome.ok,
+                outcome.validation_ok,
+                quote(&outcome.validation_msg),
+                quote(&truncate_utf8(&outcome.output, 4096)),
+                format_diff_json(outcome.diff.as_ref()),
+            )),
+            AgentEvent::WorkspaceChanged { workdir: new_wd } => {
+                let canon = new_wd.to_path_buf();
+                srv.register_project_path(&canon);
+                write_sse(&format!(
+                    r#"{{"type":"workspace_changed","workdir":{}}}"#,
+                    quote(&canon.to_string_lossy())
+                ))
+            }
+            AgentEvent::ValidationRepair { step, report } => write_sse(&format!(
+                r#"{{"type":"validation_repair","step":{step},"report":{}}}"#,
+                quote(report)
+            )),
+            AgentEvent::Verified { step, report } => {
+                let details: Vec<String> = report.details.iter().map(|d| quote(d)).collect();
+                write_sse(&format!(
+                    r#"{{"type":"verified","step":{step},"checks_run":{},"elapsed_ms":{:.1},"summary":{},"details":[{}]}}"#,
+                    report.checks_run,
+                    report.elapsed_ms,
+                    quote(&report.summary),
+                    details.join(",")
+                ))
+            }
+            AgentEvent::JevVerification {
+                step,
+                eval,
+                rolled_back,
+            } => write_sse(&format!(
+                r#"{{"type":"jev_verification","step":{step},"passed":{},"score":{:.3},"confidence":{:.3},"predicates":{},"rolled_back":{},"elapsed_ms":{:.2}}}"#,
+                eval.passed,
+                eval.score.expected,
+                eval.score.confidence,
+                eval.predicates.len(),
+                rolled_back,
+                eval.elapsed_ms,
+            )),
+            AgentEvent::Done { .. } => true,
+        },
+    );
+
+    let final_wd = tracked_workdir.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let deliverables = collect_workspace_deliverables(&final_wd);
+    let deliv_json: Vec<String> = deliverables.iter().map(|d| quote(d)).collect();
+
+    let out_res = match run_res {
         Ok(final_text) => {
-            let ctx_tokens = model.count_prompt_tokens(&history, &tools_json);
-            let ctx_limit = model.context_size();
+            kronos_2t::conversations::record_conversation_exchange(
+                &last_user_text,
+                &final_text,
+                active_route.as_str(),
+            );
+            let (ctx_tokens, ctx_limit) = {
+                let model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    model.count_prompt_tokens(&history, &tools_json),
+                    model.context_size(),
+                )
+            };
             let done_json = format!(
-                r#"{{"type":"done","route":{},"context_tokens":{ctx_tokens},"context_limit":{ctx_limit},"text":{},"messages":{}}}"#,
+                r#"{{"type":"done","route":{},"workdir":{},"deliverables":[{}],"context_tokens":{ctx_tokens},"context_limit":{ctx_limit},"text":{},"messages":{}}}"#,
                 quote(active_route.as_str()),
+                quote(&final_wd.to_string_lossy()),
+                deliv_json.join(","),
                 quote(&final_text),
                 serialize_messages_json(&history),
             );
             let _ = write_sse(&done_json);
+            Ok(final_text)
         }
         Err(e) => {
             let err_json = format!(r#"{{"type":"error","message":{}}}"#, quote(&e));
             let _ = write_sse(&err_json);
+            Err(e)
+        }
+    };
+    if let Some(ref mut s) = stream_opt {
+        let _ = s.write_all(b"data: [DONE]\n\n");
+    }
+    {
+        let mut turns = srv.live_turns.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(lt) = turns.iter_mut().find(|t| t.turn_id == live_turn_id) {
+            lt.active = false;
+            lt.finished_at = now();
+            lt.deliverables = deliverables;
+            lt.status_detail = if out_res.is_ok() {
+                "completed".to_string()
+            } else {
+                "error".to_string()
+            };
         }
     }
-    let _ = stream.write_all(b"data: [DONE]\n\n");
+    out_res
 }
 
-fn agent_chat_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
-    let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
-        Ok(b) => b,
-        Err(e) => return error(stream, 400, &format!("invalid JSON: {e}")),
-    };
-    let mut history = match parse_messages_field(&body) {
-        Ok(m) => m,
-        Err(e) => return error(stream, 400, &e),
-    };
-    let workdir = srv.active_workdir();
-    let (attachments, media_ms) =
-        match attach_request_media(&body, &mut history, &workdir, &srv.media_seq) {
-            Ok(v) => v,
-            Err(e) => return error(stream, 400, &e),
-        };
-    let agent_defaults = GenParams {
-        temperature: 0.0,
-        top_k: 40,
-        top_p: 0.9,
-        repeat_penalty: 1.05,
-        max_tokens: 4096,
-        seed: 0,
-    };
-    let params = parse_gen_params(&body, &agent_defaults);
-    let max_steps = body
-        .get("max_steps")
-        .and_then(Json::as_f64)
-        .map_or(10, |v| (v as usize).clamp(1, 24));
-    let cmd_timeout = body
-        .get("cmd_timeout")
-        .and_then(Json::as_f64)
-        .map_or(20, |v| (v as u64).clamp(1, 120));
-    stream_agent_loop_sse(
-        srv,
-        stream,
-        StreamTurnSpec {
-            history,
-            params,
-            max_steps,
-            cmd_timeout,
-            initial_route: TurnRoute::Agent,
-            workdir,
-            attachments,
-            media_ms,
-        },
-    );
-}
-
-fn unified_turn_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
+fn agent_chat_sse(srv: &Arc<Server>, stream: &mut TcpStream, req: &Request) {
     let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
         Ok(b) => b,
         Err(e) => return error(stream, 400, &format!("invalid JSON: {e}")),
@@ -968,7 +1324,82 @@ fn unified_turn_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
         .find(|m| m.role == "user")
         .map(|m| m.content.clone())
         .unwrap_or_default();
-    let workdir = srv.active_workdir();
+    let origin = req.header("x-kronos-tab").unwrap_or("external").to_string();
+    let workdir = match resolve_request_workdir(srv, body.get("workdir").and_then(Json::as_str), true) {
+        Ok(w) => w,
+        Err((code, msg)) => return error(stream, code, &msg),
+    };
+    let agent_label = body
+        .get("agent_label")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_string();
+    let (attachments, media_ms) =
+        match attach_request_media(&body, &mut history, &workdir, &srv.media_seq) {
+            Ok(v) => v,
+            Err(e) => return error(stream, 400, &e),
+        };
+    let agent_defaults = GenParams {
+        temperature: 0.0,
+        top_k: 40,
+        top_p: 0.9,
+        repeat_penalty: 1.02,
+        max_tokens: 4096,
+        seed: 0,
+    };
+    let params = parse_gen_params(&body, &agent_defaults);
+    let max_steps = body
+        .get("max_steps")
+        .and_then(Json::as_f64)
+        .map_or(24, |v| (v as usize).clamp(1, 48));
+    let cmd_timeout = body
+        .get("cmd_timeout")
+        .and_then(Json::as_f64)
+        .map_or(300, |v| (v as u64).clamp(1, 600));
+    stream_agent_loop_sse(
+        srv,
+        stream,
+        StreamTurnSpec {
+            history,
+            params,
+            max_steps,
+            cmd_timeout,
+            initial_route: TurnRoute::Agent,
+            workdir,
+            attachments,
+            media_ms,
+            origin,
+            raw_user_text,
+            agent_label,
+            parent_turn_id: 0,
+        },
+    );
+}
+
+fn unified_turn_sse(srv: &Arc<Server>, stream: &mut TcpStream, req: &Request) {
+    let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
+        Ok(b) => b,
+        Err(e) => return error(stream, 400, &format!("invalid JSON: {e}")),
+    };
+    let mut history = match parse_messages_field(&body) {
+        Ok(m) => m,
+        Err(e) => return error(stream, 400, &e),
+    };
+    let raw_user_text = history
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    let workdir = match resolve_request_workdir(srv, body.get("workdir").and_then(Json::as_str), true) {
+        Ok(w) => w,
+        Err((code, msg)) => return error(stream, code, &msg),
+    };
+    let agent_label = body
+        .get("agent_label")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_string();
     let (attachments, media_ms) =
         match attach_request_media(&body, &mut history, &workdir, &srv.media_seq) {
             Ok(v) => v,
@@ -1005,7 +1436,7 @@ fn unified_turn_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
             temperature: 0.0,
             top_k: 40,
             top_p: 0.9,
-            repeat_penalty: 1.05,
+            repeat_penalty: 1.02,
             max_tokens: 1024,
             seed: 0,
         },
@@ -1013,7 +1444,7 @@ fn unified_turn_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
             temperature: 0.0,
             top_k: 40,
             top_p: 0.9,
-            repeat_penalty: 1.05,
+            repeat_penalty: 1.02,
             max_tokens: 4096,
             seed: 0,
         },
@@ -1022,16 +1453,17 @@ fn unified_turn_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
     let default_steps = match route {
         TurnRoute::Chat => 4,
         TurnRoute::Computer => 4,
-        TurnRoute::Agent => 10,
+        TurnRoute::Agent => 24,
     };
     let max_steps = body
         .get("max_steps")
         .and_then(Json::as_f64)
-        .map_or(default_steps, |v| (v as usize).clamp(1, 24));
+        .map_or(default_steps, |v| (v as usize).clamp(1, 48));
     let cmd_timeout = body
         .get("cmd_timeout")
         .and_then(Json::as_f64)
-        .map_or(20, |v| (v as u64).clamp(1, 120));
+        .map_or(300, |v| (v as u64).clamp(1, 600));
+    let origin = req.header("x-kronos-tab").unwrap_or("external").to_string();
     stream_agent_loop_sse(
         srv,
         stream,
@@ -1044,7 +1476,98 @@ fn unified_turn_sse(srv: &Server, stream: &mut TcpStream, req: &Request) {
             workdir,
             attachments,
             media_ms,
+            origin,
+            raw_user_text,
+            agent_label,
+            parent_turn_id: 0,
         },
+    );
+}
+
+fn handle_agents_spawn(srv: &Arc<Server>, stream: &mut TcpStream, req: &Request) {
+    let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
+        Ok(b) => b,
+        Err(e) => return error(stream, 400, &format!("invalid JSON: {e}")),
+    };
+    let single_slice = std::slice::from_ref(&body);
+    let tasks_slice: &[Json] = match body.get("tasks").and_then(Json::as_arr) {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => single_slice,
+    };
+    let mut spawned_json = Vec::new();
+    for item in tasks_slice {
+        let prompt = item
+            .get("prompt")
+            .or_else(|| item.get("task"))
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .trim();
+        if prompt.is_empty() {
+            return error(stream, 400, "each spawned agent task requires a non-empty `prompt`");
+        }
+        let workdir = match resolve_request_workdir(srv, item.get("workdir").and_then(Json::as_str), true) {
+            Ok(w) => w,
+            Err((code, msg)) => return error(stream, code, &msg),
+        };
+        let mut history = vec![Message::new("user", prompt)];
+        let (attachments, media_ms) =
+            match attach_request_media(item, &mut history, &workdir, &srv.media_seq) {
+                Ok(v) => v,
+                Err(e) => return error(stream, 400, &e),
+            };
+        let defaults = GenParams {
+            temperature: 0.0,
+            top_k: 40,
+            top_p: 0.9,
+            repeat_penalty: 1.02,
+            max_tokens: 4096,
+            seed: 0,
+        };
+        let params = parse_gen_params(item, &defaults);
+        let max_steps = item
+            .get("max_steps")
+            .and_then(Json::as_f64)
+            .map_or(24, |v| (v as usize).clamp(1, 48));
+        let cmd_timeout = item
+            .get("cmd_timeout")
+            .and_then(Json::as_f64)
+            .map_or(360, |v| (v as u64).clamp(1, 600));
+        let label = item
+            .get("label")
+            .or_else(|| item.get("agent_label"))
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_string();
+        let spec = StreamTurnSpec {
+            history,
+            params,
+            max_steps,
+            cmd_timeout,
+            initial_route: TurnRoute::Agent,
+            workdir: workdir.clone(),
+            attachments,
+            media_ms,
+            origin: "multi_agent".to_string(),
+            raw_user_text: prompt.to_string(),
+            agent_label: label,
+            parent_turn_id: 0,
+        };
+        let (tid, ord, final_label) = allocate_live_turn(srv, &spec);
+        let srv_bg = Arc::clone(srv);
+        std::thread::spawn(move || {
+            let _ = execute_allocated_turn(&srv_bg, tid, None, spec);
+        });
+        spawned_json.push(format!(
+            r#"{{"turn_id":{tid},"agent_ord":{ord},"agent_label":{},"workdir":{}}}"#,
+            quote(&final_label),
+            quote(&workdir.to_string_lossy()),
+        ));
+    }
+    respond(
+        stream,
+        200,
+        "application/json",
+        &format!(r#"{{"status":"ok","agents":[{}]}}"#, spawned_json.join(",")),
     );
 }
 
@@ -1455,8 +1978,21 @@ fn format_agent_files_with_ctx(workdir: &Path, ctx_limit: usize) -> String {
         .iter()
         .find(|e| e.path == "index.html")
         .or_else(|| entries.iter().find(|e| e.path.ends_with(".html")))
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|e| !e.path.contains('/') && e.path.ends_with(".mp4"))
+        })
+        .or_else(|| entries.iter().find(|e| e.path.ends_with(".mp4")))
+        .or_else(|| entries.iter().find(|e| e.path == "rendered_after.png"))
+        .or_else(|| entries.iter().find(|e| e.path.ends_with(".png")))
+        .or_else(|| entries.iter().find(|e| e.path.ends_with(".wav")))
         .map(|e| e.path.as_str())
         .unwrap_or("");
+    let deliv_items: Vec<String> = collect_workspace_deliverables(workdir)
+        .into_iter()
+        .map(|d| quote(&d))
+        .collect();
     let items: Vec<String> = entries
         .iter()
         .map(|e| {
@@ -1470,9 +2006,10 @@ fn format_agent_files_with_ctx(workdir: &Path, ctx_limit: usize) -> String {
         })
         .collect();
     format!(
-        r#"{{"workdir":{},"context_limit":{ctx_limit},"has_html":{has_index},"preview_path":{},"files":[{}]}}"#,
+        r#"{{"workdir":{},"context_limit":{ctx_limit},"has_html":{has_index},"preview_path":{},"deliverables":[{}],"files":[{}]}}"#,
         quote(&workdir.to_string_lossy()),
         quote(preview_entry),
+        deliv_items.join(","),
         items.join(",")
     )
 }
@@ -1518,14 +2055,92 @@ fn clear_workspace_dir(workdir: &Path) -> Result<usize, String> {
     Ok(removed)
 }
 
-fn serve_preview(workdir: &Path, stream: &mut TcpStream, req_path: &str) {
-    let raw_rel = req_path
+fn parse_byte_range(range_hdr: &str, total: usize) -> Option<(usize, usize)> {
+    if total == 0 {
+        return None;
+    }
+    let spec = range_hdr.trim().strip_prefix("bytes=")?;
+    let first_range = spec.split(',').next()?.trim();
+    let (lhs, rhs) = first_range.split_once('-')?;
+    let lhs = lhs.trim();
+    let rhs = rhs.trim();
+    if lhs.is_empty() {
+        let suffix: usize = rhs.parse().ok()?;
+        if suffix == 0 {
+            return None;
+        }
+        let start = total.saturating_sub(suffix);
+        Some((start, total - 1))
+    } else {
+        let start: usize = lhs.parse().ok()?;
+        if start >= total {
+            return None;
+        }
+        let end = if rhs.is_empty() {
+            total - 1
+        } else {
+            rhs.parse::<usize>().ok()?.min(total - 1)
+        };
+        if start > end {
+            None
+        } else {
+            Some((start, end))
+        }
+    }
+}
+
+fn resolve_preview_target(srv: &Server, req: &Request) -> Result<(PathBuf, String), (u16, String)> {
+    let after_preview = req
+        .path
         .strip_prefix("/preview")
         .unwrap_or("")
         .trim_start_matches('/');
-    let decoded = percent_decode(raw_rel);
-    let rel = if decoded.is_empty() { "index.html" } else { decoded.as_str() };
-    let mut target = match resolve_jailed_path(workdir, rel) {
+    if let Some(after_tag) = after_preview.strip_prefix("@ws/") {
+        let (hex_part, rel_part) = after_tag.split_once('/').unwrap_or((after_tag, ""));
+        let Some(wd_raw) = decode_hex_utf8(hex_part) else {
+            return Err((400, "invalid workspace hex prefix".to_string()));
+        };
+        let canon = resolve_request_workdir(srv, Some(&wd_raw), false)?;
+        if !srv.is_known_project_path(&canon) {
+            return Err((403, "workspace is not registered in Kronos".to_string()));
+        }
+        let decoded = percent_decode(rel_part);
+        let rel = if decoded.is_empty() {
+            "index.html".to_string()
+        } else {
+            decoded
+        };
+        return Ok((canon, rel));
+    }
+    if let Some(wd_q) = req.query_param("workdir") {
+        let canon = resolve_request_workdir(srv, Some(&wd_q), false)?;
+        if !srv.is_known_project_path(&canon) {
+            return Err((403, "workspace is not registered in Kronos".to_string()));
+        }
+        let decoded = percent_decode(after_preview);
+        let rel = if decoded.is_empty() {
+            "index.html".to_string()
+        } else {
+            decoded
+        };
+        return Ok((canon, rel));
+    }
+    let canon = srv.active_workdir();
+    let decoded = percent_decode(after_preview);
+    let rel = if decoded.is_empty() {
+        "index.html".to_string()
+    } else {
+        decoded
+    };
+    Ok((canon, rel))
+}
+
+fn serve_preview(srv: &Server, stream: &mut TcpStream, req: &Request) {
+    let (workdir, rel) = match resolve_preview_target(srv, req) {
+        Ok(pair) => pair,
+        Err((code, msg)) => return error(stream, code, &msg),
+    };
+    let mut target = match resolve_jailed_path(&workdir, &rel) {
         Ok(p) => p,
         Err(e) => return error(stream, 400, &e),
     };
@@ -1535,13 +2150,26 @@ fn serve_preview(workdir: &Path, stream: &mut TcpStream, req_path: &str) {
     match fs::read(&target) {
         Ok(bytes) => {
             let mime = mime_type_for_path(&target);
-            respond_bytes(
-                stream,
-                200,
-                mime,
-                "Cache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\n",
-                &bytes,
-            );
+            let total = bytes.len();
+            if let Some(range_hdr) = req.header("range") {
+                if let Some((start, end)) = parse_byte_range(range_hdr, total) {
+                    let hdrs = format!(
+                        "Accept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{total}\r\nCache-Control: no-store, no-cache, must-revalidate\r\n"
+                    );
+                    respond_bytes(stream, 206, mime, &hdrs, &bytes[start..=end]);
+                } else {
+                    let hdrs = format!("Content-Range: bytes */{total}\r\n");
+                    respond_bytes(stream, 416, mime, &hdrs, &[]);
+                }
+            } else {
+                respond_bytes(
+                    stream,
+                    200,
+                    mime,
+                    "Accept-Ranges: bytes\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\n",
+                    &bytes,
+                );
+            }
         }
         Err(_) => respond(
             stream,
@@ -1552,7 +2180,7 @@ fn serve_preview(workdir: &Path, stream: &mut TcpStream, req_path: &str) {
     }
 }
 
-fn handle(srv: &Server, mut stream: TcpStream) {
+fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let req = match read_request(&mut stream) {
         Ok(r) => r,
@@ -1562,12 +2190,13 @@ fn handle(srv: &Server, mut stream: TcpStream) {
         return respond(&mut stream, 204, "text/plain", "");
     }
     if req.method == "GET" && (req.path == "/" || req.path == "/index.html") {
+        let live_html = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/chat.html")).ok();
         return respond_bytes(
             &mut stream,
             200,
             "text/html; charset=utf-8",
             "Cache-Control: no-store, no-cache, must-revalidate\r\n",
-            CHAT_PAGE.as_bytes(),
+            live_html.as_deref().unwrap_or(CHAT_PAGE.as_bytes()),
         );
     }
     if req.method == "GET" && req.path == "/quick" {
@@ -1580,8 +2209,7 @@ fn handle(srv: &Server, mut stream: TcpStream) {
         );
     }
     if req.method == "GET" && (req.path == "/preview" || req.path.starts_with("/preview/")) {
-        let wd = srv.active_workdir();
-        return serve_preview(&wd, &mut stream, &req.path);
+        return serve_preview(srv, &mut stream, &req);
     }
     if let Some(key) = &srv.api_key {
         let ok = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")) == Some(key.as_str());
@@ -1591,6 +2219,79 @@ fn handle(srv: &Server, mut stream: TcpStream) {
     }
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/health") => respond(&mut stream, 200, "application/json", r#"{"status":"ok"}"#),
+        ("GET", "/v1/agents") => {
+            let turns = srv.live_turns.lock().unwrap_or_else(|p| p.into_inner());
+            let active_count = turns.iter().filter(|t| t.active).count();
+            let items: Vec<String> = turns.iter().map(format_live_turn_summary_json).collect();
+            drop(turns);
+            let body = format!(
+                r#"{{"active_count":{active_count},"agents":[{}]}}"#,
+                items.join(",")
+            );
+            respond(&mut stream, 200, "application/json", &body);
+        }
+        ("POST", "/v1/agents/spawn") => handle_agents_spawn(srv, &mut stream, &req),
+        ("GET", "/v1/turn/live") => {
+            let req_tid: u64 = req
+                .query_param("turn_id")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let since: usize = req
+                .query_param("since")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let turns = srv.live_turns.lock().unwrap_or_else(|p| p.into_inner());
+            let active_count = turns.iter().filter(|t| t.active).count();
+            let agents_items: Vec<String> = turns.iter().map(format_live_turn_summary_json).collect();
+            let selected = if req_tid != 0 {
+                turns
+                    .iter()
+                    .find(|t| t.turn_id == req_tid)
+                    .or_else(|| turns.iter().rev().find(|t| t.active))
+                    .or_else(|| turns.last())
+            } else {
+                turns
+                    .iter()
+                    .rev()
+                    .find(|t| t.active)
+                    .or_else(|| turns.last())
+            };
+            let body = if let Some(lt) = selected {
+                let start = if req_tid == lt.turn_id {
+                    since.min(lt.events.len())
+                } else {
+                    0
+                };
+                let next_idx = lt.events.len();
+                let ev_slice = &lt.events[start..next_idx];
+                let deliv_items: Vec<String> = lt.deliverables.iter().map(|d| quote(d)).collect();
+                format!(
+                    r#"{{"turn_id":{},"agent_ord":{},"agent_label":{},"parent_turn_id":{},"origin":{},"active":{},"active_count":{},"started_at":{},"finished_at":{},"step":{},"max_steps":{},"status_detail":{},"workdir":{},"user_text":{},"deliverables":[{}],"agents":[{}],"next_index":{},"events":[{}]}}"#,
+                    lt.turn_id,
+                    lt.agent_ord,
+                    quote(&lt.agent_label),
+                    lt.parent_turn_id,
+                    quote(&lt.origin),
+                    lt.active,
+                    active_count,
+                    lt.started_at,
+                    lt.finished_at,
+                    lt.step,
+                    lt.max_steps,
+                    quote(&lt.status_detail),
+                    quote(&lt.workdir),
+                    quote(&lt.user_text),
+                    deliv_items.join(","),
+                    agents_items.join(","),
+                    next_idx,
+                    ev_slice.join(","),
+                )
+            } else {
+                r#"{"turn_id":0,"agent_ord":0,"agent_label":"","parent_turn_id":0,"origin":"","active":false,"active_count":0,"started_at":0,"finished_at":0,"step":0,"max_steps":0,"status_detail":"","workdir":"","user_text":"","deliverables":[],"agents":[],"next_index":0,"events":[]}"#.to_string()
+            };
+            drop(turns);
+            respond(&mut stream, 200, "application/json", &body);
+        }
         ("GET", "/v1/models") => respond(
             &mut stream,
             200,
@@ -1710,7 +2411,14 @@ fn handle(srv: &Server, mut stream: TcpStream) {
             };
             let existed_before = body.get("existed_before").and_then(Json::as_bool).unwrap_or(false);
             let before_content = body.get("before_content").and_then(Json::as_str).unwrap_or("");
-            let wd = srv.active_workdir();
+            let wd = match resolve_request_workdir(
+                srv,
+                body.get("workdir").and_then(Json::as_str),
+                false,
+            ) {
+                Ok(w) => w,
+                Err((code, msg)) => return error(&mut stream, code, &msg),
+            };
             match revert_workspace_change(&wd, path, existed_before, before_content) {
                 Ok(json_body) => respond(&mut stream, 200, "application/json", &json_body),
                 Err((code, msg)) => error(&mut stream, code, &msg),
@@ -1781,6 +2489,61 @@ fn handle(srv: &Server, mut stream: TcpStream) {
             );
             respond(&mut stream, 200, "application/json", &body);
         }
+        ("GET", "/v1/device/conversations") => {
+            let q = req.query_param("q").unwrap_or_default();
+            respond(
+                &mut stream,
+                200,
+                "application/json",
+                &kronos_2t::conversations::retrieve_local_conversation_json(&q),
+            );
+        }
+        ("GET", "/v1/device/memory") => {
+            respond(
+                &mut stream,
+                200,
+                "application/json",
+                &kronos_2t::conversations::read_learned_memory_json(),
+            );
+        }
+        ("POST", "/v1/device/memory") => {
+            let body = match std::str::from_utf8(&req.body)
+                .map_err(|e| e.to_string())
+                .and_then(Json::parse)
+            {
+                Ok(b) => b,
+                Err(e) => return error(&mut stream, 400, &format!("invalid JSON: {e}")),
+            };
+            respond(
+                &mut stream,
+                200,
+                "application/json",
+                &kronos_2t::conversations::merge_learned_memory_json(&body),
+            );
+        }
+        ("GET", "/v1/device/distill_vault") => {
+            respond(
+                &mut stream,
+                200,
+                "application/json",
+                &kronos_2t::conversations::read_distilled_vault_json(),
+            );
+        }
+        ("POST", "/v1/device/distill_vault") => {
+            let body = match std::str::from_utf8(&req.body)
+                .map_err(|e| e.to_string())
+                .and_then(Json::parse)
+            {
+                Ok(b) => b,
+                Err(e) => return error(&mut stream, 400, &format!("invalid JSON: {e}")),
+            };
+            respond(
+                &mut stream,
+                200,
+                "application/json",
+                &kronos_2t::conversations::merge_distilled_vault_json(&body),
+            );
+        }
         ("POST", "/v1/device/open") => {
             let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
                 Ok(b) => b,
@@ -1797,7 +2560,14 @@ fn handle(srv: &Server, mut stream: TcpStream) {
             }
         }
         ("GET", "/v1/agent/files") => {
-            let wd = srv.active_workdir();
+            let wd = match resolve_request_workdir(
+                srv,
+                req.query_param("workdir").as_deref(),
+                false,
+            ) {
+                Ok(w) => w,
+                Err((code, msg)) => return error(&mut stream, code, &msg),
+            };
             respond(
                 &mut stream,
                 200,
@@ -1809,14 +2579,32 @@ fn handle(srv: &Server, mut stream: TcpStream) {
             let Some(rel) = req.query_param("path") else {
                 return error(&mut stream, 400, "missing `path` query parameter");
             };
-            let wd = srv.active_workdir();
+            let wd = match resolve_request_workdir(
+                srv,
+                req.query_param("workdir").as_deref(),
+                false,
+            ) {
+                Ok(w) => w,
+                Err((code, msg)) => return error(&mut stream, code, &msg),
+            };
             match format_agent_file_detail_json(&wd, &rel) {
                 Ok(json_body) => respond(&mut stream, 200, "application/json", &json_body),
                 Err((code, msg)) => error(&mut stream, code, &msg),
             }
         }
         ("POST", "/v1/agent/clear") => {
-            let wd = srv.active_workdir();
+            let body_wd = std::str::from_utf8(&req.body)
+                .ok()
+                .and_then(|s| Json::parse(s).ok())
+                .and_then(|j| j.get("workdir").and_then(Json::as_str).map(str::to_string));
+            let wd = match resolve_request_workdir(
+                srv,
+                body_wd.as_deref().or(req.query_param("workdir").as_deref()),
+                false,
+            ) {
+                Ok(w) => w,
+                Err((code, msg)) => return error(&mut stream, code, &msg),
+            };
             match clear_workspace_dir(&wd) {
                 Ok(n) => respond(
                     &mut stream,
@@ -1957,7 +2745,7 @@ fn main() {
         let dj = s.spawn(move || {
             let mgr = global_device_manager();
             if enable_dev_ctx {
-                mgr.update_config(Some(true), None, false);
+                mgr.update_config(Some(true), None, true);
             }
         });
         prewarmed_tokens = model.prewarm_prefix(&warm_sys, &warm_tools);
@@ -2002,8 +2790,11 @@ fn main() {
         workdir: Mutex::new(workdir.clone()),
         state_dir,
         ui_index: Mutex::new(ui_index),
+        live_turns: Mutex::new(Vec::new()),
         ctx_limit: ctx_sz,
         next_id: AtomicU64::new(1),
+        turn_seq: AtomicU64::new(now_millis()),
+        agent_seq: AtomicU64::new(1),
         media_seq: AtomicU64::new(1),
     });
     eprintln!(
@@ -2183,6 +2974,42 @@ mod tests {
 
         let removed = clear_workspace_dir(&dir).unwrap();
         assert_eq!(removed, 2);
+        assert_eq!(parse_byte_range("bytes=0-99", 500), Some((0, 99)));
+        assert_eq!(parse_byte_range("bytes=100-", 500), Some((100, 499)));
+        assert_eq!(parse_byte_range("bytes=-50", 500), Some((450, 499)));
+        assert_eq!(parse_byte_range("bytes=600-700", 500), None);
+        fs::write(dir.join("kronos_explained.mp4"), b"mp4bytes").unwrap();
+        fs::write(dir.join("script.md"), b"# Kronos Script\n").unwrap();
+        let mp4_files_json = Json::parse(&format_agent_files_json(&dir)).unwrap();
+        assert_eq!(
+            mp4_files_json.get("preview_path").and_then(Json::as_str),
+            Some("kronos_explained.mp4")
+        );
+        let delivs = collect_workspace_deliverables(&dir);
+        assert_eq!(delivs.first().map(String::as_str), Some("kronos_explained.mp4"));
+        assert!(delivs.iter().any(|d| d == "script.md"));
+        assert_eq!(decode_hex_utf8("2f746d702f64656d6f").as_deref(), Some("/tmp/demo"));
+        assert_eq!(decode_hex_utf8("zz"), None);
+        let summary = format_live_turn_summary_json(&LiveTurnBroadcast {
+            turn_id: 42,
+            agent_ord: 2,
+            agent_label: "Task #2 · kronos-long-agent-eval".into(),
+            parent_turn_id: 0,
+            origin: "eval".into(),
+            active: true,
+            started_at: 100,
+            finished_at: 0,
+            step: 3,
+            max_steps: 28,
+            status_detail: "write_file js/render.js".into(),
+            workdir: "/tmp/demo".into(),
+            user_text: "Modularize website".into(),
+            deliverables: delivs,
+            events: Vec::new(),
+        });
+        let summary_json = Json::parse(&summary).unwrap();
+        assert_eq!(summary_json.get("turn_id").and_then(Json::as_f64), Some(42.0));
+        assert_eq!(summary_json.get("active").and_then(Json::as_bool), Some(true));
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&state_dir);
     }

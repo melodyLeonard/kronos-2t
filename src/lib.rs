@@ -28,6 +28,7 @@ pub mod attachments;
 pub mod bpe_tokenizer;
 pub mod chat;
 pub mod compiler;
+pub mod conversations;
 #[cfg(all(feature = "ane", target_os = "macos"))]
 pub mod coreml;
 pub mod demo_model;

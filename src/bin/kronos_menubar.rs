@@ -463,9 +463,11 @@ mod macos {
     }
 
     unsafe fn show_panel(reset_chat: bool) {
-        STATE.with(|cell| {
-            let mut borrow = cell.borrow_mut();
-            let Some(st) = borrow.as_mut() else { return };
+        let setup = STATE.with(|cell| {
+            let Ok(mut borrow) = cell.try_borrow_mut() else {
+                return None;
+            };
+            let st = borrow.as_mut()?;
             if !st.has_custom_pos || !is_anchor_visible_on_any_screen(st.panel_x, st.panel_top_y) {
                 let (ax, top_y) = compute_default_anchor();
                 st.panel_x = ax;
@@ -473,6 +475,7 @@ mod macos {
                 st.has_custom_pos = false;
             }
             st.dragging = false;
+            st.visible = true;
             let frame = NSRect {
                 origin: NSPoint {
                     x: st.panel_x,
@@ -483,77 +486,88 @@ mod macos {
                     height: st.panel_height,
                 },
             };
-            let _: () = msg!(st.panel, "setFrame:display:", frame => NSRect, true => bool; ());
-
-            let cur_url: Id = msg!(st.webview, "URL"; Id);
-            let url_blank = if cur_url.is_null() {
-                true
-            } else {
-                let abs: Id = msg!(cur_url, "absoluteString"; Id);
-                ns_string_to_rust(abs)
-                    .map(|u| u.is_empty() || u == "about:blank")
-                    .unwrap_or(true)
-            };
-            let title_ns: Id = msg!(st.webview, "title"; Id);
-            let title_ready = ns_string_to_rust(title_ns)
-                .map(|t| t.contains("Kronos"))
-                .unwrap_or(false);
-            let is_loading: bool = msg!(st.webview, "isLoading"; bool);
-            if !is_loading && (url_blank || !title_ready) {
-                let quick_url = format!("{}/quick", st.base_url.trim_end_matches('/'));
-                let ns_u = ns_string(&quick_url);
-                let url_obj: Id = msg!(class("NSURL"), "URLWithString:", ns_u => Id; Id);
-                if !url_obj.is_null() {
-                    // NSURLRequestReloadIgnoringLocalCacheData = 1
-                    let req: Id = msg!(
-                        class("NSURLRequest"),
-                        "requestWithURL:cachePolicy:timeoutInterval:",
-                        url_obj => Id,
-                        1usize => usize,
-                        15.0f64 => f64;
-                        Id
-                    );
-                    let _: Id = msg!(st.webview, "loadRequest:", req => Id; Id);
-                }
-            }
-
-            let app: Id = msg!(class("NSApplication"), "sharedApplication"; Id);
-            let _: () = msg!(app, "activateIgnoringOtherApps:", true => bool; ());
-            let _: () = msg!(st.panel, "makeKeyAndOrderFront:", ptr::null_mut() => Id; ());
-            let _: bool = msg!(st.panel, "makeFirstResponder:", st.webview => Id; bool);
-            st.visible = true;
-
-            if reset_chat {
-                eval_js(
-                    st.webview,
-                    "if (window.kronosNewChat) window.kronosNewChat();",
-                );
-            } else {
-                eval_js(
-                    st.webview,
-                    "if (window.kronosFocusInput) window.kronosFocusInput();",
-                );
-            }
+            let quick_url = format!("{}/quick", st.base_url.trim_end_matches('/'));
+            Some((st.panel, st.webview, frame, quick_url))
         });
+        let Some((panel, webview, frame, quick_url)) = setup else {
+            return;
+        };
+        let _: () = msg!(panel, "setFrame:display:", frame => NSRect, true => bool; ());
+
+        let cur_url: Id = msg!(webview, "URL"; Id);
+        let url_blank = if cur_url.is_null() {
+            true
+        } else {
+            let abs: Id = msg!(cur_url, "absoluteString"; Id);
+            ns_string_to_rust(abs)
+                .map(|u| u.is_empty() || u == "about:blank")
+                .unwrap_or(true)
+        };
+        let title_ns: Id = msg!(webview, "title"; Id);
+        let title_ready = ns_string_to_rust(title_ns)
+            .map(|t| t.contains("Kronos"))
+            .unwrap_or(false);
+        let is_loading: bool = msg!(webview, "isLoading"; bool);
+        if !is_loading && (url_blank || !title_ready) {
+            let ns_u = ns_string(&quick_url);
+            let url_obj: Id = msg!(class("NSURL"), "URLWithString:", ns_u => Id; Id);
+            if !url_obj.is_null() {
+                let req: Id = msg!(
+                    class("NSURLRequest"),
+                    "requestWithURL:cachePolicy:timeoutInterval:",
+                    url_obj => Id,
+                    1usize => usize,
+                    15.0f64 => f64;
+                    Id
+                );
+                let _: Id = msg!(webview, "loadRequest:", req => Id; Id);
+            }
+        }
+
+        let app: Id = msg!(class("NSApplication"), "sharedApplication"; Id);
+        let _: () = msg!(app, "activateIgnoringOtherApps:", true => bool; ());
+        let _: () = msg!(panel, "makeKeyAndOrderFront:", ptr::null_mut() => Id; ());
+        let _: bool = msg!(panel, "makeFirstResponder:", webview => Id; bool);
+
+        if reset_chat {
+            eval_js(
+                webview,
+                "if (window.kronosNewChat) window.kronosNewChat();",
+            );
+        } else {
+            eval_js(
+                webview,
+                "if (window.kronosFocusInput) window.kronosFocusInput();",
+            );
+        }
     }
 
     unsafe fn hide_panel() {
-        STATE.with(|cell| {
-            let mut borrow = cell.borrow_mut();
-            let Some(st) = borrow.as_mut() else { return };
-            let _: () = msg!(st.panel, "orderOut:", ptr::null_mut() => Id; ());
+        let panel = STATE.with(|cell| {
+            let Ok(mut borrow) = cell.try_borrow_mut() else {
+                return ptr::null_mut();
+            };
+            let Some(st) = borrow.as_mut() else {
+                return ptr::null_mut();
+            };
             st.dragging = false;
             st.visible = false;
+            st.panel
         });
+        if !panel.is_null() {
+            let _: () = msg!(panel, "orderOut:", ptr::null_mut() => Id; ());
+        }
     }
 
     unsafe fn toggle_panel() {
         let currently_visible = STATE.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .map(|st| {
-                    let is_vis: bool = unsafe { msg!(st.panel, "isVisible"; bool) };
-                    st.visible && is_vis
+            cell.try_borrow()
+                .ok()
+                .and_then(|b| {
+                    b.as_ref().map(|st| {
+                        let is_vis: bool = unsafe { msg!(st.panel, "isVisible"; bool) };
+                        st.visible && is_vis
+                    })
                 })
                 .unwrap_or(false)
         });
@@ -566,11 +580,13 @@ mod macos {
 
     unsafe fn resize_panel(new_height: f64) {
         let clamped = new_height.clamp(124.0, 560.0);
-        STATE.with(|cell| {
-            let mut borrow = cell.borrow_mut();
-            let Some(st) = borrow.as_mut() else { return };
+        let target = STATE.with(|cell| {
+            let Ok(mut borrow) = cell.try_borrow_mut() else {
+                return None;
+            };
+            let st = borrow.as_mut()?;
             if (st.panel_height - clamped).abs() < 1.0 {
-                return;
+                return None;
             }
             st.panel_height = clamped;
             let frame = NSRect {
@@ -583,9 +599,12 @@ mod macos {
                     height: clamped,
                 },
             };
-            let _: () = msg!(st.panel, "setFrame:display:", frame => NSRect, true => bool; ());
-            let _: () = msg!(st.panel, "invalidateShadow"; ());
+            Some((st.panel, frame))
         });
+        if let Some((panel, frame)) = target {
+            let _: () = msg!(panel, "setFrame:display:", frame => NSRect, true => bool; ());
+            let _: () = msg!(panel, "invalidateShadow"; ());
+        }
     }
 
     fn open_external_url(url: &str) {
@@ -644,9 +663,12 @@ mod macos {
 
     unsafe extern "C" fn on_window_resign_key(_this: Id, _cmd: Sel, _notif: Id) {
         let should_hide = STATE.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .map(|st| st.visible && !st.suppress_auto_hide && !st.dragging)
+            cell.try_borrow()
+                .ok()
+                .and_then(|b| {
+                    b.as_ref()
+                        .map(|st| st.visible && !st.suppress_auto_hide && !st.dragging)
+                })
                 .unwrap_or(false)
         });
         if should_hide {
@@ -656,9 +678,12 @@ mod macos {
 
     unsafe extern "C" fn on_app_resign_active(_this: Id, _cmd: Sel, _notif: Id) {
         let should_hide = STATE.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .map(|st| st.visible && !st.suppress_auto_hide && !st.dragging)
+            cell.try_borrow()
+                .ok()
+                .and_then(|b| {
+                    b.as_ref()
+                        .map(|st| st.visible && !st.suppress_auto_hide && !st.dragging)
+                })
                 .unwrap_or(false)
         });
         if should_hide {

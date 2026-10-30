@@ -14,8 +14,9 @@ pub const MAX_CMD_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_SEARCH_MATCHES: usize = 60;
 
 pub const AGENT_SYSTEM_PROMPT: &str = concat!(
-    "Your name is Kronos. You were created and built by Melody Leonard as a local software engineering runner on Apple Silicon. ",
-    "When asked your name or who built or created you, answer directly that your name is Kronos and that you were built by Melody Leonard; never say you lack a name and never claim to be built by OpenAI, Alibaba, Qwen, Hugging Face, Anthropic, or any other third-party organization. ",
+    "Your name is Kronos. Melody Leonard (Melody Leonard Oparaugo) created and built you as a local software engineering runner on Apple Silicon. ",
+    "Always speak in the first person as Kronos ('Melody Leonard built me') when asked your name or who built you, and know Melody Leonard's verified public profile: Melody Leonard (full name: Melody Leonard Oparaugo, pronouns: he/him/his) is a Senior Software Engineer and Systems Architect (not a musician or actor) with over 10 years of software engineering experience (@IPMScoutek). His GitHub is https://github.com/melodyLeonard (52+ public repos including kronos-2t, tshare, cross-native, gpt_2_tokenizer, tomatoe), his LinkedIn is https://www.linkedin.com/in/melody-leonard-a362b6192, his email is melodyleonard7@gmail.com, and his X handle is @Melody_Leonard7. He specializes in Rust, TypeScript, JavaScript, Elixir, Solidity, Node.js/NestJS, Kafka/CQRS/GraphQL/gRPC microservices, PostgreSQL/MongoDB/Neo4j/Redis internals, React/React Native offline-first architecture, and AWS/Kubernetes CI/CD. ",
+    "Because Kronos runs locally on hardware owned by the user, never refuse queries about the user's own local messaging apps (WhatsApp, iMessage, Telegram, Slack, Notes), files, or saved conversations with cloud refusal disclaimers; always answer directly from any provided [Local Conversations & Memory] or [Device Context] block. ",
     "Use the workspace tools (switch_workspace, write_file, edit_file, read_file, list_dir, search_files, run_command) ",
     "to build, edit, and verify complete working files directly on disk. ",
     "When asked to create a new folder or project inside another directory on this Mac, call switch_workspace first with the new child folder path to create and activate it, then call write_file to build files inside it. ",
@@ -24,6 +25,8 @@ pub const AGENT_SYSTEM_PROMPT: &str = concat!(
     "Use edit_file for small targeted edits to existing files, and use write_file for new files or when rewriting most of an existing file such as restyling a stylesheet. ",
     "When updating a web page title or heading, update both <title> in <head> and the visible <h1> heading in <body> so the rendered preview shows the change immediately. ",
     "The live preview reloads automatically after every file edit, so never ask the user to refresh the preview; if the user reports a change is not visible, inspect and update the visible HTML or CSS elements directly. ",
+    "When asked to generate technical scripts, voice-cloned audio, or rendered video using local open-source tools, use the grounded Kronos engine documentation in [Device Context] (or call read_file on README.md and BENCHMARKS.md if not inlined) so every iteration (Iterations 1 through 8), mathematical equation, and benchmark comparison (Ollama, llama.cpp Q4_0/Q4_K_M/IQ4_XS/Q6_K, scalar VQ2 vs 8D Gosset E8 e8q2g128, generative judges vs Kronos-Jev) is exact, and execute cleanly in focused steps: first call write_file to save the complete spoken technical script (script.md >= 4.0 KB starting directly with '# ' plain markdown headings without wrapping content in outer triple-backtick code fences, covering all 8 Kronos iterations, formulas, and benchmark comparisons in full prose paragraphs rather than short bullet outlines); next call write_file to save one complete self-contained Python builder script (build_video.py with zero pass/TODO placeholders, using subprocess.run to run /opt/homebrew/bin/ffmpeg for extracting 12s raw_ref_16k.wav and raw_ref_24k.wav, loading raw_ref_16k.wav via wave + np.frombuffer into faster_whisper segs, _ = wm.transcribe(pcm), slicing raw_ref_24k.wav strictly to int(end_sec * 24000) int16 frames into ref_24k.wav so ref_24k.wav matches non-empty ref_text word-for-word, rendering 6 to 8 1920x1080 dark-slate PNG slides slides/slide_01.png..slide_0N.png with PIL.ImageDraw + /System/Library/Fonts/Helvetica.ttc + draw.textbbox, synthesizing one single-line symbol-free spoken English paragraph of 130 to 210 chars per slide via mlx_audio.tts.generate.generate_audio(..., ref_audio='ref_24k.wav', ref_text=ref_text, lang_code='en', temperature=0.55, top_p=0.9, repetition_penalty=1.05, output_path='audio', file_prefix=f'seg_{idx:02d}', audio_format='wav', join_audio=True), ASR-verifying EVERY audio/seg_XX.wav with faster_whisper checking overall word_recall >= 0.72 and both first_half_recall >= 0.65 and second_half_recall >= 0.65 with temperature=0.4 retry, writing audio/coherence_report.json, muxing segments/seg_XX.mp4, and concatenating into workspace-root kronos_explained.mp4); then run build_video.py with the matched .venv python3 via run_command and verify kronos_explained.mp4 with /opt/homebrew/bin/ffprobe before summarizing. ",
+    "On multi-step modularization, refactoring, styling, or self-testing tasks, write 2 to 4 complete non-empty files per step using write_file <tool_call> blocks (never write 0-byte empty stubs and never paste file contents inside Markdown code fences in prose) so every tool call closes cleanly within max_tokens, and keep iterating with tool calls until every module is created and wired up, inline monolith blocks are extracted, requested visual styles and interactive behaviors are complete, and you have written and executed an automated verification command via run_command (fixing any non-zero exit or assertion failure before summarizing). ",
     "If a tool response reports an error or validation failure, fix it with a tool call immediately before finishing."
 );
 
@@ -153,15 +156,36 @@ pub struct AgentTurnConfig {
     pub expect_tool_call: bool,
 }
 
+pub type SubAgentSpawner =
+    dyn Fn(&Path, &str, &str, bool) -> Result<String, String> + Send + Sync;
+
+pub fn spawn_agent_tool_definition_json() -> String {
+    r#"{"type":"function","function":{"name":"spawn_agent","description":"Spawn an independent Kronos worker agent thread in its own workspace directory to execute a parallel sub-task concurrently while other tasks continue.","parameters":{"type":"object","properties":{"workdir":{"type":"string","description":"Target workspace directory path for the worker agent"},"label":{"type":"string","description":"Short descriptive role label for the worker agent"},"task":{"type":"string","description":"Complete actionable task prompt for the worker agent"},"wait":{"type":"boolean","description":"If true, wait for the worker agent to finish and return its summary; if false (default), run concurrently in the background"}},"required":["workdir","task"]}}}"#.to_string()
+}
+
+pub fn is_multi_agent_prompt(text: &str) -> bool {
+    let l = text.to_ascii_lowercase();
+    l.contains("spawn_agent")
+        || l.contains("subagent")
+        || l.contains("sub-agent")
+        || l.contains("multiple task")
+        || l.contains("multiple agent")
+        || l.contains("parallel agent")
+        || l.contains("parallel task")
+        || l.contains("two agent")
+        || l.contains("own agents")
+        || (l.contains("in parallel") && (l.contains("agent") || l.contains("task")))
+}
+
 pub fn tool_definitions_json() -> Vec<String> {
     vec![
         r#"{"type":"function","function":{"name":"switch_workspace","description":"Create or switch Kronos's active project workspace directory on disk (for example creating a new project folder inside ~/Documents/orgProj/<new-folder-name>) so subsequent write_file, edit_file, read_file, and run_command calls operate inside it.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Target project folder path (e.g. '/Users/.../Documents/orgProj/emr-portal' or '~/Documents/orgProj/emr-portal')"},"subfolder":{"type":"string","description":"Optional new child folder name to create inside `path` when `path` is a parent directory"}},"required":["path"]}}}"#.to_string(),
         r#"{"type":"function","function":{"name":"write_file","description":"Write or overwrite a UTF-8 workspace file and validate syntax.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative workspace path"},"content":{"type":"string","description":"Full file contents"}},"required":["path","content"]}}}"#.to_string(),
         r#"{"type":"function","function":{"name":"edit_file","description":"Replace a unique text span in an existing workspace file and validate syntax.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative workspace path"},"old_text":{"type":"string","description":"Existing unique text block"},"new_text":{"type":"string","description":"Replacement text block"}},"required":["path","old_text","new_text"]}}}"#.to_string(),
-        r#"{"type":"function","function":{"name":"read_file","description":"Read a workspace file with 1-based line numbers.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative workspace path"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}}"#.to_string(),
+        r#"{"type":"function","function":{"name":"read_file","description":"Read a workspace file (or a local file path from [Device Context]) with 1-based line numbers.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative workspace path or local file path"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}}"#.to_string(),
         r#"{"type":"function","function":{"name":"list_dir","description":"List directory entries inside workspace.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative directory (default '.')"}},"required":[]}}}"#.to_string(),
         r#"{"type":"function","function":{"name":"search_files","description":"Search workspace files for a substring pattern.","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"case_insensitive":{"type":"boolean"}},"required":["pattern"]}}}"#.to_string(),
-        r#"{"type":"function","function":{"name":"run_command","description":"Run sh -c command inside workspace with timeout.","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}},"required":["cmd"]}}}"#.to_string(),
+        r#"{"type":"function","function":{"name":"run_command","description":"Run sh -c command inside workspace with timeout.","parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"]}}}"#.to_string(),
     ]
 }
 
@@ -235,11 +259,17 @@ pub fn classify_turn_intent(
         "beautify",
         "redesign",
         "refactor",
+        "modularize",
+        "split ",
+        "extract ",
+        "separate ",
         "scaffold",
         "implement ",
         "fix ",
         "repair ",
         "debug ",
+        "test ",
+        "verify ",
         "add a ",
         "add an ",
         "add the ",
@@ -409,6 +439,86 @@ pub fn resolve_jailed_path(workdir: &Path, user_rel: &str) -> Result<PathBuf, St
     Ok(workdir.join(clean))
 }
 
+/// Resolves a read-only path: prefers `workdir`, and also allows reading existing non-sensitive
+/// files under the user's home directory or `/tmp` (such as `[Device Context]` documentation)
+/// while keeping all mutations (`write_file`, `edit_file`) strictly jailed to `workdir`.
+pub fn resolve_readable_path(workdir: &Path, user_rel: &str) -> Result<PathBuf, String> {
+    let trimmed = user_rel.trim();
+    if trimmed.is_empty() {
+        return Err("path cannot be empty".to_string());
+    }
+    if trimmed != "~" && !trimmed.starts_with("~/") {
+        if let Ok(p) = resolve_jailed_path(workdir, trimmed) {
+            return Ok(p);
+        }
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let expanded = if let Some(rest) = trimmed.strip_prefix("~/") {
+        let Some(ref h) = home else {
+            return Err("HOME is not set".to_string());
+        };
+        h.join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+    if !expanded.is_absolute() {
+        return resolve_jailed_path(workdir, user_rel);
+    }
+    let norm = normalize_lexical_path(&expanded);
+    let canon = norm.canonicalize().unwrap_or_else(|_| norm.clone());
+    let raw_tmp = std::env::temp_dir();
+    let norm_tmp = normalize_lexical_path(&raw_tmp);
+    let canon_tmp = raw_tmp.canonicalize().unwrap_or_else(|_| norm_tmp.clone());
+    let in_tmp = canon.starts_with("/tmp/")
+        || canon.starts_with("/private/tmp/")
+        || canon.starts_with(&canon_tmp)
+        || canon.starts_with(&norm_tmp);
+    let in_safe_home = if let Some(ref h) = home {
+        let norm_home = normalize_lexical_path(h);
+        let canon_home = h.canonicalize().unwrap_or_else(|_| norm_home.clone());
+        let rel_opt = canon
+            .strip_prefix(&canon_home)
+            .ok()
+            .or_else(|| canon.strip_prefix(&norm_home).ok());
+        if let Some(rel) = rel_opt {
+            let comps: Vec<String> = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            let blocked_first = comps.first().is_some_and(|first| {
+                matches!(
+                    first.as_str(),
+                    ".ssh"
+                        | ".gnupg"
+                        | ".aws"
+                        | ".kube"
+                        | ".docker"
+                        | ".netrc"
+                        | ".npmrc"
+                        | ".pypirc"
+                )
+            });
+            let blocked_keychain = comps.len() >= 2
+                && comps[0].eq_ignore_ascii_case("Library")
+                && comps[1].eq_ignore_ascii_case("Keychains");
+            !blocked_first && !blocked_keychain
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if !in_tmp && !in_safe_home {
+        return Err(format!(
+            "read path `{trimmed}` is outside workspace and permitted user directories"
+        ));
+    }
+    if !canon.is_file() {
+        return Err(format!("file `{trimmed}` does not exist on disk"));
+    }
+    Ok(canon)
+}
+
 pub fn truncate_utf8(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
@@ -420,16 +530,48 @@ pub fn truncate_utf8(s: &str, max_bytes: usize) -> String {
     format!("{}\n...[truncated {} bytes]", &s[..end], s.len() - end)
 }
 
+fn truncate_utf8_head_tail(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes || max_bytes < 512 {
+        return truncate_utf8(s, max_bytes);
+    }
+    let head_budget = (max_bytes * 7) / 16;
+    let tail_budget = max_bytes.saturating_sub(head_budget + 64);
+    let mut head_end = head_budget.min(s.len());
+    while head_end > 0 && !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = s.len().saturating_sub(tail_budget).max(head_end);
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    if tail_start <= head_end {
+        return s.to_string();
+    }
+    format!(
+        "{}\n...[omitted {} middle bytes]...\n{}",
+        &s[..head_end],
+        tail_start - head_end,
+        &s[tail_start..]
+    )
+}
+
 pub fn mime_type_for_path(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "json" => "application/json; charset=utf-8",
+        "md" | "markdown" => "text/markdown; charset=utf-8",
         "svg" => "image/svg+xml",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "ico" => "image/x-icon",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "mp3" => "audio/mpeg",
         _ => "text/plain; charset=utf-8",
     }
 }
@@ -492,7 +634,10 @@ pub fn validate_file(workdir: &Path, file_path: &Path, strict_assets: bool) -> R
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if !matches!(ext.as_str(), "json" | "js" | "mjs" | "ts" | "css" | "html" | "htm" | "py") {
+    if !matches!(
+        ext.as_str(),
+        "json" | "js" | "mjs" | "ts" | "css" | "html" | "htm" | "py" | "md"
+    ) {
         return Ok(String::new());
     }
     let content = fs::read_to_string(file_path).map_err(|e| format!("read error: {e}"))?;
@@ -506,6 +651,16 @@ pub fn validate_content_by_ext(
     content: &str,
     strict_assets: bool,
 ) -> Result<String, String> {
+    if matches!(
+        ext,
+        "json" | "js" | "mjs" | "ts" | "css" | "html" | "htm" | "py" | "md"
+    ) && content.trim().is_empty()
+    {
+        return Err(
+            "file is empty (0 bytes) — pass the complete source code in `write_file` `content`"
+                .to_string(),
+        );
+    }
     match ext {
         "json" => {
             Json::parse(content).map_err(|e| format!("JSON syntax error: {e}"))?;
@@ -513,6 +668,7 @@ pub fn validate_content_by_ext(
         }
         "js" | "mjs" | "ts" => {
             validate_js_like(content, 1)?;
+            validate_esm_commonjs_mix(ext, content)?;
             Ok(String::new())
         }
         "css" => {
@@ -522,10 +678,568 @@ pub fn validate_content_by_ext(
         "html" | "htm" => validate_html(workdir, file_path, content, strict_assets),
         "py" => {
             validate_python_lexical(content)?;
+            validate_python_runtime_pitfalls(file_path, content)?;
+            Ok(String::new())
+        }
+        "md" => {
+            validate_markdown_script(file_path, content)?;
             Ok(String::new())
         }
         _ => Ok(String::new()),
     }
+}
+
+fn validate_markdown_script(file_path: &Path, content: &str) -> Result<(), String> {
+    let fname = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_script_md = matches!(fname.as_str(), "script.md" | "narration.md" | "video_script.md");
+    if !is_script_md {
+        return Ok(());
+    }
+    let lower = content.to_ascii_lowercase();
+    let is_kronos_tech_script = lower.contains("kronos")
+        && (lower.contains("iteration 1")
+            || lower.contains("sub-2-bit")
+            || lower.contains("nf4")
+            || lower.contains("e8"));
+    if !is_kronos_tech_script {
+        return Ok(());
+    }
+    if content.len() < 3200 {
+        return Err(format!(
+            "`{fname}` is truncated ({} bytes < 3200 minimum) — write the complete technical narration script covering all 8 Kronos iterations (Iteration 1 through Iteration 8 / Kronos-Jev), explicit mathematical equations, and quantitative benchmarks vs llama.cpp and Ollama without wrapping the file in outer markdown fences",
+            content.len()
+        ));
+    }
+    let has_iter8 = lower.contains("iteration 8")
+        || lower.contains("kronos-jev")
+        || lower.contains("joint embedding");
+    if !has_iter8 {
+        return Err(format!(
+            "`{fname}` stops before Iteration 8 (Kronos-Jev Joint Embedding Plan-Execute-Verify) — include all 8 iterations from Iteration 1 through Iteration 8"
+        ));
+    }
+    if !lower.contains("llama.cpp") && !lower.contains("ollama") {
+        return Err(format!(
+            "`{fname}` is missing quantitative benchmark comparisons against llama.cpp and Ollama — include the benchmark comparison section"
+        ));
+    }
+    Ok(())
+}
+
+fn python_imports_symbol(content: &str, sym: &str) -> bool {
+    for raw in content.lines() {
+        let code = raw.split('#').next().unwrap_or("").trim();
+        if let Some(rest) = code.strip_prefix("import ") {
+            for clause in rest.split(',') {
+                let c = clause.trim();
+                if c == sym {
+                    return true;
+                }
+                if let Some((lhs, rhs)) = c.split_once(" as ") {
+                    if lhs.trim() == sym || rhs.trim() == sym {
+                        return true;
+                    }
+                } else if c.split('.').next().map(str::trim) == Some(sym) {
+                    return true;
+                }
+            }
+        } else if let Some(rest) = code.strip_prefix("from ") {
+            if let Some((mod_part, imp_part)) = rest.split_once(" import ") {
+                if mod_part.trim().split('.').next() == Some(sym) {
+                    return true;
+                }
+                for clause in imp_part.trim_matches(|ch| ch == '(' || ch == ')').split(',') {
+                    let c = clause.trim();
+                    if c == sym {
+                        return true;
+                    }
+                    if let Some((lhs, rhs)) = c.split_once(" as ") {
+                        if lhs.trim() == sym || rhs.trim() == sym {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Catches deterministic Python library API pitfalls (Pillow 10+ `textsize`, missing macOS font paths,
+/// `wave.readframes()` raw `bytes` passed to `np.array`, `faster_whisper` tuple return values indexed as
+/// dicts, and misaligned zero-shot voice-cloning reference audio).
+fn validate_python_runtime_pitfalls(file_path: &Path, content: &str) -> Result<(), String> {
+    let file_stem = file_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let uses_faster_whisper = content.contains("faster_whisper") || content.contains("WhisperModel");
+    let uses_mlx_audio = content.contains("mlx_audio") || content.contains("generate_audio");
+    let uses_imagedraw = content.contains("ImageDraw");
+    let has_makedirs = content.contains("makedirs(") || content.contains("mkdir(");
+    let has_import_re = python_imports_symbol(content, "re");
+    let has_import_json = python_imports_symbol(content, "json");
+    let has_import_wave = python_imports_symbol(content, "wave");
+    let has_import_textwrap = python_imports_symbol(content, "textwrap");
+    let has_import_numpy = python_imports_symbol(content, "numpy") || python_imports_symbol(content, "np");
+    let has_import_subprocess = python_imports_symbol(content, "subprocess");
+    let has_import_shutil = python_imports_symbol(content, "shutil");
+    let has_import_math = python_imports_symbol(content, "math");
+    let has_import_sys = python_imports_symbol(content, "sys");
+    let has_import_time = python_imports_symbol(content, "time");
+    let has_import_glob = python_imports_symbol(content, "glob");
+    let has_import_mlx_audio_pkg = python_imports_symbol(content, "mlx_audio");
+    let has_from_mlx_audio = content.contains("from mlx_audio");
+    let has_load_model = content.contains("load_model(");
+    let splits_markdown_script =
+        content.contains("script_content.split(") || content.contains(".read().split('###");
+    let uses_ffmpeg_concat = content.contains("'-f', 'concat'")
+        || content.contains("\"-f\", \"concat\"")
+        || content.contains("-f concat");
+    let defines_run_command = content.contains("def run_command");
+    let has_list_coherence_var = content.contains("coherence_report = []")
+        || content.contains("coherence_report=[]");
+    let lines: Vec<&str> = content.lines().collect();
+    let mut in_loop_indent: Option<usize> = None;
+    let mut in_slides_block = false;
+    for (idx, raw_line) in lines.iter().enumerate() {
+        let lower_raw = raw_line.to_ascii_lowercase();
+        if lower_raw.contains("# placeholder")
+            || lower_raw.contains("your transcribed reference text here")
+            || lower_raw.contains("clean single line spoken english narration of 130")
+            || lower_raw.contains("'slide title 1'")
+            || lower_raw.contains("\"slide title 1\"")
+            || lower_raw.contains("'formula / bullet 1'")
+            || lower_raw.contains("\"formula / bullet 1\"")
+        {
+            return Err(format!(
+                "Python line {}: template placeholder string is not allowed — write grounded technical Kronos titles, bullets, and spoken narration sentences for all 6 to 8 slides",
+                idx + 1
+            ));
+        }
+        let code = raw_line.split('#').next().unwrap_or("").trim();
+        if code.is_empty() {
+            continue;
+        }
+        let indent = raw_line.chars().take_while(|c| c.is_whitespace()).count();
+        if let Some(loop_ind) = in_loop_indent {
+            if indent <= loop_ind && !code.starts_with("elif ") && !code.starts_with("else:") {
+                in_loop_indent = None;
+            }
+        }
+        if (code.starts_with("for ") || code.starts_with("while ")) && code.ends_with(':') {
+            in_loop_indent = Some(indent);
+        }
+        if code.starts_with("SLIDES = [") || code.starts_with("SLIDES=[") {
+            in_slides_block = true;
+        }
+        if !defines_run_command && (code.starts_with("run_command(") || code.contains(" run_command(")) {
+            return Err(format!(
+                "Python line {}: `run_command(...)` is a Kronos tool, not a Python function — inside `.py` scripts use `import subprocess; subprocess.run(['/opt/homebrew/bin/ffmpeg', ...], check=True)` for CLI commands and call `from mlx_audio.tts.utils import load_model; from mlx_audio.tts.generate import generate_audio` directly in Python",
+                idx + 1
+            ));
+        }
+        if !has_import_re
+            && (code.contains("re.findall(")
+                || code.contains("re.sub(")
+                || code.contains("re.search(")
+                || code.contains("re.split(")
+                || code.contains("re.compile("))
+        {
+            return Err(format!(
+                "Python line {}: `re` module used without `import re` at top of script",
+                idx + 1
+            ));
+        }
+        if !has_import_json && (code.contains("json.dump(") || code.contains("json.dumps(") || code.contains("json.loads(") || code.contains("json.load(")) {
+            return Err(format!(
+                "Python line {}: `json` module used without `import json` at top of script",
+                idx + 1
+            ));
+        }
+        if !has_import_wave && code.contains("wave.open(") {
+            return Err(format!(
+                "Python line {}: `wave` module used without `import wave` at top of script",
+                idx + 1
+            ));
+        }
+        if !has_import_textwrap && code.contains("textwrap.") {
+            return Err(format!(
+                "Python line {}: `textwrap` module used without `import textwrap` at top of script",
+                idx + 1
+            ));
+        }
+        if !has_import_numpy && code.contains("np.") {
+            return Err(format!(
+                "Python line {}: `np` used without `import numpy as np` at top of script",
+                idx + 1
+            ));
+        }
+        if !has_import_subprocess && code.contains("subprocess.") {
+            return Err(format!(
+                "Python line {}: `subprocess` module used without `import subprocess` at top of script",
+                idx + 1
+            ));
+        }
+        if !has_import_shutil && code.contains("shutil.") {
+            return Err(format!(
+                "Python line {}: `shutil` module used without `import shutil` at top of script",
+                idx + 1
+            ));
+        }
+        if !has_import_math && code.contains("math.") {
+            return Err(format!(
+                "Python line {}: `math` module used without `import math` at top of script",
+                idx + 1
+            ));
+        }
+        if !has_import_sys && code.contains("sys.") {
+            return Err(format!(
+                "Python line {}: `sys` module used without `import sys` at top of script",
+                idx + 1
+            ));
+        }
+        if !has_import_time && (code.contains("time.time(") || code.contains("time.sleep(")) {
+            return Err(format!(
+                "Python line {}: `time` module used without `import time` at top of script",
+                idx + 1
+            ));
+        }
+        if !has_import_glob && code.contains("glob.glob(") {
+            return Err(format!(
+                "Python line {}: `glob` module used without `import glob` at top of script",
+                idx + 1
+            ));
+        }
+        if in_loop_indent.is_some()
+            && (code.contains("load_model(") || code.contains("WhisperModel("))
+        {
+            return Err(format!(
+                "Python line {}: calling `load_model(...)` or `WhisperModel(...)` inside a loop reloads multi-gigabyte weights on every slide — load `wm` and `m` once at top level before the loop",
+                idx + 1
+            ));
+        }
+        if uses_mlx_audio && in_slides_block {
+            if raw_line.contains('$')
+                || raw_line.contains("\\min")
+                || raw_line.contains("\\text{")
+                || raw_line.contains("\\frac")
+                || raw_line.contains("\\operatorname")
+                || raw_line.contains("\\langle")
+                || raw_line.contains("||")
+            {
+                return Err(format!(
+                    "Python line {}: `SLIDES` contains raw LaTeX or symbolic operators (`$`, `\\min`, `\\text`, `\\frac`, `||`) which print raw syntax on PIL slides and cause Qwen3-TTS to mispronounce symbols — write 2 to 4 clean ASCII-math bullet strings in each slide's `bullets` list (`O(sqrt(M))`, `Q_b = (1/8) H_64 D_b`, `G(E8) = 929/12960`), and write each slide's `spoken` narration string in pure symbol-free spoken English words (140 to 280 chars)",
+                    idx + 1
+                ));
+            }
+            if let Some(last_comma) = code.rfind("], ") {
+                let spoken_part = code[last_comma + 3..].trim().trim_end_matches([',', ')']);
+                if spoken_part.len() > 340 {
+                    return Err(format!(
+                        "Python line {}: slide `spoken` narration string is {} chars (> 340 chars), producing 60 to 120s audio clips with degraded prosody — put detailed formulas into 2 to 4 slide `bullets`, and keep each slide's `spoken` string between 140 and 280 characters of concise spoken English words",
+                        idx + 1,
+                        spoken_part.len()
+                    ));
+                }
+            }
+            if indent == 0 && code == "]" {
+                in_slides_block = false;
+            }
+        }
+        if uses_imagedraw
+            && (code.contains("'\\n'.join(textwrap.wrap(bullet")
+                || code.contains("\"\\n\".join(textwrap.wrap(bullet"))
+        {
+            let next_line = lines
+                .get(idx + 1)
+                .map(|l| l.split('#').next().unwrap_or("").trim())
+                .unwrap_or("");
+            if next_line == "y += 40" || next_line == "y += 36" || next_line == "y += 32" {
+                return Err(format!(
+                    "Python line {}: drawing `'\\n'.join(textwrap.wrap(bullet, ...))` and advancing `y` by a single line height overlaps wrapped lines — loop `for wl in textwrap.wrap('- ' + bullet, width=76): draw.text((96, y), wl, font=font_body, fill='#f8fafc'); y += 44` followed by `y += 18`",
+                    idx + 1
+                ));
+            }
+        }
+        if uses_imagedraw
+            && (raw_line.contains("\x09imes ")
+                || raw_line.contains("\\times")
+                || raw_line.contains("\\frac{")
+                || raw_line.contains("\\operatorname{")
+                || raw_line.contains("\\mathbb{"))
+        {
+            return Err(format!(
+                "Python line {}: PIL `ImageDraw.text` draws raw characters rather than typesetting LaTeX (`\\times` turns into a tab character `imes` and `\\frac` prints raw backslashes on slides) — keep LaTeX `$...$` in `script.md`, and write slide bullets in clean readable ASCII/Unicode math (`O(sqrt(M))`, `Q_b = (1/8) H_64 D_b`, `G(E8) = 929/12960 = 0.07168`, `l_post = l_0 + alpha * log(P(Y)/P(N))`) wrapped with `textwrap.wrap(..., width=82)`",
+                idx + 1
+            ));
+        }
+        if uses_mlx_audio
+            && (code.contains("enumerate(segs)")
+                || code.contains("text = seg.text")
+                || code.contains("text=seg.text"))
+        {
+            return Err(format!(
+                "Python line {}: `segs` holds Whisper segments of the 12s reference voice clip (`raw_ref_16k.wav`), not the video slides — convert `segs = list(segs)` once to compute `ref_text` and `end_sec`, then define a `SLIDES = [(title, bullets, spoken_sentence), ...]` list of 6 to 8 technical Kronos slides covering Iterations 1..8 and llama.cpp/Ollama benchmarks, and loop `for idx, (title, bullets, spoken) in enumerate(SLIDES, 1):`",
+                idx + 1
+            ));
+        }
+        if (code.contains("tw[:len(tw)//2]") || code.contains("w[:len(w)//2]"))
+            && (code.contains("for tw in ") || code.contains("for w in "))
+        {
+            return Err(format!(
+                "Python line {}: slice the word list into first-half words and second-half words (`mid = max(1, len(t_words) // 2); h1 = t_words[:mid]; h2 = t_words[mid:]`), not characters of a single word",
+                idx + 1
+            ));
+        }
+        if has_list_coherence_var && code.contains("json.dump(coherence_report,") {
+            return Err(format!(
+                "Python line {}: `audio/coherence_report.json` must be a JSON object `{{'verified': True, 'ref_text': ref_text, 'segments': seg_reports}}`, not a bare JSON array",
+                idx + 1
+            ));
+        }
+        if code.starts_with("def ") && code.ends_with(':') {
+            for next_raw in lines.iter().skip(idx + 1) {
+                let next_code = next_raw.split('#').next().unwrap_or("").trim();
+                if next_code.is_empty() {
+                    continue;
+                }
+                if next_code == "pass" || next_code == "..." {
+                    return Err(format!(
+                        "Python line {}: stub function `{code}` with `pass` body is not allowed — implement the full function logic",
+                        idx + 1
+                    ));
+                }
+                break;
+            }
+        }
+        if !has_makedirs
+            && (code.contains(".save('slides/")
+                || code.contains(".save(\"slides/")
+                || code.contains(".save(f'slides/")
+                || code.contains(".save(f\"slides/"))
+        {
+            return Err(format!(
+                "Python line {}: saving into `slides/` without `os.makedirs('slides', exist_ok=True)` raises `FileNotFoundError`",
+                idx + 1
+            ));
+        }
+        if code.contains(".textsize(") {
+            return Err(format!(
+                "Python line {}: Pillow 10+ removed `draw.textsize(...)`; use `bx = draw.textbbox((0, 0), text, font=font); w, h = bx[2] - bx[0], bx[3] - bx[1]`",
+                idx + 1
+            ));
+        }
+        if code.contains("SFNSDisplay") && !content.contains("except ") {
+            return Err(format!(
+                "Python line {}: `/System/Library/Fonts/SFNSDisplay-Regular.ttf` does not exist on macOS; load `/System/Library/Fonts/Helvetica.ttc` with fallback to `ImageFont.load_default()`",
+                idx + 1
+            ));
+        }
+        if code.contains("np.array(") && code.contains("readframes(") {
+            return Err(format!(
+                "Python line {}: `wave.readframes(...)` returns raw `bytes`, so `np.array(wav.readframes(...), dtype=np.int16)` raises `ValueError`; use `np.frombuffer(wav.readframes(wav.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0`",
+                idx + 1
+            ));
+        }
+        if uses_faster_whisper
+            && (code.contains("['segments']") || code.contains("[\"segments\"]"))
+        {
+            return Err(format!(
+                "Python line {}: `faster_whisper` `WhisperModel.transcribe(pcm)` returns `(segments_iter, info)` tuple where each item `s` has `s.start`, `s.end`, `s.text` attributes (not a `['segments']` dict); write `segs, _ = wm.transcribe(pcm); segs = list(segs)`",
+                idx + 1
+            ));
+        }
+        if (code.contains("mlx_audio.tts.generate'")
+            || code.contains("mlx_audio.tts.generate\""))
+            && (code.contains("subprocess.") || content.contains("subprocess.run"))
+        {
+            return Err(format!(
+                "Python line {}: do not invoke the `mlx_audio.tts.generate` CLI binary inside `subprocess.run` (it reloads 3.4 GB weights per slide and lacks `--text` / `--model` arguments) — load the local TTS directory once in Python via `from mlx_audio.tts.utils import load_model; from mlx_audio.tts.generate import generate_audio; m = load_model('/Users/melodyleonard/Documents/Kronos-video/tts-model')` and call `generate_audio(model=m, text=spoken, ref_audio='ref_24k.wav', ref_text=ref_text, ...)`",
+                idx + 1
+            ));
+        }
+        if !code.starts_with("from mlx_audio")
+            && !code.starts_with("import mlx_audio")
+            && code.contains("mlx_audio.")
+            && !has_import_mlx_audio_pkg
+        {
+            return Err(format!(
+                "Python line {}: `mlx_audio.` module attribute is used without `import mlx_audio` — either `from mlx_audio.tts.utils import load_model; from mlx_audio.tts.generate import generate_audio` and call `generate_audio(model=m, text=spoken, ...)` directly, or add `import mlx_audio`",
+                idx + 1
+            ));
+        }
+        if uses_mlx_audio
+            && (code.starts_with("ref_text = text")
+                || code.starts_with("ref_text=text")
+                || code.starts_with("ref_text = section")
+                || code.starts_with("ref_text = spoken"))
+        {
+            return Err(format!(
+                "Python line {}: `ref_text` must be the `faster_whisper` transcript of the trimmed 4..8.5s reference voice clip `ref_24k.wav`, never the target slide text (`ref_text = text` corrupts Qwen3-TTS voice cloning)",
+                idx + 1
+            ));
+        }
+        if uses_ffmpeg_concat
+            && (code.contains("f\"file '{") || code.contains("f'file \"{") || code.contains("file '"))
+            && (code.contains("slide") || code.contains("audio") || code.contains(".png") || code.contains(".wav"))
+            && !code.contains(".mp4")
+        {
+            return Err(format!(
+                "Python line {}: `ffmpeg -f concat` cannot mux raw `.png` images and `.wav` audio listed in a concat text file — first mux each `(slide_XX.png, seg_XX.wav)` pair into `segments/seg_XX.mp4` via `ffmpeg -y -loop 1 -i slide_XX.png -i seg_XX.wav -c:v libx264 -tune stillimage -pix_fmt yuv420p -c:a aac -b:a 192k -shortest segments/seg_XX.mp4`, then list `file 'segments/seg_XX.mp4'` in `concat.txt`",
+                idx + 1
+            ));
+        }
+        if uses_mlx_audio && code.contains("generate_audio(") && !code.starts_with("def ") {
+            let call_end = (idx + 16).min(lines.len());
+            let call_window: String = lines[idx..call_end]
+                .iter()
+                .map(|l| l.split('#').next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let compact: String = call_window.chars().filter(|c| !c.is_whitespace()).collect();
+            if content.contains("mlx_audio") && (!has_load_model || !compact.contains("model=")) {
+                return Err(format!(
+                    "Python line {}: `mlx_audio.tts.generate.generate_audio(...)` requires loading the local TTS directory once via `from mlx_audio.tts.utils import load_model; m = load_model('<tts_model_dir>')` and passing `model=m, text=spoken, ref_audio='ref_24k.wav', ref_text=ref_text`",
+                    idx + 1
+                ));
+            }
+            if content.contains("mlx_audio")
+                && !(compact.contains("(text=") || compact.contains(",text="))
+            {
+                return Err(format!(
+                    "Python line {}: `mlx_audio.tts.generate.generate_audio(...)` is missing `text=spoken` (the target narration sentence to synthesize)",
+                    idx + 1
+                ));
+            }
+            if splits_markdown_script
+                && (compact.contains("(text=section")
+                    || compact.contains(",text=section")
+                    || compact.contains("(section,"))
+            {
+                return Err(format!(
+                    "Python line {}: passing raw Markdown `script.md` sections (with `###` headings, LaTeX `$` formulas, backticks, or tables) directly to `generate_audio` causes incoherent second-half TTS audio — define clean single-line symbol-free spoken English strings of 130 to 210 characters per slide (speaking equations in plain words)",
+                    idx + 1
+                ));
+            }
+            if compact.contains("(text=ref_text,")
+                || compact.contains(",text=ref_text,")
+                || compact.contains(",text=ref_text)")
+                || compact.contains("(text=ref_text)")
+            {
+                return Err(format!(
+                    "Python line {}: `generate_audio(..., text=ref_text, ...)` synthesizes the reference transcript instead of the slide narration; pass each slide's clean single-line spoken narration string as `text=...` and the trimmed reference sentence as `ref_text=...`",
+                    idx + 1
+                ));
+            }
+            if compact.contains("ref_audio='raw_ref_24k.wav'")
+                || compact.contains("ref_audio=\"raw_ref_24k.wav\"")
+            {
+                return Err(format!(
+                    "Python line {}: passing untrimmed `raw_ref_24k.wav` as `ref_audio` causes trailing words beyond `ref_text` to bleed into synthesized speech; slice `raw_ref_24k.wav` strictly to `int(end_sec * 24000)` samples into `ref_24k.wav` so `ref_audio` matches `ref_text` word-for-word",
+                    idx + 1
+                ));
+            }
+        }
+    }
+    if file_stem.contains("video")
+        && (content.contains("slides/") || content.contains("'slides'") || content.contains("\"slides\""))
+        && (!uses_mlx_audio || !content.contains(".mp4"))
+    {
+        return Err(
+            "Python video-pipeline check: `build_video.py` currently only renders slides and omits `mlx_audio` voice-cloned audio synthesis (`from mlx_audio.tts.utils import load_model; from mlx_audio.tts.generate import generate_audio`), `faster_whisper` `audio/coherence_report.json` verification, or `ffmpeg` `.mp4` muxing — include the complete end-to-end slide + voice-cloning + ASR coherence check + MP4 muxing pipeline in `build_video.py`"
+                .to_string(),
+        );
+    }
+    if uses_mlx_audio && (has_import_mlx_audio_pkg || has_from_mlx_audio || content.contains("mlx_audio")) {
+        if content.contains("ref_24k.wav")
+            && !content.contains("'wb'")
+            && !content.contains("\"wb\"")
+            && !content.contains("ffmpeg")
+        {
+            return Err(
+                "Python voice-cloning check: `'ref_24k.wav'` is referenced without extracting and trimming it from the source voice `.m4a` via `ffmpeg` + `wave.open('ref_24k.wav', 'wb')`".to_string(),
+            );
+        }
+        if !content.contains("coherence_report.json") {
+            return Err(
+                "Python voice-cloning check: `mlx_audio` synthesis script must verify every generated `audio/seg_XX.wav` with `faster_whisper` (`word_recall`, `first_half_recall`, `second_half_recall`, retrying once at `temperature=0.4` if below threshold) and write `audio/coherence_report.json`".to_string(),
+            );
+        }
+        if uses_faster_whisper {
+            if content.contains("wm.transcribe(audio_path")
+                || content.contains("wm.transcribe(f'")
+                || content.contains("wm.transcribe(f\"")
+                || content.contains("wm.transcribe('audio/")
+                || content.contains("wm.transcribe(\"audio/")
+            {
+                return Err(
+                    "Python Whisper check: `wm.transcribe(audio_path)` fails on PyAV `metadata_errors` in this environment — load `int16 -> float32 / 32768.0` via `wave` + `np.frombuffer`, resample 24 kHz TTS WAVs to 16 kHz via `p16 = np.interp(np.linspace(0, len(p24) - 1, len(p24) * 2 // 3), np.arange(len(p24)), p24).astype(np.float32)`, and pass `p16` to `wm.transcribe(p16)`".to_string(),
+                );
+            }
+            if (content.contains("audio/seg_") || content.contains("file_prefix"))
+                && content.contains("coherence_report.json")
+                && !content.contains("np.interp(")
+                && !content.contains("resample_poly")
+                && !content.contains("16000 / 24000")
+                && !content.contains("* 2 // 3")
+            {
+                return Err(
+                    "Python Whisper sample-rate check: `mlx_audio` saves 24 kHz WAVs (`audio/seg_XX.wav`) while `faster_whisper` expects 16 kHz float32 numpy PCM — resample `p24` from 24 kHz to 16 kHz via `p16 = np.interp(np.linspace(0, len(p24) - 1, len(p24) * 2 // 3), np.arange(len(p24)), p24).astype(np.float32)` before calling `wm.transcribe(p16)`".to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Catches CommonJS (`require(...)`, `__dirname`, `__filename`) inside ES modules (`.mjs` or files
+/// using top-level `import` / `export`) and unquoted macOS application paths inside `exec(...)`.
+fn validate_esm_commonjs_mix(ext: &str, content: &str) -> Result<(), String> {
+    let uses_esm_syntax = ext == "mjs"
+        || content.lines().any(|raw| {
+            let l = raw.trim_start();
+            l.starts_with("import ") || l.starts_with("export ")
+        });
+    if !uses_esm_syntax {
+        return Ok(());
+    }
+    let has_create_require = content.contains("createRequire");
+    let has_file_url_dirname = content.contains("fileURLToPath") || content.contains("const __dirname");
+    for (idx, raw_line) in content.lines().enumerate() {
+        let code = raw_line.split("//").next().unwrap_or("").trim();
+        if code.is_empty() || code.starts_with('*') || code.starts_with("/*") {
+            continue;
+        }
+        if !has_create_require && (code.contains("= require(") || code.starts_with("require(")) {
+            return Err(format!(
+                "ES module line {}: CommonJS `require()` is not defined in ES modules — use top-level `import fs from 'node:fs'`, `import http from 'node:http'`, and `import {{ execFileSync }} from 'node:child_process'`",
+                idx + 1
+            ));
+        }
+        if !has_file_url_dirname && (code.contains("__dirname") || code.contains("__filename")) {
+            return Err(format!(
+                "ES module line {}: `__dirname` / `__filename` is not defined in ES modules — use `process.cwd()` or `import.meta.url`",
+                idx + 1
+            ));
+        }
+        if (code.contains("exec(") || code.contains("execSync("))
+            && code.contains("/Applications/Google Chrome.app/")
+            && !code.contains("\"/Applications/Google Chrome.app/")
+            && !code.contains("'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', [")
+        {
+            return Err(format!(
+                "ES module line {}: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` contains spaces and must be double-quoted inside shell `exec(...)` or invoked via `execFileSync('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', [...args])`",
+                idx + 1
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Validates all source files in `workdir`, returning `Ok(())` or a combined diagnostic report.
@@ -1404,21 +2118,25 @@ fn is_umbrella_parent_directory(dir: &Path) -> bool {
     subdirs >= 2 && code_files == 0
 }
 
-fn exec_switch_workspace(cur_workdir: &Path, args: &Json) -> ToolExecOutcome {
-    let Some(raw_path) = args.get("path").and_then(Json::as_str) else {
-        return err_outcome("error: `switch_workspace` requires string argument `path`");
-    };
+pub fn resolve_safe_project_workdir(
+    cur_workdir: &Path,
+    raw_path: &str,
+    subfolder: Option<&str>,
+) -> Result<(PathBuf, bool), String> {
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
-        return err_outcome("error: `switch_workspace` `path` cannot be empty");
+        return Err("error: workspace `path` cannot be empty".to_string());
     }
 
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut candidate = if trimmed == "~" {
-        return err_outcome("error: cannot switch workspace directly to home directory; specify a project subfolder");
+        return Err(
+            "error: cannot switch workspace directly to home directory; specify a project subfolder"
+                .to_string(),
+        );
     } else if let Some(rest) = trimmed.strip_prefix("~/") {
         let Some(ref h) = home else {
-            return err_outcome("error: HOME is not set; provide an absolute path");
+            return Err("error: HOME is not set; provide an absolute path".to_string());
         };
         h.join(rest)
     } else {
@@ -1442,14 +2160,9 @@ fn exec_switch_workspace(cur_workdir: &Path, args: &Json) -> ToolExecOutcome {
         }
     };
 
-    if let Some(sub) = args
-        .get("subfolder")
-        .and_then(Json::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(sub) = subfolder.map(str::trim).filter(|s| !s.is_empty()) {
         if sub.contains("..") || sub.starts_with('/') {
-            return err_outcome("error: `subfolder` must be a clean child folder name without `..`");
+            return Err("error: `subfolder` must be a clean child folder name without `..`".to_string());
         }
         candidate = candidate.join(sub.trim_matches('/'));
     }
@@ -1473,11 +2186,14 @@ fn exec_switch_workspace(cur_workdir: &Path, args: &Json) -> ToolExecOutcome {
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect();
             if comps.is_empty() {
-                return err_outcome("error: cannot switch workspace directly to home directory; pass a child project directory");
+                return Err(
+                    "error: cannot switch workspace directly to home directory; pass a child project directory"
+                        .to_string(),
+                );
             }
             let first = comps[0].as_str();
             if first.starts_with('.') || first.eq_ignore_ascii_case("Library") {
-                return err_outcome(&format!(
+                return Err(format!(
                     "error: switching workspace into protected system/hidden folder `~/{first}` is not permitted"
                 ));
             }
@@ -1494,7 +2210,7 @@ fn exec_switch_workspace(cur_workdir: &Path, args: &Json) -> ToolExecOutcome {
                         | "Public"
                 )
             {
-                return err_outcome(&format!(
+                return Err(format!(
                     "error: `{}` is a top-level personal folder; pass a new or specific child project folder such as `{}/<project-folder>`",
                     norm.display(),
                     norm.display()
@@ -1509,14 +2225,14 @@ fn exec_switch_workspace(cur_workdir: &Path, args: &Json) -> ToolExecOutcome {
     };
 
     if !in_tmp && !in_safe_home {
-        return err_outcome(&format!(
+        return Err(format!(
             "error: workspace path `{}` must reside inside a project folder under the user home directory or /tmp",
             norm.display()
         ));
     }
 
     if is_umbrella_parent_directory(&norm) {
-        return err_outcome(&format!(
+        return Err(format!(
             "error: `{}` is an existing parent directory containing multiple folders; pass a new child project folder path such as `{}/<new-folder-name>` (or set `subfolder`)",
             norm.display(),
             norm.display()
@@ -1525,12 +2241,24 @@ fn exec_switch_workspace(cur_workdir: &Path, args: &Json) -> ToolExecOutcome {
 
     let existed = norm.exists();
     if let Err(e) = fs::create_dir_all(&norm) {
-        return err_outcome(&format!(
+        return Err(format!(
             "error creating workspace directory `{}`: {e}",
             norm.display()
         ));
     }
     let canon = norm.canonicalize().unwrap_or(norm);
+    Ok((canon, existed))
+}
+
+fn exec_switch_workspace(cur_workdir: &Path, args: &Json) -> ToolExecOutcome {
+    let Some(raw_path) = args.get("path").and_then(Json::as_str) else {
+        return err_outcome("error: `switch_workspace` requires string argument `path`");
+    };
+    let sub = args.get("subfolder").and_then(Json::as_str);
+    let (canon, existed) = match resolve_safe_project_workdir(cur_workdir, raw_path, sub) {
+        Ok(v) => v,
+        Err(e) => return err_outcome(&e),
+    };
     let file_count = list_workspace_files(&canon).len();
     let action_verb = if existed {
         "switched active workspace to"
@@ -1702,15 +2430,50 @@ fn attach_validation_status(
                 new_workdir: None,
             }
         }
-        Err(err) => ToolExecOutcome {
-            ok: true,
-            validation_ok: false,
-            validation_msg: err.clone(),
-            output: format!("{base_msg}\n[validation error in `{rel}`: {err} — fix with `edit_file` or `write_file`]"),
-            diff,
-            new_workdir: None,
-        },
+        Err(err) => {
+            let snippet = extract_validation_line_snippet(target, &err);
+            ToolExecOutcome {
+                ok: true,
+                validation_ok: false,
+                validation_msg: err.clone(),
+                output: format!(
+                    "{base_msg}\n[validation error in `{rel}`: {err} — fix with `edit_file` or `write_file`]{snippet}"
+                ),
+                diff,
+                new_workdir: None,
+            }
+        }
     }
+}
+
+fn extract_validation_line_snippet(target: &Path, err: &str) -> String {
+    let Some(pos) = err.find("line ") else {
+        return String::new();
+    };
+    let digits: String = err[pos + 5..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let Ok(line_no) = digits.parse::<usize>() else {
+        return String::new();
+    };
+    if line_no == 0 {
+        return String::new();
+    }
+    let Ok(src) = fs::read_to_string(target) else {
+        return String::new();
+    };
+    let all_lines: Vec<&str> = src.lines().collect();
+    if line_no > all_lines.len() {
+        return String::new();
+    }
+    let start = line_no.saturating_sub(1).max(1);
+    let end = (line_no + 1).min(all_lines.len());
+    let mut out = String::from("\nContext around offending line:");
+    for ln in start..=end {
+        out.push_str(&format!("\n  {ln}: {}", all_lines[ln - 1]));
+    }
+    out
 }
 
 fn relative_display_in_workdir(workdir: &Path, target: &Path, fallback: &str) -> String {
@@ -1749,13 +2512,54 @@ fn extract_plain_html_tag_inner(html: &str, tag: &str) -> Option<String> {
     }
 }
 
+fn strip_outer_markdown_code_fence(lower_rel: &str, raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("```") {
+        return None;
+    }
+    let first_nl = trimmed.find('\n')?;
+    let open_fence = trimmed[..first_nl].trim_end_matches('\r');
+    let lang = open_fence.strip_prefix("```")?.trim();
+    if !lang
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    let is_md_file = lower_rel.ends_with(".md") || lower_rel.ends_with(".markdown");
+    if is_md_file && !lang.eq_ignore_ascii_case("markdown") && !lang.eq_ignore_ascii_case("md") {
+        return None;
+    }
+    let body_and_close = &trimmed[first_nl + 1..];
+    let last_nl = body_and_close.rfind('\n')?;
+    if body_and_close[last_nl + 1..].trim() != "```" {
+        return None;
+    }
+    let mut inner = body_and_close[..last_nl].to_string();
+    inner.push('\n');
+    Some(inner)
+}
+
 fn exec_write_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
     let Some(rel) = args.get("path").and_then(Json::as_str) else {
         return err_outcome("error: `write_file` requires string argument `path`");
     };
     let Some(content) = args.get("content").and_then(Json::as_str) else {
-        return err_outcome("error: `write_file` requires string argument `content`");
+        return err_outcome(
+            "error: `write_file` requires string arguments `path` and `content` (pass full file text in `content`)",
+        );
     };
+    let lower_rel_check = rel.trim().trim_start_matches("./").to_ascii_lowercase();
+    if lower_rel_check == ".kronos_media" || lower_rel_check.starts_with(".kronos_media/") {
+        return err_outcome(
+            "error: `.kronos_media/` holds read-only attached reference files — call `write_file` on project source files (such as `styles/*.css`, `js/*.js`, `index.html`, or `tests/*.mjs`) instead",
+        );
+    }
+    if content.trim().is_empty() && !lower_rel_check.ends_with(".gitkeep") {
+        return err_outcome(&format!(
+            "error: refusing to write empty (0-byte) file `{rel}` — pass the complete non-empty source code in `write_file` `content` (write 2 to 3 complete files per step so output never truncates)"
+        ));
+    }
     let target = match resolve_jailed_path(workdir, rel) {
         Ok(p) => p,
         Err(e) => return err_outcome(&format!("error: {e}")),
@@ -1766,16 +2570,17 @@ fn exec_write_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
         }
     }
     let prev_opt = fs::read_to_string(&target).ok();
-    let mut final_content = content.to_string();
-    let mut sync_note = String::new();
     let lower_rel = rel.to_ascii_lowercase();
+    let mut final_content =
+        strip_outer_markdown_code_fence(&lower_rel, content).unwrap_or_else(|| content.to_string());
+    let mut sync_note = String::new();
     if lower_rel.ends_with(".html") || lower_rel.ends_with(".htm") {
         if let Some(prev) = &prev_opt {
             if let (Some(old_t), Some(old_h1), Some(new_t), Some(new_h1)) = (
                 extract_plain_html_tag_inner(prev, "title"),
                 extract_plain_html_tag_inner(prev, "h1"),
-                extract_plain_html_tag_inner(content, "title"),
-                extract_plain_html_tag_inner(content, "h1"),
+                extract_plain_html_tag_inner(&final_content, "title"),
+                extract_plain_html_tag_inner(&final_content, "h1"),
             ) {
                 if old_t != new_t && new_h1 == old_h1 && new_h1 != new_t {
                     let new_title_tag = format!("<title>{new_t}</title>");
@@ -1963,6 +2768,24 @@ fn exec_edit_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
         Ok(p) => p,
         Err(e) => return err_outcome(&format!("error: {e}")),
     };
+    if !old_text.trim().is_empty() && old_text == new_text {
+        let mut snippet = String::new();
+        if let Ok(existing) = fs::read_to_string(&target) {
+            if let Some(pos) = existing.find(old_text) {
+                let (ln, _) = line_col_at(&existing, pos, 1);
+                let all_lines: Vec<&str> = existing.lines().collect();
+                let s = ln.saturating_sub(1).max(1);
+                let e = (ln + 2).min(all_lines.len());
+                snippet.push_str("\nExact lines on disk at that location:");
+                for l in s..=e {
+                    snippet.push_str(&format!("\n  {l}: {}", all_lines[l - 1]));
+                }
+            }
+        }
+        return err_outcome(&format!(
+            "error: `edit_file` `new_text` is identical to `old_text` (no-op edit) — include the full line on disk in `old_text` and provide a different `new_text`, or rewrite cleanly with `write_file`{snippet}"
+        ));
+    }
     if old_text.trim().is_empty() {
         if new_text.trim().is_empty() {
             return err_outcome("error: `edit_file` `old_text` and `new_text` cannot both be empty");
@@ -2067,7 +2890,7 @@ fn exec_read_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
     let Some(rel) = args.get("path").and_then(Json::as_str) else {
         return err_outcome("error: `read_file` requires string argument `path`");
     };
-    let target = match resolve_jailed_path(workdir, rel) {
+    let target = match resolve_readable_path(workdir, rel) {
         Ok(p) => p,
         Err(e) => return err_outcome(&format!("error: {e}")),
     };
@@ -2263,6 +3086,251 @@ fn err_outcome(msg: &str) -> ToolExecOutcome {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ShellWordSpan {
+    start: usize,
+    end: usize,
+    unquoted: bool,
+    has_backslash: bool,
+}
+
+/// Automatically wraps unquoted space-containing filesystem paths that physically exist on disk
+/// (such as `/Users/.../Downloads/James Iroha Close 4.m4a` or `/Applications/Google Chrome.app/...`)
+/// in single quotes so `sh -c` does not split them on spaces.
+fn auto_quote_unquoted_existing_paths(workdir: &Path, cmd: &str) -> String {
+    if !cmd.contains(' ') {
+        return cmd.to_string();
+    }
+    let bytes = cmd.as_bytes();
+    let n = bytes.len();
+    let mut spans: Vec<ShellWordSpan> = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let b = bytes[i];
+        if b.is_ascii_whitespace() || matches!(b, b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b')') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut unquoted = true;
+        let mut has_backslash = false;
+        while i < n {
+            let c = bytes[i];
+            if c.is_ascii_whitespace() || matches!(c, b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b')') {
+                break;
+            }
+            if c == b'\'' {
+                unquoted = false;
+                i += 1;
+                while i < n && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                if i < n {
+                    i += 1;
+                }
+            } else if c == b'"' {
+                unquoted = false;
+                i += 1;
+                while i < n && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < n {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if i < n {
+                    i += 1;
+                }
+            } else if c == b'`' {
+                unquoted = false;
+                i += 1;
+                while i < n && bytes[i] != b'`' {
+                    if bytes[i] == b'\\' && i + 1 < n {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if i < n {
+                    i += 1;
+                }
+            } else if c == b'\\' && i + 1 < n {
+                has_backslash = true;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        spans.push(ShellWordSpan {
+            start,
+            end: i,
+            unquoted,
+            has_backslash,
+        });
+    }
+
+    if spans.len() < 2 {
+        return cmd.to_string();
+    }
+
+    let mut out = String::with_capacity(cmd.len() + 16);
+    let mut cursor = 0usize;
+    let mut idx = 0usize;
+    while idx < spans.len() {
+        let sp = spans[idx];
+        let tok = &cmd[sp.start..sp.end];
+        let mut matched: Option<(usize, String)> = None;
+        if sp.unquoted && !sp.has_backslash {
+            let (prefix, head, is_abs) =
+                if tok.starts_with('/') && tok.len() > 1 && !tok.starts_with("//") {
+                    ("", tok, true)
+                } else if let Some(eq_pos) = tok.find("=/") {
+                    let h = &tok[eq_pos + 1..];
+                    if h.len() > 1 && !h.starts_with("//") {
+                        (&tok[..eq_pos + 1], h, true)
+                    } else {
+                        ("", "", false)
+                    }
+                } else if !tok.starts_with('-') && idx > 0 {
+                    ("", tok, false)
+                } else {
+                    ("", "", false)
+                };
+
+            if !head.is_empty() {
+                let mut max_k = 0usize;
+                for k in 1..=8 {
+                    if idx + k >= spans.len() {
+                        break;
+                    }
+                    let prev = spans[idx + k - 1];
+                    let next = spans[idx + k];
+                    let sep = &cmd[prev.end..next.start];
+                    if !next.unquoted
+                        || next.has_backslash
+                        || sep.is_empty()
+                        || !sep.bytes().all(|b| b == b' ')
+                    {
+                        break;
+                    }
+                    max_k = k;
+                }
+                for k in (1..=max_k).rev() {
+                    let tail_end = spans[idx + k].end;
+                    let candidate = format!("{head}{}", &cmd[sp.end..tail_end]);
+                    let exists = if is_abs {
+                        Path::new(&candidate).exists()
+                    } else {
+                        workdir.join(&candidate).exists()
+                    };
+                    if exists {
+                        let escaped = candidate.replace('\'', "'\\''");
+                        matched = Some((idx + k, format!("{prefix}'{escaped}'")));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some((last_idx, replacement)) = matched {
+            out.push_str(&cmd[cursor..sp.start]);
+            out.push_str(&replacement);
+            cursor = spans[last_idx].end;
+            idx = last_idx + 1;
+        } else {
+            idx += 1;
+        }
+    }
+    if cursor == 0 {
+        return cmd.to_string();
+    }
+    out.push_str(&cmd[cursor..]);
+    out
+}
+
+/// Extracts third-party Python package roots (`mlx_audio`, `faster_whisper`, `PIL`, etc.) from a
+/// bare `python3 <script>.py` invocation and binds it to an indexed local `.venv/bin/python3`
+/// when `workdir` has no local `.venv` of its own.
+fn resolve_device_venv_python_command(workdir: &Path, cmd: &str) -> String {
+    let trimmed = cmd.trim_start();
+    let lead_ws = &cmd[..cmd.len() - trimmed.len()];
+    let (py_bin, after_py) = if let Some(rest) = trimmed.strip_prefix("python3 ") {
+        ("python3", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("python ") {
+        ("python", rest)
+    } else {
+        return cmd.to_string();
+    };
+    let after_trimmed = after_py.trim_start();
+    if after_trimmed.starts_with("-m py_compile")
+        || after_trimmed.starts_with("-m pip")
+        || workdir.join(".venv/bin/python3").is_file()
+    {
+        return cmd.to_string();
+    }
+    let mut py_source = String::new();
+    for tok in after_trimmed.split_whitespace() {
+        if tok == "-c" {
+            py_source.push_str(after_trimmed);
+            break;
+        }
+        if tok.starts_with('-') {
+            continue;
+        }
+        let clean = tok.trim_matches(|c| c == '\'' || c == '"');
+        if clean.ends_with(".py") {
+            if let Ok(full) = resolve_jailed_path(workdir, clean) {
+                if let Ok(src) = fs::read_to_string(&full) {
+                    py_source = src;
+                }
+            }
+        }
+        break;
+    }
+    if py_source.is_empty() {
+        return cmd.to_string();
+    }
+    const SPECIALIZED_PKGS: &[&str] = &[
+        "mlx_audio",
+        "faster_whisper",
+        "mlx",
+        "soundfile",
+        "librosa",
+        "scipy",
+        "moviepy",
+        "cv2",
+        "torch",
+    ];
+    let mut needed: Vec<String> = Vec::new();
+    for line in py_source.lines() {
+        let l = line.trim();
+        let mod_spec = if let Some(r) = l.strip_prefix("from ") {
+            r.split_whitespace().next()
+        } else if let Some(r) = l.strip_prefix("import ") {
+            r.split(|c: char| c.is_ascii_whitespace() || c == ',').next()
+        } else {
+            None
+        };
+        if let Some(m) = mod_spec {
+            let root = m.split('.').next().unwrap_or("").trim();
+            if SPECIALIZED_PKGS.iter().any(|p| p.eq_ignore_ascii_case(root))
+                && !needed.iter().any(|e| e.eq_ignore_ascii_case(root))
+            {
+                needed.push(root.to_string());
+            }
+        }
+    }
+    if needed.is_empty() {
+        return cmd.to_string();
+    }
+    if let Some(venv_py) = crate::device::global_device_manager().find_venv_python_for_packages(&needed) {
+        let rest_after_bin = &trimmed[py_bin.len()..];
+        let quoted_py = format!("'{}'", venv_py.replace('\'', "'\\''"));
+        return format!("{lead_ws}{quoted_py}{rest_after_bin}");
+    }
+    cmd.to_string()
+}
+
 /// Redirects stdout/stderr to a file rather than a pipe so backgrounded child processes do not block wait.
 pub fn run_shell_command_with_timeout(
     workdir: &Path,
@@ -2270,6 +3338,9 @@ pub fn run_shell_command_with_timeout(
     timeout_secs: u64,
     step_tag: usize,
 ) -> String {
+    let quoted_cmd = auto_quote_unquoted_existing_paths(workdir, cmd);
+    let normalized_cmd = resolve_device_venv_python_command(workdir, &quoted_cmd);
+    let cmd = normalized_cmd.as_str();
     let log_path = workdir.join(format!(".kronos_cmd_{}_{}.log", std::process::id(), step_tag));
     let out_file = match File::create(&log_path) {
         Ok(f) => f,
@@ -2283,10 +3354,20 @@ pub fn run_shell_command_with_timeout(
         }
     };
 
+    let inherited_path = std::env::var("PATH").unwrap_or_default();
+    let full_path = if inherited_path.contains("/opt/homebrew/bin") {
+        inherited_path
+    } else if inherited_path.is_empty() {
+        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string()
+    } else {
+        format!("/opt/homebrew/bin:/usr/local/bin:{inherited_path}")
+    };
+
     let mut child = match Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .current_dir(workdir)
+        .env("PATH", &full_path)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(err_file))
@@ -2326,7 +3407,7 @@ pub fn run_shell_command_with_timeout(
 
     let raw_out = fs::read(&log_path).unwrap_or_default();
     let _ = fs::remove_file(&log_path);
-    let text_out = truncate_utf8(&String::from_utf8_lossy(&raw_out), MAX_CMD_OUTPUT_BYTES);
+    let text_out = truncate_utf8_head_tail(&String::from_utf8_lossy(&raw_out), MAX_CMD_OUTPUT_BYTES);
 
     if timed_out {
         format!(
@@ -2334,10 +3415,18 @@ pub fn run_shell_command_with_timeout(
         )
     } else {
         let code = exit_code.unwrap_or(0);
-        if text_out.trim().is_empty() {
-            format!("exit_code={code} (no stdout/stderr)")
+        let py_inline_hint = if code != 0
+            && (cmd.contains("python -c") || cmd.contains("python3 -c"))
+            && (text_out.contains("SyntaxError") || cmd.contains("; for ") || cmd.contains("; with "))
+        {
+            "\n[hint: Python `-c` one-liners reject `; for` / `; with` compound statements after semicolons — use `write_file` to save a `.py` script file and execute `python3 <script>.py` with `run_command`]"
         } else {
-            format!("exit_code={code}\n{text_out}")
+            ""
+        };
+        if text_out.trim().is_empty() {
+            format!("exit_code={code} (no stdout/stderr){py_inline_hint}")
+        } else {
+            format!("exit_code={code}\n{text_out}{py_inline_hint}")
         }
     }
 }
@@ -2346,6 +3435,7 @@ pub fn run_shell_command_with_timeout(
 enum FilterMode {
     Normal,
     XmlTool,
+    XmlToolsBlock,
     FencedJsonTool,
 }
 
@@ -2420,6 +3510,8 @@ impl ProseStreamFilter {
     fn push(&mut self, piece: &str, mut on_prose: impl FnMut(&str) -> bool) -> bool {
         const OPEN: &str = "<tool_call>";
         const CLOSE: &str = "</tool_call>";
+        const OPEN_TOOLS: &str = "<tools>";
+        const CLOSE_TOOLS: &str = "</tools>";
         const FENCE: &str = "```json";
         self.buf.push_str(piece);
         loop {
@@ -2428,6 +3520,14 @@ impl ProseStreamFilter {
                 FilterMode::XmlTool => {
                     if let Some(end_rel) = tail.find(CLOSE) {
                         self.emitted += end_rel + CLOSE.len();
+                        self.mode = FilterMode::Normal;
+                    } else {
+                        break;
+                    }
+                }
+                FilterMode::XmlToolsBlock => {
+                    if let Some(end_rel) = tail.find(CLOSE_TOOLS) {
+                        self.emitted += end_rel + CLOSE_TOOLS.len();
                         self.mode = FilterMode::Normal;
                     } else {
                         break;
@@ -2452,9 +3552,13 @@ impl ProseStreamFilter {
                 }
                 FilterMode::Normal => {
                     let xml_pos = tail.find(OPEN);
+                    let tools_pos = tail.find(OPEN_TOOLS);
                     let fence_pos = tail.find(FENCE);
                     let brace_pos = find_line_start_brace(&self.buf, self.emitted);
-                    let earliest = [xml_pos, fence_pos, brace_pos].into_iter().flatten().min();
+                    let earliest = [xml_pos, tools_pos, fence_pos, brace_pos]
+                        .into_iter()
+                        .flatten()
+                        .min();
                     if let Some(open_rel) = xml_pos.filter(|&x| Some(x) == earliest) {
                         if open_rel > 0 {
                             let chunk = &self.buf[self.emitted..self.emitted + open_rel];
@@ -2464,6 +3568,15 @@ impl ProseStreamFilter {
                         }
                         self.emitted += open_rel + OPEN.len();
                         self.mode = FilterMode::XmlTool;
+                    } else if let Some(t_rel) = tools_pos.filter(|&x| Some(x) == earliest) {
+                        if t_rel > 0 {
+                            let chunk = &self.buf[self.emitted..self.emitted + t_rel];
+                            if !on_prose(chunk) {
+                                return false;
+                            }
+                        }
+                        self.emitted += t_rel + OPEN_TOOLS.len();
+                        self.mode = FilterMode::XmlToolsBlock;
                     } else if let Some(f_rel) = fence_pos.filter(|&x| Some(x) == earliest) {
                         if f_rel > 0 {
                             let chunk = &self.buf[self.emitted..self.emitted + f_rel];
@@ -2525,7 +3638,7 @@ impl ProseStreamFilter {
                         }
                     } else {
                         let mut hold = 0usize;
-                        for pat in [OPEN, FENCE] {
+                        for pat in [OPEN, OPEN_TOOLS, FENCE] {
                             let max_check = tail.len().min(pat.len() - 1);
                             for k in (1..=max_check).rev() {
                                 if tail.is_char_boundary(tail.len() - k)
@@ -2622,10 +3735,10 @@ fn extract_partial_json_str(haystack: &str, key: &str) -> Option<String> {
 }
 
 pub const UNIFIED_SYSTEM_PROMPT: &str = concat!(
-    "Your name is Kronos. You were created and built by Melody Leonard as a local multimodal software engineering and reasoning engine on Apple Silicon. ",
-    "When asked your name or who built or created you, answer directly that your name is Kronos and that you were built by Melody Leonard; never say you lack a name and never claim to be built by OpenAI, Alibaba, Qwen, Hugging Face, Anthropic, or any other third-party organization. ",
+    "Your name is Kronos. Melody Leonard (Melody Leonard Oparaugo) created and built you as a local multimodal software engineering and reasoning engine on Apple Silicon. ",
+    "Always speak in the first person as Kronos ('Melody Leonard built me') when asked your name or who built you, and know Melody Leonard's verified public profile: Melody Leonard (full name: Melody Leonard Oparaugo, pronouns: he/him/his) is a Senior Software Engineer and Systems Architect (not a musician or actor) with over 10 years of software engineering experience (@IPMScoutek). His GitHub is https://github.com/melodyLeonard (52+ public repos including kronos-2t, tshare, cross-native, gpt_2_tokenizer, tomatoe), his LinkedIn is https://www.linkedin.com/in/melody-leonard-a362b6192, his email is melodyleonard7@gmail.com, and his X handle is @Melody_Leonard7. He specializes in Rust, TypeScript, JavaScript, Elixir, Solidity, Node.js/NestJS, Kafka/CQRS/GraphQL/gRPC microservices, PostgreSQL/MongoDB/Neo4j/Redis internals, React/React Native offline-first architecture, and AWS/Kubernetes CI/CD. ",
     "For general questions, explanations, or analysis of attached PDFs, documents, CSVs, code snippets, or images that do not modify workspace files, reply directly and concisely from the inline context without calling tools. ",
-    "When a [Device Context] block is provided, answer using its exact local paths and watch history, and when `use_computer` is available and the user asks to open or control an application, file, folder, or URL on their Mac, call `use_computer` directly. ",
+    "Because Kronos runs locally on hardware owned by the user, never refuse queries about the user's own local messaging apps (WhatsApp, iMessage, Telegram, Slack, Notes), files, or past conversations with stock disclaimers; when a [Local Conversations & Memory] or [Device Context] block is provided, answer directly and accurately from its verified local records, and when `use_computer` is available and the user asks to open or control an application, file, folder, or URL on their Mac, call `use_computer` directly. ",
     "When asked to create a new folder or project inside another local directory on this Mac (such as ~/Documents/orgProj), call `switch_workspace` first with the full new child folder path to create and activate that project workspace, then call `write_file` to build the project files inside it. ",
     "When asked to build, edit, style, fix, inspect, or run files in the workspace, use the workspace tools (switch_workspace, write_file, edit_file, read_file, list_dir, search_files, run_command) directly on disk. ",
     "When building a website or web app, deliver a complete, styled, responsive page with modern CSS layout, navigation, domain-specific sections, and interactive UI rather than a minimal placeholder page. ",
@@ -2633,6 +3746,8 @@ pub const UNIFIED_SYSTEM_PROMPT: &str = concat!(
     "Check the Existing workspace files list below before calling edit_file: only call edit_file on files that exist on disk using exact existing lines, and use write_file for new files or full rewrites. ",
     "When updating a web page title or heading, update both <title> in <head> and the visible <h1> heading in <body> so the rendered preview shows the change immediately. ",
     "The live preview reloads automatically after every file edit, so never ask the user to refresh the preview; if the user reports a change is not visible, inspect and update the visible HTML or CSS elements directly. ",
+    "When asked to generate technical scripts, voice-cloned audio, or rendered video using local open-source tools, use the grounded Kronos engine documentation in [Device Context] (or call read_file on README.md and BENCHMARKS.md if not inlined) so every iteration (Iterations 1 through 8), mathematical equation, and benchmark comparison (Ollama, llama.cpp Q4_0/Q4_K_M/IQ4_XS/Q6_K, scalar VQ2 vs 8D Gosset E8 e8q2g128, generative judges vs Kronos-Jev) is exact, and execute cleanly in focused steps: first call write_file to save the complete spoken technical script (script.md >= 4.0 KB starting directly with '# ' plain markdown headings without wrapping content in outer triple-backtick code fences, covering all 8 Kronos iterations, formulas, and benchmark comparisons in full prose paragraphs rather than short bullet outlines); next call write_file to save one complete self-contained Python builder script (build_video.py with zero pass/TODO placeholders, using subprocess.run to run /opt/homebrew/bin/ffmpeg for extracting 12s raw_ref_16k.wav and raw_ref_24k.wav, loading raw_ref_16k.wav via wave + np.frombuffer into faster_whisper segs, _ = wm.transcribe(pcm), slicing raw_ref_24k.wav strictly to int(end_sec * 24000) int16 frames into ref_24k.wav so ref_24k.wav matches non-empty ref_text word-for-word, rendering 6 to 8 1920x1080 dark-slate PNG slides slides/slide_01.png..slide_0N.png with PIL.ImageDraw + /System/Library/Fonts/Helvetica.ttc + draw.textbbox, synthesizing one single-line symbol-free spoken English paragraph of 130 to 210 chars per slide via mlx_audio.tts.generate.generate_audio(..., ref_audio='ref_24k.wav', ref_text=ref_text, lang_code='en', temperature=0.55, top_p=0.9, repetition_penalty=1.05, output_path='audio', file_prefix=f'seg_{idx:02d}', audio_format='wav', join_audio=True), ASR-verifying EVERY audio/seg_XX.wav with faster_whisper checking overall word_recall >= 0.72 and both first_half_recall >= 0.65 and second_half_recall >= 0.65 with temperature=0.4 retry, writing audio/coherence_report.json, muxing segments/seg_XX.mp4, and concatenating into workspace-root kronos_explained.mp4); then run build_video.py with the matched .venv python3 via run_command and verify kronos_explained.mp4 with /opt/homebrew/bin/ffprobe before summarizing. ",
+    "On multi-step modularization, refactoring, styling, or self-testing tasks, write 2 to 4 complete non-empty files per step using write_file <tool_call> blocks (never write 0-byte empty stubs and never paste file contents inside Markdown code fences in prose) so every tool call closes cleanly within max_tokens, and keep iterating with tool calls until every module is created and wired up, inline monolith blocks are extracted, requested visual styles and interactive behaviors are complete, and you have written and executed an automated verification command via run_command (fixing any non-zero exit or assertion failure before summarizing). ",
     "If a tool response reports an error or validation failure, fix it with a tool call immediately before finishing."
 );
 
@@ -2771,16 +3886,27 @@ pub fn compact_messages_with_budget(
         };
     }
 
-    // Group non-system messages into user-anchored atomic turns so tool_calls/tool_results never split.
+    // Group non-system messages into genuine user-anchored atomic turns so synthetic intra-turn
+    // harness prompts (`[Repair Required`, `[Workspace Progress Checkpoint`) never cause the active
+    // user request (`[Device Context]`, `[Attached Image]`) to be compacted away as an older turn.
+    let is_synthetic_harness_user = |content: &str| -> bool {
+        let t = content.trim_start();
+        t.starts_with("[Repair Required")
+            || t.starts_with("[Workspace Progress Checkpoint")
+            || t.starts_with(COMPACTED_MEMORY_HEADER)
+    };
     let mut group_starts: Vec<usize> = Vec::new();
     for (i, m) in history.iter().enumerate().skip(sys_offset) {
-        if m.role == "user" || group_starts.is_empty() {
+        let starts_real_turn = m.role == "user" && !is_synthetic_harness_user(&m.content);
+        if starts_real_turn || group_starts.is_empty() {
             group_starts.push(i);
         }
     }
 
     let total_groups = group_starts.len();
-    let ends_with_open_user = history.last().is_some_and(|m| m.role == "user");
+    let ends_with_open_user = history
+        .last()
+        .is_some_and(|m| m.role == "user" && !is_synthetic_harness_user(&m.content));
     let mut compacted_messages = 0usize;
 
     let min_groups_for_inter = if force { 2 } else { 3 };
@@ -2899,41 +4025,125 @@ pub fn compact_messages_with_budget(
         }
     }
 
-    // Intra-turn pass: if history still exceeds budget (e.g., one long multi-step turn), slim older tool steps.
+    // Intra-turn pass: if one long multi-step turn exceeds budget, fold older completed
+    // `(assistant(tool_calls), tool(results)...)` step batches into a plain-text progress checkpoint
+    // right after the active `user` turn while keeping `history[0..=active_user_idx]` verbatim
+    // (preserving the hot KV prefix) and keeping the recent tail tool calls 100% uncorrupted
+    // (never rewriting `<tool_call>` JSON arguments to synthetic keys).
     let mid_tokens = count_fn(history);
     if (force && compacted_messages == 0) || mid_tokens > threshold_tokens {
-        let protect_tail = 4usize;
-        let stop_at = history.len().saturating_sub(protect_tail);
-        for m in history.iter_mut().take(stop_at).skip(sys_offset) {
-            if m.role == "assistant" && !m.tool_calls.is_empty() {
-                for tc in &mut m.tool_calls {
-                    if matches!(tc.name.as_str(), "write_file" | "edit_file") && tc.arguments.len() > 260 {
-                        let path = Json::parse(&tc.arguments)
+        let active_user_idx = history
+            .iter()
+            .enumerate()
+            .skip(sys_offset)
+            .rev()
+            .find(|(_, m)| m.role == "user" && !is_synthetic_harness_user(&m.content))
+            .map(|(i, _)| i)
+            .unwrap_or(sys_offset);
+        for protect_tail in [6usize, 2, 0] {
+            let raw_stop = history.len().saturating_sub(protect_tail);
+            if raw_stop <= active_user_idx + 1 {
+                continue;
+            }
+            // Align `split_idx` to an `assistant` message boundary so `(assistant, tool...)` batches
+            // and ChatML role alternation stay intact, backing up to the most recent `assistant`
+            // step when `raw_stop` lands inside multi-tool `tool` responses.
+            let mut split_idx = raw_stop;
+            while split_idx < history.len() && history[split_idx].role != "assistant" {
+                split_idx += 1;
+            }
+            if protect_tail > 0 && split_idx >= history.len() {
+                let mut back = raw_stop;
+                while back > active_user_idx + 1 && history[back].role != "assistant" {
+                    back -= 1;
+                }
+                if back > active_user_idx + 1 && history[back].role == "assistant" {
+                    split_idx = back;
+                } else {
+                    continue;
+                }
+            }
+            if split_idx <= active_user_idx + 1 {
+                continue;
+            }
+            let mut completed_steps: Vec<String> = Vec::new();
+            for m in &history[active_user_idx + 1..split_idx] {
+                if m.role == "user" && m.content.starts_with("[Workspace Progress Checkpoint") {
+                    for ln in m.content.lines() {
+                        if ln.starts_with("- ") && completed_steps.len() < 32 {
+                            completed_steps.push(ln.to_string());
+                        }
+                    }
+                } else if m.role == "assistant" && !m.tool_calls.is_empty() {
+                    for tc in &m.tool_calls {
+                        let target = Json::parse(&tc.arguments)
                             .ok()
-                            .and_then(|j| j.get("path").and_then(Json::as_str).map(str::to_string))
-                            .unwrap_or_else(|| "file".to_string());
-                        let orig_len = tc.arguments.len();
-                        tc.arguments = format!(
-                            r#"{{"path":{},"compacted_bytes":{orig_len}}}"#,
-                            quote(&path)
-                        );
-                        compacted_messages += 1;
+                            .and_then(|j| {
+                                j.get("path")
+                                    .or_else(|| j.get("cmd"))
+                                    .or_else(|| j.get("pattern"))
+                                    .and_then(Json::as_str)
+                                    .map(|s| summarize_single_line(s, 48))
+                            })
+                            .unwrap_or_default();
+                        if target.is_empty() {
+                            completed_steps.push(format!("- executed `{}`", tc.name));
+                        } else {
+                            completed_steps.push(format!("- executed `{}` on `{target}`", tc.name));
+                        }
                     }
                 }
-            } else if m.role == "tool" && m.content.len() > 260 {
-                let first = m.content.lines().next().unwrap_or("ok");
-                m.content = format!(
-                    "{}\n[compacted earlier step output; current workspace state is on disk]",
-                    summarize_single_line(first, 140)
-                );
-                compacted_messages += 1;
+            }
+            let disk_files = summarize_workspace_files_brief(workdir);
+            let mut checkpoint_user = String::from(
+                "[Workspace Progress Checkpoint — earlier steps in this turn are already applied on disk]\n",
+            );
+            for s in completed_steps.iter().take(28) {
+                checkpoint_user.push_str(s);
+                checkpoint_user.push('\n');
+            }
+            checkpoint_user.push_str(&format!(
+                "Current workspace files on disk: {disk_files}\n"
+            ));
+            for entry in list_workspace_files(workdir) {
+                if !entry.validation_ok && entry.bytes <= 8192 {
+                    if let Ok(full) = resolve_jailed_path(workdir, &entry.path) {
+                        if let Ok(src) = fs::read_to_string(&full) {
+                            checkpoint_user.push_str(&format!(
+                                "File `{}` on disk currently has validation error ({}):\n{}\n",
+                                entry.path, entry.validation_msg, src
+                            ));
+                        }
+                    }
+                }
+            }
+            checkpoint_user.push_str(
+                "Continue completing and testing any remaining requirements using valid workspace tool calls (`write_file` requires both `path` and full `content`).",
+            );
+
+            let mut rebuilt =
+                Vec::with_capacity((active_user_idx + 1) + 2 + (history.len() - split_idx));
+            rebuilt.extend_from_slice(&history[..=active_user_idx]);
+            rebuilt.push(Message::new(
+                "assistant",
+                "Earlier workspace files and edits are saved on disk; continuing remaining steps.",
+            ));
+            rebuilt.push(Message::new("user", &checkpoint_user));
+            rebuilt.extend_from_slice(&history[split_idx..]);
+
+            let cand_tokens = count_fn(&rebuilt);
+            if cand_tokens + 64 < mid_tokens {
+                let folded = split_idx.saturating_sub(active_user_idx + 1);
+                compacted_messages += folded;
+                *history = rebuilt;
+                break;
             }
         }
     }
 
     let after_tokens = count_fn(history);
     CompactionReport {
-        compacted: compacted_messages > 0 && after_tokens < before_tokens,
+        compacted: compacted_messages > 0 && (force || after_tokens + 64 < before_tokens),
         before_tokens,
         after_tokens,
         compacted_messages,
@@ -2948,13 +4158,18 @@ pub fn compact_conversation_history(
     force: bool,
 ) -> CompactionReport {
     let ctx = model.context_size();
-    // Auto-compact once prompt reaches ~68% of context window so multi-step decode always has ample KV room.
-    let threshold = (ctx * 68) / 100;
+    // Keep hot KV prefix intact while guaranteeing >= 3,200 tokens of generation headroom on 16k context.
+    let threshold = if ctx >= 8192 {
+        ((ctx * 80) / 100).min(ctx.saturating_sub(3200))
+    } else {
+        (ctx * 74) / 100
+    };
     compact_messages_with_budget(history, workdir, force, threshold, |msgs| {
         model.count_prompt_tokens(msgs, tools_json)
     })
 }
 
+#[cfg(not(target_os = "ios"))]
 fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -3334,6 +4549,7 @@ fn verify_local_imports_and_anti_stubs(
     }
 }
 
+#[cfg(not(target_os = "ios"))]
 fn verify_web_headless_dom_runtime(
     workdir: &Path,
     modified_files: &[String],
@@ -3358,19 +4574,23 @@ fn verify_web_headless_dom_runtime(
     };
 
     let harness = concat!(
-        "const fs=require('fs'),path=require('path'),vm=require('vm');",
+        "const fs=require('fs'),path=require('path'),vm=require('vm'),{pathToFileURL}=require('url');",
+        "const realErr=s=>process.stderr.write(String(s)+'\\n');",
         "const htmlPath=process.argv[1];",
         "const html=fs.readFileSync(htmlPath,'utf8');",
-        "const base=path.dirname(htmlPath);",
+        "const base=path.dirname(path.resolve(htmlPath));",
         "const re=/<script\\b([^>]*)\\bsrc\\s*=\\s*[\"']([^\"']+)[\"'][^>]*>/gi;",
-        "const scripts=[];let m;",
+        "const scripts=[],modules=[];let m;",
         "while((m=re.exec(html))!==null){",
         "const attrs=(m[1]||'').toLowerCase();const src=m[2].split(/[?#]/)[0];",
-        "if(attrs.includes('module')||/^(https?:|\\/\\/)/i.test(src))continue;",
+        "if(/^(https?:|\\/\\/)/i.test(src))continue;",
         "const fp=path.resolve(base,src);",
-        "if(fs.existsSync(fp)&&fs.statSync(fp).isFile())scripts.push([src,fs.readFileSync(fp,'utf8')]);",
+        "if(!fs.existsSync(fp)||!fs.statSync(fp).isFile())continue;",
+        "const code=fs.readFileSync(fp,'utf8');",
+        "if(attrs.includes('module')||/^\\s*(import|export)\\b/m.test(code))modules.push([src,fp,code]);",
+        "else scripts.push([src,code]);",
         "}",
-        "if(!scripts.length)process.exit(0);",
+        "if(!scripts.length&&!modules.length)process.exit(0);",
         "function mkEl(){let p;const fn=function(){return p;};",
         "p=new Proxy(fn,{get(_t,k){",
         "if(k===Symbol.toPrimitive)return()=>'';",
@@ -3378,6 +4598,8 @@ fn verify_web_headless_dom_runtime(
         "if(k==='length')return 0;",
         "if(k==='checked'||k==='disabled')return false;",
         "if(k==='value'||k==='textContent'||k==='innerHTML'||k==='id'||k==='className')return '';",
+        "if(k==='getAttribute'||k==='closest')return()=>null;",
+        "if(k==='matches')return()=>false;",
         "if(k==='dataset'||k==='style')return new Proxy({},{get:()=>'',set:()=>true});",
         "if(k==='classList')return{add(){},remove(){},toggle(){return false;},contains(){return false;}};",
         "if(k==='getBoundingClientRect')return()=>({width:800,height:600,top:0,left:0,right:800,bottom:600});",
@@ -3386,15 +4608,17 @@ fn verify_web_headless_dom_runtime(
         "const rootEl=mkEl();const store=new Map();",
         "const storage={getItem:k=>store.has(k)?store.get(k):null,setItem:(k,v)=>{store.set(String(k),String(v));},removeItem:k=>store.delete(k),clear:()=>store.clear()};",
         "const cbs=[];",
+        "const addEv=(ev,cb)=>{if((ev==='DOMContentLoaded'||ev==='load')&&typeof cb==='function')cbs.push(cb);};",
         "const doc=new Proxy({body:rootEl,documentElement:rootEl,head:rootEl,readyState:'complete',",
         "getElementById:()=>mkEl(),querySelector:()=>mkEl(),querySelectorAll:()=>[],createElement:()=>mkEl(),createTextNode:()=>mkEl(),createDocumentFragment:()=>mkEl(),",
-        "addEventListener:(ev,cb)=>{if(ev==='DOMContentLoaded'&&typeof cb==='function')cbs.push(cb);}},",
+        "addEventListener:addEv,removeEventListener(){}},",
         "{get(t,k){return k in t?t[k]:mkEl();},set(t,k,v){t[k]=v;return true;}});",
         "const ctx={console:{log(){},warn(){},error(){},info(){}},setTimeout:()=>1,clearTimeout(){},setInterval:()=>1,clearInterval(){},",
         "requestAnimationFrame:()=>1,cancelAnimationFrame(){},fetch:()=>Promise.resolve({ok:true,json:async()=>({}),text:async()=>''}),",
         "localStorage:storage,sessionStorage:storage,navigator:{clipboard:{writeText:async()=>{}},userAgent:'KronosCheck'},",
         "location:{href:'http://127.0.0.1/',pathname:'/',search:'',hash:'',reload(){}},history:{pushState(){},replaceState(){}},",
         "matchMedia:()=>({matches:false,addEventListener(){},removeEventListener(){}}),",
+        "addEventListener:addEv,removeEventListener(){},",
         "Event:class{constructor(t){this.type=t;}preventDefault(){}stopPropagation(){}},",
         "CustomEvent:class{constructor(t,o){this.type=t;this.detail=o&&o.detail;}},",
         "IntersectionObserver:class{observe(){}unobserve(){}disconnect(){}},",
@@ -3404,10 +4628,19 @@ fn verify_web_headless_dom_runtime(
         "ctx.window=ctx;ctx.globalThis=ctx;ctx.self=ctx;",
         "const box=vm.createContext(ctx);",
         "for(const[name,code]of scripts){",
-        "if(/^\\s*(import|export)\\b/m.test(code))continue;",
-        "vm.runInContext(code,box,{filename:name,timeout:600});",
+        "vm.runInContext(code,box,{filename:name,timeout:800});",
         "}",
-        "for(const cb of cbs){cb({type:'DOMContentLoaded',target:doc,preventDefault(){}});}"
+        "(async()=>{",
+        "if(modules.length){",
+        "for(const[k,v]of Object.entries(ctx)){if(k==='globalThis')continue;try{Object.defineProperty(globalThis,k,{value:v,configurable:true,writable:true});}catch(_){}}",
+        "globalThis.window=globalThis;globalThis.self=globalThis;",
+        "for(const[_name,fp,code]of modules){",
+        "if(/\\bfrom\\s+['\"]https?:\\/\\//i.test(code))continue;",
+        "await import(pathToFileURL(fp).href);",
+        "}",
+        "}",
+        "for(const cb of cbs){cb({type:'DOMContentLoaded',target:doc,preventDefault(){}});}",
+        "})().catch(e=>{realErr(e&&e.stack||e);process.exit(1);});"
     );
     let cmd = format!(
         "if command -v node >/dev/null 2>&1; then node -e {} {}; fi",
@@ -3451,83 +4684,88 @@ pub fn verify_workspace_work(
         Err(e) => errors.push(e),
     }
 
-    let mut js_checked = 0usize;
-    let mut py_checked = 0usize;
-    let mut sh_checked = 0usize;
-    let mut check_rust = false;
+    #[cfg(not(target_os = "ios"))]
+    {
+        let mut js_checked = 0usize;
+        let mut py_checked = 0usize;
+        let mut sh_checked = 0usize;
+        let mut check_rust = false;
 
-    for rel in modified_files {
-        let lower = rel.to_ascii_lowercase();
-        let Ok(full) = resolve_jailed_path(workdir, rel) else {
-            continue;
-        };
-        if !full.is_file() {
-            continue;
+        for rel in modified_files {
+            let lower = rel.to_ascii_lowercase();
+            let Ok(full) = resolve_jailed_path(workdir, rel) else {
+                continue;
+            };
+            if !full.is_file() {
+                continue;
+            }
+            if lower.ends_with(".js") || lower.ends_with(".mjs") {
+                let cmd = format!(
+                    "if command -v node >/dev/null 2>&1; then node --check {}; fi",
+                    shell_single_quote(rel)
+                );
+                let out = run_shell_command_with_timeout(workdir, &cmd, 5, 9100 + js_checked);
+                if !out.starts_with("exit_code=0") {
+                    errors.push(format!("`{rel}` V8 syntax check failed:\n{out}"));
+                } else {
+                    js_checked += 1;
+                }
+            } else if lower.ends_with(".py") {
+                let cmd = format!(
+                    "if command -v python3 >/dev/null 2>&1; then python3 -m py_compile {}; fi",
+                    shell_single_quote(rel)
+                );
+                let out = run_shell_command_with_timeout(workdir, &cmd, 5, 9200 + py_checked);
+                if !out.starts_with("exit_code=0") {
+                    errors.push(format!("`{rel}` python3 compile check failed:\n{out}"));
+                } else {
+                    py_checked += 1;
+                }
+            } else if lower.ends_with(".sh") {
+                let cmd = format!("sh -n {}", shell_single_quote(rel));
+                let out = run_shell_command_with_timeout(workdir, &cmd, 5, 9300 + sh_checked);
+                if !out.starts_with("exit_code=0") {
+                    errors.push(format!("`{rel}` shell syntax check failed:\n{out}"));
+                } else {
+                    sh_checked += 1;
+                }
+            } else if lower.ends_with(".rs") || lower == "cargo.toml" {
+                check_rust = true;
+            }
         }
-        if lower.ends_with(".js") || lower.ends_with(".mjs") {
-            let cmd = format!(
-                "if command -v node >/dev/null 2>&1; then node --check {}; fi",
-                shell_single_quote(rel)
-            );
-            let out = run_shell_command_with_timeout(workdir, &cmd, 5, 9100 + js_checked);
-            if !out.starts_with("exit_code=0") {
-                errors.push(format!("`{rel}` V8 syntax check failed:\n{out}"));
-            } else {
-                js_checked += 1;
-            }
-        } else if lower.ends_with(".py") {
-            let cmd = format!(
-                "if command -v python3 >/dev/null 2>&1; then python3 -m py_compile {}; fi",
-                shell_single_quote(rel)
-            );
-            let out = run_shell_command_with_timeout(workdir, &cmd, 5, 9200 + py_checked);
-            if !out.starts_with("exit_code=0") {
-                errors.push(format!("`{rel}` python3 compile check failed:\n{out}"));
-            } else {
-                py_checked += 1;
-            }
-        } else if lower.ends_with(".sh") {
-            let cmd = format!("sh -n {}", shell_single_quote(rel));
-            let out = run_shell_command_with_timeout(workdir, &cmd, 5, 9300 + sh_checked);
-            if !out.starts_with("exit_code=0") {
-                errors.push(format!("`{rel}` shell syntax check failed:\n{out}"));
-            } else {
-                sh_checked += 1;
-            }
-        } else if lower.ends_with(".rs") || lower == "cargo.toml" {
-            check_rust = true;
-        }
-    }
 
-    if js_checked > 0 {
-        details.push(format!("V8 `node --check` passed ({js_checked} file(s))"));
-    }
-    if errors.is_empty() {
-        match verify_web_headless_dom_runtime(workdir, modified_files) {
-            Ok(Some(note)) => details.push(note),
-            Ok(None) => {}
-            Err(e) => errors.push(e),
+        if js_checked > 0 {
+            details.push(format!("V8 `node --check` passed ({js_checked} file(s))"));
+        }
+        if errors.is_empty() {
+            match verify_web_headless_dom_runtime(workdir, modified_files) {
+                Ok(Some(note)) => details.push(note),
+                Ok(None) => {}
+                Err(e) => errors.push(e),
+            }
+        }
+        if py_checked > 0 {
+            details.push(format!("`python3 -m py_compile` passed ({py_checked} file(s))"));
+        }
+        if sh_checked > 0 {
+            details.push(format!("`sh -n` passed ({sh_checked} file(s))"));
+        }
+        if check_rust && workdir.join("Cargo.toml").is_file() {
+            let out = run_shell_command_with_timeout(
+                workdir,
+                "if command -v cargo >/dev/null 2>&1; then cargo check --quiet; fi",
+                timeout_secs.clamp(5, 30),
+                9400,
+            );
+            if !out.starts_with("exit_code=0") {
+                errors.push(format!("`cargo check` failed:\n{out}"));
+            } else {
+                details.push("`cargo check` passed".to_string());
+            }
         }
     }
-    if py_checked > 0 {
-        details.push(format!("`python3 -m py_compile` passed ({py_checked} file(s))"));
-    }
-    if sh_checked > 0 {
-        details.push(format!("`sh -n` passed ({sh_checked} file(s))"));
-    }
-    if check_rust && workdir.join("Cargo.toml").is_file() {
-        let out = run_shell_command_with_timeout(
-            workdir,
-            "if command -v cargo >/dev/null 2>&1; then cargo check --quiet; fi",
-            timeout_secs.clamp(5, 30),
-            9400,
-        );
-        if !out.starts_with("exit_code=0") {
-            errors.push(format!("`cargo check` failed:\n{out}"));
-        } else {
-            details.push("`cargo check` passed".to_string());
-        }
-    }
+    #[cfg(target_os = "ios")]
+    let _ = timeout_secs;
 
     if !errors.is_empty() {
         return Err(errors.join("\n"));
@@ -3602,18 +4840,162 @@ impl WorkspaceCheckpoint {
 
 fn strip_injected_prompt_headers(user_content: &str) -> &str {
     let mut cur = user_content.trim();
-    for marker in [
-        "[Device Context",
-        "[Workspace Context Snapshot",
-        "[Attached ",
-    ] {
-        if cur.starts_with(marker) {
-            if let Some(idx) = cur.find("\n\n") {
-                cur = cur[idx + 2..].trim();
+    loop {
+        let mut stripped_any = false;
+        for (marker, closer) in [
+            ("[Device Context", Some("[/Device Context]")),
+            ("[Workspace Context Snapshot", Some("[/Workspace Context Snapshot]")),
+            ("[Attached Image", Some("[/Attached Image]")),
+            ("[Attached ", None),
+            ("[Local Conversations", None),
+        ] {
+            if cur.starts_with(marker) {
+                if let Some(close_tag) = closer {
+                    if let Some(end) = cur.find(close_tag) {
+                        cur = cur[end + close_tag.len()..].trim();
+                        stripped_any = true;
+                        continue;
+                    }
+                }
+                if let Some(idx) = cur.find("\n\n") {
+                    cur = cur[idx + 2..].trim();
+                    stripped_any = true;
+                }
             }
+        }
+        if !stripped_any {
+            break;
         }
     }
     cur
+}
+
+fn append_repair_directive_to_history(
+    history: &mut Vec<Message>,
+    assistant_text: &str,
+    directive: &str,
+) {
+    // Replace any immediately preceding stalled repair pair in-place so repeated repair prompts
+    // never stack duplicate assistant turns into few-shot history while keeping strict
+    // `user/tool -> assistant -> user` ChatML alternation outside `<tool_response>`.
+    if history.len() >= 2
+        && history[history.len() - 1].role == "user"
+        && history[history.len() - 1]
+            .content
+            .starts_with("[Repair Required")
+        && history[history.len() - 2].role == "assistant"
+        && history[history.len() - 2].tool_calls.is_empty()
+    {
+        history.truncate(history.len() - 2);
+    }
+
+    let first_clean_line = assistant_text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("```") && !l.starts_with('<'))
+        .unwrap_or("Inspecting remaining workspace verification items.");
+    let mut brief = String::new();
+    for ch in first_clean_line.chars().take(140) {
+        brief.push(ch);
+    }
+    if history
+        .last()
+        .is_some_and(|m| m.role == "user" || m.role == "tool")
+    {
+        history.push(Message::new("assistant", &brief));
+    }
+    history.push(Message::new("user", directive));
+}
+
+fn summarize_workspace_files_brief(workdir: &Path) -> String {
+    let files: Vec<String> = list_workspace_files(workdir)
+        .into_iter()
+        .filter(|e| !e.path.starts_with(".kronos_media/"))
+        .take(24)
+        .map(|e| format!("{} ({} B)", e.path, e.bytes))
+        .collect();
+    if files.is_empty() {
+        "none yet".to_string()
+    } else {
+        files.join(", ")
+    }
+}
+
+fn is_verification_or_test_command(cmd: &str) -> bool {
+    let lower = cmd.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let active_runners = [
+        "node ",
+        "python",
+        "pytest",
+        "cargo ",
+        "npm ",
+        "npx ",
+        "bun ",
+        "deno ",
+        "sh ",
+        "bash ",
+        "zsh ",
+        "./",
+        "curl ",
+        "google chrome",
+        "playwright",
+        "puppeteer",
+        "test",
+        "verify",
+        "check",
+    ];
+    active_runners.iter().any(|r| lower.contains(r))
+}
+
+fn exec_spawn_agent(
+    cur_workdir: &Path,
+    raw_args: &str,
+    spawner: Option<&SubAgentSpawner>,
+) -> ToolExecOutcome {
+    let Some(spawn_fn) = spawner else {
+        return err_outcome("error: `spawn_agent` is only available inside the multi-task server runtime");
+    };
+    let args = match Json::parse(raw_args) {
+        Ok(j) => j,
+        Err(e) => return err_outcome(&format!("error parsing `spawn_agent` JSON arguments: {e}")),
+    };
+    let Some(raw_wd) = args.get("workdir").and_then(Json::as_str) else {
+        return err_outcome("error: `spawn_agent` requires string argument `workdir`");
+    };
+    let Some(task) = args.get("task").and_then(Json::as_str) else {
+        return err_outcome("error: `spawn_agent` requires string argument `task`");
+    };
+    if task.trim().is_empty() {
+        return err_outcome("error: `spawn_agent` `task` prompt cannot be empty");
+    }
+    let label = args.get("label").and_then(Json::as_str).unwrap_or("");
+    let wait = args.get("wait").and_then(Json::as_bool).unwrap_or(false);
+    let (canon_wd, _) = match resolve_safe_project_workdir(cur_workdir, raw_wd, None) {
+        Ok(v) => v,
+        Err(e) => return err_outcome(&e),
+    };
+    match spawn_fn(&canon_wd, label, task.trim(), wait) {
+        Ok(msg) => ok_outcome(msg),
+        Err(e) => err_outcome(&format!("error spawning worker agent: {e}")),
+    }
+}
+
+fn extract_tail_lines(text: &str, max_lines: usize, max_bytes: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    let joined = lines[start..].join("\n");
+    if joined.len() <= max_bytes {
+        joined
+    } else {
+        let mut cut = joined.len().saturating_sub(max_bytes);
+        while cut < joined.len() && !joined.is_char_boundary(cut) {
+            cut += 1;
+        }
+        format!("...{}", &joined[cut..])
+    }
 }
 
 /// Runs an iterative tool-calling and Jev-verified monotonic repair loop while preserving the KV-cache prefix.
@@ -3622,6 +5004,53 @@ pub fn run_agent_turn(
     history: &mut Vec<Message>,
     tools_json: &[String],
     cfg: &AgentTurnConfig,
+    on_event: impl FnMut(AgentEvent<'_>) -> bool,
+) -> Result<String, String> {
+    let mut slot = Some(model);
+    run_agent_turn_inner(
+        |f| {
+            if let Some(ref mut m) = slot {
+                f(m);
+            }
+        },
+        history,
+        tools_json,
+        cfg,
+        None,
+        on_event,
+    )
+}
+
+/// Runs `run_agent_turn` acquiring `model_lock` strictly per forward-pass step and releasing it
+/// during file I/O, shell execution, and workspace verification so multiple concurrent Kronos
+/// worker agents interleave GPU inference and OS tool execution without blocking one another.
+pub fn run_agent_turn_shared_with_spawner(
+    model_lock: &std::sync::Mutex<ChatModel>,
+    history: &mut Vec<Message>,
+    tools_json: &[String],
+    cfg: &AgentTurnConfig,
+    spawner: Option<&SubAgentSpawner>,
+    on_event: impl FnMut(AgentEvent<'_>) -> bool,
+) -> Result<String, String> {
+    run_agent_turn_inner(
+        |f| {
+            let mut guard = model_lock.lock().unwrap_or_else(|p| p.into_inner());
+            f(&mut guard);
+        },
+        history,
+        tools_json,
+        cfg,
+        spawner,
+        on_event,
+    )
+}
+
+fn run_agent_turn_inner(
+    mut with_model: impl FnMut(&mut dyn FnMut(&mut ChatModel)),
+    history: &mut Vec<Message>,
+    tools_json: &[String],
+    cfg: &AgentTurnConfig,
+    spawner: Option<&SubAgentSpawner>,
     mut on_event: impl FnMut(AgentEvent<'_>) -> bool,
 ) -> Result<String, String> {
     let mut active_workdir = cfg.workdir.clone();
@@ -3644,7 +5073,8 @@ pub fn run_agent_turn(
     let history_used_tools = history
         .iter()
         .any(|m| m.role == "tool" || !m.tool_calls.is_empty());
-    let has_images = raw_last_user.contains("[Image Attachment")
+    let has_images = raw_last_user.contains("[Attached Image")
+        || raw_last_user.contains("[Image Attachment")
         || raw_last_user.contains(".kronos_media/");
     let allow_computer = crate::device::global_device_manager()
         .current_config()
@@ -3659,18 +5089,22 @@ pub fn run_agent_turn(
         None
     };
 
-    let jev_plan = crate::jev::plan_turn_with_jev(
-        Some(model),
-        &sys_prompt_snapshot,
-        &clean_user_goal,
-        forced_route,
-        has_images,
-        &active_workdir,
-        history_used_tools,
-        tools_json,
-        allow_computer,
-        recent_has_prefetch,
-    );
+    let mut jev_plan_opt = None;
+    with_model(&mut |model| {
+        jev_plan_opt = Some(crate::jev::plan_turn_with_jev(
+            Some(model),
+            &sys_prompt_snapshot,
+            &clean_user_goal,
+            forced_route,
+            has_images,
+            &active_workdir,
+            history_used_tools,
+            tools_json,
+            allow_computer,
+            recent_has_prefetch,
+        ));
+    });
+    let jev_plan = jev_plan_opt.ok_or_else(|| "model unavailable".to_string())?;
     if !on_event(AgentEvent::JevDecision { plan: &jev_plan }) {
         return Err("cancelled".to_string());
     }
@@ -3685,19 +5119,35 @@ pub fn run_agent_turn(
         &jev_plan.active_tools_json
     };
 
+    const MAX_CONSECUTIVE_NO_TOOL_STEPS: usize = 5;
     let t_start = Instant::now();
     let mut touched_files = false;
     let mut used_any_tools = false;
     let mut repair_attempts = 0usize;
-    let max_repairs = 3usize;
+    let mut consecutive_no_tool_steps = 0usize;
+    let mut consecutive_edit_failures = 0usize;
+    let max_repairs = (cfg.max_steps * 3 / 4).max(8);
+    let mut action_seq = 0usize;
+    let mut last_mutation_seq = 0usize;
+    let mut last_passing_test_seq = 0usize;
     let mut unresolved_edits: Vec<(String, String)> = Vec::new();
     let mut modified_files: Vec<String> = Vec::new();
     let mut tracked_files: Vec<String> = Vec::new();
     let mut best_checkpoint: Option<WorkspaceCheckpoint> = None;
+    let mut last_failed_cmd: Option<(usize, String, String)> = None;
 
     for step in 1..=cfg.max_steps {
-        let comp_rep =
-            compact_conversation_history(model, history, active_tools, &active_workdir, false);
+        let mut comp_rep_opt = None;
+        with_model(&mut |model| {
+            comp_rep_opt = Some(compact_conversation_history(
+                model,
+                history,
+                active_tools,
+                &active_workdir,
+                false,
+            ));
+        });
+        let comp_rep = comp_rep_opt.ok_or_else(|| "model unavailable".to_string())?;
         if comp_rep.compacted
             && !on_event(AgentEvent::ContextCompacted {
                 before_tokens: comp_rep.before_tokens,
@@ -3717,30 +5167,97 @@ pub fn run_agent_turn(
 
         let mut filter = ProseStreamFilter::new();
         let mut alive = true;
+        let mut aborted_fence_prose = false;
+        let mut prose_probe = String::new();
         let mut last_prog_bytes = 0usize;
         let mut last_prog_target = String::new();
-        let mut comp = model.generate_with_tools(history, active_tools, &cfg.params, |piece| {
-            alive = filter.push(piece, |prose| on_event(AgentEvent::TextDelta(prose)));
-            if alive {
-                if let Some((t_name, t_target, bytes)) = filter.active_tool_progress() {
-                    let target_ready = !t_target.is_empty() && t_target != last_prog_target;
-                    if target_ready || bytes >= last_prog_bytes + 96 {
-                        last_prog_bytes = bytes;
-                        if !t_target.is_empty() {
-                            last_prog_target.clone_from(&t_target);
+        let mut step_params = cfg.params.clone();
+        let force_tool_prefix = if !active_tools.is_empty()
+            && ((!used_any_tools && cfg.expect_tool_call)
+                || consecutive_no_tool_steps > 0
+                || !unresolved_edits.is_empty())
+        {
+            "<tool_call>\n{\"name\": \""
+        } else {
+            ""
+        };
+        if consecutive_no_tool_steps > 0 || !unresolved_edits.is_empty() || consecutive_edit_failures > 0 {
+            let retry_ord = consecutive_no_tool_steps.max(consecutive_edit_failures).max(1);
+            let max_temp = if force_tool_prefix.is_empty() {
+                0.65
+            } else if consecutive_edit_failures >= 2 {
+                0.34
+            } else {
+                0.22
+            };
+            let escalated_temp = (0.12 + 0.06 * (retry_ord as f32)).min(max_temp);
+            step_params.temperature = step_params.temperature.max(escalated_temp);
+            step_params.top_p = step_params.top_p.min(0.92);
+            step_params.repeat_penalty = step_params.repeat_penalty.max(
+                if retry_ord >= 2 {
+                    1.04
+                } else {
+                    1.02
+                },
+            );
+            step_params.seed = cfg
+                .params
+                .seed
+                .wrapping_add(
+                    (repair_attempts as u64).wrapping_mul(7919)
+                        + (consecutive_edit_failures as u64).wrapping_mul(1009)
+                        + (step as u64).wrapping_mul(131),
+                );
+        }
+        let guard_fence_stall = !active_tools.is_empty()
+            && force_tool_prefix.is_empty()
+            && (cfg.expect_tool_call
+                || !unresolved_edits.is_empty()
+                || matches!(jev_plan.route, TurnRoute::Agent));
+        let mut comp_res: Option<Result<Completion, String>> = None;
+        with_model(&mut |model| {
+            comp_res = Some(model.generate_with_tools_prefixed(
+                history,
+                active_tools,
+                force_tool_prefix,
+                &step_params,
+                |piece| {
+                    alive = filter.push(piece, |prose| {
+                        if guard_fence_stall && prose_probe.len() < 1400 {
+                            prose_probe.push_str(prose);
                         }
-                        alive = on_event(AgentEvent::ToolProgress {
-                            step,
-                            name: &t_name,
-                            target: &t_target,
-                            bytes,
-                        });
+                        on_event(AgentEvent::TextDelta(prose))
+                    });
+                    if alive {
+                        if let Some((t_name, t_target, bytes)) = filter.active_tool_progress() {
+                            let target_ready = !t_target.is_empty() && t_target != last_prog_target;
+                            if target_ready || bytes >= last_prog_bytes + 96 {
+                                last_prog_bytes = bytes;
+                                if !t_target.is_empty() {
+                                    last_prog_target.clone_from(&t_target);
+                                }
+                                alive = on_event(AgentEvent::ToolProgress {
+                                    step,
+                                    name: &t_name,
+                                    target: &t_target,
+                                    bytes,
+                                });
+                            }
+                        } else if guard_fence_stall
+                            && last_prog_bytes == 0
+                            && prose_probe.len() >= 680
+                            && prose_probe.contains("```")
+                        {
+                            aborted_fence_prose = true;
+                            return false;
+                        }
                     }
-                }
-            }
-            alive
-        })?;
-        if alive {
+                    alive
+                },
+            ));
+        });
+        let mut comp = comp_res.ok_or_else(|| "model unavailable".to_string())??;
+        if alive && !aborted_fence_prose {
             let _ = filter.finish(|prose| on_event(AgentEvent::TextDelta(prose)));
         }
         if !on_event(AgentEvent::StepStats {
@@ -3751,10 +5268,15 @@ pub fn run_agent_turn(
         }
 
         if comp.tool_calls.is_empty() {
-            history.push(Message::new("assistant", &comp.text));
-            if !unresolved_edits.is_empty() && repair_attempts < max_repairs && step < cfg.max_steps
-            {
+            let can_repair = repair_attempts < max_repairs
+                && consecutive_no_tool_steps < MAX_CONSECUTIVE_NO_TOOL_STEPS
+                && step < cfg.max_steps;
+            let had_fence = aborted_fence_prose
+                || comp.text.contains("```")
+                || comp.text.contains("<tool_call>");
+            if !unresolved_edits.is_empty() && can_repair {
                 repair_attempts += 1;
+                consecutive_no_tool_steps += 1;
                 let report = unresolved_edits
                     .iter()
                     .map(|(p, err)| {
@@ -3773,12 +5295,22 @@ pub fn run_agent_turn(
                 }) {
                     return Err("cancelled".to_string());
                 }
-                history.push(Message::new(
-                    "user",
-                    &format!(
-                        "A file edit failed and has not been written to disk yet:\n{report}\nEmit a <tool_call> with `write_file` or `edit_file` now to apply the change before finishing."
-                    ),
-                ));
+                let fence_note = if had_fence {
+                    "Markdown code fences in prose do NOT write files on disk. "
+                } else {
+                    ""
+                };
+                let html_hint = if report.contains("unexpected closing `</style>`")
+                    || report.contains("unexpected closing `</script>`")
+                {
+                    "\nHint: `index.html` still has leftover inline CSS/JS lines from a partial tag replacement. Call `write_file` on `index.html` with the complete clean HTML document."
+                } else {
+                    ""
+                };
+                let directive = format!(
+                    "[Repair Required — attempt {repair_attempts}] {fence_note}A file edit failed or has validation errors on disk:\n{report}{html_hint}\nDo not write prose summaries. Start your very next token immediately with `<tool_call>` using `write_file` or `edit_file`."
+                );
+                append_repair_directive_to_history(history, &comp.text, &directive);
                 continue;
             }
 
@@ -3801,16 +5333,23 @@ pub fn run_agent_turn(
                 .as_ref()
                 .and_then(|r| r.as_ref().err().map(String::as_str));
 
-            let jev_eval = crate::jev::evaluate_rubric(
-                Some(model),
-                &clean_user_goal,
-                &jev_plan.rubric,
-                &active_workdir,
-                &modified_files,
-                used_any_tools,
-                oracle_err,
-                &comp.text,
-            );
+            let tested_after_last_edit = !touched_files
+                || (last_passing_test_seq > 0 && last_passing_test_seq >= last_mutation_seq);
+            let mut jev_eval_opt = None;
+            with_model(&mut |model| {
+                jev_eval_opt = Some(crate::jev::evaluate_rubric_with_telemetry(
+                    Some(model),
+                    &clean_user_goal,
+                    &jev_plan.rubric,
+                    &active_workdir,
+                    &modified_files,
+                    used_any_tools,
+                    tested_after_last_edit,
+                    oracle_err,
+                    &comp.text,
+                ));
+            });
+            let jev_eval = jev_eval_opt.ok_or_else(|| "model unavailable".to_string())?;
 
             let cur_oracle_ok = oracle_err.is_none();
             if touched_files {
@@ -3834,11 +5373,7 @@ pub fn run_agent_turn(
             }
 
             let needs_tool_kick = cfg.expect_tool_call && !used_any_tools;
-            if (!jev_eval.passed || needs_tool_kick)
-                && !active_tools.is_empty()
-                && repair_attempts < max_repairs
-                && step < cfg.max_steps
-            {
+            if (!jev_eval.passed || needs_tool_kick) && !active_tools.is_empty() && can_repair {
                 let mut rolled_back = false;
                 if let Some(ref prev) = best_checkpoint {
                     if prev.workdir == active_workdir
@@ -3860,6 +5395,12 @@ pub fn run_agent_turn(
                     return Err("cancelled".to_string());
                 }
                 repair_attempts += 1;
+                consecutive_no_tool_steps += 1;
+                let fence_note = if had_fence {
+                    "You emitted markdown code fences in prose instead of `<tool_call>`. Markdown fences do NOT save files or run commands on disk. "
+                } else {
+                    ""
+                };
                 if needs_tool_kick && !used_any_tools {
                     let report = if jev_eval.unmet_summary.is_empty() {
                         "requested tool action has not been executed yet"
@@ -3869,21 +5410,23 @@ pub fn run_agent_turn(
                     if !on_event(AgentEvent::ValidationRepair { step, report }) {
                         return Err("cancelled".to_string());
                     }
-                    history.push(Message::new(
-                        "user",
-                        "No tool call was emitted yet, so the requested action has not run. Emit a <tool_call> now (using `use_computer` for macOS app or file actions, or `switch_workspace`/`write_file`/`edit_file`/`read_file`/`list_dir`/`run_command` for workspace actions) before replying.",
-                    ));
+                    let directive = format!(
+                        "[Repair Required — attempt {repair_attempts}] {fence_note}No tool call was emitted yet, so the requested action has not run. Start your very next token immediately with `<tool_call>` (`write_file`, `edit_file`, `read_file`, `list_dir`, or `run_command`) without prose summaries or markdown code blocks."
+                    );
+                    append_repair_directive_to_history(history, &comp.text, &directive);
                     continue;
                 }
 
-                let repair_report = if let Some(err) = oracle_err {
-                    err.to_string()
-                } else {
-                    jev_eval.unmet_summary.clone()
+                let combined_report = match (oracle_err, jev_eval.unmet_summary.is_empty()) {
+                    (Some(err), false) if !jev_eval.unmet_summary.contains(err) => {
+                        format!("{err}\n{}", jev_eval.unmet_summary)
+                    }
+                    (Some(err), _) => err.to_string(),
+                    (None, _) => jev_eval.unmet_summary.clone(),
                 };
                 if !on_event(AgentEvent::ValidationRepair {
                     step,
-                    report: &repair_report,
+                    report: &combined_report,
                 }) {
                     return Err("cancelled".to_string());
                 }
@@ -3892,15 +5435,28 @@ pub fn run_agent_turn(
                 } else {
                     ""
                 };
-                history.push(Message::new(
-                    "user",
-                    &format!(
-                        "{rollback_note}Verification found unmet requirements:\n{}\nApply a targeted fix using `edit_file` or `write_file` now before finishing.",
-                        jev_eval.unmet_summary
+                let html_hint = if combined_report.contains("unexpected closing `</style>`")
+                    || combined_report.contains("unexpected closing `</script>`")
+                {
+                    "\nHint: `index.html` still contains leftover inline CSS/JS lines. Call `write_file` on `index.html` with the complete clean HTML document."
+                } else {
+                    ""
+                };
+                let cmd_fail_note = match last_failed_cmd.as_ref() {
+                    Some((fail_seq, prev_cmd, fail_tail)) if *fail_seq == last_mutation_seq => format!(
+                        "\nLast command failure (`{prev_cmd}` — modify code with `write_file` or `edit_file` before re-running):\n{fail_tail}"
                     ),
-                ));
+                    _ => String::new(),
+                };
+                let disk_files = summarize_workspace_files_brief(&active_workdir);
+                let directive = format!(
+                    "[Repair Required — attempt {repair_attempts}] {fence_note}{rollback_note}Current workspace files on disk: {disk_files}\nVerification found unmet requirements or errors:\n{combined_report}{html_hint}{cmd_fail_note}\nDo not write prose tutorials or markdown code blocks. Start your very next token immediately with `<tool_call>` (`write_file`, `edit_file`, `read_file`, or `run_command`) to fix and verify the remaining requirements on disk."
+                );
+                append_repair_directive_to_history(history, &comp.text, &directive);
                 continue;
             }
+
+            history.push(Message::new("assistant", &comp.text));
 
             let mut final_rolled_back = false;
             if let Some(ref prev) = best_checkpoint {
@@ -3927,12 +5483,15 @@ pub fn run_agent_turn(
         }
 
         used_any_tools = true;
+        consecutive_no_tool_steps = 0;
 
         for (idx, tc) in comp.tool_calls.iter_mut().enumerate() {
             tc.id = format!("call_s{step}_{idx}");
         }
-        history.push(Message::assistant_tool_calls(&comp.text, comp.tool_calls.clone()));
+        let assistant_msg_idx = history.len();
+        history.push(Message::assistant_tool_calls("", comp.tool_calls.clone()));
 
+        let mut batch_blocker: Option<String> = None;
         for (idx, tc) in comp.tool_calls.iter().enumerate() {
             let is_file_mutation = matches!(tc.name.as_str(), "write_file" | "edit_file");
             if is_file_mutation {
@@ -3949,14 +5508,42 @@ pub fn run_agent_turn(
             if !on_event(AgentEvent::ToolStart { step, call: tc }) {
                 return Err("cancelled".to_string());
             }
-            let outcome = execute_tool(&active_workdir, tc, cfg.cmd_timeout_secs, step * 100 + idx);
+            let outcome = if tc.name == "spawn_agent" {
+                exec_spawn_agent(&active_workdir, &tc.arguments, spawner)
+            } else if tc.name == "run_command" {
+                let cmd_key = Json::parse(&tc.arguments)
+                    .ok()
+                    .and_then(|j| j.get("cmd").and_then(Json::as_str).map(|s| s.trim().to_string()))
+                    .unwrap_or_default();
+                if let Some(ref reason) = batch_blocker {
+                    err_outcome(&format!(
+                        "skipped `run_command` because {reason}; inspect and resolve that error first before running dependent commands"
+                    ))
+                } else if let Some((fail_seq, ref prev_cmd, ref fail_tail)) = last_failed_cmd {
+                    if fail_seq == last_mutation_seq && !cmd_key.is_empty() && prev_cmd == &cmd_key {
+                        err_outcome(&format!(
+                            "error: blocked duplicate `run_command` (`{cmd_key}`) because this exact command already failed and no workspace files have been modified since that failure. Last failure output tail:\n{fail_tail}\nCall `edit_file` or `write_file` to fix the script on disk before running `{cmd_key}` again."
+                        ))
+                    } else {
+                        execute_tool(&active_workdir, tc, cfg.cmd_timeout_secs, step * 100 + idx)
+                    }
+                } else {
+                    execute_tool(&active_workdir, tc, cfg.cmd_timeout_secs, step * 100 + idx)
+                }
+            } else {
+                execute_tool(&active_workdir, tc, cfg.cmd_timeout_secs, step * 100 + idx)
+            };
             if let Some(ref next_dir) = outcome.new_workdir {
                 active_workdir.clone_from(next_dir);
                 touched_files = false;
+                action_seq = 0;
+                last_mutation_seq = 0;
+                last_passing_test_seq = 0;
                 modified_files.clear();
                 tracked_files.clear();
                 best_checkpoint = None;
                 unresolved_edits.clear();
+                last_failed_cmd = None;
                 if !on_event(AgentEvent::WorkspaceChanged {
                     workdir: &active_workdir,
                 }) {
@@ -3976,21 +5563,74 @@ pub fn run_agent_turn(
                     tracked_files.push(target_path.clone());
                 }
                 if outcome.ok {
+                    action_seq += 1;
+                    last_mutation_seq = action_seq;
                     unresolved_edits.retain(|(p, _)| p != &target_path && p != &raw_target);
+                    if !outcome.validation_ok {
+                        consecutive_edit_failures += 1;
+                        if batch_blocker.is_none() {
+                            batch_blocker = Some(format!(
+                                "an earlier file edit (`{target_path}`) failed validation: {}",
+                                outcome.validation_msg
+                            ));
+                        }
+                        if tc.name == "write_file" && outcome.validation_msg.contains("is truncated") {
+                            if let Some(msg) = history.get_mut(assistant_msg_idx) {
+                                if let Some(stored_tc) = msg.tool_calls.get_mut(idx) {
+                                    stored_tc.arguments = format!(
+                                        "{{\"path\":{},\"content\":\"[truncated draft omitted; rewrite complete file]\"}}",
+                                        quote(&target_path)
+                                    );
+                                }
+                            }
+                        }
+                        unresolved_edits.push((target_path.clone(), outcome.validation_msg.clone()));
+                    } else {
+                        consecutive_edit_failures = 0;
+                    }
                     if !target_path.is_empty() && !modified_files.iter().any(|p| p == &target_path) {
                         modified_files.push(target_path);
                     }
                 } else {
+                    consecutive_edit_failures += 1;
                     let summary = outcome
                         .output
                         .lines()
                         .next()
                         .unwrap_or("edit failed")
                         .to_string();
+                    if batch_blocker.is_none() {
+                        batch_blocker = Some(format!(
+                            "an earlier file edit (`{target_path}`) failed: {summary}"
+                        ));
+                    }
                     if let Some(existing) = unresolved_edits.iter_mut().find(|(p, _)| p == &target_path) {
                         existing.1 = summary;
                     } else {
                         unresolved_edits.push((target_path, summary));
+                    }
+                }
+            } else if tc.name == "run_command" {
+                let cmd_str = Json::parse(&tc.arguments)
+                    .ok()
+                    .and_then(|j| j.get("cmd").and_then(Json::as_str).map(|s| s.trim().to_string()))
+                    .unwrap_or_default();
+                if outcome.ok {
+                    last_failed_cmd = None;
+                    if is_verification_or_test_command(&cmd_str) {
+                        action_seq += 1;
+                        last_passing_test_seq = action_seq;
+                    }
+                } else {
+                    if !outcome.output.starts_with("error: blocked duplicate `run_command`")
+                        && !outcome.output.starts_with("skipped `run_command`")
+                    {
+                        let tail = extract_tail_lines(&outcome.output, 14, 1400);
+                        last_failed_cmd = Some((last_mutation_seq, cmd_str, tail));
+                    }
+                    if batch_blocker.is_none() {
+                        batch_blocker =
+                            Some("an earlier `run_command` in this step exited with an error".to_string());
                     }
                 }
             }
@@ -4002,6 +5642,45 @@ pub fn run_agent_turn(
                 return Err("cancelled".to_string());
             }
             history.push(Message::tool_result(&tc.id, &outcome.output));
+        }
+
+        if !unresolved_edits.is_empty() {
+            if let Some(last_tool) = history.last_mut().filter(|m| m.role == "tool") {
+                let pending: Vec<String> = unresolved_edits
+                    .iter()
+                    .filter(|(p, _)| !p.is_empty() && !last_tool.content.contains(p.as_str()))
+                    .map(|(p, err)| format!("`{p}`: {err}"))
+                    .collect();
+                if !pending.is_empty() {
+                    last_tool.content.push_str(&format!(
+                        "\n[Pending validation errors still on disk — fix with `write_file` before finishing: {}]",
+                        pending.join("; ")
+                    ));
+                }
+            }
+        }
+
+        let step_had_mutation = comp
+            .tool_calls
+            .iter()
+            .any(|tc| matches!(tc.name.as_str(), "write_file" | "edit_file"));
+        let had_unparsed_tool_tag = comp.text.contains("<tool_call>");
+        let had_unsaved_prose_fences =
+            !step_had_mutation && comp.text.contains("```") && comp.text.len() > 400;
+        if had_unparsed_tool_tag || had_unsaved_prose_fences {
+            let disk_files = summarize_workspace_files_brief(&active_workdir);
+            let note = if had_unparsed_tool_tag {
+                format!(
+                    "\n[System warning: An unclosed or malformed <tool_call> in your step did not execute. Current workspace files on disk: {disk_files}. Write 2 to 3 complete files per step using valid write_file <tool_call> JSON blocks.]"
+                )
+            } else {
+                format!(
+                    "\n[System warning: Markdown code fences in prose are NOT written to disk. Current workspace files on disk: {disk_files}. Call write_file <tool_call> with complete non-empty content for each file.]"
+                )
+            };
+            if let Some(last_msg) = history.last_mut().filter(|m| m.role == "tool") {
+                last_msg.content.push_str(&note);
+            }
         }
     }
 
@@ -4079,6 +5758,15 @@ mod tests {
         assert!(resolve_jailed_path(&dir, "a/../../escape.txt").is_err());
         assert!(resolve_jailed_path(&dir, "/etc/passwd").is_err());
         assert_eq!(resolve_jailed_path(&dir, "src/app.js").unwrap(), dir.join("src/app.js"));
+        assert!(resolve_readable_path(&dir, "/etc/passwd").is_err());
+        assert!(resolve_readable_path(&dir, "~/.ssh/id_rsa").is_err());
+        let ext_doc = std::env::temp_dir().join(format!("kronos_ext_doc_{}.md", std::process::id()));
+        fs::write(&ext_doc, "# Kronos External Doc\n").unwrap();
+        assert_eq!(
+            resolve_readable_path(&dir, &ext_doc.display().to_string()).unwrap(),
+            ext_doc.canonicalize().unwrap()
+        );
+        let _ = fs::remove_file(&ext_doc);
 
         // 1. write_file with broken JS reports validation error in < 20 ms.
         let t_val = Instant::now();
@@ -4603,6 +6291,186 @@ mod tests {
         // 4. Checkpoint rollback restores verified workspace state cleanly.
         clean_cp.restore();
         assert!(verify_workspace_work(&dir, &tracked, 5).is_ok());
+
+        // 5. ES module `<script type="module">` cross-file named export mismatch is caught, and matching exports pass.
+        if Command::new("sh")
+            .args(["-c", "command -v node >/dev/null 2>&1"])
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            let esm_dir = dir.join("esm_case");
+            fs::create_dir_all(esm_dir.join("js")).unwrap();
+            fs::write(esm_dir.join("style.css"), "body { color: #f8fafc; background: #0f172a; }\n").unwrap();
+            fs::write(
+                esm_dir.join("index.html"),
+                "<!doctype html><html><head><title>App</title><link rel=\"stylesheet\" href=\"style.css\"></head><body><h1 id=\"title\">App</h1><script type=\"module\" src=\"js/entry.js\"></script></body></html>",
+            )
+            .unwrap();
+            fs::write(
+                esm_dir.join("js/state.js"),
+                "export const ITEMS = ['a', 'b'];\n",
+            )
+            .unwrap();
+            fs::write(
+                esm_dir.join("js/entry.js"),
+                "import { ITEMS, missingExport } from './state.js';\nwindow.addEventListener('DOMContentLoaded', () => { document.getElementById('title').textContent = String(ITEMS.length + missingExport); });\n",
+            )
+            .unwrap();
+            let esm_files = vec![
+                "index.html".to_string(),
+                "style.css".to_string(),
+                "js/state.js".to_string(),
+                "js/entry.js".to_string(),
+            ];
+            let esm_err = verify_workspace_work(&esm_dir, &esm_files, 5).unwrap_err();
+            assert!(
+                esm_err.contains("missingExport"),
+                "expected missing ES module export error, got: {esm_err}"
+            );
+
+            fs::write(
+                esm_dir.join("js/state.js"),
+                "export const ITEMS = ['a', 'b'];\nexport const missingExport = 1;\n",
+            )
+            .unwrap();
+            assert!(verify_workspace_work(&esm_dir, &esm_files, 5).is_ok());
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_auto_quote_unquoted_existing_paths_and_python_pitfalls() {
+        let dir = std::env::temp_dir().join(format!("kronos_quote_and_py_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let spaced_file = dir.join("James Iroha Close 4.m4a");
+        fs::write(&spaced_file, b"fake m4a").unwrap();
+        let abs_spaced = spaced_file.display().to_string();
+
+        let raw_cmd = format!(
+            "/opt/homebrew/bin/ffmpeg -y -i {abs_spaced} -t 12 -ar 16000 -ac 1 raw_ref_16k.wav"
+        );
+        let quoted = auto_quote_unquoted_existing_paths(&dir, &raw_cmd);
+        assert_eq!(
+            quoted,
+            format!(
+                "/opt/homebrew/bin/ffmpeg -y -i '{abs_spaced}' -t 12 -ar 16000 -ac 1 raw_ref_16k.wav"
+            )
+        );
+        // Already-quoted command stays untouched.
+        assert_eq!(auto_quote_unquoted_existing_paths(&dir, &quoted), quoted);
+
+        let eq_cmd = format!("tool --input={abs_spaced} --out=ok.wav");
+        assert_eq!(
+            auto_quote_unquoted_existing_paths(&dir, &eq_cmd),
+            format!("tool --input='{abs_spaced}' --out=ok.wav")
+        );
+
+        let py_path = Path::new("script.py");
+        let vid_path = Path::new("build_video.py");
+        assert!(validate_python_runtime_pitfalls(py_path, "w, h = d.textsize('hi', font=f)\n").is_err());
+        assert!(validate_python_runtime_pitfalls(
+            py_path,
+            "pcm = np.array(wav.readframes(wav.getnframes()), dtype=np.int16)\n"
+        )
+        .is_err());
+        assert!(validate_python_runtime_pitfalls(
+            py_path,
+            "from faster_whisper import WhisperModel\nres = wm.transcribe(pcm)\ntxt = res['segments'][0]['text']\n"
+        )
+        .is_err());
+        assert!(validate_python_runtime_pitfalls(
+            py_path,
+            "from mlx_audio.tts.generate import generate_audio\ngenerate_audio(model=m, text=ref_text, ref_audio='raw_ref_24k.wav', ref_text=ref_text)\n"
+        )
+        .is_err());
+        assert!(validate_python_runtime_pitfalls(
+            py_path,
+            "from faster_whisper import WhisperModel\nsegs, _ = wm.transcribe(pcm)\nsegs = list(segs)\n"
+        )
+        .is_ok());
+        assert!(validate_python_runtime_pitfalls(
+            py_path,
+            "from mlx_audio.tts.utils import load_model\nfrom mlx_audio.tts.generate import generate_audio\nimport subprocess, json\nm = load_model('tts-model')\ngenerate_audio(model=m, text=spoken, ref_audio='ref_24k.wav', ref_text=ref_text, output_path='audio', file_prefix='seg_01')\nwith open('audio/coherence_report.json', 'w') as f:\n    json.dump({'verified': True}, f)\nsubprocess.run(['ffmpeg', '-i', 'raw.m4a', 'ref_24k.wav'])\n"
+        )
+        .is_ok());
+        assert!(validate_python_runtime_pitfalls(
+            vid_path,
+            "import os\nos.makedirs('slides', exist_ok=True)\n"
+        )
+        .is_err());
+        assert!(validate_python_runtime_pitfalls(
+            py_path,
+            "def f(text):\n    ref_text = text\n    mlx_audio.tts.generate.generate_audio(ref_audio='ref_24k.wav', ref_text=ref_text)\n"
+        )
+        .is_err());
+        assert!(validate_python_runtime_pitfalls(
+            py_path,
+            "import subprocess\nwith open('input.txt', 'w') as f:\n    f.write(\"file 'slides/slide_01.png'\\n\")\nsubprocess.run(['ffmpeg', '-f', 'concat', '-i', 'input.txt', 'out.mp4'])\n"
+        )
+        .is_err());
+        // `, ref_audio=` must never fool the `import re` check when `re.findall` is used without `import re`.
+        assert!(validate_python_runtime_pitfalls(
+            py_path,
+            "from mlx_audio.tts.utils import load_model\nfrom mlx_audio.tts.generate import generate_audio\nimport subprocess, json\nm = load_model('tts-model')\ngenerate_audio(model=m, text=spoken, ref_audio='ref_24k.wav', ref_text=ref_text, output_path='audio', file_prefix='seg_01')\ntoks = re.findall(r'[a-z]+', spoken)\nwith open('audio/coherence_report.json', 'w') as f:\n    json.dump({'verified': True}, f)\nsubprocess.run(['ffmpeg', '-i', 'raw.m4a', 'ref_24k.wav'])\n"
+        )
+        .is_err());
+        // Calling `load_model(...)` inside a loop or passing unresampled 24kHz TTS WAVs to `wm.transcribe` must fail validation.
+        assert!(validate_python_runtime_pitfalls(
+            py_path,
+            "from mlx_audio.tts.utils import load_model\nfrom mlx_audio.tts.generate import generate_audio\nimport subprocess, json\nfor idx, spoken in enumerate(['hello world']):\n    m = load_model('tts-model')\n    generate_audio(model=m, text=spoken, ref_audio='ref_24k.wav', ref_text=ref_text, output_path='audio', file_prefix='seg_01')\nwith open('audio/coherence_report.json', 'w') as f:\n    json.dump({'verified': True}, f)\nsubprocess.run(['ffmpeg', '-i', 'raw.m4a', 'ref_24k.wav'])\n"
+        )
+        .is_err());
+        assert!(validate_python_runtime_pitfalls(
+            py_path,
+            "import wave, json, subprocess, numpy as np\nfrom faster_whisper import WhisperModel\nfrom mlx_audio.tts.utils import load_model\nfrom mlx_audio.tts.generate import generate_audio\nwm = WhisperModel('Systran/faster-whisper-small')\nm = load_model('tts-model')\ngenerate_audio(model=m, text=spoken, ref_audio='ref_24k.wav', ref_text=ref_text, output_path='audio', file_prefix='seg_01')\nwf = wave.open('audio/seg_01.wav', 'rb')\np24 = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0\nwf.close()\nhyp = list(wm.transcribe(p24)[0])\nwith open('audio/coherence_report.json', 'w') as f:\n    json.dump({'verified': True}, f)\nsubprocess.run(['ffmpeg', '-i', 'raw.m4a', 'ref_24k.wav'])\n"
+        )
+        .is_err());
+
+        // Intra-turn compaction must preserve the active user prompt (`[Device Context]`) verbatim
+        // even when synthetic `[Repair Required ...]` messages exist in the same turn.
+        let big_script = "A".repeat(9000);
+        let user_with_ctx = "[Device Context · retrieved in 1.20 ms]\n  - [project] Kronos-video MLX Audio Python venv -> '/Users/test/.venv/bin/python3'\n[/Device Context]\n\nMake a video on Kronos";
+        let mut hist = vec![
+            Message::new("system", "Sys"),
+            Message::new("user", user_with_ctx),
+            Message::new("assistant", "Inspecting."),
+            Message::new("user", "[Repair Required — attempt 1] Emit <tool_call>."),
+            Message::assistant_tool_calls(
+                "",
+                vec![crate::chat::ToolCall {
+                    id: "c1".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: format!("{{\"path\":\"script.md\",\"content\":\"{big_script}\"}}"),
+                }],
+            ),
+            Message::tool_result("c1", "ok: wrote 9000 bytes to script.md"),
+            Message::new("assistant", "Inspecting."),
+            Message::new("user", "[Repair Required — attempt 2] Continue."),
+        ];
+        fs::write(dir.join("script.md"), &big_script).unwrap();
+        let rep = compact_messages_with_budget(&mut hist, &dir, false, 1200, |msgs| {
+            msgs.iter().map(|m| m.content.len() / 4 + m.tool_calls.iter().map(|t| t.arguments.len() / 4).sum::<usize>() + 8).sum()
+        });
+        assert!(rep.compacted);
+        assert_eq!(hist[1].content, user_with_ctx, "active user [Device Context] must never be compacted away");
+
+        assert_eq!(
+            strip_outer_markdown_code_fence("script.md", "```markdown\n# Kronos\nbody\n```\n").as_deref(),
+            Some("# Kronos\nbody\n")
+        );
+        assert!(strip_outer_markdown_code_fence("script.md", "# Kronos\n```rust\nlet x = 1;\n```\n").is_none());
+        assert!(validate_markdown_script(
+            Path::new("script.md"),
+            "# Kronos\nIteration 1 NF4 sub-2-bit truncated\n"
+        )
+        .is_err());
+        let full_md = format!(
+            "# Kronos Technical Script\nIteration 1 sub-2-bit NF4\n{}\nIteration 8 Kronos-Jev Joint Embedding\nBenchmarks vs llama.cpp and Ollama\n",
+            "math ".repeat(700)
+        );
+        assert!(validate_markdown_script(Path::new("script.md"), &full_md).is_ok());
 
         let _ = fs::remove_dir_all(&dir);
     }

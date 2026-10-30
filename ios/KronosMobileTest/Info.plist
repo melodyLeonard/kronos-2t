@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>Kronos Mobile</string>
+    <key>CFBundleExecutable</key>
+    <string>KronosMobileTest</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.ipmscoutek.kronosmobile</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Kronos</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.2</string>
+    <key>CFBundleVersion</key>
+    <string>3</string>
+    <key>LSApplicationQueriesSchemes</key>
+    <array>
+        <string>whatsapp</string>
+        <string>tg</string>
+        <string>slack</string>
+        <string>youtube</string>
+        <string>instagram</string>
+        <string>twitter</string>
+        <string>github</string>
+        <string>linkedin</string>
+        <string>googlegmail</string>
+        <string>maps</string>
+        <string>shortcuts</string>
+        <string>calshow</string>
+        <string>mobilenotes</string>
+        <string>x-apple-reminderkit</string>
+        <string>shareddocuments</string>
+        <string>photos-redirect</string>
+    </array>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>LSSupportsOpeningDocumentsInPlace</key>
+    <true/>
+    <key>MinimumOSVersion</key>
+    <string>16.0</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoadsInWebContent</key>
+        <true/>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Kronos indexes upcoming calendar events locally on your iPhone when Develop Device Context is enabled.</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>Kronos indexes upcoming calendar events locally on your iPhone when Develop Device Context is enabled.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Kronos captures photos you take so you can ask questions about objects, documents, code, or scenes.</string>
+    <key>NSContactsUsageDescription</key>
+    <string>Kronos resolves contact names on your iPhone when you ask to prepare a WhatsApp or SMS draft.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Kronos connects to your local Mac Kronos server over Wi-Fi when Local Mac Context Sync is enabled.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Kronos uses the microphone so you can speak directly to Kronos on device.</string>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>Kronos saves generated images and workspace exports to your Photo Library when requested.</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>Kronos reads photos you select or your latest photo when you ask to prepare a post or analyze an image.</string>
+    <key>NSRemindersFullAccessUsageDescription</key>
+    <string>Kronos indexes reminders locally on your iPhone when Develop Device Context is enabled.</string>
+    <key>NSRemindersUsageDescription</key>
+    <string>Kronos indexes reminders locally on your iPhone when Develop Device Context is enabled.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Kronos transcribes your voice prompts live on your iPhone.</string>
+    <key>UIApplicationSceneManifest</key>
+    <dict>
+        <key>UIApplicationSupportsMultipleScenes</key>
+        <false/>
+        <key>UISceneConfigurations</key>
+        <dict>
+            <key>UIWindowSceneSessionRoleApplication</key>
+            <array>
+                <dict>
+                    <key>UISceneConfigurationName</key>
+                    <string>Default Configuration</string>
+                    <key>UISceneDelegateClassName</key>
+                    <string>KronosSceneDelegate</string>
+                </dict>
+            </array>
+        </dict>
+    </dict>
+    <key>UIDeviceFamily</key>
+    <array>
+        <integer>1</integer>
+        <integer>2</integer>
+    </array>
+    <key>UIFileSharingEnabled</key>
+    <true/>
+    <key>UILaunchScreen</key>
+    <dict/>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+    </array>
+</dict>
+</plist>

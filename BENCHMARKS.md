@@ -163,14 +163,25 @@ will be lower than with Zipf routing. On FFN layers from SmolLM2-1.7B, 3-bit NF3
 0.96 output cosine to FP32 and 2-bit VQ2 0.86. On the full 1.7B model, 2-bit VQ2 scores
 35 PPL against 12.8, too lossy to use.
 
+## Edge-20B Sparse-MoE envelopes, Gosset E8 2-bit quantization, and Kronos-Jev (`bench_edge_budget`)
+
+Measured on the same Apple Silicon machine with `cargo run --release --bin bench_edge_budget`:
+
+| Suite / Configuration | Active / Total Params | Weight Format | Resident RSS / Envelope | Throughput / Latency | Quality / Calibration |
+|---|---|---|---:|---:|---|
+| Edge8G Sparse-MoE (SLRU `F_NOCACHE`) | 3.6B / 20.91B (top-4 of 32) | `e8q2g128` experts + `nf4` trunk + `Q4` sink KV | 3.832 GiB / 5.000 GiB | 69.7 tok/s decode | zero swap, deterministic cap |
+| Mobile5G Sparse-MoE (SLRU `F_NOCACHE`) | 3.6B / 20.91B (top-4 of 32) | `e8q2g128` experts + `nf4` trunk + `Q4` sink KV | 4.006 GiB / 4.900 GiB | 32.4 tok/s decode | iOS 5 GB envelope compliant |
+| Mobile5G Sparse-MoE (zero-copy `mmap`) | 2.8B / 15.90B (top-4 of 24) | `e8q2g128` experts + `nf4` trunk + `Q4` sink KV | 3.953 GiB / 4.900 GiB | 40.9 tok/s decode | zero-copy `MADV_PAGEOUT` |
+| SmolLM2-135M Gosset `e8q2g128` | 135M dense | 8D Gosset $E_8$ Cholesky-Wagner GPTQ (`2.136 bpw`) | 36.0 MiB | 562.4 tok/s decode | beats scalar `vq2g128` at `2.13 bpw` |
+| Kronos-Jev single-pass decision engine | 0.5B / structural + neural | Bayes-factor log-odds + KV prefix cache | 0 B extra weights | 13.72 ms neural / 0.016 ms structural | 94.4% acc, Brier 0.0307, ECE 0.0672 (36x faster than 497 ms generative judge; -55.4% cold tool tokens) |
+
 ## Remaining limitations
 
-- Only 4-bit NF4 (`nf4`, `nf4g128`) runs on the Metal GPU; bipolar and mixed-plane tiers run on
-  CPU (or `--ane` for prefill).
+- Metal GPU acceleration covers `nf4`, `nf4g128`, `nf3`, `nf5`, and `e8q2g128`; bipolar bit-plane tiers (`b4`, `p55454`, `b5`, `b6`) run on CPU (or `--ane` for prefill).
 - 4-bit quality depends on the calibration domain (see above).
 - Bipolar-6 single-core decode is ~7% slower than Q6_K at 135M/360M (43% faster at 1.7B).
 - GPTQ compile: 34 s (135M), 90 s (360M), ~12 min (1.7B) per tier.
-- Apple Silicon only (NEON + `sdot`, `Metal.framework` on macOS).
+- Apple Silicon only (`aarch64` NEON + `sdot`, `Metal.framework` on macOS, `libkronos_2t.a` C FFI on `aarch64-apple-ios`).
 
 ## Reproduce
 

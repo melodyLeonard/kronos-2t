@@ -3,12 +3,17 @@
 use std::path::Path;
 use std::time::Instant;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct OcrRegion {
     pub zone: String,
     pub text: String,
     pub top_y: f32,
     pub left_x: f32,
+    pub width_n: f32,
+    pub height_n: f32,
+    pub bg_rgb: [u8; 3],
+    pub has_left_quote_bar: bool,
+    pub has_left_tick_icon: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -53,7 +58,7 @@ impl ImagePerception {
             self.accent_hex
         ));
         if let Some(rel) = &self.saved_rel_path {
-            out.push_str(&format!(", workspace_asset_path=\"{rel}\""));
+            out.push_str(&format!(", read_only_reference_image=\"{rel}\""));
         }
         out.push_str("]\n");
 
@@ -95,6 +100,7 @@ impl ImagePerception {
                 ));
             }
         }
+        out.push_str("[/Attached Image]\n");
         out
     }
 }
@@ -571,8 +577,8 @@ mod macos {
             return Err("decoded image has zero dimensions".to_string());
         }
 
-        // Downsample to <= 192 px along longest edge for sub-millisecond palette & spatial band analysis.
-        let scale = (192.0 / (width.max(height) as f64)).min(1.0);
+        // Downsample to <= 320 px along longest edge for sub-millisecond palette, bubble tint, and spatial band analysis.
+        let scale = (320.0 / (width.max(height) as f64)).min(1.0);
         let sw = ((width as f64 * scale).round() as usize).max(1);
         let sh = ((height as f64 * scale).round() as usize).max(1);
         let mut rgba = vec![0u8; sw * sh * 4];
@@ -597,7 +603,7 @@ mod macos {
         unsafe { CGColorSpaceRelease(cs) };
         let pal = analyze_rgba_grid(&rgba, sw, sh);
 
-        let ocr_regions = unsafe { run_vision_ocr(cg_img) };
+        let ocr_regions = unsafe { run_vision_ocr(cg_img, &rgba, sw, sh) };
         let scene_tags = unsafe { run_vision_classify(cg_img) };
         unsafe { CGImageRelease(cg_img) };
 
@@ -617,7 +623,138 @@ mod macos {
         })
     }
 
-    unsafe fn run_vision_ocr(cg_img: *const c_void) -> Vec<OcrRegion> {
+    fn sample_region_visual_cues(
+        rgba: &[u8],
+        sw: usize,
+        sh: usize,
+        left_x: f32,
+        top_y: f32,
+        width_n: f32,
+        height_n: f32,
+    ) -> ([u8; 3], bool, bool) {
+        if sw == 0 || sh == 0 || rgba.len() < sw * sh * 4 {
+            return ([0, 0, 0], false, false);
+        }
+        let x0 = ((left_x * sw as f32).floor() as isize - 1).clamp(0, sw as isize - 1) as usize;
+        let x1 = (((left_x + width_n) * sw as f32).ceil() as isize + 1)
+            .clamp(x0 as isize, sw as isize - 1) as usize;
+        let y0 = ((top_y * sh as f32).floor() as isize - 1).clamp(0, sh as isize - 1) as usize;
+        let y1 = (((top_y + height_n) * sh as f32).ceil() as isize + 1)
+            .clamp(y0 as isize, sh as isize - 1) as usize;
+
+        let mut total_px = 0u32;
+        let mut green_px = 0u32;
+        let mut green_sum = [0u64; 3];
+        let mut blue_px = 0u32;
+        let mut blue_sum = [0u64; 3];
+        let mut mid_px = 0u32;
+        let mut mid_sum = [0u64; 3];
+        let mut all_sum = [0u64; 3];
+
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let idx = (y * sw + x) * 4;
+                let r = i32::from(rgba[idx]);
+                let g = i32::from(rgba[idx + 1]);
+                let b = i32::from(rgba[idx + 2]);
+                total_px += 1;
+                all_sum[0] += r as u64;
+                all_sum[1] += g as u64;
+                all_sum[2] += b as u64;
+
+                if g - r >= 15 && g - b >= 7 {
+                    green_px += 1;
+                    green_sum[0] += r as u64;
+                    green_sum[1] += g as u64;
+                    green_sum[2] += b as u64;
+                } else if b - r >= 24 && b - g >= 14 {
+                    blue_px += 1;
+                    blue_sum[0] += r as u64;
+                    blue_sum[1] += g as u64;
+                    blue_sum[2] += b as u64;
+                }
+                let max_c = r.max(g).max(b);
+                if (16..=205).contains(&max_c) {
+                    mid_px += 1;
+                    mid_sum[0] += r as u64;
+                    mid_sum[1] += g as u64;
+                    mid_sum[2] += b as u64;
+                }
+            }
+        }
+
+        let bg_rgb = if total_px > 0 && green_px * 100 / total_px >= 18 {
+            [
+                (green_sum[0] / u64::from(green_px)) as u8,
+                (green_sum[1] / u64::from(green_px)) as u8,
+                (green_sum[2] / u64::from(green_px)) as u8,
+            ]
+        } else if total_px > 0 && blue_px * 100 / total_px >= 18 {
+            [
+                (blue_sum[0] / u64::from(blue_px)) as u8,
+                (blue_sum[1] / u64::from(blue_px)) as u8,
+                (blue_sum[2] / u64::from(blue_px)) as u8,
+            ]
+        } else if mid_px > 0 {
+            [
+                (mid_sum[0] / u64::from(mid_px)) as u8,
+                (mid_sum[1] / u64::from(mid_px)) as u8,
+                (mid_sum[2] / u64::from(mid_px)) as u8,
+            ]
+        } else if total_px > 0 {
+            [
+                (all_sum[0] / u64::from(total_px)) as u8,
+                (all_sum[1] / u64::from(total_px)) as u8,
+                (all_sum[2] / u64::from(total_px)) as u8,
+            ]
+        } else {
+            [0, 0, 0]
+        };
+
+        // Check narrow strip immediately left of the OCR span for:
+        // 1. High-saturation vertical reply-quote accent bar (pink/purple/teal/orange inside message bubbles).
+        // 2. Sidebar outgoing read/delivery checkmark glyph pixels (cyan/blue #53bdeb or gray tick stroke).
+        let lx0 = (((left_x - 0.026).max(0.0)) * sw as f32).floor() as usize;
+        let lx1 = (((left_x - 0.002).max(0.0)) * sw as f32).ceil() as usize;
+        let mut quote_bar_hits = 0u32;
+        let mut blue_tick_hits = 0u32;
+        let mut gray_tick_hits = 0u32;
+        if lx0 <= lx1 && lx1 < sw {
+            let bg_lum = i32::from(bg_rgb[0]) + i32::from(bg_rgb[1]) + i32::from(bg_rgb[2]);
+            for y in y0..=y1 {
+                for x in lx0..=lx1 {
+                    let idx = (y * sw + x) * 4;
+                    let r = i32::from(rgba[idx]);
+                    let g = i32::from(rgba[idx + 1]);
+                    let b = i32::from(rgba[idx + 2]);
+                    let max_c = r.max(g).max(b);
+                    let min_c = r.min(g).min(b);
+                    let sat = max_c - min_c;
+                    if max_c >= 115 && sat >= 46 {
+                        quote_bar_hits += 1;
+                    }
+                    if b >= 140 && g >= 110 && (b - r) >= 35 {
+                        blue_tick_hits += 1;
+                    }
+                    let px_lum = r + g + b;
+                    if (px_lum - bg_lum).abs() >= 95 && sat <= 35 {
+                        gray_tick_hits += 1;
+                    }
+                }
+            }
+        }
+        let span_rows = (y1.saturating_sub(y0) + 1) as u32;
+        let has_left_quote_bar = quote_bar_hits >= span_rows.div_ceil(2).max(2);
+        let has_left_tick_icon = blue_tick_hits >= 1 || gray_tick_hits >= 2;
+        (bg_rgb, has_left_quote_bar, has_left_tick_icon)
+    }
+
+    unsafe fn run_vision_ocr(
+        cg_img: *const c_void,
+        rgba: &[u8],
+        sw: usize,
+        sh: usize,
+    ) -> Vec<OcrRegion> {
         let mut regions = Vec::new();
         let handler_cls = class("VNImageRequestHandler");
         let req_cls = class("VNRecognizeTextRequest");
@@ -689,11 +826,21 @@ mod macos {
                             let top_y = (1.0 - (bbox.origin.y + bbox.size.height)).clamp(0.0, 1.0) as f32;
                             let left_x = bbox.origin.x.clamp(0.0, 1.0) as f32;
                             let width_n = bbox.size.width.clamp(0.0, 1.0) as f32;
+                            let height_n = bbox.size.height.clamp(0.0, 1.0) as f32;
+                            let (bg_rgb, has_left_quote_bar, has_left_tick_icon) =
+                                sample_region_visual_cues(
+                                    rgba, sw, sh, left_x, top_y, width_n, height_n,
+                                );
                             regions.push(OcrRegion {
                                 zone: spatial_zone(left_x, top_y, width_n),
                                 text,
                                 top_y,
                                 left_x,
+                                width_n,
+                                height_n,
+                                bg_rgb,
+                                has_left_quote_bar,
+                                has_left_tick_icon,
                             });
                         }
                     }

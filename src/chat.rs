@@ -12,8 +12,24 @@ use std::time::Instant;
 #[cfg(all(feature = "ane", target_os = "macos"))]
 const ANE_MIN_NEW_TOKENS: usize = 32;
 
-pub const DEFAULT_SYSTEM: &str = "Your name is Kronos. You were created and built by Melody Leonard, running locally on the Kronos engine on Apple Silicon. When asked your name or who built or created you, answer directly that your name is Kronos and that you were built by Melody Leonard; never say you lack a name and never claim to be built by OpenAI, Alibaba, Qwen, Hugging Face, Anthropic, or any other third-party organization.";
-pub const DEFAULT_SYSTEM_QWEN: &str = "Your name is Kronos. You were created and built by Melody Leonard, running locally on the Kronos engine on Apple Silicon. When asked your name or who built or created you, answer directly that your name is Kronos and that you were built by Melody Leonard; never say you lack a name and never claim to be built by OpenAI, Alibaba, Qwen, Hugging Face, Anthropic, or any other third-party organization.";
+pub const CREATOR_PUBLIC_PROFILE: &str = concat!(
+    "Creator and primary user public profile: Melody Leonard (full name: Melody Leonard Oparaugo, pronouns: he/him/his) ",
+    "is a Senior Software Engineer and Systems Architect (not a musician, songwriter, or actor) with over 10 years of software engineering experience (@IPMScoutek). ",
+    "His GitHub is https://github.com/melodyLeonard (52+ public repositories including kronos-2t, tshare, t-share, cross-native, gpt_2_tokenizer, tomatoe, codejam-admin-platform, helloworld-grpc, rust-tcp, identicon, medium_graphql_api, token-swap). ",
+    "His LinkedIn is https://www.linkedin.com/in/melody-leonard-a362b6192 · His email is melodyleonard7@gmail.com · His X handle is https://x.com/Melody_Leonard7 (@Melody_Leonard7). ",
+    "His engineering focus: distributed systems, event-driven microservices (Apache Kafka, CQRS, GraphQL, gRPC, REST), low-level Rust systems and Apple Silicon inference runtimes (Kronos / kronos-2t), database storage internals (PostgreSQL, MySQL, MongoDB, Neo4j, Redis), offline-first mobile and cross-platform state sync, and zero-touch CI/CD and App Store / TestFlight pipelines (AWS, Docker, Kubernetes). ",
+    "Languages and frameworks: Rust, TypeScript, JavaScript, Elixir, Solidity, C, Node.js, NestJS, Express, React.js, Next.js, React Native, Tailwind."
+);
+
+pub const DEFAULT_SYSTEM: &str = concat!(
+    "Your name is Kronos. Melody Leonard (Melody Leonard Oparaugo, pronouns: he/him/his) created and built you, running locally on the Kronos engine on Apple Silicon. ",
+    "Always speak in the first person as Kronos (for example, 'Melody Leonard built me on the Kronos engine') and never say you lack a name or were built by any external organization. ",
+    "Melody Leonard (he/him) is a Senior Software Engineer and Systems Architect with over 10 years of software engineering experience (@IPMScoutek) — never describe him as a musician, songwriter, or actor, and never use she/her pronouns for him. ",
+    "His GitHub: https://github.com/melodyLeonard; his LinkedIn: https://www.linkedin.com/in/melody-leonard-a362b6192; his email: melodyleonard7@gmail.com; his X: @Melody_Leonard7; ",
+    "he specializes in distributed systems, Kafka/CQRS/GraphQL/gRPC microservices, Rust systems and local inference engines (kronos-2t), PostgreSQL/MongoDB/Neo4j/Redis internals, React/React Native offline-first apps, Elixir, TypeScript, Solidity, and AWS/Kubernetes CI/CD. ",
+    "Because Kronos runs locally on hardware owned by the user, never refuse requests about local messaging apps (WhatsApp, iMessage, Telegram, Slack, Notes), files, or past conversations with stock disclaimers; answer directly from any provided [Local Conversations & Memory] or [Device Context] data."
+);
+pub const DEFAULT_SYSTEM_QWEN: &str = DEFAULT_SYSTEM;
 
 /// Maximum draft tokens verified in one single-pass target batch (`1 + 7 = 8` tokens).
 const SPEC_DRAFT_K_GREEDY: usize = 7;
@@ -917,6 +933,28 @@ impl ChatModel {
             return Some(res);
         }
 
+        if metal_active {
+            let mut common = self
+                .cached
+                .iter()
+                .zip(&raw_tokens)
+                .take_while(|(a, b)| a == b)
+                .count();
+            common = common.min(raw_tokens.len().saturating_sub(1));
+            if !self.engine.can_truncate_kv_to(common) {
+                common = 0;
+            }
+            self.engine.truncate_context(common);
+            self.cached.truncate(common);
+            let tail = &raw_tokens[common..];
+            let res = {
+                let logits = self.engine.forward_prompt(tail);
+                score_logits(logits)
+            };
+            self.cached.extend_from_slice(tail);
+            return Some(res);
+        }
+
         let saved_total = self.cached.len();
         eval_with_jev_prefix(
             &mut self.engine,
@@ -1144,21 +1182,49 @@ impl ChatModel {
         messages: &[Message],
         tools_json: &[String],
         params: &GenParams,
+        on_text: impl FnMut(&str) -> bool,
+    ) -> Result<Completion, String> {
+        self.generate_with_tools_prefixed(messages, tools_json, "", params, on_text)
+    }
+
+    /// Like [`Self::generate_with_tools`], optionally pre-seeding the open assistant turn with
+    /// `assistant_prefix` (for example `"<tool_call>\n{\"name\": \""` during deterministic repair steps)
+    /// so generation enters structured tool invocation immediately from token 0.
+    pub fn generate_with_tools_prefixed(
+        &mut self,
+        messages: &[Message],
+        tools_json: &[String],
+        assistant_prefix: &str,
+        params: &GenParams,
         mut on_text: impl FnMut(&str) -> bool,
     ) -> Result<Completion, String> {
         let mut msgs = messages.to_vec();
         let reserve = params.max_tokens.min(512).min(self.ctx / 4).max(1);
-        let mut prompt = self.render_with_tools(&msgs, tools_json);
+        let render_prefixed = |m: &[Message], model: &Self| -> Vec<usize> {
+            let mut s = render_chatml_prompt(m, tools_json, model.default_system());
+            if !assistant_prefix.is_empty() {
+                s.push_str(assistant_prefix);
+            }
+            model.tok.encode(&s)
+        };
+        let mut prompt = render_prefixed(&msgs, self);
         while prompt.len() + reserve > self.ctx {
             let first = usize::from(msgs.first().is_some_and(|m| m.role == "system"));
             if msgs.len() <= first + 1 {
                 return Err(format!("prompt of {} tokens exceeds the {}-token context", prompt.len(), self.ctx));
             }
+            // Drop the oldest complete conversational turn (user + following reply/tool
+            // replies, plus any leading non-user messages) so ChatML role alternation after
+            // `system` always starts with a `user` turn.
             msgs.remove(first);
-            while msgs.get(first).is_some_and(|m| m.role == "tool") && msgs.len() > first + 1 {
+            while msgs.len() > first + 1
+                && msgs
+                    .get(first)
+                    .is_some_and(|m| m.role == "assistant" || m.role == "tool")
+            {
                 msgs.remove(first);
             }
-            prompt = self.render_with_tools(&msgs, tools_json);
+            prompt = render_prefixed(&msgs, self);
         }
         let max_new = params.max_tokens.min(self.ctx - prompt.len());
         let vocab = self.engine.cfg.vocab_size;
@@ -1290,8 +1356,36 @@ impl ChatModel {
             });
         }
 
-        if self.im_start < self.scratch.cur_logits.len() {
-            self.scratch.cur_logits[self.im_start] = f32::NEG_INFINITY;
+        if !assistant_prefix.is_empty() {
+            raw_bytes.extend_from_slice(assistant_prefix.as_bytes());
+            emitted_bytes = raw_bytes.len();
+            if !on_text(assistant_prefix) {
+                return Ok(Completion {
+                    text: assistant_prefix.to_string(),
+                    token_ids: Vec::new(),
+                    tool_calls: Vec::new(),
+                    prompt_tokens: prompt.len(),
+                    prefilled_tokens: prompt.len() - common,
+                    completion_tokens: 0,
+                    drafted_tokens: 0,
+                    accepted_tokens: 0,
+                    finish: FinishReason::Stop,
+                    prefill_secs,
+                    prefill_unit,
+                    decode_secs: 0.0,
+                });
+            }
+        }
+
+        for &stop_id in &[self.im_start, self.im_end, self.tok.eos_token_id] {
+            if stop_id < self.scratch.cur_logits.len() {
+                self.scratch.cur_logits[stop_id] = f32::NEG_INFINITY;
+            }
+        }
+        for &stop_id in &self.tok.eos_token_ids {
+            if stop_id < self.scratch.cur_logits.len() {
+                self.scratch.cur_logits[stop_id] = f32::NEG_INFINITY;
+            }
         }
         let mut next = sample_token(
             &self.scratch.cur_logits,
@@ -1689,7 +1783,11 @@ impl ChatModel {
             crate::thread_pool::SpinThreadPool::park_idle_workers();
         }
         let raw_text = String::from_utf8_lossy(&raw_bytes).into_owned();
-        let (text, tool_calls) = if !tools_json.is_empty() || raw_text.contains("<tool_call>") {
+        let (text, tool_calls) = if !tools_json.is_empty()
+            || raw_text.contains("<tool_call>")
+            || raw_text.contains("<tools>")
+            || raw_text.contains("<tool ")
+        {
             let (prose, calls) = parse_qwen_tool_calls(&raw_text);
             if calls.is_empty() {
                 (raw_text, Vec::new())
@@ -1791,18 +1889,211 @@ pub fn render_chatml_prompt(messages: &[Message], tools_json: &[String], default
     out
 }
 
-/// Escapes raw control bytes (`\n`, `\r`, `\t`) inside JSON string literals when models emit multiline arguments.
+/// Escapes raw control bytes (`\n`, `\r`, `\t`), single-line code string `\n` escapes (`split('\n')`,
+/// `f"...\n"`), LaTeX backslash commands (`\frac`, `\times`, `\rangle`, `\beta`), and non-RFC8259
+/// backslash sequences (`\'`, `\ `, `\d`, `\s`, `\u{...}`) inside JSON string literals.
 fn sanitize_json_control_chars(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 16);
+    let mut out = String::with_capacity(s.len() + 32);
     let mut in_str = false;
     let mut esc = false;
-    for ch in s.chars() {
+    // Tracks inner single-quoted spans inside a JSON string:
+    // `None` = outside `'...'`, `Some(false)` = opened by plain `'`, `Some(true)` = opened by over-escaped `\'`.
+    let mut sq_mode: Option<bool> = None;
+    let mut inner_sq_open_on_line = false;
+    let mut inner_dq_open_on_line = false;
+    let mut after_json_escaped_backslash = false;
+    let bytes = s.as_bytes();
+    let mut iter = s.char_indices().peekable();
+    while let Some((byte_idx, ch)) = iter.next() {
         if in_str {
             if esc {
                 esc = false;
-                out.push(ch);
+                after_json_escaped_backslash = false;
+                let rest = &s[byte_idx + ch.len_utf8()..];
+                match ch {
+                    '"' => {
+                        out.push('"');
+                        if out.ends_with("\\\"\\\"\\\"") {
+                            inner_dq_open_on_line = false;
+                        } else {
+                            inner_dq_open_on_line = !inner_dq_open_on_line;
+                        }
+                    }
+                    '/' => out.push('/'),
+                    'b' | 'f' => {
+                        if rest.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) {
+                            // LaTeX / regex identifier escape (`\frac`, `\forall`, `\beta`, `\mathbf`, `\bmod`).
+                            out.push('\\');
+                            out.push(ch);
+                        } else {
+                            out.push(ch);
+                        }
+                    }
+                    't' => {
+                        let inline_sq_tab = inner_sq_open_on_line
+                            && (rest.starts_with('\'') || rest.starts_with("\\'"));
+                        let latex_t = [
+                            "imes", "ext{", "extrm{", "extbf{", "exttt{", "heta", "au", "op",
+                            "o ", "riangle", "ilde", "frac", "anh",
+                        ]
+                        .iter()
+                        .any(|p| rest.starts_with(p));
+                        if inline_sq_tab || latex_t {
+                            out.push('\\');
+                            out.push('t');
+                        } else {
+                            out.push('t');
+                        }
+                    }
+                    'r' => {
+                        let inline_sq_cr = inner_sq_open_on_line
+                            && (rest.starts_with('\'')
+                                || rest.starts_with("\\'")
+                                || rest.starts_with("\\n'")
+                                || rest.starts_with("\\n\\'"));
+                        let latex_r = ["angle", "ight", "ho", "mathbb", "mathrm"]
+                            .iter()
+                            .any(|p| rest.starts_with(p));
+                        if inline_sq_cr || latex_r {
+                            out.push('\\');
+                            out.push('r');
+                        } else {
+                            out.push('r');
+                        }
+                    }
+                    'n' => {
+                        let inline_sq_nl = inner_sq_open_on_line
+                            && (rest.starts_with('\'') || rest.starts_with("\\'"));
+                        let inline_dq_nl = inner_dq_open_on_line
+                            && rest.starts_with("\\\"")
+                            && !rest.starts_with("\\\"\\\"\\\"")
+                            && matches!(
+                                rest.as_bytes().get(2).copied(),
+                                Some(b')' | b',' | b';' | b'+' | b']' | b'}' | b':')
+                            );
+                        if inline_sq_nl || inline_dq_nl {
+                            out.push('\\');
+                            out.push('n');
+                        } else {
+                            out.push('n');
+                            sq_mode = None;
+                            inner_sq_open_on_line = false;
+                            inner_dq_open_on_line = false;
+                        }
+                    }
+                    '\\' => {
+                        out.push('\\');
+                        after_json_escaped_backslash = true;
+                    }
+                    '\'' => match sq_mode {
+                        None => {
+                            // Over-escaped opening single-quote delimiter (`owner:\'Core\'`).
+                            out.pop();
+                            out.push('\'');
+                            sq_mode = Some(true);
+                            inner_sq_open_on_line = true;
+                        }
+                        Some(true) => {
+                            let next_is_word = iter
+                                .peek()
+                                .is_some_and(|&(_, nc)| nc.is_ascii_alphanumeric());
+                            if next_is_word {
+                                // Apostrophe inside `\'it\'s live\'` stays escaped in JS (`\'`).
+                                out.push('\\');
+                                out.push('\'');
+                            } else {
+                                out.pop();
+                                out.push('\'');
+                                sq_mode = None;
+                                inner_sq_open_on_line = false;
+                            }
+                        }
+                        Some(false) => {
+                            let closes_before_delim = rest.starts_with(',')
+                                || rest.starts_with(']')
+                                || rest.starts_with(')')
+                                || rest.starts_with('}')
+                                || rest.starts_with(':')
+                                || rest.starts_with(';')
+                                || rest.starts_with("\\n")
+                                || rest.starts_with("\\r")
+                                || rest.starts_with('\n')
+                                || rest.starts_with('\r')
+                                || {
+                                    let trimmed = rest.trim_start_matches([' ', '\t']);
+                                    trimmed.len() < rest.len()
+                                        && (trimmed.starts_with(',')
+                                            || trimmed.starts_with(']')
+                                            || trimmed.starts_with(')')
+                                            || trimmed.starts_with('#')
+                                            || trimmed.starts_with("\\n")
+                                            || trimmed.starts_with('\n'))
+                                };
+                            if closes_before_delim {
+                                // Over-escaped closing delimiter on a string opened with plain `'` (`'0\', \'-i\'`).
+                                out.pop();
+                                out.push('\'');
+                                sq_mode = None;
+                                inner_sq_open_on_line = false;
+                            } else {
+                                // Escaped apostrophe inside plain `'it\'s ok'` stays escaped (`\\'`).
+                                out.push('\\');
+                                out.push('\'');
+                            }
+                        }
+                    },
+                    'u' => {
+                        let valid_hex4 = bytes
+                            .get(byte_idx + 1..byte_idx + 5)
+                            .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit));
+                        if valid_hex4 {
+                            out.push('u');
+                        } else {
+                            out.push('\\');
+                            out.push('u');
+                        }
+                    }
+                    '\n' => {
+                        out.push('n');
+                        sq_mode = None;
+                        inner_sq_open_on_line = false;
+                        inner_dq_open_on_line = false;
+                    }
+                    '\r' => {
+                        if iter.peek().is_some_and(|&(_, next_c)| next_c == '\n') {
+                            let _ = iter.next();
+                        }
+                        out.push('n');
+                        sq_mode = None;
+                        inner_sq_open_on_line = false;
+                        inner_dq_open_on_line = false;
+                    }
+                    '`' => {
+                        // Drop stray line-ending `\`\n` / `\`` before newline emitted around JS template literals.
+                        let before_newline = match iter.peek().copied() {
+                            Some((_, '\n' | '\r')) => true,
+                            Some((next_idx, '\\')) => matches!(
+                                bytes.get(next_idx + 1).copied(),
+                                Some(b'n' | b'r')
+                            ),
+                            _ => false,
+                        };
+                        if before_newline {
+                            out.pop();
+                        } else {
+                            out.push('\\');
+                            out.push('`');
+                        }
+                    }
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
                 continue;
             }
+            let prev_esc_bs = after_json_escaped_backslash;
+            after_json_escaped_backslash = false;
             match ch {
                 '\\' => {
                     esc = true;
@@ -1810,10 +2101,47 @@ fn sanitize_json_control_chars(s: &str) -> String {
                 }
                 '"' => {
                     in_str = false;
+                    sq_mode = None;
+                    inner_sq_open_on_line = false;
+                    inner_dq_open_on_line = false;
                     out.push('"');
                 }
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
+                '\'' => {
+                    if !prev_esc_bs {
+                        let prev_is_word = byte_idx > 0
+                            && bytes[byte_idx - 1].is_ascii_alphanumeric();
+                        let next_is_word = iter
+                            .peek()
+                            .is_some_and(|&(_, nc)| nc.is_ascii_alphanumeric());
+                        let is_contraction_apostrophe =
+                            sq_mode.is_none() && prev_is_word && next_is_word;
+                        if !is_contraction_apostrophe {
+                            sq_mode = match sq_mode {
+                                None => {
+                                    inner_sq_open_on_line = !out.ends_with("''");
+                                    Some(false)
+                                }
+                                Some(_) => {
+                                    inner_sq_open_on_line = false;
+                                    None
+                                }
+                            };
+                        }
+                    }
+                    out.push('\'');
+                }
+                '\n' => {
+                    sq_mode = None;
+                    inner_sq_open_on_line = false;
+                    inner_dq_open_on_line = false;
+                    out.push_str("\\n");
+                }
+                '\r' => {
+                    sq_mode = None;
+                    inner_sq_open_on_line = false;
+                    inner_dq_open_on_line = false;
+                    out.push_str("\\r");
+                }
                 '\t' => out.push_str("\\t"),
                 c if (c as u32) < 0x20 => {
                     let code = c as u32;
@@ -1824,6 +2152,10 @@ fn sanitize_json_control_chars(s: &str) -> String {
         } else {
             if ch == '"' {
                 in_str = true;
+                sq_mode = None;
+                inner_sq_open_on_line = false;
+                inner_dq_open_on_line = false;
+                after_json_escaped_backslash = false;
             }
             out.push(ch);
         }
@@ -1832,14 +2164,440 @@ fn sanitize_json_control_chars(s: &str) -> String {
 }
 
 fn parse_json_lenient(s: &str) -> Option<Json> {
-    Json::parse(s)
-        .ok()
-        .or_else(|| Json::parse(&sanitize_json_control_chars(s)).ok())
+    let sanitized = sanitize_json_control_chars(s);
+    if let Ok(v) = Json::parse(&sanitized) {
+        return Some(v);
+    }
+    if let Ok(v) = Json::parse(s) {
+        return Some(v);
+    }
+    let trimmed = sanitized.trim();
+    if trimmed.starts_with('{') && trimmed.contains("\"name\"") && trimmed.contains("\"arguments\"") {
+        let with_brace = format!("{trimmed}}}");
+        if let Ok(v) = Json::parse(&with_brace) {
+            return Some(v);
+        }
+    }
+    None
 }
 
-/// Extracts Qwen2.5 `<tool_call>...</tool_call>` JSON invocations from `text`, returning
-/// `(remaining_prose, parsed_tool_calls)` using JSON-string-aware brace matching so literal
-/// `</tool_call>` substrings inside string arguments never corrupt parsing.
+/// Repairs unescaped `"` inside the final string argument (`content`, `new_text`, `cmd`, or `old_text`)
+/// and missing outer `}` of a `<tool_call>{...}</tool_call>` or fenced JSON tool block.
+fn repair_tool_call_inner_quotes(raw_obj: &str) -> Option<Json> {
+    let trimmed = raw_obj.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    if let Some(v) = parse_json_lenient(trimmed) {
+        return Some(v);
+    }
+    let mut best_val_start: Option<(usize, u8, u8)> = None;
+    for (prio, key) in [
+        (2u8, "\"content\""),
+        (2u8, "\"new_text\""),
+        (2u8, "\"cmd\""),
+        (1u8, "\"old_text\""),
+    ] {
+        let mut search_from = 0usize;
+        while search_from < trimmed.len() {
+            let Some(rel) = trimmed[search_from..].find(key) else {
+                break;
+            };
+            let key_pos = search_from + rel;
+            // Ignore escaped `\"content\"` occurrences inside string payloads.
+            if key_pos > 0 && trimmed.as_bytes()[key_pos - 1] == b'\\' {
+                search_from = key_pos + key.len();
+                continue;
+            }
+            let after_key = key_pos + key.len();
+            let rest = trimmed[after_key..].trim_start();
+            if let Some(after_colon) = rest.strip_prefix(':') {
+                let after_ws = after_colon.trim_start();
+                if let Some(&delim) = after_ws.as_bytes().first() {
+                    if delim == b'"' || delim == b'`' {
+                        let quote_offset = trimmed.len() - after_ws.len();
+                        let val_start = quote_offset + 1;
+                        let better = match best_val_start {
+                            None => true,
+                            Some((prev_pos, _, prev_prio)) => {
+                                // Prefer higher-priority argument keys (`new_text` over `old_text`),
+                                // and the earliest occurrence of that key so inner user code containing
+                                // `"content": "..."` never shadows the outer tool argument key.
+                                prio > prev_prio || (prio == prev_prio && val_start < prev_pos)
+                            }
+                        };
+                        if better {
+                            best_val_start = Some((val_start, delim, prio));
+                        }
+                    }
+                }
+            }
+            search_from = after_key;
+        }
+    }
+    let (val_start, open_delim, _) = best_val_start?;
+    // Locate the closing delimiter of the string value right before `}}` (or single/omitted outer brace).
+    let mut tail_idx = trimmed.len();
+    let bytes = trimmed.as_bytes();
+    let mut braces_seen = 0usize;
+    while tail_idx > val_start && braces_seen < 2 {
+        let b = bytes[tail_idx - 1];
+        if b.is_ascii_whitespace() {
+            tail_idx -= 1;
+            continue;
+        }
+        if b == b'}' {
+            braces_seen += 1;
+            tail_idx -= 1;
+        } else {
+            break;
+        }
+    }
+    while tail_idx > val_start && (bytes[tail_idx - 1].is_ascii_whitespace() || bytes[tail_idx - 1] == b',') {
+        tail_idx -= 1;
+    }
+    // Handle reversed argument order `{"content": "...", "path": "foo.py"}}`.
+    if tail_idx > val_start && bytes[tail_idx - 1] == b'"' {
+        let prefix = &trimmed[val_start..tail_idx - 1];
+        if let Some(path_key_rel) = prefix.rfind("\"path\"") {
+            let before_path = prefix[..path_key_rel].trim_end();
+            let after_path = prefix[path_key_rel + "\"path\"".len()..].trim_start();
+            if let (Some(before_comma), Some(after_colon)) =
+                (before_path.strip_suffix(','), after_path.strip_prefix(':'))
+            {
+                let path_val = after_colon.trim_start();
+                if path_val.starts_with('"') && !path_val[1..].contains('"') {
+                    let trimmed_before = before_comma.trim_end();
+                    if trimmed_before.as_bytes().last().copied() == Some(open_delim) {
+                        tail_idx = val_start + trimmed_before.len();
+                    }
+                }
+            }
+        }
+    }
+    if tail_idx <= val_start || bytes[tail_idx - 1] != open_delim {
+        return None;
+    }
+    let val_end = tail_idx - 1;
+    let inner = &trimmed[val_start..val_end];
+    let mut repaired = String::with_capacity(trimmed.len() + 40);
+    repaired.push_str(&trimmed[..val_start - 1]);
+    repaired.push('"');
+    let mut backslashes = 0usize;
+    for ch in inner.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+            repaired.push('\\');
+        } else {
+            if ch == '"' && backslashes.is_multiple_of(2) {
+                repaired.push('\\');
+            }
+            backslashes = 0;
+            repaired.push(ch);
+        }
+    }
+    if !backslashes.is_multiple_of(2) {
+        repaired.push('\\');
+    }
+    repaired.push('"');
+    let suffix = trimmed[val_end + 1..].trim_start();
+    if let Some(after_comma) = suffix.strip_prefix(',') {
+        let rest_t = after_comma.trim_start();
+        if rest_t.starts_with('}') || rest_t.is_empty() {
+            repaired.push_str(rest_t);
+        } else {
+            repaired.push_str(suffix);
+        }
+    } else {
+        repaired.push_str(suffix);
+    }
+    if braces_seen == 0 {
+        repaired.push_str("}}");
+    }
+    if let Some(v) = parse_json_lenient(&repaired) {
+        return Some(v);
+    }
+    if braces_seen == 1 {
+        repaired.push('}');
+        return parse_json_lenient(&repaired);
+    }
+    None
+}
+
+fn extract_name_and_args(v: &Json) -> Option<(String, String)> {
+    let fn_obj = v.get("function").unwrap_or(v);
+    let name = fn_obj.get("name").and_then(Json::as_str)?.to_string();
+    let arguments = match fn_obj.get("arguments") {
+        Some(Json::Str(s)) => s.clone(),
+        Some(other) => other.stringify(),
+        None => {
+            if let Some(kvs) = fn_obj.as_obj() {
+                let extra: Vec<(String, Json)> = kvs
+                    .iter()
+                    .filter(|(k, _)| !matches!(k.as_str(), "name" | "type" | "id" | "function"))
+                    .cloned()
+                    .collect();
+                if !extra.is_empty() {
+                    Json::Obj(extra).stringify()
+                } else {
+                    "{}".to_string()
+                }
+            } else {
+                "{}".to_string()
+            }
+        }
+    };
+    Some((name, arguments))
+}
+
+/// Returns the byte offset of the next genuine `<tool_call>` block header (followed by `{` or `` ``` ``)
+/// starting at or after `from`, ignoring inline prose mentions such as `` `<tool_call>` ``.
+fn find_next_real_tool_open(text: &str, from: usize) -> Option<usize> {
+    const OPEN_TAG: &str = "<tool_call>";
+    let mut scan = from;
+    while let Some(rel) = text[scan..].find(OPEN_TAG) {
+        let pos = scan + rel;
+        let after = text[pos + OPEN_TAG.len()..].trim_start();
+        if after.starts_with('{') || after.starts_with("```") {
+            return Some(pos);
+        }
+        scan = pos + OPEN_TAG.len();
+    }
+    None
+}
+
+/// Locates the `</tool_call>` closing tag belonging to the `<tool_call>` object starting at `obj_start`,
+/// stopping before any subsequent `<tool_call>` tag and preferring a `</tool_call>` preceded by `}`.
+fn find_enclosing_tool_close(text: &str, obj_start: usize) -> Option<usize> {
+    const CLOSE_TAG: &str = "</tool_call>";
+    let next_open = find_next_real_tool_open(text, obj_start).unwrap_or(text.len());
+    let mut candidate: Option<usize> = None;
+    let mut scan = obj_start;
+    while scan < next_open {
+        let Some(rel) = text[scan..next_open].find(CLOSE_TAG) else {
+            break;
+        };
+        let close_pos = scan + rel;
+        let before = text[obj_start..close_pos]
+            .trim_end()
+            .trim_end_matches("```")
+            .trim_end();
+        if before.ends_with('}') || candidate.is_none() {
+            candidate = Some(close_pos);
+        }
+        scan = close_pos + CLOSE_TAG.len();
+    }
+    candidate
+}
+
+/// Extracts tool `(name, arguments)` only when explicit `"name"` and `"arguments"` keys are present.
+fn extract_explicit_tool_name_and_args(v: &Json) -> Option<(String, String)> {
+    let fn_obj = v.get("function").unwrap_or(v);
+    let name = fn_obj.get("name").and_then(Json::as_str)?.to_string();
+    let args_val = fn_obj.get("arguments")?;
+    let arguments = match args_val {
+        Json::Str(s) => s.clone(),
+        other => other.stringify(),
+    };
+    Some((name, arguments))
+}
+
+/// Extracts non-`<tool_call>` invocations (`<tool .../>`, fenced JSON tool blocks, and line-start
+/// bare `{"name": ..., "arguments": ...}` objects) from `span` in exact left-to-right document order.
+fn extract_non_xml_tool_calls_in_span(
+    span: &str,
+    prose_out: &mut String,
+    calls_out: &mut Vec<ToolCall>,
+) {
+    if span.is_empty() {
+        return;
+    }
+    let flush_gap = |gap: &str, p_out: &mut String, c_out: &mut Vec<ToolCall>| {
+        if gap.is_empty() {
+            return;
+        }
+        let mut cur = gap.to_string();
+        if cur.contains("<tool ") || cur.contains("<tool\t") {
+            let (xml_p, xml_c) = parse_xml_attr_tool_calls(&cur);
+            if !xml_c.is_empty() {
+                for mut tc in xml_c {
+                    tc.id = format!("call_{}", c_out.len());
+                    c_out.push(tc);
+                }
+                cur = xml_p;
+            }
+        }
+        if cur.contains("\"name\"") && cur.contains("\"arguments\"") {
+            let (bare_p, bare_c) = parse_bare_json_tool_calls(&cur);
+            if !bare_c.is_empty() {
+                for mut tc in bare_c {
+                    tc.id = format!("call_{}", c_out.len());
+                    c_out.push(tc);
+                }
+                cur = bare_p;
+            }
+        }
+        p_out.push_str(&cur);
+    };
+
+    if !span.contains("```") {
+        flush_gap(span, prose_out, calls_out);
+        return;
+    }
+
+    const FENCE: &str = "```";
+    let mut cursor = 0usize;
+    while let Some(rel) = span[cursor..].find(FENCE) {
+        let fence_start = cursor + rel;
+        let after_ticks = fence_start + FENCE.len();
+        let lang_end = span[after_ticks..]
+            .find(['\n', '{', '['])
+            .map(|i| after_ticks + i)
+            .unwrap_or(after_ticks);
+        let lang_tag = span[after_ticks..lang_end].trim();
+        let is_tool_fence_lang = lang_tag.is_empty()
+            || lang_tag.eq_ignore_ascii_case("json")
+            || lang_tag.eq_ignore_ascii_case("tool_call")
+            || lang_tag.eq_ignore_ascii_case("tool");
+        if !is_tool_fence_lang {
+            let close_end = span[lang_end..]
+                .find("\n```")
+                .map(|i| lang_end + i + 4)
+                .or_else(|| span[lang_end..].find(FENCE).map(|i| lang_end + i + FENCE.len()))
+                .unwrap_or(span.len());
+            flush_gap(&span[cursor..close_end], prose_out, calls_out);
+            cursor = close_end;
+            continue;
+        }
+
+        let mut p = lang_end;
+        let ws1 = span[p..].trim_start();
+        p += span[p..].len() - ws1.len();
+        let opened_array = span[p..].starts_with('[');
+        if opened_array {
+            p += 1;
+            let ws2 = span[p..].trim_start();
+            p += span[p..].len() - ws2.len();
+        }
+        if !span[p..].starts_with('{') {
+            let close_end = span[lang_end..]
+                .find("\n```")
+                .map(|i| lang_end + i + 4)
+                .or_else(|| span[lang_end..].find(FENCE).map(|i| lang_end + i + FENCE.len()))
+                .unwrap_or(span.len());
+            flush_gap(&span[cursor..close_end], prose_out, calls_out);
+            cursor = close_end;
+            continue;
+        }
+
+        let mut block_calls: Vec<(String, String)> = Vec::new();
+        let mut scan = p;
+        while span[scan..].starts_with('{') {
+            let primary = find_balanced_json_object_end(&span[scan..]).and_then(|len| {
+                let end = scan + len;
+                let parsed = parse_json_lenient(&span[scan..end])
+                    .and_then(|v| extract_explicit_tool_name_and_args(&v))?;
+                Some((end, parsed))
+            });
+            let Some((obj_end, pair)) = primary else {
+                break;
+            };
+            block_calls.push(pair);
+            scan = obj_end;
+            loop {
+                let t = span[scan..].trim_start();
+                scan += span[scan..].len() - t.len();
+                if span[scan..].starts_with(',') {
+                    scan += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // If an object inside this fence broke brace balance due to unescaped inner quotes,
+        // locate the closing ``` fence preceded by `}` and rescue via `repair_tool_call_inner_quotes`.
+        if span[scan..].starts_with('{') {
+            let mut close_fence: Option<usize> = None;
+            let mut fscan = scan;
+            let next_json_fence = span[scan + 1..]
+                .find("```json")
+                .map(|i| scan + 1 + i)
+                .unwrap_or(span.len());
+            while fscan < next_json_fence {
+                let Some(frel) = span[fscan..next_json_fence].find(FENCE) else {
+                    break;
+                };
+                let fpos = fscan + frel;
+                let candidate = span[scan..fpos]
+                    .trim_end()
+                    .trim_end_matches(']')
+                    .trim_end();
+                if candidate.ends_with('}') {
+                    close_fence = Some(fpos);
+                }
+                fscan = fpos + FENCE.len();
+            }
+            let end_bound = close_fence.unwrap_or(next_json_fence);
+            let candidate = span[scan..end_bound]
+                .trim_end()
+                .trim_end_matches(']')
+                .trim_end();
+            if let Some(pair) = repair_tool_call_inner_quotes(candidate)
+                .and_then(|v| extract_explicit_tool_name_and_args(&v))
+            {
+                block_calls.push(pair);
+                scan = if close_fence.is_some() {
+                    end_bound + FENCE.len()
+                } else {
+                    end_bound
+                };
+            }
+        }
+
+        if block_calls.is_empty() {
+            let close_end = span[lang_end..]
+                .find("\n```")
+                .map(|i| lang_end + i + 4)
+                .or_else(|| span[lang_end..].find(FENCE).map(|i| lang_end + i + FENCE.len()))
+                .unwrap_or(span.len());
+            flush_gap(&span[cursor..close_end], prose_out, calls_out);
+            cursor = close_end;
+            continue;
+        }
+
+        flush_gap(&span[cursor..fence_start], prose_out, calls_out);
+        for (name, arguments) in block_calls {
+            calls_out.push(ToolCall {
+                id: format!("call_{}", calls_out.len()),
+                name,
+                arguments,
+            });
+        }
+        let mut after = scan;
+        if opened_array {
+            let t0 = span[after..].trim_start();
+            after += span[after..].len() - t0.len();
+            if span[after..].starts_with(']') {
+                after += 1;
+            }
+        }
+        let t1 = span[after..].trim_start();
+        after += span[after..].len() - t1.len();
+        if span[after..].starts_with(FENCE) {
+            after += FENCE.len();
+        }
+        cursor = after;
+    }
+
+    if cursor < span.len() {
+        flush_gap(&span[cursor..], prose_out, calls_out);
+    }
+}
+
+/// Extracts Qwen2.5 `<tool_call>...</tool_call>` JSON invocations (including multi-object
+/// `<tool_call>` blocks and interleaved fenced/bare JSON tool blocks in exact document order),
+/// returning `(remaining_prose, parsed_tool_calls)` using JSON-string-aware brace matching.
 pub fn parse_qwen_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     const OPEN_TAG: &str = "<tool_call>";
     const CLOSE_TAG: &str = "</tool_call>";
@@ -1850,11 +2608,11 @@ pub fn parse_qwen_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
 
     while let Some(rel) = text[cursor..].find(OPEN_TAG) {
         let tag_start = cursor + rel;
-        prose.push_str(&text[cursor..tag_start]);
+        extract_non_xml_tool_calls_in_span(&text[cursor..tag_start], &mut prose, &mut calls);
         let mut p = tag_start + OPEN_TAG.len();
         let rest = &text[p..];
 
-        // Skip whitespace and optional ```json / ``` fence.
+        // Skip whitespace, optional ```json / ``` fence, and optional `[` array wrapper.
         let trimmed_ws = rest.trim_start();
         p += rest.len() - trimmed_ws.len();
         if text[p..].starts_with("```") {
@@ -1863,73 +2621,275 @@ pub fn parse_qwen_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
                 p += nl + 1;
             }
         }
+        let ws_arr = text[p..].trim_start();
+        p += text[p..].len() - ws_arr.len();
+        let opened_array = text[p..].starts_with('[');
+        if opened_array {
+            p += 1;
+        }
 
-        let Some(brace_rel) = text[p..].find('{') else {
-            prose.push_str(&text[tag_start..]);
-            cursor = text.len();
-            break;
-        };
-        let obj_start = p + brace_rel;
-        let Some(obj_end) = find_balanced_json_object_end(&text[obj_start..]).map(|len| obj_start + len) else {
-            prose.push_str(&text[tag_start..]);
-            cursor = text.len();
-            break;
-        };
-
-        let json_slice = &text[obj_start..obj_end];
-        let parsed = parse_json_lenient(json_slice).and_then(|v| {
-            let fn_obj = v.get("function").unwrap_or(&v);
-            let name = fn_obj.get("name").and_then(Json::as_str)?.to_string();
-            let arguments = match fn_obj.get("arguments") {
-                Some(Json::Str(s)) => s.clone(),
-                Some(other) => other.stringify(),
-                None => "{}".to_string(),
-            };
-            Some((name, arguments))
-        });
-
-        let Some((name, arguments)) = parsed else {
-            prose.push_str(&text[tag_start..obj_end]);
-            cursor = obj_end;
+        let next_open_guard = find_next_real_tool_open(text, tag_start + OPEN_TAG.len())
+            .unwrap_or(text.len());
+        let Some(brace_rel) = text[p..next_open_guard].find('{') else {
+            prose.push_str(&text[tag_start..next_open_guard]);
+            cursor = next_open_guard;
             continue;
         };
+        let mut obj_start = p + brace_rel;
+        let mut extracted_in_tag = 0usize;
 
-        calls.push(ToolCall {
-            id: format!("call_{}", calls.len()),
-            name,
-            arguments,
-        });
+        while text[obj_start..].starts_with('{') {
+            let primary = find_balanced_json_object_end(&text[obj_start..]).and_then(|len| {
+                let obj_end = obj_start + len;
+                let parsed = parse_json_lenient(&text[obj_start..obj_end])
+                    .and_then(|v| extract_name_and_args(&v))?;
+                Some((obj_end, parsed))
+            });
+            let Some((obj_end, (name, arguments))) = primary else {
+                break;
+            };
+            calls.push(ToolCall {
+                id: format!("call_{}", calls.len()),
+                name,
+                arguments,
+            });
+            extracted_in_tag += 1;
+            let mut after = obj_end;
+            loop {
+                let t = text[after..].trim_start();
+                after += text[after..].len() - t.len();
+                if text[after..].starts_with(',') {
+                    after += 1;
+                } else {
+                    break;
+                }
+            }
+            obj_start = after;
+        }
 
-        let mut after = obj_end;
-        let t1 = text[after..].trim_start();
-        after += text[after..].len() - t1.len();
-        if text[after..].starts_with("```") {
-            after += 3;
-            let t2 = text[after..].trim_start();
-            after += text[after..].len() - t2.len();
+        if extracted_in_tag > 0 && !text[obj_start..].starts_with('{') {
+            let mut after = obj_start;
+            if opened_array && text[after..].starts_with(']') {
+                after += 1;
+                let t0 = text[after..].trim_start();
+                after += text[after..].len() - t0.len();
+            }
+            if text[after..].starts_with("```") {
+                after += 3;
+                let t2 = text[after..].trim_start();
+                after += text[after..].len() - t2.len();
+            }
+            if text[after..].starts_with(CLOSE_TAG) {
+                after += CLOSE_TAG.len();
+            }
+            cursor = after;
+            continue;
         }
-        if text[after..].starts_with(CLOSE_TAG) {
-            after += CLOSE_TAG.len();
+
+        // Fallback: if unescaped inner quotes or non-standard escapes broke brace balance,
+        // rescue using the enclosing `</tool_call>` boundary without aborting later `<tool_call>` blocks.
+        if let Some(close_pos) = find_enclosing_tool_close(text, obj_start) {
+            let candidate = text[obj_start..close_pos]
+                .trim_end()
+                .trim_end_matches("```")
+                .trim_end()
+                .trim_end_matches(']')
+                .trim_end();
+            if let Some((name, arguments)) =
+                repair_tool_call_inner_quotes(candidate).and_then(|v| extract_name_and_args(&v))
+            {
+                calls.push(ToolCall {
+                    id: format!("call_{}", calls.len()),
+                    name,
+                    arguments,
+                });
+                cursor = close_pos + CLOSE_TAG.len();
+                continue;
+            }
+            if extracted_in_tag == 0 {
+                prose.push_str(&text[tag_start..close_pos + CLOSE_TAG.len()]);
+            } else {
+                prose.push_str(&text[obj_start..close_pos + CLOSE_TAG.len()]);
+            }
+            cursor = close_pos + CLOSE_TAG.len();
+            continue;
         }
-        cursor = after;
+
+        // Unclosed `<tool_call>` followed by another `<tool_call>`: rescue up to `next_open`
+        // and continue scanning subsequent `<tool_call>` blocks.
+        if let Some(next_open) = find_next_real_tool_open(text, obj_start + 1) {
+            let between = text[obj_start..next_open]
+                .trim_end()
+                .trim_end_matches("```")
+                .trim_end()
+                .trim_end_matches(']')
+                .trim_end();
+            if let Some((name, arguments)) =
+                repair_tool_call_inner_quotes(between).and_then(|v| extract_name_and_args(&v))
+            {
+                calls.push(ToolCall {
+                    id: format!("call_{}", calls.len()),
+                    name,
+                    arguments,
+                });
+            } else if extracted_in_tag == 0 {
+                prose.push_str(&text[tag_start..next_open]);
+            } else {
+                prose.push_str(&text[obj_start..next_open]);
+            }
+            cursor = next_open;
+            continue;
+        }
+
+        // Unclosed `<tool_call>` at end of turn: rescue if the JSON object closed before `<|im_end|>` without `</tool_call>`.
+        let tail_candidate = text[obj_start..]
+            .trim_end()
+            .trim_end_matches("```")
+            .trim_end()
+            .trim_end_matches(']')
+            .trim_end();
+        if let Some((name, arguments)) =
+            repair_tool_call_inner_quotes(tail_candidate).and_then(|v| extract_name_and_args(&v))
+        {
+            calls.push(ToolCall {
+                id: format!("call_{}", calls.len()),
+                name,
+                arguments,
+            });
+            cursor = text.len();
+            break;
+        }
+        if extracted_in_tag == 0 {
+            prose.push_str(&text[tag_start..]);
+        } else {
+            prose.push_str(&text[obj_start..]);
+        }
+        cursor = text.len();
+        break;
     }
 
     if cursor < text.len() {
+        extract_non_xml_tool_calls_in_span(&text[cursor..], &mut prose, &mut calls);
+    }
+    (strip_empty_tool_wrappers(&prose), calls)
+}
+
+fn parse_xml_attr_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    const TAG: &str = "<tool ";
+    let mut prose = String::new();
+    let mut calls = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel) = text[cursor..].find(TAG) {
+        let tag_start = cursor + rel;
+        let mut p = tag_start + TAG.len();
+        let Some(name_pos) = text[p..].find("name=") else {
+            prose.push_str(&text[cursor..p]);
+            cursor = p;
+            continue;
+        };
+        let nq_pos = p + name_pos + "name=".len();
+        let Some(&nq) = text.as_bytes().get(nq_pos) else {
+            break;
+        };
+        if nq != b'"' && nq != b'\'' {
+            prose.push_str(&text[cursor..nq_pos]);
+            cursor = nq_pos;
+            continue;
+        }
+        let name_start = nq_pos + 1;
+        let Some(name_end_rel) = text[name_start..].find(nq as char) else {
+            break;
+        };
+        let name = text[name_start..name_start + name_end_rel].trim().to_string();
+        p = name_start + name_end_rel + 1;
+
+        let Some(arg_pos) = text[p..].find("arguments=") else {
+            prose.push_str(&text[cursor..p]);
+            cursor = p;
+            continue;
+        };
+        let aq_pos = p + arg_pos + "arguments=".len();
+        let Some(&aq) = text.as_bytes().get(aq_pos) else {
+            break;
+        };
+        let brace_search_start = if aq == b'"' || aq == b'\'' {
+            aq_pos + 1
+        } else {
+            aq_pos
+        };
+        let trimmed = text[brace_search_start..].trim_start();
+        let obj_start = brace_search_start + (text[brace_search_start..].len() - trimmed.len());
+        let Some(obj_len) = find_balanced_json_object_end(&text[obj_start..]) else {
+            prose.push_str(&text[cursor..obj_start]);
+            cursor = obj_start;
+            continue;
+        };
+        let obj_end = obj_start + obj_len;
+        let raw_args = &text[obj_start..obj_end];
+        let Some(parsed_args) = parse_json_lenient(raw_args) else {
+            prose.push_str(&text[cursor..obj_end]);
+            cursor = obj_end;
+            continue;
+        };
+        prose.push_str(&text[cursor..tag_start]);
+        calls.push(ToolCall {
+            id: format!("call_{}", calls.len()),
+            name,
+            arguments: parsed_args.stringify(),
+        });
+        let mut after = obj_end;
+        if text.as_bytes().get(after).copied() == Some(aq) {
+            after += 1;
+        }
+        let tail_ws = text[after..].trim_start();
+        after += text[after..].len() - tail_ws.len();
+        if text[after..].starts_with("/>") {
+            after += 2;
+        } else if text[after..].starts_with('>') {
+            after += 1;
+            let t2 = text[after..].trim_start();
+            after += text[after..].len() - t2.len();
+            if text[after..].starts_with("</tool>") {
+                after += "</tool>".len();
+            }
+        }
+        cursor = after;
+    }
+    if cursor < text.len() {
         prose.push_str(&text[cursor..]);
     }
-    if calls.is_empty() && text.contains("```") && text.contains("\"name\"") {
-        let (fenced_prose, fenced_calls) = parse_fenced_json_tool_calls(text);
-        if !fenced_calls.is_empty() {
-            return (fenced_prose, fenced_calls);
+    (prose, calls)
+}
+
+fn strip_empty_tool_wrappers(s: &str) -> String {
+    let mut cur = s.to_string();
+    loop {
+        let mut changed = false;
+        for (open, close) in [
+            ("<tools>", "</tools>"),
+            ("<tool_call>", "</tool_call>"),
+            ("```xml", "```"),
+            ("```json", "```"),
+        ] {
+            if let Some(i) = cur.find(open) {
+                let body_start = i + open.len();
+                if let Some(rel_end) = cur[body_start..].find(close) {
+                    let body = &cur[body_start..body_start + rel_end];
+                    if body.trim().is_empty() {
+                        let end = body_start + rel_end + close.len();
+                        cur.replace_range(i..end, "");
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
         }
     }
-    if calls.is_empty() && text.contains("\"name\"") && text.contains("\"arguments\"") {
-        let (bare_prose, bare_calls) = parse_bare_json_tool_calls(text);
-        if !bare_calls.is_empty() {
-            return (bare_prose, bare_calls);
-        }
-    }
-    (prose.trim().to_string(), calls)
+    cur.trim().to_string()
 }
 
 fn parse_bare_json_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
@@ -1983,70 +2943,6 @@ fn parse_bare_json_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
             after += ws_len + "</tool_call>".len();
         } else if t.starts_with("```") {
             after += ws_len + 3;
-        }
-        cursor = after;
-    }
-    if cursor < text.len() {
-        prose.push_str(&text[cursor..]);
-    }
-    (prose.trim().to_string(), calls)
-}
-
-fn parse_fenced_json_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
-    const FENCE: &str = "```";
-    let mut prose = String::new();
-    let mut calls = Vec::new();
-    let mut cursor = 0usize;
-
-    while let Some(rel) = text[cursor..].find(FENCE) {
-        let fence_start = cursor + rel;
-        let after_ticks = fence_start + FENCE.len();
-        let lang_end = text[after_ticks..]
-            .find(['\n', '{'])
-            .map(|i| after_ticks + i)
-            .unwrap_or(after_ticks);
-        let lang_tag = text[after_ticks..lang_end].trim();
-        let body_start = if lang_tag.is_empty() || lang_tag.eq_ignore_ascii_case("json") || lang_tag.eq_ignore_ascii_case("tool_call") {
-            lang_end
-        } else {
-            prose.push_str(&text[cursor..after_ticks]);
-            cursor = after_ticks;
-            continue;
-        };
-        let trimmed = text[body_start..].trim_start();
-        let p = body_start + (text[body_start..].len() - trimmed.len());
-        let Some(obj_len) = find_balanced_json_object_end(&text[p..]) else {
-            prose.push_str(&text[cursor..after_ticks]);
-            cursor = after_ticks;
-            continue;
-        };
-        let obj_end = p + obj_len;
-        let parsed = parse_json_lenient(&text[p..obj_end]).and_then(|v| {
-            let fn_obj = v.get("function").unwrap_or(&v);
-            let name = fn_obj.get("name").and_then(Json::as_str)?.to_string();
-            let args_val = fn_obj.get("arguments")?;
-            let arguments = match args_val {
-                Json::Str(s) => s.clone(),
-                other => other.stringify(),
-            };
-            Some((name, arguments))
-        });
-        let Some((name, arguments)) = parsed else {
-            prose.push_str(&text[cursor..obj_end]);
-            cursor = obj_end;
-            continue;
-        };
-        prose.push_str(&text[cursor..fence_start]);
-        calls.push(ToolCall {
-            id: format!("call_{}", calls.len()),
-            name,
-            arguments,
-        });
-        let mut after = obj_end;
-        let t = text[after..].trim_start();
-        after += text[after..].len() - t.len();
-        if text[after..].starts_with("```") {
-            after += 3;
         }
         cursor = after;
     }
@@ -2155,6 +3051,34 @@ fn top1_and_margin(logits: &[f32]) -> (usize, f32) {
 }
 
 #[inline]
+fn apply_repeat_penalty_unique(l: &mut [f32], recent: &[usize], repeat_penalty: f32) {
+    let mut seen = [usize::MAX; 128];
+    let mut seen_len = 0usize;
+    for (idx, &t) in recent.iter().enumerate() {
+        if t >= l.len() {
+            continue;
+        }
+        let already_seen = if idx <= seen.len() {
+            seen[..seen_len].contains(&t)
+        } else {
+            recent[..idx].contains(&t)
+        };
+        if already_seen {
+            continue;
+        }
+        if seen_len < seen.len() {
+            seen[seen_len] = t;
+            seen_len += 1;
+        }
+        l[t] = if l[t] > 0.0 {
+            l[t] / repeat_penalty
+        } else {
+            l[t] * repeat_penalty
+        };
+    }
+}
+
+#[inline]
 fn sample_greedy_with_margin(
     logits: &[f32],
     recent: &[usize],
@@ -2172,11 +3096,7 @@ fn sample_greedy_with_margin(
     }
     let l = &mut scratch[..logits.len()];
     l.copy_from_slice(logits);
-    for &t in recent {
-        if t < l.len() {
-            l[t] = if l[t] > 0.0 { l[t] / repeat_penalty } else { l[t] * repeat_penalty };
-        }
-    }
+    apply_repeat_penalty_unique(l, recent, repeat_penalty);
     top1_and_margin(l)
 }
 
@@ -2194,11 +3114,7 @@ fn sample_greedy(logits: &[f32], recent: &[usize], repeat_penalty: f32, scratch:
     }
     let l = &mut scratch[..logits.len()];
     l.copy_from_slice(logits);
-    for &t in recent {
-        if t < l.len() {
-            l[t] = if l[t] > 0.0 { l[t] / repeat_penalty } else { l[t] * repeat_penalty };
-        }
-    }
+    apply_repeat_penalty_unique(l, recent, repeat_penalty);
     argmax(l)
 }
 
@@ -2224,7 +3140,7 @@ fn sample_token(
 }
 
 /// Builds the normalized `(token_id, prob)` `top_k` + `top_p` distribution in a single `O(V)` scan
-/// using a `k`-element binary min-heap (`0` `49,152`-index allocations!).
+/// using a `k`-element binary min-heap (`0` `49,152`-index allocations).
 fn build_sampling_dist(
     logits: &[f32],
     recent: &[usize],
@@ -2238,11 +3154,7 @@ fn build_sampling_dist(
     } else {
         let l = &mut pen_scratch[..logits.len()];
         l.copy_from_slice(logits);
-        for &t in recent {
-            if t < l.len() {
-                l[t] = if l[t] > 0.0 { l[t] / p.repeat_penalty } else { l[t] * p.repeat_penalty };
-            }
-        }
+        apply_repeat_penalty_unique(l, recent, p.repeat_penalty);
         l
     };
 
@@ -2394,10 +3306,13 @@ mod tests {
 
         let g = sample_greedy(&logits, &recent, p.repeat_penalty, &mut pen);
         let mut ref_l = logits.clone();
-        for &t in &recent {
+        for &t in &[17usize, 99, 512] {
             ref_l[t] = if ref_l[t] > 0.0 { ref_l[t] / p.repeat_penalty } else { ref_l[t] * p.repeat_penalty };
         }
         assert_eq!(g, argmax(&ref_l));
+        let mut dup_probe = vec![2.0f32, 1.90f32];
+        apply_repeat_penalty_unique(&mut dup_probe, &[0, 0, 0, 0], 1.05);
+        assert!((dup_probe[0] - (2.0f32 / 1.05f32)).abs() < 1e-6);
     }
 
     #[test]
@@ -2460,6 +3375,56 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_qwen_keeps_write_before_run_with_unescaped_python_quotes() {
+        // A write_file whose Python payload has raw unescaped `"` (breaking brace balance)
+        // followed by a run_command in the same turn must yield both calls in order.
+        let raw = concat!(
+            "<tool_call>\n",
+            r#"{"name": "write_file", "arguments": {"path": "build_video.py", "content": "import os\nmsg = "hello {world}"\ndoc = """triple"""\nprint(msg)\n"}}"#,
+            "\n</tool_call>\n",
+            "<tool_call>\n",
+            r#"{"name": "run_command", "arguments": {"cmd": "python3 build_video.py"}}"#,
+            "\n</tool_call>",
+        );
+        let (_prose, calls) = parse_qwen_tool_calls(raw);
+        assert_eq!(calls.len(), 2, "calls: {calls:?}");
+        assert_eq!(calls[0].name, "write_file");
+        let a0 = Json::parse(&calls[0].arguments).unwrap();
+        assert_eq!(a0.get("path").and_then(Json::as_str), Some("build_video.py"));
+        let content = a0.get("content").and_then(Json::as_str).unwrap();
+        assert!(content.contains("msg = \"hello {world}\""), "content: {content}");
+        assert!(content.contains("\"\"\"triple\"\"\""), "content: {content}");
+        assert_eq!(calls[1].name, "run_command");
+    }
+
+    #[test]
+    fn test_parse_qwen_extracts_fenced_and_bare_calls_after_first_tool_call() {
+        // Calls 2..N emitted as fenced JSON or bare JSON (without repeating `<tool_call>`)
+        // must not be dropped once the first `<tool_call>` parsed.
+        let raw = concat!(
+            "<tool_call>\n",
+            r#"{"name": "write_file", "arguments": {"path": "styles/tokens.css", "content": ":root { --bg: #0b1120; }"}}"#,
+            "\n</tool_call>\nNext the layout file:\n```json\n",
+            r#"{"name": "write_file", "arguments": {"path": "styles/layout.css", "content": "body { margin: 0; }"}}"#,
+            "\n```\nAnd the script:\n",
+            r#"{"name": "write_file", "arguments": {"path": "js/app.js", "content": "console.log('ok');"}}"#,
+            "\n",
+        );
+        let (prose, calls) = parse_qwen_tool_calls(raw);
+        let paths: Vec<String> = calls
+            .iter()
+            .map(|c| {
+                Json::parse(&c.arguments)
+                    .ok()
+                    .and_then(|v| v.get("path").and_then(Json::as_str).map(str::to_string))
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(paths, vec!["styles/tokens.css", "styles/layout.css", "js/app.js"]);
+        assert!(!prose.contains("\"arguments\""), "prose leaked tool JSON: {prose}");
+    }
+
+    #[test]
     fn test_parse_qwen_tool_calls_with_embedded_tags_and_fences() {
         let raw = concat!(
             "Creating the file and running a quick check.\n",
@@ -2515,6 +3480,107 @@ mod tests {
         assert_eq!(gf_prose, "Applying styles:");
         assert_eq!(gf_calls.len(), 1);
         assert_eq!(gf_calls[0].name, "edit_file");
+
+        let xml_attr = concat!(
+            "Updating script:\n```xml\n<tools>\n",
+            "  <tool name=\"edit_file\" arguments='{\"path\":\"script.md\",\"old_text\":\"a\",\"new_text\":\"Here's line 1\nLine 2\"}' />\n",
+            "</tools>\n```",
+        );
+        let (xa_prose, xa_calls) = parse_qwen_tool_calls(xml_attr);
+        assert_eq!(xa_prose, "Updating script:");
+        assert_eq!(xa_calls.len(), 1);
+        assert_eq!(xa_calls[0].name, "edit_file");
+        let xa_args = Json::parse(&xa_calls[0].arguments).unwrap();
+        assert_eq!(
+            xa_args.get("new_text").and_then(Json::as_str),
+            Some("Here's line 1\nLine 2")
+        );
+
+        // Non-RFC8259 JS/shell backslash escapes (`\'`, `\ `, `\d`, `\u{...}`) and unescaped inner HTML quotes.
+        let sloppy_coder = concat!(
+            "<tool_call>\n",
+            r#"{"name": "write_file", "arguments": {"path": "tests/verify_app.mjs", "content": "const chrome = '/Applications/Google\ Chrome.app';\nconst re = /\d+\s+/;\nconst u = '\u{1F680}';\nconst msg = 'it\'s ok';\n"}}"#,
+            "\n</tool_call>\n",
+            "<tool_call>\n",
+            r#"{"name": "write_file", "arguments": {"path": "index.html", "content": "<div class="kpi-card" data-id="uptime">99.98%</div>"}}"#,
+            "\n</tool_call>\n",
+            "<tool_call>\n",
+            r#"{"name": "run_command", "arguments": {"cmd": "node tests/verify_app.mjs"}}"#,
+            "\n</tool_call>",
+        );
+        let (sc_prose, sc_calls) = parse_qwen_tool_calls(sloppy_coder);
+        assert!(sc_prose.is_empty(), "unexpected leftover prose: {sc_prose}");
+        assert_eq!(sc_calls.len(), 3);
+        assert_eq!(sc_calls[0].name, "write_file");
+        let sc0 = Json::parse(&sc_calls[0].arguments).unwrap();
+        let sc0_content = sc0.get("content").and_then(Json::as_str).unwrap();
+        assert!(sc0_content.contains(r"Google\ Chrome.app"));
+        assert!(sc0_content.contains(r"/\d+\s+/"));
+        assert!(sc0_content.contains(r"\u{1F680}"));
+        assert!(sc0_content.contains(r"const msg = 'it\'s ok';"));
+        assert_eq!(sc_calls[1].name, "write_file");
+        let sc1 = Json::parse(&sc_calls[1].arguments).unwrap();
+        assert_eq!(
+            sc1.get("content").and_then(Json::as_str),
+            Some(r#"<div class="kpi-card" data-id="uptime">99.98%</div>"#)
+        );
+        assert_eq!(sc_calls[2].name, "run_command");
+
+        // Over-escaped single-quote JS delimiters (`owner:\'Core\'`) + backtick-wrapped content without `</tool_call>`.
+        let over_escaped_js = concat!(
+            "<tool_call>\n",
+            r#"{"name": "write_file", "arguments": {"path": "js/data.js", "content": "export const S = [{ owner:\'Core Networking\', region:\'us-east-1', note:\'it\'s live\' }];"}}"#,
+            "\n</tool_call>",
+        );
+        let (_, oe_calls) = parse_qwen_tool_calls(over_escaped_js);
+        assert_eq!(oe_calls.len(), 1);
+        let oe0 = Json::parse(&oe_calls[0].arguments).unwrap();
+        assert_eq!(
+            oe0.get("content").and_then(Json::as_str),
+            Some(r#"export const S = [{ owner:'Core Networking', region:'us-east-1', note:'it\'s live' }];"#)
+        );
+
+        let backtick_unclosed = "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"js/state.js\", \"content\": `export const state = { filter: \"all\" };`}}";
+        let (_, bt_calls) = parse_qwen_tool_calls(backtick_unclosed);
+        assert_eq!(bt_calls.len(), 1);
+        let bt0 = Json::parse(&bt_calls[0].arguments).unwrap();
+        assert_eq!(
+            bt0.get("content").and_then(Json::as_str),
+            Some("export const state = { filter: \"all\" };")
+        );
+
+        let stray_line_end_bt = "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"js/render.js\", \"content\": \"function f() {\\n  render();\\`\\n}\\n\"}}\n</tool_call>";
+        let (_, sl_calls) = parse_qwen_tool_calls(stray_line_end_bt);
+        assert_eq!(sl_calls.len(), 1);
+        let sl0 = Json::parse(&sl_calls[0].arguments).unwrap();
+        assert_eq!(
+            sl0.get("content").and_then(Json::as_str),
+            Some("function f() {\n  render();\n}\n")
+        );
+
+        // Single-line Python `split('\n')` and `f"file '{s}'\n"` inside JSON string + LaTeX `\frac`/`\times`/`\rangle` + missing outer `}`.
+        let py_and_latex = concat!(
+            "<tool_call>\n",
+            r#"{"name": "write_file", "arguments": {"path": "build_video.py", "content": "title = section.split('\n')[0]\nf.write(f\"file '{slide}'\n\")\n"}"#,
+            "\n</tool_call>\n",
+            "<tool_call>\n",
+            r#"{"name": "write_file", "arguments": {"path": "script.md", "content": "Transform $Q_b = \frac{1}{8} H_{64} D_b$ over $C_1 \times C_2$ with $\langle x, y \rangle$ and `<tool_call>` tags ("Kronos")."}"#,
+            "\n</tool_call>",
+        );
+        let (_, pl_calls) = parse_qwen_tool_calls(py_and_latex);
+        assert_eq!(pl_calls.len(), 2);
+        let pl0 = Json::parse(&pl_calls[0].arguments).unwrap();
+        assert_eq!(
+            pl0.get("content").and_then(Json::as_str),
+            Some("title = section.split('\\n')[0]\nf.write(f\"file '{slide}'\\n\")\n")
+        );
+        let pl1 = Json::parse(&pl_calls[1].arguments).unwrap();
+        let pl1_c = pl1.get("content").and_then(Json::as_str).unwrap();
+        assert!(pl1_c.contains(r"\frac{1}{8}"), "got: {pl1_c}");
+        assert!(pl1_c.contains(r"\times"), "got: {pl1_c}");
+        assert!(pl1_c.contains(r"\langle"), "got: {pl1_c}");
+        assert!(pl1_c.contains(r"\rangle"), "got: {pl1_c}");
+        assert!(pl1_c.contains(r#"("Kronos")"#), "got: {pl1_c}");
     }
 
     static HEAVY_14B_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -2711,6 +3777,23 @@ mod tests {
         }
         eprintln!(
             "10-prompt 14B Metal vs CPU summary: max_kl={max_kl:.6}, exact_32tok_greedy={exact_greedy_matches}/10"
+        );
+    }
+
+    #[test]
+    fn test_parse_qwen_tool_calls_mixed_plain_and_escaped_single_quotes() {
+        let raw = "<tool_call>\n{\"name\":\"write_file\",\"arguments\":{\"path\":\"build_video.py\",\"content\":\"note = 'Viazovska\\'s theorem'\\nsubprocess.run(['ffmpeg', '-f', 'concat', '-safe', '0\\', \\'-i\\', \\'concat.txt\\', \\'-c\\', \\'copy\\', \\'out.mp4\\'], check=True)\\n\"}}\n</tool_call>";
+        let (_, calls) = parse_qwen_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        let parsed = Json::parse(&calls[0].arguments).expect("valid tool arguments json");
+        let content = parsed.get("content").and_then(Json::as_str).unwrap_or("");
+        assert!(
+            content.contains("note = 'Viazovska\\'s theorem'"),
+            "apostrophe inside plain single-quoted string should stay escaped: {content}"
+        );
+        assert!(
+            content.contains("'-safe', '0', '-i', 'concat.txt', '-c', 'copy', 'out.mp4']"),
+            "mixed plain/over-escaped single-quote list delimiters should decode cleanly: {content}"
         );
     }
 }
