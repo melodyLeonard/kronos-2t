@@ -22,11 +22,11 @@
 //! Commands: `/agent` toggles workspace tools, `/workdir [dir]` views or sets workspace,
 //! `/files` lists workspace files, `/validate` validates workspace syntax, `/reset` clears history, `/exit` quits.
 
-use kronos_2t::agent::{
+use kronos_2t::runtime::agent::{
     list_workspace_files, run_agent_turn, tool_definitions_json, truncate_utf8, validate_workspace,
     AgentEvent, AgentTurnConfig, AGENT_SYSTEM_PROMPT,
 };
-use kronos_2t::chat::{ChatModel, GenParams, Message};
+use kronos_2t::runtime::chat::{ChatModel, GenParams, Message};
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -54,13 +54,13 @@ fn main() {
     let mut agent_mode = args.iter().any(|a| a == "--agent" || a == "--tools");
 
     eprintln!("loading {} ({mode})...", model_dir.display());
-    let default_threads = kronos_2t::thread_pool::default_inference_threads() as f64;
+    let default_threads = kronos_2t::kernels::thread_pool::default_inference_threads() as f64;
     let calib_opt = calib.as_deref().map(|c| (Path::new(c), calib_tokens));
     let cache_dir_flag = flag("--cache-dir");
     let cache_dir_opt = cache_dir_flag.as_deref().map(Path::new);
     if let Some(mb_str) = flag("--memory-budget-mb") {
         let mb: usize = mb_str.parse().expect("numeric --memory-budget-mb");
-        kronos_2t::memory_budget::MemoryBudgetProfile::set_global_budget_override_mb(mb);
+        kronos_2t::model::memory_budget::MemoryBudgetProfile::set_global_budget_override_mb(mb);
     }
     let default_ctx = if agent_mode { 32768.0 } else { 2048.0 };
     let mut model = ChatModel::load_with_cache_dir(

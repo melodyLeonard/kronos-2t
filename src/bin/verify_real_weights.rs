@@ -1,17 +1,17 @@
 use kronos_2t::{
-    bpe_tokenizer::BpeTokenizer,
-    compiler::{
+    model::bpe_tokenizer::BpeTokenizer,
+    model::compiler::{
         compile_global_ternary_as_multiplane, compile_hadamard_gptq_bipolar,
         compile_hadamard_gptq_full_row, compile_kronecker_matrix, compile_multiplane_ternary,
         FullRowGptqHessian,
     },
-    hadamard::fwht64_signed_inplace,
-    real_llm::{
+    kernels::hadamard::fwht64_signed_inplace,
+    model::real_llm::{
         collect_fp32_reference_logits, evaluate_quality_against_reference, RealLlamaEngine,
         RealWeightMode,
     },
-    safetensors::SafeTensorsFile,
-    simd_lut::{
+    storage::safetensors::SafeTensorsFile,
+    kernels::simd_lut::{
         default_register_codebook_64, fused_kronecker_gemv, simd_lut_base3_gemv,
         simd_lut_bipolar_gemv, simd_lut_gemv_multiplane, BipolarActivationLut, GgufQ4_0Matrix,
         QuantizedActivationLut,

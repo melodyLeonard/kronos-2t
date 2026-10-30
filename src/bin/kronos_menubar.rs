@@ -16,8 +16,8 @@ fn main() {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use kronos_2t::agent::mime_type_for_path;
-    use kronos_2t::json::quote;
+    use kronos_2t::runtime::agent::mime_type_for_path;
+    use kronos_2t::util::json::quote;
     use std::cell::RefCell;
     use std::ffi::{c_char, c_void, CStr, CString};
     use std::fs;
@@ -758,7 +758,7 @@ mod macos {
             cell.borrow()
                 .as_ref()
                 .map(|s| s.base_url.clone())
-                .unwrap_or_else(|| "http://127.0.0.1:18080".to_string())
+                .unwrap_or_else(|| kronos_2t::config::server::DEFAULT_BASE_URL.to_string())
         });
         hide_panel();
         open_external_url(&url);
@@ -1222,7 +1222,7 @@ mod macos {
                 .position(|a| a == name)
                 .and_then(|i| args.get(i + 1).cloned())
         };
-        let base_url = flag("--url").unwrap_or_else(|| "http://127.0.0.1:18080".to_string());
+        let base_url = flag("--url").unwrap_or_else(|| kronos_2t::config::server::DEFAULT_BASE_URL.to_string());
         let open_now = args.iter().any(|a| a == "--show");
 
         if args.iter().any(|a| a == "--self-test") {

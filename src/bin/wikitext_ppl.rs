@@ -19,8 +19,8 @@
 //! and top-1 agreement are measured against the Exact FP32 reference at the same positions.
 
 use kronos_2t::{
-    bpe_tokenizer::BpeTokenizer,
-    real_llm::{argmax, RealLlamaEngine, RealWeightMode},
+    model::bpe_tokenizer::BpeTokenizer,
+    model::real_llm::{argmax, RealLlamaEngine, RealWeightMode},
 };
 use std::path::Path;
 use std::time::Instant;
@@ -151,7 +151,7 @@ fn main() {
         None => "builtin".to_string(),
     };
     let first = n_ctx / 2;
-    let p_cores = kronos_2t::thread_pool::default_inference_threads();
+    let p_cores = kronos_2t::kernels::thread_pool::default_inference_threads();
 
     println!(
         "WikiText-2: {} tokens in file | {} chunks x n_ctx={} | {} scored tokens",

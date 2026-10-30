@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
 //! Sandboxed tool-calling coding runner (`kronos_agent --model <dir> --workdir <dir> --prompt "..."` or `--server 127.0.0.1:18080`).
 
-use kronos_2t::agent::{
+use kronos_2t::runtime::agent::{
     execute_tool, run_agent_turn, serialize_messages_json, tool_definitions_json, truncate_utf8,
     validate_workspace, AgentEvent, AgentTurnConfig, AGENT_SYSTEM_PROMPT,
 };
-use kronos_2t::chat::{ChatModel, FinishReason, GenParams, Message, ToolCall};
-use kronos_2t::json::Json;
+use kronos_2t::runtime::chat::{ChatModel, FinishReason, GenParams, Message, ToolCall};
+use kronos_2t::util::json::Json;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -355,9 +355,9 @@ fn main() {
         let cache_dir_opt = cache_dir_flag.as_deref().map(Path::new);
         if let Some(mb_str) = flag("--memory-budget-mb") {
             let mb: usize = mb_str.parse().expect("numeric --memory-budget-mb");
-            kronos_2t::memory_budget::MemoryBudgetProfile::set_global_budget_override_mb(mb);
+            kronos_2t::model::memory_budget::MemoryBudgetProfile::set_global_budget_override_mb(mb);
         }
-        let default_threads = kronos_2t::thread_pool::default_inference_threads() as f64;
+        let default_threads = kronos_2t::kernels::thread_pool::default_inference_threads() as f64;
         let mut model = ChatModel::load_with_cache_dir(
             model_dir,
             cache_dir_opt,
@@ -509,7 +509,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kronos_2t::agent::resolve_jailed_path;
+    use kronos_2t::runtime::agent::resolve_jailed_path;
 
     #[test]
     fn test_workspace_jail_and_tools_and_nonblocking_background_command() {

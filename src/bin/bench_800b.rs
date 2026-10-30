@@ -7,15 +7,15 @@
 //! Flags: --shard-path P, --real-model DIR, --shard-layers N, --shard-experts N, --threads N,
 //!        --exec-layers N, --vq2, --keep-shard
 
-use kronos_2t::compiler::{compile_hadamard_gptq_nf, compile_hadamard_gptq_vq2};
-use kronos_2t::moe_800b::{
+use kronos_2t::model::compiler::{compile_hadamard_gptq_nf, compile_hadamard_gptq_vq2};
+use kronos_2t::model::moe_800b::{
     write_exact_experts_k2tm, write_exact_nf_experts_k2tm, write_k2tm_shard_file,
     write_nf_k2tm_shard_file, DirectNvmeShard, DirectNvmeSlruPager, K2tmShardMmap,
     Kronos800bConfig, Kronos800bMoEEngine, MmapNfExpertView, MmapVq2ExpertView,
 };
-use kronos_2t::safetensors::SafeTensorsFile;
-use kronos_2t::simd_lut::{Int8ChunkActivation, Vq2ActivationLut};
-use kronos_2t::thread_pool::{default_inference_threads, physical_p_cores, SpinThreadPool};
+use kronos_2t::storage::safetensors::SafeTensorsFile;
+use kronos_2t::kernels::simd_lut::{Int8ChunkActivation, Vq2ActivationLut};
+use kronos_2t::kernels::thread_pool::{default_inference_threads, physical_p_cores, SpinThreadPool};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

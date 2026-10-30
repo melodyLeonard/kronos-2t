@@ -1,16 +1,16 @@
 use kronos_2t::{
-    compiler::compile_kronecker_matrix,
-    demo_model::{
+    model::compiler::compile_kronecker_matrix,
+    model::demo_model::{
         build_trained_demo_engine, generate_visible_sentence, run_needle_in_haystack_test,
     },
-    engine::{KronosConfig, KronosEngine},
-    lut_gemv, router,
-    simd_lut::{
+    model::engine::{KronosConfig, KronosEngine},
+    kernels::lut_gemv, kernels::router,
+    kernels::simd_lut::{
         default_register_codebook_64, default_simd_codebook, fused_kronecker_gemv, simd_lut_gemv,
         QuantizedActivationLut, SimdPackedMatrix,
     },
-    ssd::{SsdBlock, SsdScratch, SsdState},
-    synthesis,
+    kernels::ssd::{SsdBlock, SsdScratch, SsdState},
+    kernels::synthesis,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;

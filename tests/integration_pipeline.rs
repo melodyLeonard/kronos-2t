@@ -1,6 +1,6 @@
 use kronos_2t::{
-    engine::{KronosConfig, KronosEngine},
-    k2t_format::{encode_expert_page, K2tExpertPageView, K2tHeader, K2T_PAGE_SIZE},
+    model::engine::{KronosConfig, KronosEngine},
+    storage::k2t_format::{encode_expert_page, K2tExpertPageView, K2tHeader, K2T_PAGE_SIZE},
 };
 
 #[test]

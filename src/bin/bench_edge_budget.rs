@@ -10,17 +10,17 @@
 //! Expected Calibration Error (ECE), Turn-1 tool-schema token savings, and deterministic oracle
 //! verification.
 
-use kronos_2t::agent::{tool_definitions_json, verify_workspace_work, TurnRoute};
-use kronos_2t::bpe_tokenizer::BpeTokenizer;
-use kronos_2t::chat::{ChatModel, Message};
-use kronos_2t::jev::{
+use kronos_2t::runtime::agent::{tool_definitions_json, verify_workspace_work, TurnRoute};
+use kronos_2t::model::bpe_tokenizer::BpeTokenizer;
+use kronos_2t::runtime::chat::{ChatModel, Message};
+use kronos_2t::runtime::jev::{
     evaluate_rubric, extract_requirement_rubric, fuse_binary_log_odds, fuse_choice_logits,
     plan_turn_with_jev, structural_route_logits, CalibratedBool, CalibratedChoice,
 };
-use kronos_2t::memory_budget::{current_resident_bytes, MemoryBudgetProfile, MemoryTier};
-use kronos_2t::moe_800b::{write_nf_k2tm_shard_file, Kronos800bConfig};
-use kronos_2t::real_llm::{argmax, LlamaConfig, RealLlamaEngine, RealWeightMode};
-use kronos_2t::sparse_moe::{MoeExpertOpenPolicy, MoeRouterScoring};
+use kronos_2t::model::memory_budget::{current_resident_bytes, MemoryBudgetProfile, MemoryTier};
+use kronos_2t::model::moe_800b::{write_nf_k2tm_shard_file, Kronos800bConfig};
+use kronos_2t::model::real_llm::{argmax, LlamaConfig, RealLlamaEngine, RealWeightMode};
+use kronos_2t::model::sparse_moe::{MoeExpertOpenPolicy, MoeRouterScoring};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -721,7 +721,7 @@ fn run_suite_2_pretrained_quantizer_quality() {
         ),
     ];
 
-    let eval_threads = kronos_2t::thread_pool::default_inference_threads();
+    let eval_threads = kronos_2t::kernels::thread_pool::default_inference_threads();
     for (label, mode) in modes {
         let mut eng = fp32.compile_sequential_bipolar_gptq(mode, &calib_seqs, eval_threads);
         eng.repack_sdot();
@@ -806,7 +806,7 @@ fn run_suite_3_jev_calibration_latency_and_oracles() {
     println!("================================================================================");
 
     let model_dir = Path::new("models/Qwen2.5-Coder-0.5B-Instruct");
-    let jev_threads = kronos_2t::thread_pool::default_inference_threads();
+    let jev_threads = kronos_2t::kernels::thread_pool::default_inference_threads();
     let mut chat_opt = if model_dir.join("kronos-nf4g128.k2tb").exists() {
         Some(
             ChatModel::load(model_dir, "nf4g128", 2048, jev_threads, None)

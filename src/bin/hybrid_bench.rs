@@ -5,8 +5,8 @@
 //! Needs `<model_dir>/kronos-<mode>.k2tb` (from `kronos_chat`) and Neural Engine buckets
 //! `<model_dir>/ane/prefill_s<N>.mlmodelc` (from `ane/export_prefill.py`).
 
-use kronos_2t::coreml::{ComputeUnits, CoreMlModel};
-use kronos_2t::real_llm::{argmax, RealLlamaEngine};
+use kronos_2t::backend::coreml::{ComputeUnits, CoreMlModel};
+use kronos_2t::model::real_llm::{argmax, RealLlamaEngine};
 use std::path::Path;
 use std::time::Instant;
 

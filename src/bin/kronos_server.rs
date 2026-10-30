@@ -21,7 +21,7 @@
 //! `POST /v1/agent/clear`, `GET /preview/<path>`, `GET /v1/models`, `GET /health`,
 //! the workspace UI at `/`, and the floating quick-prompt UI at `/quick`.
 
-use kronos_2t::agent::{
+use kronos_2t::runtime::agent::{
     build_unified_system_prompt, classify_turn_intent, compact_conversation_history,
     is_multi_agent_prompt, list_workspace_files, mime_type_for_path, resolve_jailed_path,
     run_agent_turn_shared_with_spawner, serialize_messages_json, spawn_agent_tool_definition_json,
@@ -29,11 +29,11 @@ use kronos_2t::agent::{
     FileChangeDiff, SubAgentSpawner, TurnRoute, AGENT_SYSTEM_PROMPT, MAX_READ_BYTES,
     UNIFIED_SYSTEM_PROMPT,
 };
-use kronos_2t::attachments::{ingest_attachment, AttachmentIngestion};
-use kronos_2t::chat::{ChatModel, Completion, GenParams, Message, ToolCall};
-use kronos_2t::device::{global_device_manager, use_computer_tool_definition_json};
-use kronos_2t::json::{quote, Json};
-use kronos_2t::vision::analyze_image_payload;
+use kronos_2t::runtime::attachments::{ingest_attachment, AttachmentIngestion};
+use kronos_2t::runtime::chat::{ChatModel, Completion, GenParams, Message, ToolCall};
+use kronos_2t::runtime::device::{global_device_manager, use_computer_tool_definition_json};
+use kronos_2t::util::json::{quote, Json};
+use kronos_2t::runtime::vision::analyze_image_payload;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -43,11 +43,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const MAX_BODY: usize = 32 << 20;
-const CHAT_PAGE: &str = include_str!("chat.html");
-const QUICK_PAGE: &str = include_str!("quick.html");
-const MAX_HEADER: usize = 64 << 10;
-const MAX_REVERT_SNAPSHOT_BYTES: usize = 128 << 10;
+use kronos_2t::config::server::{MAX_BODY_BYTES as MAX_BODY, MAX_HEADER_BYTES as MAX_HEADER, MAX_REVERT_SNAPSHOT_BYTES};
+const CHAT_PAGE: &str = include_str!("../web/chat.html");
+const QUICK_PAGE: &str = include_str!("../web/quick.html");
 
 #[derive(Clone, Debug)]
 struct SessionSummary {
@@ -652,7 +650,7 @@ fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
         match model.generate_with_tools(&messages, &tools_json, &params, |_| true) {
             Ok(c) => {
                 if c.tool_calls.is_empty() && !c.text.trim().is_empty() {
-                    kronos_2t::conversations::record_conversation_exchange(
+                    kronos_2t::runtime::conversations::record_conversation_exchange(
                         &raw_user_text,
                         &c.text,
                         "chat",
@@ -721,7 +719,7 @@ fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
     let tail = match result {
         Ok(c) => {
             if !c.text.trim().is_empty() {
-                kronos_2t::conversations::record_conversation_exchange(
+                kronos_2t::runtime::conversations::record_conversation_exchange(
                     &raw_user_text,
                     &c.text,
                     "chat",
@@ -1021,7 +1019,7 @@ fn execute_allocated_turn(
         .unwrap_or_default();
     if !last_user_text.contains("[Device Context") {
         let lower_user = last_user_text.to_ascii_lowercase();
-        if kronos_2t::device::is_workspace_folder_target_query(&lower_user)
+        if kronos_2t::runtime::device::is_workspace_folder_target_query(&lower_user)
             && effective_route == TurnRoute::Chat
         {
             effective_route = TurnRoute::Agent;
@@ -1066,7 +1064,7 @@ fn execute_allocated_turn(
         TurnRoute::Agent => {
             let mut t = tool_definitions_json();
             if global_device_manager().current_config().allow_computer_control
-                && kronos_2t::device::is_computer_control_prompt(&last_user_text.to_ascii_lowercase())
+                && kronos_2t::runtime::device::is_computer_control_prompt(&last_user_text.to_ascii_lowercase())
             {
                 t.push(use_computer_tool_definition_json());
             }
@@ -1261,7 +1259,7 @@ fn execute_allocated_turn(
 
     let out_res = match run_res {
         Ok(final_text) => {
-            kronos_2t::conversations::record_conversation_exchange(
+            kronos_2t::runtime::conversations::record_conversation_exchange(
                 &last_user_text,
                 &final_text,
                 active_route.as_str(),
@@ -1945,18 +1943,18 @@ fn handle_speech_transcribe(stream: &mut TcpStream, req: &Request) {
         else {
             return error(stream, 400, "missing `audio` base64 field");
         };
-        match kronos_2t::speech::decode_audio_payload(audio_str) {
+        match kronos_2t::runtime::speech::decode_audio_payload(audio_str) {
             Ok(b) => b,
             Err(e) => return error(stream, 400, &e),
         }
     };
 
-    match kronos_2t::speech::transcribe_audio_bytes(&audio_bytes) {
+    match kronos_2t::runtime::speech::transcribe_audio_bytes(&audio_bytes) {
         Ok(vt) => respond(
             stream,
             200,
             "application/json",
-            &kronos_2t::speech::voice_transcription_to_json(&vt),
+            &kronos_2t::runtime::speech::voice_transcription_to_json(&vt),
         ),
         Err(e) => error(stream, 500, &e),
     }
@@ -2190,7 +2188,7 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
         return respond(&mut stream, 204, "text/plain", "");
     }
     if req.method == "GET" && (req.path == "/" || req.path == "/index.html") {
-        let live_html = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/chat.html")).ok();
+        let live_html = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/src/web/chat.html")).ok();
         return respond_bytes(
             &mut stream,
             200,
@@ -2429,14 +2427,14 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
             &mut stream,
             200,
             "application/json",
-            &kronos_2t::speech::speech_status_json(),
+            &kronos_2t::runtime::speech::speech_status_json(),
         ),
         ("POST", "/v1/speech/transcribe") => handle_speech_transcribe(&mut stream, &req),
-        ("POST", "/v1/speech/record/start") => match kronos_2t::speech::start_mic_recording_json() {
+        ("POST", "/v1/speech/record/start") => match kronos_2t::runtime::speech::start_mic_recording_json() {
             Ok(body) => respond(&mut stream, 200, "application/json", &body),
             Err(e) => error(&mut stream, 500, &e),
         },
-        ("GET", "/v1/speech/record/poll") => match kronos_2t::speech::poll_mic_recording_json() {
+        ("GET", "/v1/speech/record/poll") => match kronos_2t::runtime::speech::poll_mic_recording_json() {
             Ok(body) => respond(&mut stream, 200, "application/json", &body),
             Err(e) => error(&mut stream, 500, &e),
         },
@@ -2446,12 +2444,12 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
                 .and_then(|s| Json::parse(s).ok())
                 .and_then(|j| j.get("cancel").and_then(Json::as_bool))
                 .unwrap_or(false);
-            match kronos_2t::speech::stop_mic_recording_json(cancel) {
+            match kronos_2t::runtime::speech::stop_mic_recording_json(cancel) {
                 Ok(body) => respond(&mut stream, 200, "application/json", &body),
                 Err(e) => error(&mut stream, 500, &e),
             }
         }
-        ("POST", "/v1/speech/settings") => match kronos_2t::speech::open_macos_microphone_settings() {
+        ("POST", "/v1/speech/settings") => match kronos_2t::runtime::speech::open_macos_microphone_settings() {
             Ok(()) => respond(&mut stream, 200, "application/json", r#"{"status":"ok"}"#),
             Err(e) => error(&mut stream, 500, &e),
         },
@@ -2495,7 +2493,7 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
                 &mut stream,
                 200,
                 "application/json",
-                &kronos_2t::conversations::retrieve_local_conversation_json(&q),
+                &kronos_2t::runtime::conversations::retrieve_local_conversation_json(&q),
             );
         }
         ("GET", "/v1/device/memory") => {
@@ -2503,7 +2501,7 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
                 &mut stream,
                 200,
                 "application/json",
-                &kronos_2t::conversations::read_learned_memory_json(),
+                &kronos_2t::runtime::conversations::read_learned_memory_json(),
             );
         }
         ("POST", "/v1/device/memory") => {
@@ -2518,7 +2516,7 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
                 &mut stream,
                 200,
                 "application/json",
-                &kronos_2t::conversations::merge_learned_memory_json(&body),
+                &kronos_2t::runtime::conversations::merge_learned_memory_json(&body),
             );
         }
         ("GET", "/v1/device/distill_vault") => {
@@ -2526,7 +2524,7 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
                 &mut stream,
                 200,
                 "application/json",
-                &kronos_2t::conversations::read_distilled_vault_json(),
+                &kronos_2t::runtime::conversations::read_distilled_vault_json(),
             );
         }
         ("POST", "/v1/device/distill_vault") => {
@@ -2541,7 +2539,7 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
                 &mut stream,
                 200,
                 "application/json",
-                &kronos_2t::conversations::merge_distilled_vault_json(&body),
+                &kronos_2t::runtime::conversations::merge_distilled_vault_json(&body),
             );
         }
         ("POST", "/v1/device/open") => {
@@ -2622,7 +2620,7 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
 fn default_state_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
-            return PathBuf::from(home).join(".kronos").join("ui_state");
+            return PathBuf::from(home).join(kronos_2t::config::paths::STATE_DIR).join(kronos_2t::config::paths::UI_STATE_DIR);
         }
     }
     std::env::temp_dir().join("kronos_ui_state")
@@ -2642,13 +2640,13 @@ fn main() {
     let model_dir = Path::new(&args[1]);
     let mode = flag("--mode").unwrap_or_else(|| "p55454".to_string());
     let calib = flag("--calib");
-    let default_threads = kronos_2t::thread_pool::default_inference_threads() as f64;
+    let default_threads = kronos_2t::kernels::thread_pool::default_inference_threads() as f64;
     let calib_opt = calib.as_deref().map(|c| (Path::new(c), num("--calib-tokens", 16384.0) as usize));
     let cache_dir_flag = flag("--cache-dir");
     let cache_dir_opt = cache_dir_flag.as_deref().map(Path::new);
     if let Some(mb_str) = flag("--memory-budget-mb") {
         let mb: usize = mb_str.parse().expect("numeric --memory-budget-mb");
-        kronos_2t::memory_budget::MemoryBudgetProfile::set_global_budget_override_mb(mb);
+        kronos_2t::model::memory_budget::MemoryBudgetProfile::set_global_budget_override_mb(mb);
     }
     let requested_ctx = flag("--ctx")
         .or_else(|| flag("--max-seq-len"))
@@ -2740,8 +2738,8 @@ fn main() {
     let warm_tools = tool_definitions_json();
     let mut prewarmed_tokens = 0usize;
     std::thread::scope(|s| {
-        let vj = s.spawn(kronos_2t::vision::prewarm_vision);
-        let sj = s.spawn(kronos_2t::speech::prewarm_speech);
+        let vj = s.spawn(kronos_2t::runtime::vision::prewarm_vision);
+        let sj = s.spawn(kronos_2t::runtime::speech::prewarm_speech);
         let dj = s.spawn(move || {
             let mgr = global_device_manager();
             if enable_dev_ctx {
@@ -2760,8 +2758,8 @@ fn main() {
 
     let addr = format!(
         "{}:{}",
-        flag("--host").unwrap_or_else(|| "127.0.0.1".into()),
-        num("--port", 18080.0) as u16
+        flag("--host").unwrap_or_else(|| kronos_2t::config::server::DEFAULT_HOST.into()),
+        num("--port", f64::from(kronos_2t::config::server::DEFAULT_PORT)) as u16
     );
     let listener = TcpListener::bind(&addr).unwrap_or_else(|e| {
         eprintln!("bind {addr}: {e}");
@@ -2811,7 +2809,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kronos_2t::chat::FinishReason;
+    use kronos_2t::runtime::chat::FinishReason;
 
     #[test]
     fn test_openai_tool_request_and_response_wire_format() {
@@ -2897,7 +2895,7 @@ mod tests {
 
     #[test]
     fn test_agent_workspace_sessions_revert_and_pages() {
-        let html_check = kronos_2t::agent::validate_content_by_ext(
+        let html_check = kronos_2t::runtime::agent::validate_content_by_ext(
             Path::new("."),
             Path::new("chat.html"),
             "html",
@@ -2906,7 +2904,7 @@ mod tests {
         );
         assert!(html_check.is_ok(), "chat.html validation failed: {html_check:?}");
 
-        let quick_check = kronos_2t::agent::validate_content_by_ext(
+        let quick_check = kronos_2t::runtime::agent::validate_content_by_ext(
             Path::new("."),
             Path::new("quick.html"),
             "html",
