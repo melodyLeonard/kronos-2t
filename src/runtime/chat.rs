@@ -374,6 +374,23 @@ struct DraftEngine {
     draft_vocab: usize,
 }
 
+/// Where the speculative tokens of one verify round came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpecSource {
+    None,
+    Lookup,
+    Draft,
+}
+
+/// Drops target and draft KV entries past `n` after a rejected speculative token.
+fn rollback_spec(engine: &mut RealLlamaEngine, draft: &mut Option<DraftEngine>, n: usize) {
+    engine.truncate_context(n);
+    if let Some(d) = draft.as_mut() {
+        d.engine.truncate_context(n);
+        d.cached.truncate(n);
+    }
+}
+
 /// Reusable zero-allocation sampling & speculative verification scratch buffers.
 struct ChatScratch {
     cur_logits: Vec<f32>,
@@ -389,7 +406,7 @@ impl ChatScratch {
         Self {
             cur_logits: vec![0.0f32; vocab_size],
             pen_logits: vec![0.0f32; vocab_size],
-            verify_logits: vec![0.0f32; (SPEC_DRAFT_K_GREEDY + 1) * vocab_size],
+            verify_logits: vec![0.0f32; (SPEC_LOOKUP_K_MAX + 1) * vocab_size],
             top_heap: Vec::with_capacity(128),
             target_dist: Vec::with_capacity(128),
             draft_dists: (0..SPEC_DRAFT_K_GREEDY).map(|_| Vec::with_capacity(128)).collect(),
@@ -409,6 +426,8 @@ pub struct ChatModel {
     jev_caches: Vec<(Vec<usize>, crate::model::real_llm::KvPrefixSnapshot)>,
     ctx: usize,
     scratch: ChatScratch,
+    /// Lookup and draft speculation (off = plain token-by-token decoding).
+    spec_enabled: bool,
     pub name: String,
     #[cfg(all(feature = "ane", target_os = "macos"))]
     ane: Vec<(usize, crate::backend::coreml::CoreMlModel)>,
@@ -479,6 +498,7 @@ impl ChatModel {
             jev_caches: Vec::with_capacity(2),
             ctx,
             scratch: ChatScratch::new(vocab_size),
+            spec_enabled: true,
             name,
             #[cfg(all(feature = "ane", target_os = "macos"))]
             ane: Vec::new(),
@@ -612,6 +632,11 @@ impl ChatModel {
 
     pub fn has_draft(&self) -> bool {
         self.draft.is_some()
+    }
+
+    /// Enables or disables lookup and draft speculation; output is identical either way.
+    pub fn set_speculation(&mut self, enabled: bool) {
+        self.spec_enabled = enabled;
     }
 
     pub fn detach_draft(&mut self) {
@@ -1407,10 +1432,16 @@ impl ChatModel {
         };
 
         let mut cur_draft_k = SPEC_DRAFT_K_INIT;
+        let mut cur_lookup_k = SPEC_LOOKUP_K_INIT;
         let mut ewma_accept = 0.70f32;
         let mut zero_accept_streak = 0usize;
         let mut draft_cooldown = 0usize;
         let mut lookup_cooldown = 0usize;
+        let spec_ok = self.spec_enabled && self.engine.is_all_sdot();
+        // Lookup pays off only where a verify batch costs little more than one token (Metal, large
+        // models); track single-step and batch times and back off when a round loses time.
+        let mut t_single: Option<f64> = None;
+        let mut lookup_gain = 1.5f64;
         'outer: loop {
             if is_stop(next, self.im_end, &self.tok) {
                 finish = FinishReason::Stop;
@@ -1427,15 +1458,32 @@ impl ChatModel {
 
             let rem = max_new - reply.len();
             let avail_ctx = self.ctx.saturating_sub(self.cached.len() + 1);
-            let max_k = if params.temperature <= 0.0 { SPEC_DRAFT_K_GREEDY } else { SPEC_DRAFT_K_SAMPLE };
+            let greedy = params.temperature <= 0.0;
+            let max_k = if greedy { SPEC_DRAFT_K_GREEDY } else { SPEC_DRAFT_K_SAMPLE };
             let max_draft = rem.min(avail_ctx).min(cur_draft_k.min(max_k));
+            let max_lookup = rem.min(avail_ctx).min(cur_lookup_k);
 
-            // Tier 1: draft-model speculative decoding (`--draft`).
-            if draft_cooldown > 0 {
+            let mut draft_tokens = [0usize; SPEC_LOOKUP_K_MAX];
+            let mut drafted = 0usize;
+            let mut source = SpecSource::None;
+
+            // Tier 1: prompt/history suffix lookup (greedy only; copies up to 16 tokens).
+            if lookup_cooldown > 0 {
+                lookup_cooldown -= 1;
+            } else if spec_ok && greedy && max_lookup >= 3 {
+                drafted = find_suffix_continuation(&self.cached, next, max_lookup, &mut draft_tokens);
+                if drafted >= 2 {
+                    source = SpecSource::Lookup;
+                } else {
+                    drafted = 0;
+                }
+            }
+
+            // Tier 2: draft model (`--draft`) when lookup found nothing.
+            if source == SpecSource::None && draft_cooldown > 0 {
                 draft_cooldown -= 1;
-            } else if max_draft >= 1 && self.engine.is_all_sdot() && self.draft.is_some() {
-                let mut draft_tokens = [0usize; SPEC_DRAFT_K_GREEDY];
-                let mut drafted = 0usize;
+            } else if source == SpecSource::None && spec_ok && max_draft >= 1 && self.draft.is_some() {
+                source = SpecSource::Draft;
                 {
                     let d = self.draft.as_mut().unwrap();
                     let dv = d.draft_vocab;
@@ -1514,9 +1562,11 @@ impl ChatModel {
                         }
                     }
                 }
+            }
 
-                // Verify `[next, d_0, ..., d_{drafted-1}]` in one single-pass target batch.
-                let mut batch = [0usize; SPEC_DRAFT_K_GREEDY + 1];
+            if source != SpecSource::None {
+                // Verify `[next, d_0, ..., d_{drafted-1}]` in one batched target pass.
+                let mut batch = [0usize; SPEC_LOOKUP_K_MAX + 1];
                 batch[0] = next;
                 batch[1..1 + drafted].copy_from_slice(&draft_tokens[..drafted]);
                 let batch_len = 1 + drafted;
@@ -1524,8 +1574,10 @@ impl ChatModel {
                 if self.scratch.verify_logits.len() < batch_len * vocab {
                     self.scratch.verify_logits.resize(batch_len * vocab, 0.0);
                 }
+                let t_batch0 = Instant::now();
                 self.engine
                     .forward_batch_logits(&batch[..batch_len], &mut self.scratch.verify_logits);
+                let t_batch = t_batch0.elapsed().as_secs_f64();
 
                 let mut accepted_all = true;
                 let mut accepted_in_round = 0usize;
@@ -1535,18 +1587,9 @@ impl ChatModel {
                     let rec = &reply[reply.len().saturating_sub(64)..];
                     let dj = draft_tokens[j];
 
-                    if params.temperature <= 0.0 {
+                    let rejected = if greedy {
                         let tj = sample_greedy(t_logits, rec, params.repeat_penalty, &mut self.scratch.pen_logits);
-                        if tj != dj {
-                            self.engine.truncate_context(pos0 + j + 1);
-                            if let Some(d) = self.draft.as_mut() {
-                                d.engine.truncate_context(pos0 + j + 1);
-                                d.cached.truncate(pos0 + j + 1);
-                            }
-                            next = tj;
-                            accepted_all = false;
-                            break;
-                        }
+                        (tj != dj).then_some(tj)
                     } else {
                         build_sampling_dist(
                             t_logits,
@@ -1558,71 +1601,43 @@ impl ChatModel {
                         );
                         let p_d = prob_in_dist(&self.scratch.target_dist, dj);
                         let q_d = prob_in_dist(&self.scratch.draft_dists[j], dj).max(1e-12);
-                        if p_d < q_d && rng.next_f32() >= (p_d / q_d) {
-                            let tj = sample_residual_dist(
+                        (p_d < q_d && rng.next_f32() >= (p_d / q_d)).then(|| {
+                            sample_residual_dist(
                                 &self.scratch.target_dist,
                                 &self.scratch.draft_dists[j],
                                 &mut rng,
-                            );
-                            self.engine.truncate_context(pos0 + j + 1);
-                            if let Some(d) = self.draft.as_mut() {
-                                d.engine.truncate_context(pos0 + j + 1);
-                                d.cached.truncate(pos0 + j + 1);
-                            }
-                            next = tj;
-                            accepted_all = false;
-                            break;
-                        }
+                            )
+                        })
+                    };
+                    if let Some(tj) = rejected {
+                        rollback_spec(&mut self.engine, &mut self.draft, pos0 + j + 1);
+                        next = tj;
+                        accepted_all = false;
+                        break;
                     }
 
                     accepted_in_round += 1;
-                    if is_stop(dj, self.im_end, &self.tok) {
+                    let stop_here = if is_stop(dj, self.im_end, &self.tok) {
+                        Some(FinishReason::Stop)
+                    } else if !emit_tok(dj, &self.tok, &mut reply, &mut raw_bytes, &mut emitted_bytes, &mut on_text) {
+                        Some(FinishReason::Stop)
+                    } else if reply.len() >= max_new {
+                        Some(FinishReason::Length)
+                    } else {
+                        None
+                    };
+                    if let Some(f) = stop_here {
                         drafted_total += j + 1;
                         accepted_total += accepted_in_round;
-                        self.engine.truncate_context(pos0 + j + 1);
-                        if let Some(d) = self.draft.as_mut() {
-                            d.engine.truncate_context(pos0 + j + 1);
-                            d.cached.truncate(pos0 + j + 1);
-                        }
-                        finish = FinishReason::Stop;
-                        break 'outer;
-                    }
-                    if !emit_tok(dj, &self.tok, &mut reply, &mut raw_bytes, &mut emitted_bytes, &mut on_text) {
-                        drafted_total += j + 1;
-                        accepted_total += accepted_in_round;
-                        self.engine.truncate_context(pos0 + j + 1);
-                        if let Some(d) = self.draft.as_mut() {
-                            d.engine.truncate_context(pos0 + j + 1);
-                            d.cached.truncate(pos0 + j + 1);
-                        }
-                        finish = FinishReason::Stop;
-                        break 'outer;
-                    }
-                    if reply.len() >= max_new {
-                        drafted_total += j + 1;
-                        accepted_total += accepted_in_round;
-                        self.engine.truncate_context(pos0 + j + 1);
-                        if let Some(d) = self.draft.as_mut() {
-                            d.engine.truncate_context(pos0 + j + 1);
-                            d.cached.truncate(pos0 + j + 1);
-                        }
-                        finish = FinishReason::Length;
+                        rollback_spec(&mut self.engine, &mut self.draft, pos0 + j + 1);
+                        finish = f;
                         break 'outer;
                     }
                 }
 
                 drafted_total += drafted;
                 accepted_total += accepted_in_round;
-                let round_rate = (accepted_in_round as f32) / (drafted.max(1) as f32);
-                ewma_accept = 0.75 * ewma_accept + 0.25 * round_rate;
-
                 if accepted_all {
-                    zero_accept_streak = 0;
-                    cur_draft_k = if ewma_accept >= 0.75 {
-                        (cur_draft_k + 2).min(SPEC_DRAFT_K_GREEDY)
-                    } else {
-                        (cur_draft_k + 1).min(SPEC_DRAFT_K_GREEDY)
-                    };
                     self.cached.push(batch[drafted]);
                     let bonus_logits = &self.scratch.verify_logits[drafted * vocab..(drafted + 1) * vocab];
                     let rec = &reply[reply.len().saturating_sub(64)..];
@@ -1634,110 +1649,72 @@ impl ChatModel {
                         &mut self.scratch.pen_logits,
                         &mut self.scratch.top_heap,
                     );
-                } else {
-                    cur_draft_k = if ewma_accept >= 0.80 {
-                        7
-                    } else if ewma_accept >= 0.68 {
-                        6
-                    } else if ewma_accept >= 0.55 {
-                        5
-                    } else if ewma_accept >= 0.40 {
-                        4
-                    } else if ewma_accept >= 0.25 {
-                        3
-                    } else {
-                        2
-                    };
-                    if accepted_in_round == 0 {
-                        zero_accept_streak += 1;
-                        if zero_accept_streak >= 4 {
-                            draft_cooldown = 4;
+                }
+
+                match source {
+                    SpecSource::Draft => {
+                        let round_rate = (accepted_in_round as f32) / (drafted.max(1) as f32);
+                        ewma_accept = 0.75 * ewma_accept + 0.25 * round_rate;
+                        if accepted_all {
                             zero_accept_streak = 0;
+                            cur_draft_k = if ewma_accept >= 0.75 {
+                                (cur_draft_k + 2).min(SPEC_DRAFT_K_GREEDY)
+                            } else {
+                                (cur_draft_k + 1).min(SPEC_DRAFT_K_GREEDY)
+                            };
+                        } else {
+                            cur_draft_k = if ewma_accept >= 0.80 {
+                                7
+                            } else if ewma_accept >= 0.68 {
+                                6
+                            } else if ewma_accept >= 0.55 {
+                                5
+                            } else if ewma_accept >= 0.40 {
+                                4
+                            } else if ewma_accept >= 0.25 {
+                                3
+                            } else {
+                                2
+                            };
+                            if accepted_in_round == 0 {
+                                zero_accept_streak += 1;
+                                if zero_accept_streak >= 4 {
+                                    draft_cooldown = 4;
+                                    zero_accept_streak = 0;
+                                }
+                            } else {
+                                zero_accept_streak = 0;
+                            }
                         }
-                    } else {
-                        zero_accept_streak = 0;
+                    }
+                    _ => {
+                        // Copied text tends to continue; grow the window on full accepts, shrink on misses.
+                        cur_lookup_k = if accepted_all {
+                            (cur_lookup_k * 2).min(SPEC_LOOKUP_K_MAX)
+                        } else if accepted_in_round == 0 {
+                            lookup_cooldown = 8;
+                            SPEC_LOOKUP_K_INIT.min(cur_lookup_k)
+                        } else {
+                            (accepted_in_round + 2).clamp(3, SPEC_LOOKUP_K_MAX)
+                        };
+                        if let Some(t1) = t_single {
+                            let gain = (accepted_in_round + 1) as f64 * t1 / t_batch.max(1e-9);
+                            lookup_gain = 0.7 * lookup_gain + 0.3 * gain;
+                            if lookup_gain < 0.9 {
+                                lookup_cooldown = 32;
+                                lookup_gain = 1.2;
+                            }
+                        }
                     }
                 }
                 continue;
             }
-
-            // Tier 2: prompt/history suffix lookup when no draft model is attached.
-            if lookup_cooldown > 0 {
-                lookup_cooldown -= 1;
-            } else if self.draft.is_none()
-                && params.temperature <= 0.0
-                && max_draft >= 3
-                && self.engine.is_all_sdot()
-            {
-                let mut draft_tokens = [0usize; SPEC_DRAFT_K_GREEDY];
-                let drafted = find_suffix_continuation(&self.cached, next, max_draft.min(5), &mut draft_tokens);
-                if drafted >= 2 {
-                    let mut batch = [0usize; SPEC_DRAFT_K_GREEDY + 1];
-                    batch[0] = next;
-                    batch[1..1 + drafted].copy_from_slice(&draft_tokens[..drafted]);
-                    let batch_len = 1 + drafted;
-                    let pos0 = self.engine.position();
-                    if self.scratch.verify_logits.len() < batch_len * vocab {
-                        self.scratch.verify_logits.resize(batch_len * vocab, 0.0);
-                    }
-                    self.engine
-                        .forward_batch_logits(&batch[..batch_len], &mut self.scratch.verify_logits);
-
-                    let mut accepted_all = true;
-                    let mut accepted_in_round = 0usize;
-                    for j in 0..drafted {
-                        self.cached.push(batch[j]);
-                        let t_logits = &self.scratch.verify_logits[j * vocab..(j + 1) * vocab];
-                        let rec = &reply[reply.len().saturating_sub(64)..];
-                        let tj = sample_greedy(t_logits, rec, params.repeat_penalty, &mut self.scratch.pen_logits);
-                        let dj = draft_tokens[j];
-                        if tj != dj {
-                            self.engine.truncate_context(pos0 + j + 1);
-                            next = tj;
-                            accepted_all = false;
-                            break;
-                        }
-                        accepted_in_round += 1;
-                        if is_stop(dj, self.im_end, &self.tok) {
-                            self.engine.truncate_context(pos0 + j + 1);
-                            finish = FinishReason::Stop;
-                            break 'outer;
-                        }
-                        if !emit_tok(dj, &self.tok, &mut reply, &mut raw_bytes, &mut emitted_bytes, &mut on_text) {
-                            self.engine.truncate_context(pos0 + j + 1);
-                            finish = FinishReason::Stop;
-                            break 'outer;
-                        }
-                        if reply.len() >= max_new {
-                            self.engine.truncate_context(pos0 + j + 1);
-                            finish = FinishReason::Length;
-                            break 'outer;
-                        }
-                    }
-                    if accepted_all {
-                        cur_draft_k = (cur_draft_k + 1).min(SPEC_DRAFT_K_GREEDY);
-                        self.cached.push(batch[drafted]);
-                        let bonus_logits = &self.scratch.verify_logits[drafted * vocab..(drafted + 1) * vocab];
-                        let rec = &reply[reply.len().saturating_sub(64)..];
-                        next = sample_greedy(
-                            bonus_logits,
-                            rec,
-                            params.repeat_penalty,
-                            &mut self.scratch.pen_logits,
-                        );
-                    } else if accepted_in_round == 0 {
-                        lookup_cooldown = 8;
-                        cur_draft_k = 3;
-                    } else {
-                        cur_draft_k = 4;
-                    }
-                    continue;
-                }
-            }
-
             // Direct single-token Megakernel step (`0` allocations!)
             let recent = &reply[reply.len().saturating_sub(64)..];
+            let t_step0 = Instant::now();
             let l = self.engine.forward_token(next);
+            let dt = t_step0.elapsed().as_secs_f64();
+            t_single = Some(t_single.map_or(dt, |t| 0.7 * t + 0.3 * dt));
             self.cached.push(next);
             next = sample_token(
                 l,
@@ -2965,7 +2942,7 @@ fn find_balanced_json_object_end(s: &str) -> Option<usize> {
     None
 }
 
-/// Scans `cached` + `next` backwards for a 6-, 5-, or 4-token suffix match and copies continuation tokens.
+/// Scans `cached` + `next` backwards for a 6-, 5-, or 4-token suffix match and copies up to `max_k` continuation tokens.
 fn find_suffix_continuation(cached: &[usize], next: usize, max_k: usize, out: &mut [usize]) -> usize {
     let n = cached.len();
     if n < 5 {
@@ -3560,6 +3537,74 @@ mod tests {
         assert!(pl1_c.contains(r"\langle"), "got: {pl1_c}");
         assert!(pl1_c.contains(r"\rangle"), "got: {pl1_c}");
         assert!(pl1_c.contains(r#"("Kronos")"#), "got: {pl1_c}");
+    }
+
+    #[test]
+    fn test_tiered_speculation_matches_plain_greedy_05b() {
+        let dir = Path::new("models/Qwen2.5-Coder-0.5B-Instruct");
+        if !dir.join("kronos-nf4g128.k2tb").exists() {
+            return;
+        }
+        let threads = crate::kernels::thread_pool::default_inference_threads();
+        let mut model = ChatModel::load(dir, "nf4g128", 4096, threads, None).unwrap();
+        let file: Vec<String> = (0..60)
+            .map(|i| format!("pub fn item_{i}(x: i32) -> i32 {{\n    x * {i} + {}\n}}\n", i * 7))
+            .collect();
+        let prompts = [
+            format!(
+                "Here is a Rust file:\n```rust\n{}```\nChange `item_30` so it returns `x * 31`. Reply with the complete file.",
+                file.concat()
+            ),
+            "Explain the difference between a Vec and a slice in Rust in three sentences.".to_string(),
+        ];
+        let params = GenParams {
+            temperature: 0.0,
+            top_k: 40,
+            top_p: 1.0,
+            repeat_penalty: 1.05,
+            max_tokens: 160,
+            seed: 0,
+        };
+        let run = |model: &mut ChatModel, p: &str| {
+            model.reset_cache();
+            let msgs = [Message::new("user", p)];
+            model.generate(&msgs, &params, |_| true).unwrap()
+        };
+
+        model.set_speculation(false);
+        let plain: Vec<Completion> = prompts.iter().map(|p| run(&mut model, p)).collect();
+        assert!(plain.iter().all(|c| c.drafted_tokens == 0 && c.completion_tokens > 20));
+
+        model.set_speculation(true);
+        for (i, p) in prompts.iter().enumerate() {
+            let c = run(&mut model, p);
+            assert_eq!(c.token_ids, plain[i].token_ids, "lookup tier changed output on prompt {i}");
+            if i == 0 {
+                assert!(c.drafted_tokens > 0, "code-edit prompt never used lookup");
+            }
+            eprintln!(
+                "lookup prompt {i}: {} tok, accept {}/{}, {:.1} -> {:.1} tok/s",
+                c.completion_tokens,
+                c.accepted_tokens,
+                c.drafted_tokens,
+                plain[i].completion_tokens as f64 / plain[i].decode_secs.max(1e-9),
+                c.completion_tokens as f64 / c.decode_secs.max(1e-9)
+            );
+        }
+
+        model.attach_draft(dir, "nf4g128", None).unwrap();
+        for (i, p) in prompts.iter().enumerate() {
+            let c = run(&mut model, p);
+            assert_eq!(c.token_ids, plain[i].token_ids, "lookup+draft tiers changed output on prompt {i}");
+            assert!(c.drafted_tokens > 0);
+            eprintln!(
+                "lookup+draft prompt {i}: {} tok, accept {}/{}, {:.1} tok/s",
+                c.completion_tokens,
+                c.accepted_tokens,
+                c.drafted_tokens,
+                c.completion_tokens as f64 / c.decode_secs.max(1e-9)
+            );
+        }
     }
 
     static HEAVY_14B_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
