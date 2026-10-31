@@ -158,7 +158,14 @@ is attached); "after" tries lookup first (up to 16 tokens), then the draft model
 |---|---|---:|---:|---:|
 | 0.5B, Metal, no draft | code edit | 249 tok/s | 290 tok/s | 1043 / 1273 |
 | 0.5B, Metal, no draft | free-form | 176 tok/s | 175 tok/s | 61 / 123 |
-%%14B_ROWS%%
+| 14B + 0.5B draft, Metal* | code edit | 15.4 tok/s | 14.7 tok/s | draft 1064 / 1077 before; lookup+draft 1102 / 1293 after |
+| 14B + 0.5B draft, Metal* | free-form | 10.5 tok/s | 9.6 tok/s | 142 / 361 before; 141 / 369 after |
+| 14B, Metal, no draft | code edit, free-form | pending | pending | – |
+
+\* Measured (n=2) while another process ran an 8-core WikiText battery, so the CPU draft had no
+free P-cores; the 48 tok/s reference above was measured on an idle machine. Under that load the
+two binaries are within noise of each other on the 14B. Re-measure on an idle machine before
+drawing a 14B conclusion.
 
 Greedy output is identical in all modes (`test_tiered_speculation_matches_plain_greedy_05b`
 compares plain decoding, lookup, and lookup + draft token-for-token on the 0.5B).
@@ -173,7 +180,7 @@ time is the server's `prefill_secs` for that request, which here is the time to 
 | 0.5B, Metal, int8 KV | 47–84 ms (11 new tokens) | 66 ms (from `state-dir/kv`, 36 MiB) | 1.3–1.6 s (5,195 tokens) |
 | 0.5B, Metal, Q4 KV | 49–96 ms | 97 ms | – |
 | 0.5B, CPU, int8 KV | 0.46–0.64 s | 1.1 s | 52–54 s cold |
-%%14B_SESS%%
+| 14B + 0.5B draft, Metal | pending | pending | pending |
 
 Replies after a restore match the replies from a full reprocess byte for byte (same KV bytes).
 The CPU rows were measured while another process used all P-cores.
