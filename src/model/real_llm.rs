@@ -2869,7 +2869,8 @@ impl RealLlamaEngine {
         let h_dim = cfg.hidden_size;
         let inter_dim = cfg.intermediate_size;
         let kv_dim = cfg.kv_dim();
-        let qkv_rows = h_dim + 2 * kv_dim;
+        let q_dim = cfg.q_dim();
+        let qkv_rows = q_dim + 2 * kv_dim;
         let head_dim = cfg.head_dim();
         let half_dim = head_dim / 2;
         let kv_group = cfg.num_attention_heads / cfg.num_key_value_heads;
@@ -2907,7 +2908,7 @@ impl RealLlamaEngine {
         }
 
         let total_tokens: usize = calib_sequences.iter().map(|s| s.len()).sum();
-        let mut all_attn_out = vec![0.0f32; total_tokens * h_dim];
+        let mut all_attn_out = vec![0.0f32; total_tokens * q_dim];
         let mut all_swiglu = vec![0.0f32; total_tokens * inter_dim];
         let mut norm_buf = vec![0.0f32; h_dim];
         let mut compiled_layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -2918,6 +2919,10 @@ impl RealLlamaEngine {
             let input_norm = get_f32_and_release(&format!("{pfx}.input_layernorm.weight"))?;
             let post_attn_norm =
                 get_f32_and_release(&format!("{pfx}.post_attention_layernorm.weight"))?;
+            let q_norm_name = format!("{pfx}.self_attn.q_norm.weight");
+            let q_norm = if store.has_tensor(&q_norm_name) { Some(get_f32_and_release(&q_norm_name)?) } else { None };
+            let k_norm_name = format!("{pfx}.self_attn.k_norm.weight");
+            let k_norm = if store.has_tensor(&k_norm_name) { Some(get_f32_and_release(&k_norm_name)?) } else { None };
 
             // 1. Pre-attention normalized activations -> compile `qkv_proj`
             let mut hess_attn = FullRowGptqHessian::new(h_dim);
@@ -2956,7 +2961,7 @@ impl RealLlamaEngine {
             drop(hess_attn);
 
             // 2. Execute quantized `qkv_proj` (+ `qkv_bias`) + causal GQA attention -> rotate for `o_proj`
-            par_calib(&mut seq_hiddens, &mut all_attn_out, h_dim, h_dim, |seq_h, attn_seq| {
+            par_calib(&mut seq_hiddens, &mut all_attn_out, h_dim, q_dim, |seq_h, attn_seq| {
                 let mut norm_buf = vec![0.0f32; h_dim];
                 let mut qkv_buf = vec![0.0f32; qkv_rows];
                 let mut scores = vec![0.0f32; cfg.max_seq_len * cfg.num_attention_heads];
@@ -2966,7 +2971,7 @@ impl RealLlamaEngine {
                 let mut vlut_h = Vq2ActivationLut::new_zeroed(h_dim);
                 for (pos, (hid, attn_dst)) in seq_h
                     .chunks_exact(h_dim)
-                    .zip(attn_seq.chunks_exact_mut(h_dim))
+                    .zip(attn_seq.chunks_exact_mut(q_dim))
                     .enumerate()
                 {
                     rms_norm(hid, &input_norm, cfg.rms_norm_eps, &mut norm_buf);
@@ -2977,8 +2982,14 @@ impl RealLlamaEngine {
                     }
 
                     let rope_row = &rope_cos_sin[pos * head_dim..(pos + 1) * head_dim];
-                    let (q_slice, kv_rest) = qkv_buf.split_at_mut(h_dim);
+                    let (q_slice, kv_rest) = qkv_buf.split_at_mut(q_dim);
                     let (k_slice, v_slice) = kv_rest.split_at_mut(kv_dim);
+                    if let Some(ref qn) = q_norm {
+                        apply_per_head_rms_norm(q_slice, head_dim, qn, cfg.rms_norm_eps);
+                    }
+                    if let Some(ref kn) = k_norm {
+                        apply_per_head_rms_norm(k_slice, head_dim, kn, cfg.rms_norm_eps);
+                    }
                     apply_llama_rope_precomp(q_slice, cfg.num_attention_heads, head_dim, half_dim, rope_row);
                     apply_llama_rope_precomp(k_slice, cfg.num_key_value_heads, head_dim, half_dim, rope_row);
                     k_seq_cache[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(k_slice);
@@ -2999,22 +3010,22 @@ impl RealLlamaEngine {
                     fwht64_signed_inplace(attn_dst);
                 }
             });
-            let mut hess_o = FullRowGptqHessian::new(h_dim);
-            for row in all_attn_out.chunks_exact(h_dim) {
+            let mut hess_o = FullRowGptqHessian::new(q_dim);
+            for row in all_attn_out.chunks_exact(q_dim) {
                 hess_o.observe_prerotated(row);
             }
             hess_o.finalize(BIPOLAR_GPTQ_DAMP);
             let o_w = get_f32_and_release(&format!("{pfx}.self_attn.o_proj.weight"))?;
-            let o_proj = compile_proj_spec(&o_w, h_dim, h_dim, o_spec, Some(&hess_o), compile_threads);
+            let o_proj = compile_proj_spec(&o_w, h_dim, q_dim, o_spec, Some(&hess_o), compile_threads);
             drop(o_w);
             drop(hess_o);
 
             // Propagate quantized o_proj (all_attn_out is pre-rotated) into seq_hiddens.
-            par_calib(&mut seq_hiddens, &mut all_attn_out, h_dim, h_dim, |seq_h, attn_seq| {
+            par_calib(&mut seq_hiddens, &mut all_attn_out, h_dim, q_dim, |seq_h, attn_seq| {
                 let mut proj_out = vec![0.0f32; h_dim];
-                let mut blut_h = BipolarActivationLut::new_zeroed(h_dim);
-                let mut vlut_h = Vq2ActivationLut::new_zeroed(h_dim);
-                for (hid, attn_rot) in seq_h.chunks_exact_mut(h_dim).zip(attn_seq.chunks_exact(h_dim)) {
+                let mut blut_h = BipolarActivationLut::new_zeroed(q_dim);
+                let mut vlut_h = Vq2ActivationLut::new_zeroed(q_dim);
+                for (hid, attn_rot) in seq_h.chunks_exact_mut(h_dim).zip(attn_seq.chunks_exact(q_dim)) {
                     eval_proj_rot(&o_proj, attn_rot, &mut blut_h, &mut vlut_h, &mut proj_out);
                     add_inplace(hid, &proj_out);
                 }
@@ -3094,8 +3105,8 @@ impl RealLlamaEngine {
                 down_inv_scale: None,
                 qkv_bias,
                 o_bias: None,
-                q_norm: None,
-                k_norm: None,
+                q_norm,
+                k_norm,
                 qkv_proj,
                 o_proj,
                 gate_up_proj,

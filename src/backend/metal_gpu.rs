@@ -3979,6 +3979,20 @@ mod tests {
         let cache_path = dir.join("kronos-nf4g128.k2tb");
         compiled.save_bipolar(&cache_path).unwrap();
 
+        // The streaming compiler must handle q_norm/k_norm and q_dim != hidden like the reference path.
+        let calib = vec![(0..32).map(|i| (i * 5 + 1) % vocab).collect::<Vec<_>>()];
+        let mut streamed = RealLlamaEngine::compile_streaming_gptq_from_dir(&dir, mode, &calib, 2).unwrap();
+        streamed.repack_sdot();
+        let mut from_ref = RealLlamaEngine::load_bipolar(&dir, &cache_path, 256).unwrap();
+        from_ref.repack_sdot();
+        let toks: Vec<usize> = (0..24).map(|i| (i * 11 + 2) % vocab).collect();
+        let mut fp32_eng = RealLlamaEngine::load_fp32_reference(&dir, 256).unwrap();
+        let lf = fp32_eng.forward_prompt(&toks).to_vec();
+        let (ls, lr) = (streamed.forward_prompt(&toks).to_vec(), from_ref.forward_prompt(&toks).to_vec());
+        let (cos_s, cos_r) = (cosine_sim(&ls, &lf), cosine_sim(&lr, &lf));
+        eprintln!("vs fp32: streaming cos={cos_s:.6}, reference-compile cos={cos_r:.6}");
+        assert!(cos_s > 0.97 && cos_s > cos_r - 0.02, "streaming compile worse than reference: {cos_s:.6} vs {cos_r:.6}");
+
         let mut cpu_eng = RealLlamaEngine::load_bipolar(&dir, &cache_path, 256).unwrap();
         cpu_eng.repack_sdot();
         cpu_eng.enable_q8_kv_cache(true);
