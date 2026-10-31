@@ -1620,13 +1620,8 @@ impl RealLlamaEngine {
         if self.is_moe() {
             return Err("Sparse-MoE engines execute hybrid CPU P-core + NVMe SLRU paging".to_string());
         }
-        if self.cfg.q_dim() != self.cfg.hidden_size
-            || self
-                .layers
-                .iter()
-                .any(|l| l.q_norm.is_some() || l.k_norm.is_some() || l.o_bias.is_some())
-        {
-            return Err("Metal GPU requires q_dim == hidden_size without q_norm/k_norm/o_bias".to_string());
+        if self.layers.iter().any(|l| l.o_bias.is_some()) {
+            return Err("Metal GPU does not support o_bias".to_string());
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
@@ -1648,6 +1643,7 @@ impl RealLlamaEngine {
                     input_norm: &l.input_norm,
                     post_attn_norm: &l.post_attn_norm,
                     qkv_bias: l.qkv_bias.as_deref(),
+                    qk_norm: l.q_norm.as_deref().zip(l.k_norm.as_deref()),
                     qkv_proj: as_nf4(&l.qkv_proj, &format!("layer.{idx}.qkv_proj"))?,
                     o_proj: as_nf4(&l.o_proj, &format!("layer.{idx}.o_proj"))?,
                     gate_up_proj: as_nf4(&l.gate_up_proj, &format!("layer.{idx}.gate_up_proj"))?,
@@ -2124,7 +2120,7 @@ impl RealLlamaEngine {
         let mut compiled_layers = Vec::with_capacity(self.cfg.num_hidden_layers);
         let mut err_sum = 0.0f64;
         let mut mat_count = 0usize;
-        let qkv_rows = self.cfg.hidden_size + 2 * self.cfg.kv_dim();
+        let qkv_rows = self.cfg.q_dim() + 2 * self.cfg.kv_dim();
 
         for (l, ref_layer) in self.layers.iter().enumerate() {
             let mut input_norm = ref_layer.input_norm.clone();
@@ -2161,7 +2157,7 @@ impl RealLlamaEngine {
             let (o_proj, eo) = LinearBackend::from_f32_slice(
                 ref_layer.o_proj.as_fp32_slice(),
                 self.cfg.hidden_size,
-                self.cfg.hidden_size,
+                self.cfg.q_dim(),
                 mode,
                 s_o,
             );

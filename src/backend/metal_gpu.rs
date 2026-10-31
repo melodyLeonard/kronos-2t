@@ -271,6 +271,8 @@ struct RopeKvParams {
     window_size: u32,
     sink_tokens: u32,
     ring_len: u32,
+    has_qk_norm: u32,
+    eps: f32,
 }
 
 #[repr(C)]
@@ -314,6 +316,7 @@ pub(crate) struct GpuLayerWeights {
     input_norm: MtlObj,
     post_attn_norm: MtlObj,
     qkv_bias: Option<MtlObj>,
+    qk_norm: Option<(MtlObj, MtlObj)>,
     qkv_proj: GpuNf4Matrix,
     o_proj: GpuNf4Matrix,
     gate_up_proj: GpuNf4Matrix,
@@ -325,6 +328,7 @@ pub(crate) struct LayerBorrow<'a> {
     pub input_norm: &'a [f32],
     pub post_attn_norm: &'a [f32],
     pub qkv_bias: Option<&'a [f32]>,
+    pub qk_norm: Option<(&'a [f32], &'a [f32])>,
     pub qkv_proj: &'a NfSdotMatrix,
     pub o_proj: &'a NfSdotMatrix,
     pub gate_up_proj: &'a NfSdotMatrix,
@@ -679,8 +683,8 @@ impl GpuScratch {
         let n = init_tokens.max(1);
         let n_f16 = n.div_ceil(128) * 128;
         let nl = init_logits_tokens.max(1);
-        let max_rot = cfg.hidden_size.max(cfg.intermediate_size);
-        let qkv_rows = cfg.hidden_size + 2 * cfg.kv_dim();
+        let max_rot = cfg.q_dim().max(cfg.hidden_size).max(cfg.intermediate_size);
+        let qkv_rows = cfg.q_dim() + 2 * cfg.kv_dim();
         let f32_b = std::mem::size_of::<f32>();
         let f16_b = std::mem::size_of::<u16>();
         Ok(Self {
@@ -691,7 +695,7 @@ impl GpuScratch {
             x_rot_f16: alloc_shared_buffer(device, n_f16 * max_rot * f16_b, "sc.x_rot_f16")?,
             x_tok_scale: alloc_shared_buffer(device, n * f32_b, "sc.x_tok_scale")?,
             qkv: alloc_shared_buffer(device, n * qkv_rows * f32_b, "sc.qkv")?,
-            attn_out: alloc_shared_buffer(device, n * cfg.hidden_size * f32_b, "sc.attn_out")?,
+            attn_out: alloc_shared_buffer(device, n * cfg.q_dim() * f32_b, "sc.attn_out")?,
             gate_up: alloc_shared_buffer(device, n * 2 * cfg.intermediate_size * f32_b, "sc.gate_up")?,
             logits: alloc_shared_buffer(device, nl * cfg.vocab_size * f32_b, "sc.logits")?,
         })
@@ -710,14 +714,14 @@ impl GpuScratch {
         if n_tok > self.cap_tokens {
             let n = n_tok.next_power_of_two().min(max_chunk_tokens).max(n_tok);
             let n_f16 = n.div_ceil(128) * 128;
-            let max_rot = cfg.hidden_size.max(cfg.intermediate_size);
-            let qkv_rows = cfg.hidden_size + 2 * cfg.kv_dim();
+            let max_rot = cfg.q_dim().max(cfg.hidden_size).max(cfg.intermediate_size);
+            let qkv_rows = cfg.q_dim() + 2 * cfg.kv_dim();
             self.hidden = alloc_shared_buffer(device, n * cfg.hidden_size * f32_b, "sc.hidden")?;
             self.x_rot_f32 = alloc_shared_buffer(device, n * max_rot * f32_b, "sc.x_rot_f32")?;
             self.x_rot_f16 = alloc_shared_buffer(device, n_f16 * max_rot * f16_b, "sc.x_rot_f16")?;
             self.x_tok_scale = alloc_shared_buffer(device, n * f32_b, "sc.x_tok_scale")?;
             self.qkv = alloc_shared_buffer(device, n * qkv_rows * f32_b, "sc.qkv")?;
-            self.attn_out = alloc_shared_buffer(device, n * cfg.hidden_size * f32_b, "sc.attn_out")?;
+            self.attn_out = alloc_shared_buffer(device, n * cfg.q_dim() * f32_b, "sc.attn_out")?;
             self.gate_up = alloc_shared_buffer(device, n * 2 * cfg.intermediate_size * f32_b, "sc.gate_up")?;
             self.cap_tokens = n;
         }
@@ -954,11 +958,19 @@ impl MetalLlamaEngine {
                         Some(b) => Some(upload_slice_buffer(device.id(), b, "qkv_bias")?),
                         None => None,
                     };
+                    let qk_norm = match l.qk_norm {
+                        Some((q, k)) => Some((
+                            upload_slice_buffer(device.id(), q, "q_norm")?,
+                            upload_slice_buffer(device.id(), k, "k_norm")?,
+                        )),
+                        None => None,
+                    };
                     let pfx = format!("layer.{idx}");
                     layers.push(GpuLayerWeights {
                         input_norm,
                         post_attn_norm,
                         qkv_bias,
+                        qk_norm,
                         qkv_proj: wrap_nf4_matrix(device.id(), l.qkv_proj, dummy_buf.id(), &format!("{pfx}.qkv"))?,
                         o_proj: wrap_nf4_matrix(device.id(), l.o_proj, dummy_buf.id(), &format!("{pfx}.o"))?,
                         gate_up_proj: wrap_nf4_matrix(
@@ -1147,8 +1159,9 @@ impl MetalLlamaEngine {
         )?;
 
         let h_dim = cfg.hidden_size;
+        let q_dim = cfg.q_dim();
         let inter_dim = cfg.intermediate_size;
-        let qkv_rows = h_dim + 2 * cfg.kv_dim();
+        let qkv_rows = q_dim + 2 * cfg.kv_dim();
         let head_dim = cfg.head_dim();
         let num_q_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
@@ -1216,6 +1229,12 @@ impl MetalLlamaEngine {
                         msg_sel!(enc, st.set_buf, self.kv.k_scales.id() => Id, 0usize => usize, 3usize => usize; ());
                         msg_sel!(enc, st.set_buf, self.kv.v_data.id() => Id, 0usize => usize, 4usize => usize; ());
                         msg_sel!(enc, st.set_buf, self.kv.v_scales.id() => Id, 0usize => usize, 5usize => usize; ());
+                        let (qn_id, kn_id) = match &layer.qk_norm {
+                            Some((q, k)) => (q.id(), k.id()),
+                            None => (self.dummy_buf.id(), self.dummy_buf.id()),
+                        };
+                        msg_sel!(enc, st.set_buf, qn_id => Id, 0usize => usize, 7usize => usize; ());
+                        msg_sel!(enc, st.set_buf, kn_id => Id, 0usize => usize, 8usize => usize; ());
                         let rp = RopeKvParams {
                             num_q_heads: num_q_heads as u32,
                             num_kv_heads: num_kv_heads as u32,
@@ -1229,6 +1248,8 @@ impl MetalLlamaEngine {
                             window_size: self.kv.window_size as u32,
                             sink_tokens: self.kv.sink_tokens as u32,
                             ring_len: self.kv.ring_len as u32,
+                            has_qk_norm: u32::from(layer.qk_norm.is_some()),
+                            eps: cfg.rms_norm_eps,
                         };
                         msg_sel!(
                             enc,
@@ -1268,7 +1289,7 @@ impl MetalLlamaEngine {
                             kv_group: kv_group as u32,
                             head_dim: head_dim as u32,
                             qkv_rows: qkv_rows as u32,
-                            h_dim: h_dim as u32,
+                            h_dim: q_dim as u32,
                             pos0: pos0 as u32,
                             n_tok: n_tok as u32,
                             layer_idx: l_idx as u32,
@@ -1308,7 +1329,7 @@ impl MetalLlamaEngine {
                         self.scratch.attn_out.id(),
                         0,
                         self.dummy_buf.id(),
-                        h_dim,
+                        q_dim,
                         n_tok,
                         cfg.rms_norm_eps,
                         1,
@@ -1655,6 +1676,8 @@ struct RopeKvParams {
     uint window_size;
     uint sink_tokens;
     uint ring_len;
+    uint has_qk_norm;
+    float eps;
 };
 
 struct GqaFlashParams {
@@ -2585,6 +2608,8 @@ kernel void qkv_rope_kv_store(
     device uchar*       v_raw    [[buffer(4)]],
     device uchar*       vs_raw   [[buffer(5)]],
     constant RopeKvParams& p     [[buffer(6)]],
+    device const float* q_norm   [[buffer(7)]],
+    device const float* k_norm   [[buffer(8)]],
     uint2 tg_pos [[threadgroup_position_in_grid]],
     uint sg_id   [[simdgroup_index_in_threadgroup]],
     uint lane    [[thread_index_in_simdgroup]])
@@ -2600,6 +2625,25 @@ kernel void qkv_rope_kv_store(
     const uint pos = p.pos0 + t;
     device float* head = qkv + ulong(t) * ulong(p.qkv_rows) + ulong(b * hd);
     device const float* rope = rope_tab + ulong(pos) * ulong(hd);
+
+    // Per-head RMSNorm on Q and K before RoPE (Qwen3).
+    if (p.has_qk_norm != 0u && b < p.num_q_heads + p.num_kv_heads) {
+        device const float* w = (b < p.num_q_heads) ? q_norm : k_norm;
+        float ss = 0.0f;
+        for (uint e = 0u; e < (half_d >> 5u); ++e) {
+            uint i = e * 32u + lane;
+            float x0 = head[i];
+            float x1 = head[half_d + i];
+            ss += x0 * x0 + x1 * x1;
+        }
+        ss = simd_sum(ss);
+        const float inv = rsqrt(ss / float(hd) + p.eps);
+        for (uint e = 0u; e < (half_d >> 5u); ++e) {
+            uint i = e * 32u + lane;
+            head[i] *= inv * w[i];
+            head[half_d + i] *= inv * w[half_d + i];
+        }
+    }
 
     if (b < p.num_q_heads) {
         for (uint e = 0u; e < (half_d >> 5u); ++e) {
@@ -3410,6 +3454,98 @@ mod tests {
             cpu_eng.set_num_threads(1);
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    // Qwen3-style attention: q_dim (512) != hidden (256), per-head q_norm/k_norm, no biases.
+    #[test]
+    fn test_metal_qk_norm_rectangular_parity() {
+        let (hd, nh, nkv, vocab, h) = (128usize, 4usize, 2usize, 152usize, 256usize);
+        let (q_dim, kvd, inter, nl) = (nh * hd, nkv * hd, 512usize, 2usize);
+        let dir = std::env::temp_dir().join(format!("kronos_metal_qknorm_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            format!(
+                r#"{{"vocab_size":{vocab},"hidden_size":{h},"intermediate_size":{inter},"num_hidden_layers":{nl},"num_attention_heads":{nh},"num_key_value_heads":{nkv},"head_dim":{hd},"rms_norm_eps":1e-6,"rope_theta":1000000.0,"tie_word_embeddings":false}}"#
+            ),
+        )
+        .unwrap();
+        let mk_bf16 = |n: usize, seed: usize, scale: f32| -> Vec<u8> {
+            let mut out = Vec::with_capacity(n * 2);
+            for i in 0..n {
+                let mut z = (i as u64).wrapping_add((seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                let u = ((z >> 40) as f32) / ((1u32 << 24) as f32);
+                out.extend_from_slice(&f32_to_bf16((2.0 * u - 1.0) * scale).to_le_bytes());
+            }
+            out
+        };
+        let mut data = Vec::new();
+        let mut hdr_items = Vec::new();
+        let mut push = |name: String, shape: Vec<usize>, raw: Vec<u8>| {
+            let s = data.len();
+            data.extend_from_slice(&raw);
+            let sh: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+            hdr_items.push(format!(
+                r#""{name}":{{"dtype":"BF16","shape":[{}],"data_offsets":[{s},{}]}}"#,
+                sh.join(","),
+                data.len()
+            ));
+        };
+        push("model.embed_tokens.weight".into(), vec![vocab, h], mk_bf16(vocab * h, 31, 0.4));
+        for l in 0..nl {
+            let p = format!("model.layers.{l}");
+            push(format!("{p}.input_layernorm.weight"), vec![h], mk_bf16(h, 7 + l, 1.0));
+            push(format!("{p}.post_attention_layernorm.weight"), vec![h], mk_bf16(h, 11 + l, 1.0));
+            push(format!("{p}.self_attn.q_proj.weight"), vec![q_dim, h], mk_bf16(q_dim * h, 13 + l, 0.08));
+            push(format!("{p}.self_attn.k_proj.weight"), vec![kvd, h], mk_bf16(kvd * h, 17 + l, 0.08));
+            push(format!("{p}.self_attn.v_proj.weight"), vec![kvd, h], mk_bf16(kvd * h, 19 + l, 0.08));
+            push(format!("{p}.self_attn.q_norm.weight"), vec![hd], mk_bf16(hd, 23 + l, 1.0));
+            push(format!("{p}.self_attn.k_norm.weight"), vec![hd], mk_bf16(hd, 29 + l, 1.0));
+            push(format!("{p}.self_attn.o_proj.weight"), vec![h, q_dim], mk_bf16(h * q_dim, 41 + l, 0.08));
+            push(format!("{p}.mlp.gate_proj.weight"), vec![inter, h], mk_bf16(inter * h, 43 + l, 0.08));
+            push(format!("{p}.mlp.up_proj.weight"), vec![inter, h], mk_bf16(inter * h, 47 + l, 0.08));
+            push(format!("{p}.mlp.down_proj.weight"), vec![h, inter], mk_bf16(h * inter, 53 + l, 0.055));
+        }
+        push("model.norm.weight".into(), vec![h], mk_bf16(h, 59, 1.0));
+        push("lm_head.weight".into(), vec![vocab, h], mk_bf16(vocab * h, 61, 0.3));
+        let hdr = format!("{{{}}}", hdr_items.join(","));
+        let mut bytes = (hdr.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(hdr.as_bytes());
+        bytes.extend_from_slice(&data);
+        fs::write(dir.join("model.safetensors"), bytes).unwrap();
+
+        let mode = RealWeightMode::KronosNfGptq { bits: 4, scale_group_chunks: 2 };
+        let fp32 = RealLlamaEngine::load_fp32_reference(&dir, 256).unwrap();
+        let compiled = fp32.compile_from_reference(mode, None);
+        let cache_path = dir.join("kronos-nf4g128.k2tb");
+        compiled.save_bipolar(&cache_path).unwrap();
+
+        let mut cpu_eng = RealLlamaEngine::load_bipolar(&dir, &cache_path, 256).unwrap();
+        cpu_eng.repack_sdot();
+        cpu_eng.enable_q8_kv_cache(true);
+        cpu_eng.set_num_threads(2);
+        let mut gpu_eng = RealLlamaEngine::load_bipolar(&dir, &cache_path, 256).unwrap();
+        gpu_eng.repack_sdot();
+        gpu_eng.enable_metal().expect("Metal GPU unavailable on macOS test host");
+
+        let prefill: Vec<usize> = (0..70).map(|i| (i * 11 + 2) % vocab).collect();
+        let cpu_p = cpu_eng.forward_prompt(&prefill).to_vec();
+        let gpu_p = gpu_eng.forward_prompt(&prefill).to_vec();
+        let (cos_p, kl_p) = (cosine_sim(&cpu_p, &gpu_p), kl_divergence_nats(&cpu_p, &gpu_p));
+        assert!(cos_p > 0.9995 && kl_p < 0.005, "qk-norm prefill mismatch: cos={cos_p:.6}, kl={kl_p:.6}");
+        for step in 0..4 {
+            let tok = (step * 17 + 9) % vocab;
+            let cl = cpu_eng.forward_token(tok).to_vec();
+            let gl = gpu_eng.forward_token(tok).to_vec();
+            let (cos_d, kl_d) = (cosine_sim(&cl, &gl), kl_divergence_nats(&cl, &gl));
+            assert!(cos_d > 0.9995 && kl_d < 0.005, "qk-norm decode step {step}: cos={cos_d:.6}, kl={kl_d:.6}");
+        }
+        cpu_eng.set_num_threads(1);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
