@@ -5839,8 +5839,13 @@ fn run_agent_turn_inner(
                     .map(|(p, err)| format!("`{p}`: {err}"))
                     .collect();
                 if !pending.is_empty() {
+                    let first_path = unresolved_edits
+                        .iter()
+                        .map(|(p, _)| p.as_str())
+                        .find(|p| !p.is_empty())
+                        .unwrap_or("the reported file");
                     last_tool.content.push_str(&format!(
-                        "\n[Pending validation errors still on disk — fix with `write_file` before finishing: {}]",
+                        "\n[Pending validation errors still on disk: {}. Your next tool call must fix `{first_path}` (read_file it, then edit_file the failing lines or write_file a complete rewrite); do not rewrite other files first.]",
                         pending.join("; ")
                     ));
                 }
