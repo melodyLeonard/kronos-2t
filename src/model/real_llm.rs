@@ -1617,9 +1617,6 @@ impl RealLlamaEngine {
 
     /// Enables zero-copy Metal GPU execution for NfSdot engines (`0` duplicate weight RAM).
     pub fn enable_metal(&mut self) -> Result<(), String> {
-        if self.is_moe() {
-            return Err("Sparse-MoE engines execute hybrid CPU P-core + NVMe SLRU paging".to_string());
-        }
         if self.layers.iter().any(|l| l.o_bias.is_some()) {
             return Err("Metal GPU does not support o_bias".to_string());
         }
@@ -1634,11 +1631,53 @@ impl RealLlamaEngine {
                     _ => Err(format!("{name}: Metal GPU requires NfSdot weights")),
                 }
             }
+            // MoE: experts stay in the mmapped `.k2tm`; Metal reads the records in place.
+            let moe = if self.is_moe() {
+                let rt = self.moe_runtime.as_ref().ok_or("MoE runtime missing")?;
+                if rt.router_scoring != MoeRouterScoring::Softmax {
+                    return Err("Metal MoE supports softmax routers only".to_string());
+                }
+                if self.layers.iter().any(|l| l.moe.as_ref().is_some_and(|m| m.shared_expert.is_some())) {
+                    return Err("Metal MoE does not support shared experts".to_string());
+                }
+                let (bytes, header, layout) = rt
+                    .zero_copy_shard()
+                    .ok_or("Metal MoE needs the zero-copy mmap expert backend (shard exceeds the memory budget)")?;
+                let geom = crate::backend::metal_gpu::MoeGeometry {
+                    top_k: rt.top_k,
+                    norm_topk: rt.norm_topk_prob,
+                    d_ff: layout.d_ff,
+                    bits: layout.bits,
+                    scale_group_chunks: layout.scale_group_chunks,
+                    expert_bytes: layout.aligned_expert_bytes,
+                    gu_codebook_off: layout.gu_codebook_off,
+                    gu_pair_off: layout.gu_pair_off,
+                    dn_codebook_off: layout.dn_codebook_off,
+                    dn_pair_off: layout.dn_pair_off,
+                };
+                Some((bytes, header, geom))
+            } else {
+                None
+            };
             let mut borrows = Vec::with_capacity(self.layers.len());
             for (idx, l) in self.layers.iter().enumerate() {
                 if l.o_inv_scale.is_some() || l.down_inv_scale.is_some() {
                     return Err(format!("layer.{idx}: Metal GPU does not support AWQ channel inv_scale"));
                 }
+                let moe_layer = match (&l.moe, &moe) {
+                    (Some(m), Some((bytes, header, geom))) => {
+                        let per_layer = header.experts_per_layer * geom.expert_bytes;
+                        let start = crate::model::moe_800b::K2TM_VM_PAGE_BYTES + m.moe_slot_idx * per_layer;
+                        Some(crate::backend::metal_gpu::MoeLayerBorrow {
+                            router_w: &m.router.weights,
+                            router_bias: m.router.bias.as_deref(),
+                            shard: &bytes[start..start + per_layer],
+                        })
+                    }
+                    (Some(_), None) => return Err(format!("layer.{idx}: MoE layer without expert shard")),
+                    _ => None,
+                };
+                let dense = moe_layer.is_none();
                 borrows.push(crate::backend::metal_gpu::LayerBorrow {
                     input_norm: &l.input_norm,
                     post_attn_norm: &l.post_attn_norm,
@@ -1646,9 +1685,10 @@ impl RealLlamaEngine {
                     qk_norm: l.q_norm.as_deref().zip(l.k_norm.as_deref()),
                     qkv_proj: as_nf4(&l.qkv_proj, &format!("layer.{idx}.qkv_proj"))?,
                     o_proj: as_nf4(&l.o_proj, &format!("layer.{idx}.o_proj"))?,
-                    gate_up_proj: as_nf4(&l.gate_up_proj, &format!("layer.{idx}.gate_up_proj"))?,
+                    gate_up_proj: if dense { Some(as_nf4(&l.gate_up_proj, &format!("layer.{idx}.gate_up_proj"))?) } else { None },
                     gate_up_interleaved: l.gate_up_interleaved,
-                    down_proj: as_nf4(&l.down_proj, &format!("layer.{idx}.down_proj"))?,
+                    down_proj: if dense { Some(as_nf4(&l.down_proj, &format!("layer.{idx}.down_proj"))?) } else { None },
+                    moe: moe_layer,
                 });
             }
             let head_mat = as_nf4(&self.lm_head, "lm_head")?;
@@ -1662,6 +1702,7 @@ impl RealLlamaEngine {
                 kv_bits,
                 self.kv_window_pref,
                 self.kv_sinks_pref,
+                moe.map(|(_, _, g)| g),
             )?;
             self.ws.pos = 0;
             self.ws.q8_kv = None;

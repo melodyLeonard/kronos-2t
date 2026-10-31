@@ -323,7 +323,14 @@ fn load_or_compile_engine(
                 model_dir.join(format!("kronos-moe-experts-{mode_key}.k2tm")),
             ),
         };
-        let policy = crate::model::sparse_moe::MoeExpertOpenPolicy::AutoBudget;
+        // Map the whole shard when it fits in RAM so Metal can read experts in place.
+        let ram = crate::model::memory_budget::MemoryBudgetProfile::active().physical_ram_bytes;
+        let shard_len = std::fs::metadata(&experts_cache).map_or(0, |m| m.len() as usize);
+        let policy = if shard_len > 0 && shard_len <= ram / 10 * 7 {
+            crate::model::sparse_moe::MoeExpertOpenPolicy::ForceZeroCopyMmap
+        } else {
+            crate::model::sparse_moe::MoeExpertOpenPolicy::AutoBudget
+        };
         let mut engine = match RealLlamaEngine::load_moe_from_files(
             model_dir,
             &core_cache,

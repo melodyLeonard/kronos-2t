@@ -837,6 +837,14 @@ impl SparseMoeRuntime {
 
     /// Whether this runtime holds unquantized `FP32` reference experts.
     #[inline]
+    /// Zero-copy view of the expert shard (mmap bytes, header, layout); `None` for other backends.
+    pub fn zero_copy_shard(&self) -> Option<(&[u8], K2tmShardHeader, NfExpertByteLayout)> {
+        match &self.backend {
+            MoeExpertBackend::ZeroCopyMmap { mmap, header, layout, .. } => Some((mmap.as_slice(), *header, *layout)),
+            _ => None,
+        }
+    }
+
     pub fn is_fp32_reference(&self) -> bool {
         matches!(self.backend, MoeExpertBackend::Fp32Ref { .. })
     }

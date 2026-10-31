@@ -258,6 +258,40 @@ struct Nf4MatParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct MoeRouterParams {
+    num_experts: u32,
+    h_dim: u32,
+    top_k: u32,
+    n_tok: u32,
+    eps: f32,
+    norm_topk: u32,
+    has_bias: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MoeGemvParams {
+    rows: u32,
+    cols: u32,
+    num_pairs: u32,
+    num_chunks: u32,
+    scale_group_chunks: u32,
+    num_scale_groups: u32,
+    pair_total_bytes: u32,
+    chunk_bytes: u32,
+    bits: u32,
+    top_k: u32,
+    n_tok: u32,
+    expert_bytes: u32,
+    cb_off: u32,
+    pair_off: u32,
+    x_by_slot: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct RopeKvParams {
     num_q_heads: u32,
     num_kv_heads: u32,
@@ -312,6 +346,13 @@ pub(crate) struct GpuNf4Matrix {
     chunk_bytes: u32,
 }
 
+/// One MoE layer on the GPU: its router and a zero-copy view of its expert records.
+struct GpuMoeLayer {
+    shard: MtlObj,
+    router_w: MtlObj,
+    router_bias: Option<MtlObj>,
+}
+
 pub(crate) struct GpuLayerWeights {
     input_norm: MtlObj,
     post_attn_norm: MtlObj,
@@ -319,9 +360,17 @@ pub(crate) struct GpuLayerWeights {
     qk_norm: Option<(MtlObj, MtlObj)>,
     qkv_proj: GpuNf4Matrix,
     o_proj: GpuNf4Matrix,
-    gate_up_proj: GpuNf4Matrix,
+    gate_up_proj: Option<GpuNf4Matrix>,
     gate_up_interleaved: bool,
-    down_proj: GpuNf4Matrix,
+    down_proj: Option<GpuNf4Matrix>,
+    moe: Option<GpuMoeLayer>,
+}
+
+pub(crate) struct MoeLayerBorrow<'a> {
+    pub router_w: &'a [f32],
+    pub router_bias: Option<&'a [f32]>,
+    /// This layer's expert records, 16 KiB aligned, `num_experts * expert_bytes` long.
+    pub shard: &'a [u8],
 }
 
 pub(crate) struct LayerBorrow<'a> {
@@ -331,9 +380,25 @@ pub(crate) struct LayerBorrow<'a> {
     pub qk_norm: Option<(&'a [f32], &'a [f32])>,
     pub qkv_proj: &'a NfSdotMatrix,
     pub o_proj: &'a NfSdotMatrix,
-    pub gate_up_proj: &'a NfSdotMatrix,
+    pub gate_up_proj: Option<&'a NfSdotMatrix>,
     pub gate_up_interleaved: bool,
-    pub down_proj: &'a NfSdotMatrix,
+    pub down_proj: Option<&'a NfSdotMatrix>,
+    pub moe: Option<MoeLayerBorrow<'a>>,
+}
+
+/// Expert geometry shared by every MoE layer (from the `.k2tm` header and layout).
+#[derive(Clone, Copy)]
+pub(crate) struct MoeGeometry {
+    pub top_k: usize,
+    pub norm_topk: bool,
+    pub d_ff: usize,
+    pub bits: usize,
+    pub scale_group_chunks: usize,
+    pub expert_bytes: usize,
+    pub gu_codebook_off: usize,
+    pub gu_pair_off: usize,
+    pub dn_codebook_off: usize,
+    pub dn_pair_off: usize,
 }
 
 struct GpuKvCache {
@@ -676,6 +741,10 @@ struct GpuScratch {
     attn_out: MtlObj,
     gate_up: MtlObj,
     logits: MtlObj,
+    moe_ids: MtlObj,
+    moe_w: MtlObj,
+    moe_gu: MtlObj,
+    moe_out: MtlObj,
 }
 
 impl GpuScratch {
@@ -683,7 +752,8 @@ impl GpuScratch {
         let n = init_tokens.max(1);
         let n_f16 = n.div_ceil(128) * 128;
         let nl = init_logits_tokens.max(1);
-        let max_rot = cfg.q_dim().max(cfg.hidden_size).max(cfg.intermediate_size);
+        let (moe_k, moe_ff) = if cfg.is_moe() { (cfg.num_experts_per_tok, cfg.eff_moe_inter()) } else { (0, 0) };
+        let max_rot = cfg.q_dim().max(cfg.hidden_size).max(cfg.intermediate_size).max(moe_k * moe_ff);
         let qkv_rows = cfg.q_dim() + 2 * cfg.kv_dim();
         let f32_b = std::mem::size_of::<f32>();
         let f16_b = std::mem::size_of::<u16>();
@@ -698,6 +768,10 @@ impl GpuScratch {
             attn_out: alloc_shared_buffer(device, n * cfg.q_dim() * f32_b, "sc.attn_out")?,
             gate_up: alloc_shared_buffer(device, n * 2 * cfg.intermediate_size * f32_b, "sc.gate_up")?,
             logits: alloc_shared_buffer(device, nl * cfg.vocab_size * f32_b, "sc.logits")?,
+            moe_ids: alloc_shared_buffer(device, (n * moe_k).max(1) * 4, "sc.moe_ids")?,
+            moe_w: alloc_shared_buffer(device, (n * moe_k).max(1) * f32_b, "sc.moe_w")?,
+            moe_gu: alloc_shared_buffer(device, (n * moe_k * 2 * moe_ff).max(1) * f32_b, "sc.moe_gu")?,
+            moe_out: alloc_shared_buffer(device, (n * moe_k * cfg.hidden_size).max(1) * f32_b, "sc.moe_out")?,
         })
     }
 
@@ -714,7 +788,8 @@ impl GpuScratch {
         if n_tok > self.cap_tokens {
             let n = n_tok.next_power_of_two().min(max_chunk_tokens).max(n_tok);
             let n_f16 = n.div_ceil(128) * 128;
-            let max_rot = cfg.q_dim().max(cfg.hidden_size).max(cfg.intermediate_size);
+            let (moe_k, moe_ff) = if cfg.is_moe() { (cfg.num_experts_per_tok, cfg.eff_moe_inter()) } else { (0, 0) };
+            let max_rot = cfg.q_dim().max(cfg.hidden_size).max(cfg.intermediate_size).max(moe_k * moe_ff);
             let qkv_rows = cfg.q_dim() + 2 * cfg.kv_dim();
             self.hidden = alloc_shared_buffer(device, n * cfg.hidden_size * f32_b, "sc.hidden")?;
             self.x_rot_f32 = alloc_shared_buffer(device, n * max_rot * f32_b, "sc.x_rot_f32")?;
@@ -723,6 +798,10 @@ impl GpuScratch {
             self.qkv = alloc_shared_buffer(device, n * qkv_rows * f32_b, "sc.qkv")?;
             self.attn_out = alloc_shared_buffer(device, n * cfg.q_dim() * f32_b, "sc.attn_out")?;
             self.gate_up = alloc_shared_buffer(device, n * 2 * cfg.intermediate_size * f32_b, "sc.gate_up")?;
+            self.moe_ids = alloc_shared_buffer(device, (n * moe_k).max(1) * 4, "sc.moe_ids")?;
+            self.moe_w = alloc_shared_buffer(device, (n * moe_k).max(1) * f32_b, "sc.moe_w")?;
+            self.moe_gu = alloc_shared_buffer(device, (n * moe_k * 2 * moe_ff).max(1) * f32_b, "sc.moe_gu")?;
+            self.moe_out = alloc_shared_buffer(device, (n * moe_k * cfg.hidden_size).max(1) * f32_b, "sc.moe_out")?;
             self.cap_tokens = n;
         }
         if logits_tokens > self.logits_cap_tokens {
@@ -747,6 +826,10 @@ pub struct MetalLlamaEngine {
     pso_rope_kv: MtlObj,
     pso_gqa_decode: MtlObj,
     pso_gqa_prefill: MtlObj,
+    pso_moe_router: MtlObj,
+    pso_moe_gemv: MtlObj,
+    pso_moe_combine: MtlObj,
+    moe: Option<MoeGeometry>,
     dummy_buf: MtlObj,
     rademacher_buf: MtlObj,
     rope_buf: MtlObj,
@@ -828,6 +911,30 @@ fn wrap_page_aligned_nocopy(device: Id, bytes: &PageAlignedBytes, dummy: Id, wha
     MtlObj::from_retained(ptr, what)
 }
 
+/// Wraps a 16 KiB-aligned slice (e.g. an mmapped `.k2tm` range) as a shared Metal buffer without copying.
+fn wrap_slice_nocopy(device: Id, bytes: &[u8], what: &str) -> Result<MtlObj, String> {
+    const PAGE: usize = 16_384;
+    let ptr = bytes.as_ptr();
+    if !(ptr as usize).is_multiple_of(PAGE) {
+        return Err(format!("{what}: slice is not 16 KiB aligned"));
+    }
+    let len = bytes.len().div_ceil(PAGE) * PAGE;
+    let st = sels();
+    // SAFETY: page-aligned, page-multiple length over a mapping that outlives the engine.
+    let raw = unsafe {
+        msg_sel!(
+            device,
+            st.new_buf_nocopy,
+            ptr.cast_mut().cast::<c_void>() => *mut c_void,
+            len => usize,
+            MTL_RESOURCE_STORAGE_MODE_SHARED => usize,
+            std::ptr::null_mut::<c_void>() => *mut c_void;
+            Id
+        )
+    };
+    MtlObj::from_retained(raw, what)
+}
+
 fn wrap_nf4_matrix(device: Id, mat: &NfSdotMatrix, dummy: Id, label: &str) -> Result<GpuNf4Matrix, String> {
     if !(2..=5).contains(&mat.bits) {
         return Err(format!(
@@ -892,6 +999,7 @@ impl MetalLlamaEngine {
         kv_bits: u8,
         kv_window: Option<usize>,
         kv_sinks: usize,
+        moe_geom: Option<MoeGeometry>,
     ) -> Result<Self, String> {
         if !cfg.hidden_size.is_multiple_of(64) || !cfg.intermediate_size.is_multiple_of(64) {
             return Err("Metal backend requires hidden_size and intermediate_size divisible by 64".to_string());
@@ -940,9 +1048,13 @@ impl MetalLlamaEngine {
                 let pso_rope_kv = build_pipeline(device.id(), library.id(), "qkv_rope_kv_store")?;
                 let pso_gqa_decode = build_pipeline(device.id(), library.id(), "causal_gqa_flash_q8_decode")?;
                 let pso_gqa_prefill = build_pipeline(device.id(), library.id(), "causal_gqa_flash_q8_prefill")?;
+                let pso_moe_router = build_pipeline(device.id(), library.id(), "moe_router_topk")?;
+                let pso_moe_gemv = build_pipeline(device.id(), library.id(), "nf4_moe_gemv")?;
+                let pso_moe_combine = build_pipeline(device.id(), library.id(), "moe_combine")?;
 
                 let dummy_buf = alloc_shared_buffer(device.id(), 64, "dummy")?;
-                let max_blocks = cfg.hidden_size.max(cfg.intermediate_size) / 64;
+                let moe_ff = moe_geom.map_or(0, |g| g.d_ff);
+                let max_blocks = cfg.q_dim().max(cfg.hidden_size).max(cfg.intermediate_size).max(moe_ff) / 64;
                 let mut rad_masks = Vec::with_capacity(max_blocks * 64);
                 for b in 0..max_blocks {
                     rad_masks.extend_from_slice(&rademacher_sign_masks_64(b));
@@ -966,6 +1078,33 @@ impl MetalLlamaEngine {
                         None => None,
                     };
                     let pfx = format!("layer.{idx}");
+                    let gate_up_proj = match l.gate_up_proj {
+                        Some(m) => Some(wrap_nf4_matrix(device.id(), m, dummy_buf.id(), &format!("{pfx}.gate_up"))?),
+                        None => None,
+                    };
+                    let down_proj = match l.down_proj {
+                        Some(m) => Some(wrap_nf4_matrix(device.id(), m, dummy_buf.id(), &format!("{pfx}.down"))?),
+                        None => None,
+                    };
+                    let moe = match &l.moe {
+                        Some(m) => {
+                            if moe_geom.is_none() {
+                                return Err(format!("{pfx}: MoE layer without MoE geometry"));
+                            }
+                            Some(GpuMoeLayer {
+                                shard: wrap_slice_nocopy(device.id(), m.shard, &format!("{pfx}.experts"))?,
+                                router_w: upload_slice_buffer(device.id(), m.router_w, "router_w")?,
+                                router_bias: match m.router_bias {
+                                    Some(b) => Some(upload_slice_buffer(device.id(), b, "router_bias")?),
+                                    None => None,
+                                },
+                            })
+                        }
+                        None => None,
+                    };
+                    if moe.is_none() && (gate_up_proj.is_none() || down_proj.is_none()) {
+                        return Err(format!("{pfx}: dense layer without gate_up/down weights"));
+                    }
                     layers.push(GpuLayerWeights {
                         input_norm,
                         post_attn_norm,
@@ -973,14 +1112,10 @@ impl MetalLlamaEngine {
                         qk_norm,
                         qkv_proj: wrap_nf4_matrix(device.id(), l.qkv_proj, dummy_buf.id(), &format!("{pfx}.qkv"))?,
                         o_proj: wrap_nf4_matrix(device.id(), l.o_proj, dummy_buf.id(), &format!("{pfx}.o"))?,
-                        gate_up_proj: wrap_nf4_matrix(
-                            device.id(),
-                            l.gate_up_proj,
-                            dummy_buf.id(),
-                            &format!("{pfx}.gate_up"),
-                        )?,
+                        gate_up_proj,
                         gate_up_interleaved: l.gate_up_interleaved,
-                        down_proj: wrap_nf4_matrix(device.id(), l.down_proj, dummy_buf.id(), &format!("{pfx}.down"))?,
+                        down_proj,
+                        moe,
                     });
                 }
                 let final_norm = upload_slice_buffer(device.id(), final_norm_in, "final_norm")?;
@@ -1010,6 +1145,10 @@ impl MetalLlamaEngine {
                     pso_rope_kv,
                     pso_gqa_decode,
                     pso_gqa_prefill,
+                    pso_moe_router,
+                    pso_moe_gemv,
+                    pso_moe_combine,
+                    moe: moe_geom,
                     dummy_buf,
                     rademacher_buf,
                     rope_buf,
@@ -1345,6 +1484,14 @@ impl MetalLlamaEngine {
                         n_tok,
                     );
 
+                    if let Some(moe_layer) = &layer.moe {
+                        self.encode_moe_ffn(enc, cfg, layer, moe_layer, n_tok);
+                        continue;
+                    }
+                    let (Some(gate_up_proj), Some(down_proj)) = (&layer.gate_up_proj, &layer.down_proj) else {
+                        return Err("dense layer without FFN weights".to_string());
+                    };
+
                     // 6. Post-attention RMSNorm + signed FWHT-64 -> `gate_up_proj`.
                     self.encode_norm_fwht(
                         enc,
@@ -1360,7 +1507,7 @@ impl MetalLlamaEngine {
                     );
                     self.encode_nf4_proj(
                         enc,
-                        &layer.gate_up_proj,
+                        gate_up_proj,
                         None,
                         None,
                         self.scratch.gate_up.id(),
@@ -1382,7 +1529,7 @@ impl MetalLlamaEngine {
                     );
                     self.encode_nf4_proj(
                         enc,
-                        &layer.down_proj,
+                        down_proj,
                         None,
                         Some(self.scratch.hidden.id()),
                         self.scratch.hidden.id(),
@@ -1437,6 +1584,95 @@ impl MetalLlamaEngine {
             })();
             objc_autoreleasePoolPop(pool);
             res
+        }
+    }
+
+    /// Router top-k, grouped expert gate_up, SwiGLU+FWHT, grouped down and weighted combine into `hidden`.
+    unsafe fn encode_moe_ffn(&self, enc: Id, cfg: &LlamaConfig, layer: &GpuLayerWeights, moe: &GpuMoeLayer, n_tok: usize) {
+        let st = sels();
+        let g = self.moe.expect("MoE geometry");
+        let h = cfg.hidden_size;
+        let k = g.top_k;
+        let rp = MoeRouterParams {
+            num_experts: cfg.num_experts as u32,
+            h_dim: h as u32,
+            top_k: k as u32,
+            n_tok: n_tok as u32,
+            eps: cfg.rms_norm_eps,
+            norm_topk: u32::from(g.norm_topk),
+            has_bias: u32::from(moe.router_bias.is_some()),
+            _pad: 0,
+        };
+        let chunk_b = NfSdotMatrix::stripe_chunk_bytes(g.bits);
+        let gemv = |rows: usize, cols: usize, cb_off: usize, pair_off: usize, x_by_slot: bool| -> MoeGemvParams {
+            let chunks = cols / 64;
+            let sg = chunks.div_ceil(g.scale_group_chunks);
+            MoeGemvParams {
+                rows: rows as u32,
+                cols: cols as u32,
+                num_pairs: (rows / 32) as u32,
+                num_chunks: chunks as u32,
+                scale_group_chunks: g.scale_group_chunks as u32,
+                num_scale_groups: sg as u32,
+                pair_total_bytes: (sg * 64 + chunks * 2 * chunk_b) as u32,
+                chunk_bytes: chunk_b as u32,
+                bits: g.bits as u32,
+                top_k: k as u32,
+                n_tok: n_tok as u32,
+                expert_bytes: g.expert_bytes as u32,
+                cb_off: cb_off as u32,
+                pair_off: pair_off as u32,
+                x_by_slot: u32::from(x_by_slot),
+                _pad: 0,
+            }
+        };
+        let gu = gemv(2 * g.d_ff, h, g.gu_codebook_off, g.gu_pair_off, false);
+        let dn = gemv(h, g.d_ff, g.dn_codebook_off, g.dn_pair_off, true);
+        let bias_id = moe.router_bias.as_ref().map_or_else(|| self.dummy_buf.id(), MtlObj::id);
+        // SAFETY: valid encoder; all buffers are owned by `self` or borrowed for the engine's lifetime.
+        unsafe {
+            // Router: RMSNorm(hidden) -> softmax over experts -> top-k ids and weights.
+            msg_sel!(enc, st.set_cps, self.pso_moe_router.id() => Id; ());
+            msg_sel!(enc, st.set_buf, self.scratch.hidden.id() => Id, 0usize => usize, 0usize => usize; ());
+            msg_sel!(enc, st.set_buf, layer.post_attn_norm.id() => Id, 0usize => usize, 1usize => usize; ());
+            msg_sel!(enc, st.set_buf, moe.router_w.id() => Id, 0usize => usize, 2usize => usize; ());
+            msg_sel!(enc, st.set_buf, bias_id => Id, 0usize => usize, 3usize => usize; ());
+            msg_sel!(enc, st.set_buf, self.scratch.moe_ids.id() => Id, 0usize => usize, 4usize => usize; ());
+            msg_sel!(enc, st.set_buf, self.scratch.moe_w.id() => Id, 0usize => usize, 5usize => usize; ());
+            msg_sel!(enc, st.set_bytes, (&rp as *const MoeRouterParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeRouterParams>() => usize, 6usize => usize; ());
+            msg_sel!(enc, st.dispatch_tg, MtlSize::new(n_tok, 1, 1) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+
+            // Post-attention RMSNorm + FWHT -> x_rot rows [n_tok][h].
+            self.encode_norm_fwht(enc, self.scratch.hidden.id(), 0, layer.post_attn_norm.id(), h, n_tok, cfg.rms_norm_eps, 0, false, false);
+
+            // gate_up for every (token, slot): moe_gu[(t*k+s)][2*d_ff].
+            msg_sel!(enc, st.set_cps, self.pso_moe_gemv.id() => Id; ());
+            msg_sel!(enc, st.set_buf, moe.shard.id() => Id, 0usize => usize, 0usize => usize; ());
+            msg_sel!(enc, st.set_buf, self.scratch.moe_ids.id() => Id, 0usize => usize, 1usize => usize; ());
+            msg_sel!(enc, st.set_buf, self.scratch.x_rot_f32.id() => Id, 0usize => usize, 2usize => usize; ());
+            msg_sel!(enc, st.set_buf, self.scratch.moe_gu.id() => Id, 0usize => usize, 3usize => usize; ());
+            msg_sel!(enc, st.set_bytes, (&gu as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 4usize => usize; ());
+            msg_sel!(enc, st.dispatch_tg, MtlSize::new(gu.num_pairs as usize, k, n_tok) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+
+            // SwiGLU + FWHT over n_tok*k rows of width d_ff -> x_rot rows [(t*k+s)][d_ff].
+            self.encode_norm_fwht(enc, self.scratch.moe_gu.id(), 0, self.dummy_buf.id(), g.d_ff, n_tok * k, cfg.rms_norm_eps, 2, false, false);
+
+            // down for every (token, slot): moe_out[(t*k+s)][h].
+            msg_sel!(enc, st.set_cps, self.pso_moe_gemv.id() => Id; ());
+            msg_sel!(enc, st.set_buf, moe.shard.id() => Id, 0usize => usize, 0usize => usize; ());
+            msg_sel!(enc, st.set_buf, self.scratch.moe_ids.id() => Id, 0usize => usize, 1usize => usize; ());
+            msg_sel!(enc, st.set_buf, self.scratch.x_rot_f32.id() => Id, 0usize => usize, 2usize => usize; ());
+            msg_sel!(enc, st.set_buf, self.scratch.moe_out.id() => Id, 0usize => usize, 3usize => usize; ());
+            msg_sel!(enc, st.set_bytes, (&dn as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 4usize => usize; ());
+            msg_sel!(enc, st.dispatch_tg, MtlSize::new(dn.num_pairs as usize, k, n_tok) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+
+            // hidden[t] += sum_s w[t][s] * moe_out[t][s].
+            msg_sel!(enc, st.set_cps, self.pso_moe_combine.id() => Id; ());
+            msg_sel!(enc, st.set_buf, self.scratch.moe_out.id() => Id, 0usize => usize, 0usize => usize; ());
+            msg_sel!(enc, st.set_buf, self.scratch.moe_w.id() => Id, 0usize => usize, 1usize => usize; ());
+            msg_sel!(enc, st.set_buf, self.scratch.hidden.id() => Id, 0usize => usize, 2usize => usize; ());
+            msg_sel!(enc, st.set_bytes, (&rp as *const MoeRouterParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeRouterParams>() => usize, 6usize => usize; ());
+            msg_sel!(enc, st.dispatch_tg, MtlSize::new(n_tok, 1, 1) => MtlSize, MtlSize::new(256, 1, 1) => MtlSize; ());
         }
     }
 
@@ -1661,6 +1897,36 @@ struct Nf4MatParams {
     uint n_offset;
     uint bits;
     uint chunk_bytes;
+};
+
+struct MoeRouterParams {
+    uint num_experts;
+    uint h_dim;
+    uint top_k;
+    uint n_tok;
+    float eps;
+    uint norm_topk;
+    uint has_bias;
+    uint _pad;
+};
+
+struct MoeGemvParams {
+    uint rows;
+    uint cols;
+    uint num_pairs;
+    uint num_chunks;
+    uint scale_group_chunks;
+    uint num_scale_groups;
+    uint pair_total_bytes;
+    uint chunk_bytes;
+    uint bits;
+    uint top_k;
+    uint n_tok;
+    uint expert_bytes;
+    uint cb_off;
+    uint pair_off;
+    uint x_by_slot;
+    uint _pad;
 };
 
 struct RopeKvParams {
@@ -2117,6 +2383,195 @@ inline void unpack_nf_8cols(
         uint4 idx_hi = (b >> 4u) | (((hb >> (sh0 + 1u)) & 1u) << 4u);
         w_lo = float4(cb32_s[idx_lo.x], cb32_s[idx_lo.y], cb32_s[idx_lo.z], cb32_s[idx_lo.w]);
         w_hi = float4(cb32_s[idx_hi.x], cb32_s[idx_hi.y], cb32_s[idx_hi.z], cb32_s[idx_hi.w]);
+    }
+}
+
+inline void init_nf_tables_cb(
+    uint bits, uint cb0, uint cb1, uint cb2, uint cb3,
+    uint tid_tg,
+    threadgroup half2* l_pair,
+    threadgroup float* cb32_s)
+{
+    if (bits == 4u) {
+        l_pair[tid_tg] = make_nf4_pair(cb0, cb1, cb2, cb3, tid_tg);
+        l_pair[tid_tg + 128u] = make_nf4_pair(cb0, cb1, cb2, cb3, tid_tg + 128u);
+    } else if (tid_tg < 16u) {
+        float c = nf4_byte_lut(cb0, cb1, cb2, cb3, tid_tg);
+        if (bits == 5u) {
+            cb32_s[15u - tid_tg] = -c;
+            cb32_s[16u + tid_tg] = c;
+        } else {
+            cb32_s[tid_tg] = c;
+            cb32_s[16u + tid_tg] = 0.0f;
+        }
+    }
+}
+
+// One threadgroup per token: RMSNorm, router logits, softmax over all experts, top-k.
+kernel void moe_router_topk(
+    device const float* hidden   [[buffer(0)]],
+    device const float* norm_w   [[buffer(1)]],
+    device const float* router_w [[buffer(2)]],
+    device const float* router_b [[buffer(3)]],
+    device uint*        ids_out  [[buffer(4)]],
+    device float*       w_out    [[buffer(5)]],
+    constant MoeRouterParams& p  [[buffer(6)]],
+    uint t     [[threadgroup_position_in_grid]],
+    uint tid   [[thread_index_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]],
+    uint lane  [[thread_index_in_simdgroup]])
+{
+    if (t >= p.n_tok) return;
+    threadgroup float red[4];
+    threadgroup float logits[1024];
+    const uint h = p.h_dim;
+    device const float* x = hidden + ulong(t) * ulong(h);
+    float sq = 0.0f;
+    for (uint i = tid; i < h; i += 128u) {
+        float v = x[i];
+        sq += v * v;
+    }
+    sq = simd_sum(sq);
+    if (lane == 0u) red[sg_id] = sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = rsqrt((red[0] + red[1] + red[2] + red[3]) / float(h) + p.eps);
+    for (uint e = tid; e < p.num_experts; e += 128u) {
+        device const float* w = router_w + ulong(e) * ulong(h);
+        float acc = 0.0f;
+        for (uint i = 0u; i < h; ++i) {
+            acc += (x[i] * inv * norm_w[i]) * w[i];
+        }
+        if (p.has_bias != 0u) acc += router_b[e];
+        logits[e] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        const uint E = p.num_experts;
+        float m = logits[0];
+        for (uint e = 1u; e < E; ++e) m = max(m, logits[e]);
+        float z = 0.0f;
+        for (uint e = 0u; e < E; ++e) {
+            float pe = exp(logits[e] - m);
+            logits[e] = pe;
+            z += pe;
+        }
+        float sel_sum = 0.0f;
+        for (uint s = 0u; s < p.top_k; ++s) {
+            uint best = 0u;
+            float bv = -1.0f;
+            for (uint e = 0u; e < E; ++e) {
+                if (logits[e] > bv) { bv = logits[e]; best = e; }
+            }
+            logits[best] = -2.0f;
+            ids_out[t * p.top_k + s] = best;
+            w_out[t * p.top_k + s] = bv / z;
+            sel_sum += bv / z;
+        }
+        if (p.norm_topk != 0u && sel_sum > 0.0f) {
+            for (uint s = 0u; s < p.top_k; ++s) w_out[t * p.top_k + s] /= sel_sum;
+        }
+    }
+}
+
+// Threadgroup (pair, slot, token): one 32-row pair of expert ids[t*k+slot] against one x_rot row.
+kernel void nf4_moe_gemv(
+    device const uchar* shard  [[buffer(0)]],
+    device const uint*  ids    [[buffer(1)]],
+    device const float* x_rot  [[buffer(2)]],
+    device float*       out    [[buffer(3)]],
+    constant MoeGemvParams& p  [[buffer(4)]],
+    uint3 tg      [[threadgroup_position_in_grid]],
+    uint sg_id    [[simdgroup_index_in_threadgroup]],
+    uint tid      [[thread_index_in_simdgroup]],
+    uint tid_tg   [[thread_index_in_threadgroup]])
+{
+    const uint pair_idx = tg.x;
+    const uint slot = tg.z * p.top_k + tg.y;
+    if (pair_idx >= p.num_pairs || tg.y >= p.top_k || tg.z >= p.n_tok) return;
+    device const uchar* rec = shard + ulong(ids[slot]) * ulong(p.expert_bytes);
+    device const uint* cbw = (device const uint*)(rec + p.cb_off);
+
+    threadgroup half2 l_pair[256];
+    threadgroup float cb32_s[32];
+    init_nf_tables_cb(p.bits, cbw[0], cbw[1], cbw[2], cbw[3], tid_tg, l_pair, cb32_s);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint g = tid >> 3u;
+    const uint half16 = (tid >> 2u) & 1u;
+    const uint j = tid & 3u;
+    const uint lane = (g << 2u) | j;
+    const uint chunk_b = p.chunk_bytes;
+    const uint pair_chunk_b = 2u * chunk_b;
+    const uint x_row = (p.x_by_slot != 0u) ? slot : tg.z;
+    device const float* x = x_rot + ulong(x_row) * ulong(p.cols);
+
+    float acc_a = 0.0f;
+    float acc_b = 0.0f;
+    device const uchar* p_base = rec + p.pair_off + ulong(pair_idx) * ulong(p.pair_total_bytes);
+    const uint sg_stride = 64u + p.scale_group_chunks * pair_chunk_b;
+    for (uint sg = sg_id; sg < p.num_scale_groups; sg += 4u) {
+        device const uchar* sg_ptr = p_base + ulong(sg) * ulong(sg_stride);
+        float wsa = bf16_bytes_to_f32(sg_ptr + lane * 2u);
+        float wsb = bf16_bytes_to_f32(sg_ptr + 32u + lane * 2u);
+        uint c0 = sg * p.scale_group_chunks;
+        uint c1 = min(c0 + p.scale_group_chunks, p.num_chunks);
+        float sga = 0.0f;
+        float sgb = 0.0f;
+        for (uint c = c0; c < c1; ++c) {
+            uint sub_c = c - c0;
+            device const uchar* da = sg_ptr + 64u + sub_c * pair_chunk_b;
+            device const uchar* db = da + chunk_b;
+            for (uint kk = 0u; kk < 4u; ++kk) {
+                uint col = c * 64u + kk * 16u + half16 * 8u;
+                device const float4* xp = (device const float4*)(x + col);
+                float4 x0 = xp[0];
+                float4 x1 = xp[1];
+                float4 wa0, wa1, wb0, wb1;
+                unpack_nf_8cols(da, p.bits, kk, tid, l_pair, cb32_s, wa0, wa1);
+                sga += dot(wa0, x0) + dot(wa1, x1);
+                unpack_nf_8cols(db, p.bits, kk, tid, l_pair, cb32_s, wb0, wb1);
+                sgb += dot(wb0, x0) + dot(wb1, x1);
+            }
+        }
+        acc_a += sga * wsa;
+        acc_b += sgb * wsb;
+    }
+
+    acc_a += simd_shuffle_xor(acc_a, ushort(4));
+    acc_b += simd_shuffle_xor(acc_b, ushort(4));
+    threadgroup float tg_red[4][32];
+    if (half16 == 0u) {
+        tg_red[sg_id][lane] = acc_a;
+        tg_red[sg_id][16u + lane] = acc_b;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_id == 0u) {
+        uint row = pair_idx * 32u + tid;
+        if (row < p.rows) {
+            float sum = tg_red[0][tid] + tg_red[1][tid] + tg_red[2][tid] + tg_red[3][tid];
+            out[ulong(slot) * ulong(p.rows) + row] = sum;
+        }
+    }
+}
+
+// hidden[t] += sum_s w[t][s] * expert_out[t][s].
+kernel void moe_combine(
+    device const float* eo     [[buffer(0)]],
+    device const float* w      [[buffer(1)]],
+    device float*       hidden [[buffer(2)]],
+    constant MoeRouterParams& p [[buffer(6)]],
+    uint t   [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    if (t >= p.n_tok) return;
+    const uint h = p.h_dim;
+    for (uint i = tid; i < h; i += 256u) {
+        float acc = hidden[ulong(t) * ulong(h) + i];
+        for (uint s = 0u; s < p.top_k; ++s) {
+            uint slot = t * p.top_k + s;
+            acc += w[slot] * eo[ulong(slot) * ulong(h) + i];
+        }
+        hidden[ulong(t) * ulong(h) + i] = acc;
     }
 }
 
@@ -3543,6 +3998,120 @@ mod tests {
             let gl = gpu_eng.forward_token(tok).to_vec();
             let (cos_d, kl_d) = (cosine_sim(&cl, &gl), kl_divergence_nats(&cl, &gl));
             assert!(cos_d > 0.9995 && kl_d < 0.005, "qk-norm decode step {step}: cos={cos_d:.6}, kl={kl_d:.6}");
+        }
+        cpu_eng.set_num_threads(1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Qwen3-MoE layout: 4 experts top-2, QK-norm, q_dim != hidden, no shared expert; Metal vs CPU mmap path.
+    #[test]
+    fn test_metal_moe_parity() {
+        use crate::model::sparse_moe::MoeExpertOpenPolicy;
+        let (hd, nh, nkv, vocab, h) = (64usize, 4usize, 2usize, 160usize, 128usize);
+        let (q_dim, kvd, nl, n_exp, top_k, moe_inter) = (nh * hd, nkv * hd, 2usize, 4usize, 2usize, 128usize);
+        let dir = std::env::temp_dir().join(format!("kronos_metal_moe_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            format!(
+                r#"{{"architectures":["Qwen3MoeForCausalLM"],"vocab_size":{vocab},"hidden_size":{h},"intermediate_size":0,"moe_intermediate_size":{moe_inter},"num_hidden_layers":{nl},"num_attention_heads":{nh},"num_key_value_heads":{nkv},"head_dim":{hd},"num_experts":{n_exp},"num_experts_per_tok":{top_k},"norm_topk_prob":true,"rms_norm_eps":1e-6,"rope_theta":1000000.0,"tie_word_embeddings":false}}"#
+            ),
+        )
+        .unwrap();
+        let mk_bf16 = |n: usize, seed: usize, scale: f32| -> Vec<u8> {
+            let mut out = Vec::with_capacity(n * 2);
+            for i in 0..n {
+                let mut z = (i as u64).wrapping_add((seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                let u = ((z >> 40) as f32) / ((1u32 << 24) as f32);
+                out.extend_from_slice(&f32_to_bf16((2.0 * u - 1.0) * scale).to_le_bytes());
+            }
+            out
+        };
+        let mut data = Vec::new();
+        let mut hdr_items = Vec::new();
+        let mut push = |name: String, shape: Vec<usize>, raw: Vec<u8>| {
+            let s = data.len();
+            data.extend_from_slice(&raw);
+            let sh: Vec<String> = shape.iter().map(|d| d.to_string()).collect();
+            hdr_items.push(format!(
+                r#""{name}":{{"dtype":"BF16","shape":[{}],"data_offsets":[{s},{}]}}"#,
+                sh.join(","),
+                data.len()
+            ));
+        };
+        push("model.embed_tokens.weight".into(), vec![vocab, h], mk_bf16(vocab * h, 31, 0.4));
+        for l in 0..nl {
+            let p = format!("model.layers.{l}");
+            push(format!("{p}.input_layernorm.weight"), vec![h], mk_bf16(h, 7 + l, 1.0));
+            push(format!("{p}.post_attention_layernorm.weight"), vec![h], mk_bf16(h, 11 + l, 1.0));
+            push(format!("{p}.self_attn.q_proj.weight"), vec![q_dim, h], mk_bf16(q_dim * h, 13 + l, 0.08));
+            push(format!("{p}.self_attn.k_proj.weight"), vec![kvd, h], mk_bf16(kvd * h, 17 + l, 0.08));
+            push(format!("{p}.self_attn.v_proj.weight"), vec![kvd, h], mk_bf16(kvd * h, 19 + l, 0.08));
+            push(format!("{p}.self_attn.q_norm.weight"), vec![hd], mk_bf16(hd, 23 + l, 1.0));
+            push(format!("{p}.self_attn.k_norm.weight"), vec![hd], mk_bf16(hd, 29 + l, 1.0));
+            push(format!("{p}.self_attn.o_proj.weight"), vec![h, q_dim], mk_bf16(h * q_dim, 41 + l, 0.08));
+            push(format!("{p}.mlp.gate.weight"), vec![n_exp, h], mk_bf16(n_exp * h, 71 + l, 0.3));
+            for e in 0..n_exp {
+                let es = 100 + l * 10 + e * 3;
+                push(format!("{p}.mlp.experts.{e}.gate_proj.weight"), vec![moe_inter, h], mk_bf16(moe_inter * h, es, 0.1));
+                push(format!("{p}.mlp.experts.{e}.up_proj.weight"), vec![moe_inter, h], mk_bf16(moe_inter * h, es + 1, 0.1));
+                push(format!("{p}.mlp.experts.{e}.down_proj.weight"), vec![h, moe_inter], mk_bf16(h * moe_inter, es + 2, 0.08));
+            }
+        }
+        push("model.norm.weight".into(), vec![h], mk_bf16(h, 59, 1.0));
+        push("lm_head.weight".into(), vec![vocab, h], mk_bf16(vocab * h, 61, 0.3));
+        let hdr = format!("{{{}}}", hdr_items.join(","));
+        let mut bytes = (hdr.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(hdr.as_bytes());
+        bytes.extend_from_slice(&data);
+        fs::write(dir.join("model.safetensors"), bytes).unwrap();
+
+        let mode = RealWeightMode::KronosNfGptq { bits: 4, scale_group_chunks: 2 };
+        let calib = vec![
+            (0..32).map(|i| (i * 5 + 1) % vocab).collect::<Vec<_>>(),
+            (0..32).map(|i| (i * 7 + 3) % vocab).collect::<Vec<_>>(),
+        ];
+        let core = dir.join("core.k2tb");
+        let experts = dir.join("experts.k2tm");
+        RealLlamaEngine::compile_streaming_moe_to_files(&dir, &core, &experts, mode, &calib, 2).unwrap();
+        let mut cpu_eng =
+            RealLlamaEngine::load_moe_from_files(&dir, &core, &experts, 256, MoeExpertOpenPolicy::ForceZeroCopyMmap).unwrap();
+        cpu_eng.set_num_threads(2);
+        let mut gpu_eng =
+            RealLlamaEngine::load_moe_from_files(&dir, &core, &experts, 256, MoeExpertOpenPolicy::ForceZeroCopyMmap).unwrap();
+        gpu_eng.enable_metal().expect("Metal MoE");
+        assert!(gpu_eng.is_metal_enabled());
+
+        // Decode-only first (fresh context), then a batched prefill.
+        let mut worst = (1.0f64, 0.0f64);
+        for step in 0..6 {
+            let tok = (step * 17 + 9) % vocab;
+            let cl = cpu_eng.forward_token(tok).to_vec();
+            let gl = gpu_eng.forward_token(tok).to_vec();
+            let (cos_d, kl_d) = (cosine_sim(&cl, &gl), kl_divergence_nats(&cl, &gl));
+            eprintln!("moe decode-only step {step}: cos={cos_d:.6} kl={kl_d:.6}");
+            worst = (worst.0.min(cos_d), worst.1.max(kl_d));
+        }
+        assert!(worst.0 > 0.999 && worst.1 < 0.01, "moe decode-only mismatch: {worst:?}");
+        cpu_eng.reset_context();
+        gpu_eng.reset_context();
+        let prefill: Vec<usize> = (0..70).map(|i| (i * 11 + 2) % vocab).collect();
+        let cpu_p = cpu_eng.forward_prompt(&prefill).to_vec();
+        let gpu_p = gpu_eng.forward_prompt(&prefill).to_vec();
+        assert!(gpu_p.iter().all(|v| v.is_finite()), "non-finite MoE prefill logits");
+        let (cos_p, kl_p) = (cosine_sim(&cpu_p, &gpu_p), kl_divergence_nats(&cpu_p, &gpu_p));
+        eprintln!("moe prefill: cos={cos_p:.6} kl={kl_p:.6}");
+        assert!(cos_p > 0.999 && kl_p < 0.01, "moe prefill mismatch: cos={cos_p:.6}, kl={kl_p:.6}");
+        for step in 0..4 {
+            let tok = (step * 17 + 9) % vocab;
+            let cl = cpu_eng.forward_token(tok).to_vec();
+            let gl = gpu_eng.forward_token(tok).to_vec();
+            let (cos_d, kl_d) = (cosine_sim(&cl, &gl), kl_divergence_nats(&cl, &gl));
+            assert!(cos_d > 0.999 && kl_d < 0.01, "moe decode step {step}: cos={cos_d:.6}, kl={kl_d:.6}");
         }
         cpu_eng.set_num_threads(1);
         let _ = fs::remove_dir_all(&dir);
