@@ -562,6 +562,11 @@
     background:var(--accent); color:var(--accent-ink); border:none;
     height:42px; padding:0 18px; font-weight:600; flex-shrink:0;
   }
+  #stop {
+    background:var(--panel); color:var(--text); border:1px solid var(--line);
+    height:42px; padding:0 14px; font-weight:600; flex-shrink:0;
+  }
+  #stop.hidden { display:none; }
 
   /* Drag Resizer & Closeable Adaptive Workspace Pane */
   #ws-resizer {
@@ -798,6 +803,7 @@
             <span id="voice-btn-label">Voice</span>
           </button>
           <button id="send" type="submit">Send</button>
+          <button id="stop" type="button" class="hidden" title="Stop the running turn">Stop</button>
         </div>
       </form>
     </section>
@@ -2666,7 +2672,7 @@ function createTurnStreamContext(text, attachedItems, isMirrored, liveTurnId, ag
 function applyTurnStreamEvent(ctx, j) {
   if (!ctx || !j) return;
   if (j.type === "error") {
-    throw new Error(j.message || "turn failed");
+    throw new Error(j.message === "cancelled" ? "stopped" : (j.message || "turn failed"));
   }
   if (j.type === "route") {
     ctx.activeRoute = j.mode || "chat";
@@ -3304,11 +3310,23 @@ $("form").onsubmit = async (e) => {
   input.value = "";
   input.style.height = "auto";
   send.disabled = true;
+  $("stop").classList.remove("hidden");
   try {
     await runUnifiedTurn(text, atts);
   } finally {
+    $("stop").classList.add("hidden");
     send.disabled = false;
     input.focus();
+  }
+};
+
+$("stop").onclick = async () => {
+  $("stop").disabled = true;
+  try {
+    await fetch("/v1/agent/cancel", { method: "POST", headers: headers(), body: "{}" });
+  } catch (_) {
+  } finally {
+    $("stop").disabled = false;
   }
 };
 

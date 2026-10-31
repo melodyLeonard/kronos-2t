@@ -18,7 +18,7 @@
 //! `POST /v1/compact`, `GET /v1/sessions`, `GET /v1/sessions/get?id=...`, `POST /v1/sessions/save`,
 //! `POST /v1/sessions/delete`, `POST /v1/projects/select`, `POST /v1/workspace/revert`,
 //! `POST /v1/screencapture`, `GET /v1/agent/files`, `GET /v1/agent/file?path=...`,
-//! `POST /v1/agent/clear`, `GET /preview/<path>`, `GET /v1/models`, `GET /health`,
+//! `POST /v1/agent/clear`, `POST /v1/agent/cancel`, `GET /preview/<path>`, `GET /v1/models`, `GET /health`,
 //! the workspace UI at `/`, and the floating quick-prompt UI at `/quick`.
 
 use kronos_2t::runtime::agent::{
@@ -39,7 +39,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -82,6 +82,8 @@ struct LiveTurnBroadcast {
     user_text: String,
     deliverables: Vec<String>,
     events: Vec<String>,
+    /// Set by `POST /v1/agent/cancel`; the turn's event sink returns false and the loop stops.
+    cancel: Arc<AtomicBool>,
 }
 
 struct Server {
@@ -865,6 +867,7 @@ fn allocate_live_turn(srv: &Server, spec: &StreamTurnSpec) -> (u64, u64, String)
         user_text: spec.raw_user_text.clone(),
         deliverables: Vec::new(),
         events: Vec::new(),
+        cancel: Arc::new(AtomicBool::new(false)),
     };
     let mut turns = srv.live_turns.lock().unwrap_or_else(|p| p.into_inner());
     while turns.len() >= 24 {
@@ -911,8 +914,19 @@ fn execute_allocated_turn(
     } = spec;
 
     let tracked_workdir = Mutex::new(workdir.clone());
+    let cancel_flag = {
+        let turns = srv.live_turns.lock().unwrap_or_else(|p| p.into_inner());
+        turns
+            .iter()
+            .find(|t| t.turn_id == live_turn_id)
+            .map(|t| Arc::clone(&t.cancel))
+            .unwrap_or_default()
+    };
 
     let mut write_sse = |payload: &str| -> bool {
+        if cancel_flag.load(Ordering::Relaxed) && !payload.starts_with(r#"{"type":"error""#) {
+            return false;
+        }
         {
             let mut turns = srv.live_turns.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(lt) = turns.iter_mut().find(|t| t.turn_id == live_turn_id) {
@@ -1304,6 +1318,8 @@ fn execute_allocated_turn(
             lt.deliverables = deliverables;
             lt.status_detail = if out_res.is_ok() {
                 "completed".to_string()
+            } else if lt.cancel.load(Ordering::Relaxed) {
+                "cancelled".to_string()
             } else {
                 "error".to_string()
             };
@@ -1484,6 +1500,52 @@ fn unified_turn_sse(srv: &Arc<Server>, stream: &mut TcpStream, req: &Request) {
             agent_label,
             parent_turn_id: 0,
         },
+    );
+}
+
+/// Cancels running turns: by `turn_id` in the body, else every active turn started from the
+/// caller's `X-Kronos-Tab`, else every active turn. Child worker turns are cancelled with their parent.
+fn handle_agent_cancel(srv: &Arc<Server>, stream: &mut TcpStream, req: &Request) {
+    let body = std::str::from_utf8(&req.body).ok().and_then(|s| Json::parse(s).ok());
+    let req_tid = body
+        .as_ref()
+        .and_then(|j| j.get("turn_id").and_then(Json::as_f64))
+        .map(|v| v as u64)
+        .unwrap_or(0);
+    let origin = req.header("x-kronos-tab").map(str::to_string);
+    let turns = srv.live_turns.lock().unwrap_or_else(|p| p.into_inner());
+    let mut cancelled: Vec<u64> = turns
+        .iter()
+        .filter(|t| t.active)
+        .filter(|t| {
+            if req_tid != 0 {
+                t.turn_id == req_tid
+            } else {
+                origin.as_deref().is_none_or(|o| t.origin == o)
+            }
+        })
+        .map(|t| t.turn_id)
+        .collect();
+    loop {
+        let children: Vec<u64> = turns
+            .iter()
+            .filter(|t| t.active && cancelled.contains(&t.parent_turn_id) && !cancelled.contains(&t.turn_id))
+            .map(|t| t.turn_id)
+            .collect();
+        if children.is_empty() {
+            break;
+        }
+        cancelled.extend(children);
+    }
+    for t in turns.iter().filter(|t| cancelled.contains(&t.turn_id)) {
+        t.cancel.store(true, Ordering::Relaxed);
+    }
+    let ids: Vec<String> = cancelled.iter().map(u64::to_string).collect();
+    respond(
+        stream,
+        200,
+        "application/json",
+        &format!(r#"{{"cancelled":[{}]}}"#, ids.join(",")),
     );
 }
 
@@ -2234,6 +2296,7 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
             respond(&mut stream, 200, "application/json", &body);
         }
         ("POST", "/v1/agents/spawn") => handle_agents_spawn(srv, &mut stream, &req),
+        ("POST", "/v1/agent/cancel") => handle_agent_cancel(srv, &mut stream, &req),
         ("GET", "/v1/turn/live") => {
             let req_tid: u64 = req
                 .query_param("turn_id")
@@ -3008,6 +3071,7 @@ mod tests {
             workdir: "/tmp/demo".into(),
             user_text: "Modularize website".into(),
             deliverables: delivs,
+            cancel: Arc::new(AtomicBool::new(false)),
             events: Vec::new(),
         });
         let summary_json = Json::parse(&summary).unwrap();
