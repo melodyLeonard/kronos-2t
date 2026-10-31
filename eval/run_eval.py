@@ -185,6 +185,9 @@ def sse_agent_turn(base, payload, deadline):
                     if kind == "tool_start":
                         cur["tools"].append(ev.get("name"))
                         turn["tool_calls"].append(ev.get("name"))
+                        cur.setdefault("tool_args", []).append((ev.get("arguments") or "")[:200])
+                elif kind == "tool_done" and cur is not None:
+                    cur.setdefault("tool_results", []).append({"name": ev.get("name"), "ok": ev.get("ok"), "output": (ev.get("output") or "")[:300]})
                 elif kind == "step_stats" and cur is not None:
                     us = ev.get("usage", {})
                     cur.update({"prompt_tokens": us.get("prompt_tokens"), "prefilled_tokens": us.get("prefilled_tokens"),

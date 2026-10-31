@@ -2640,6 +2640,37 @@ fn small_rewrite_nudge(diff: &FileChangeDiff) -> Option<String> {
     ))
 }
 
+fn strip_line_number_prefix(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let rest = &t[digits..];
+    let rest = rest.strip_prefix(':').or_else(|| rest.strip_prefix(" |")).or_else(|| rest.strip_prefix('|'))?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
+/// Removes `N: ` / `N | ` line-number prefixes copied from tool output when every non-empty
+/// line of `old_text` carries one; `new_text` is stripped the same way.
+fn strip_line_number_prefixes(old_text: &str, new_text: &str) -> (String, String) {
+    let lines: Vec<&str> = old_text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() || !lines.iter().all(|l| strip_line_number_prefix(l).is_some()) {
+        return (old_text.to_string(), new_text.to_string());
+    }
+    let strip_all = |text: &str| -> String {
+        let mut out: Vec<String> = text
+            .lines()
+            .map(|l| strip_line_number_prefix(l).unwrap_or(l).to_string())
+            .collect();
+        if text.ends_with('\n') {
+            out.push(String::new());
+        }
+        out.join("\n")
+    };
+    (strip_all(old_text), strip_all(new_text))
+}
+
 /// Matches `norm_old` against `norm_existing` by comparing contiguous non-empty trimmed lines.
 fn match_unique_trimmed_span(
     norm_existing: &str,
@@ -2831,6 +2862,15 @@ fn exec_edit_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
     let existing = match fs::read_to_string(&target) {
         Ok(s) => s,
         Err(e) => return err_outcome(&format!("error reading `{rel}`: {e}")),
+    };
+    // Models often paste `read_file` output verbatim; drop `  12: ` / `  12 | ` prefixes when
+    // the literal text is absent but the stripped text is present.
+    let (stripped_old, stripped_new) = strip_line_number_prefixes(old_text, new_text);
+    let use_stripped = !existing.contains(old_text) && existing.contains(stripped_old.as_str());
+    let (old_text, new_text): (&str, &str) = if use_stripped {
+        (stripped_old.as_str(), stripped_new.as_str())
+    } else {
+        (old_text, new_text)
     };
 
     let mut match_positions = Vec::new();
@@ -4124,7 +4164,7 @@ pub fn compact_messages_with_budget(
             .find(|(_, m)| m.role == "user" && !is_synthetic_harness_user(&m.content))
             .map(|(i, _)| i)
             .unwrap_or(sys_offset);
-        for protect_tail in [6usize, 2, 0] {
+        for protect_tail in [6usize, 4, 2] {
             let raw_stop = history.len().saturating_sub(protect_tail);
             if raw_stop <= active_user_idx + 1 {
                 continue;
@@ -6675,6 +6715,34 @@ mod tests {
             2,
         );
         assert!(fresh.ok && !fresh.output.contains("use edit_file"));
+
+        // edit_file tolerates line-number prefixes pasted from read_file output.
+        fs::write(dir.join("cfg.py"), "A = 1\nB = 2\nC = 3\n").unwrap();
+        let prefixed = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "e1".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"path":"cfg.py","old_text":"2: B = 2","new_text":"2: B = 20"}"#.into(),
+            },
+            5,
+            3,
+        );
+        assert!(prefixed.ok, "{}", prefixed.output);
+        assert_eq!(fs::read_to_string(dir.join("cfg.py")).unwrap(), "A = 1\nB = 20\nC = 3\n");
+        let piped = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "e2".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"path":"cfg.py","old_text":"   1 | A = 1\n   2 | B = 20","new_text":"   1 | A = 10\n   2 | B = 20"}"#.into(),
+            },
+            5,
+            4,
+        );
+        assert!(piped.ok, "{}", piped.output);
+        assert_eq!(fs::read_to_string(dir.join("cfg.py")).unwrap(), "A = 10\nB = 20\nC = 3\n");
+        assert_eq!(strip_line_number_prefixes("x: 1", "x: 2"), ("x: 1".to_string(), "x: 2".to_string()));
 
         // The loop may finish without another model step only once a test passed after the last edit.
         assert!(early_finish_after_verified_edit(true, 0, 0, "", &[]).is_none());
