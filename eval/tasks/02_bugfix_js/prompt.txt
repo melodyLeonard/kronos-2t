@@ -1,0 +1,5 @@
+Bug reports against stats.js (Node, CommonJS):
+1. median([1, 2, 3, 4]) returns 3; for an even count it must return the mean of the two middle values, 2.5.
+2. variance([2, 4, 4, 4, 5, 5, 7, 9]) returns 4.571...; the comment says population variance, so it must divide by n and return 4.
+3. percentile([1, 2, 3, 4, 5], 100) returns undefined and percentile([1, 2, 3, 4, 5], 0) returns 1 only by luck; use nearest-rank with rank clamped into the array so p=100 gives 5 and p=0 gives 1.
+Fix these in stats.js with minimal edits; keep the exports unchanged. Verify with node -e.

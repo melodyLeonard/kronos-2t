@@ -1,0 +1,5 @@
+Three bugs were reported in ledger.py:
+1. transfer() charges the 25 cent fee twice: after transfer("a", "b", 1000, d) from a balance of 2000, account "a" should hold 975 but holds 950.
+2. balance(account, as_of=d) must include entries dated on d (on or before), but currently excludes them.
+3. fmt_cents(-5) returns "-$0.5"; it must return "-$0.05", and fmt_cents(123456) must return "$1234.56".
+Fix these with minimal edits in ledger.py, keep all names and signatures, and verify with python3.

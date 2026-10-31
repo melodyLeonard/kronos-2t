@@ -1,0 +1,1 @@
+{"kind": "agent", "max_steps": 40, "cmd_timeout": 60, "timeout_secs": 1800, "check": ["python3", "-I", "hidden/check.py"]}
