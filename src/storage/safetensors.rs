@@ -993,4 +993,22 @@ mod tests {
         assert_eq!(store.tensor("b.bias").unwrap().to_f32_vec(), vec![-1.25]);
         let _ = fs::remove_dir_all(&dir);
     }
+
+    // Needs the Qwen3-Coder-30B FP8 checkpoint; prints stats to compare with a NumPy dequant.
+    #[test]
+    #[ignore]
+    fn fp8_block_dequant_real_checkpoint() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../models/Qwen3-Coder-30B-A3B-Instruct-FP8");
+        let Ok(store) = SafeTensorsStore::open_dir(&dir) else { return };
+        let w = store.tensor("model.layers.0.mlp.experts.0.gate_proj.weight").unwrap().to_f32_vec();
+        let n = w.len() as f64;
+        let mean = w.iter().map(|&v| v as f64).sum::<f64>() / n;
+        let std = (w.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n).sqrt();
+        let absmax = w.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        println!("dequant mean {mean:.6} std {std:.6} absmax {absmax:.5}");
+        println!("row0[:6]: {:?}", &w[..6]);
+        println!("row767[2042:]: {:?}", &w[767 * 2048 + 2042..]);
+        assert!(std > 0.01 && std < 0.05);
+    }
 }

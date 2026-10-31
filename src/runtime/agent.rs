@@ -5108,6 +5108,8 @@ fn run_agent_turn_inner(
     let mut consecutive_no_tool_steps = 0usize;
     let mut consecutive_edit_failures = 0usize;
     let max_repairs = (cfg.max_steps * 3 / 4).max(8);
+    let mut tool_prefix = crate::runtime::chat::ToolFormat::Json.call_prefix();
+    with_model(&mut |m| tool_prefix = m.tool_format().call_prefix());
     let mut action_seq = 0usize;
     let mut last_mutation_seq = 0usize;
     let mut last_passing_test_seq = 0usize;
@@ -5158,7 +5160,7 @@ fn run_agent_turn_inner(
                 || consecutive_no_tool_steps > 0
                 || !unresolved_edits.is_empty())
         {
-            "<tool_call>\n{\"name\": \""
+            tool_prefix
         } else {
             ""
         };

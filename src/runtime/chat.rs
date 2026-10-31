@@ -24,6 +24,35 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// How tool schemas and calls are written in the prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolFormat {
+    /// Qwen2.5: `<tool_call>{"name": ..., "arguments": {...}}</tool_call>`.
+    Json,
+    /// Qwen3-Coder: `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>`.
+    Xml,
+}
+
+impl ToolFormat {
+    /// Reads the model's chat template to pick the format; JSON when there is none.
+    pub fn detect(model_dir: &Path) -> Self {
+        let has_fn_tag = |p: &Path| std::fs::read_to_string(p).is_ok_and(|s| s.contains("<function="));
+        if has_fn_tag(&model_dir.join("chat_template.jinja")) || has_fn_tag(&model_dir.join("tokenizer_config.json")) {
+            Self::Xml
+        } else {
+            Self::Json
+        }
+    }
+
+    /// Assistant prefix that forces the next output to be a tool call.
+    pub fn call_prefix(self) -> &'static str {
+        match self {
+            Self::Json => "<tool_call>\n{\"name\": \"",
+            Self::Xml => "<tool_call>\n<function=",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub role: String,
@@ -410,6 +439,7 @@ pub struct ChatModel {
     ctx: usize,
     scratch: ChatScratch,
     pub name: String,
+    tool_format: ToolFormat,
     #[cfg(all(feature = "ane", target_os = "macos"))]
     ane: Vec<(usize, crate::backend::coreml::CoreMlModel)>,
 }
@@ -480,6 +510,7 @@ impl ChatModel {
             ctx,
             scratch: ChatScratch::new(vocab_size),
             name,
+            tool_format: ToolFormat::detect(model_dir),
             #[cfg(all(feature = "ane", target_os = "macos"))]
             ane: Vec::new(),
         })
@@ -591,6 +622,10 @@ impl ChatModel {
 
     pub fn kv_cache_bytes(&self) -> usize {
         self.engine.kv_cache_bytes()
+    }
+
+    pub fn tool_format(&self) -> ToolFormat {
+        self.tool_format
     }
 
     pub fn default_system(&self) -> &'static str {
@@ -713,7 +748,7 @@ impl ChatModel {
 
     /// Returns true if the target KV cache already holds the exact `system + tools` prefix.
     pub fn has_hot_prefix(&self, system_prompt: &str, tools_json: &[String]) -> bool {
-        let full = render_chatml_prompt(&[Message::new("system", system_prompt)], tools_json, "");
+        let full = render_chatml_prompt_with(&[Message::new("system", system_prompt)], tools_json, "", self.tool_format);
         let prefix_str = full.strip_suffix("assistant\n").unwrap_or(&full);
         let tokens = self.tok.encode(prefix_str);
         !tokens.is_empty()
@@ -946,7 +981,7 @@ impl ChatModel {
 
     /// Pre-warms the fixed system + tool-schema prefix into target and draft KV caches.
     pub fn prewarm_prefix(&mut self, system_prompt: &str, tools_json: &[String]) -> usize {
-        let full = render_chatml_prompt(&[Message::new("system", system_prompt)], tools_json, "");
+        let full = render_chatml_prompt_with(&[Message::new("system", system_prompt)], tools_json, "", self.tool_format);
         let prefix_str = full.strip_suffix("assistant\n").unwrap_or(&full);
         let tokens = self.tok.encode(prefix_str);
         if tokens.is_empty() || tokens.len() >= self.ctx {
@@ -1072,7 +1107,7 @@ impl ChatModel {
     /// Renders a ChatML / Qwen2.5 tool-calling prompt (including `<tools>` system block,
     /// `<tool_call>` assistant turns, and grouped `<tool_response>` user turns) into token IDs.
     pub fn render_with_tools(&self, messages: &[Message], tools_json: &[String]) -> Vec<usize> {
-        let prompt_str = render_chatml_prompt(messages, tools_json, self.default_system());
+        let prompt_str = render_chatml_prompt_with(messages, tools_json, self.default_system(), self.tool_format);
         self.tok.encode(&prompt_str)
     }
 
@@ -1180,7 +1215,7 @@ impl ChatModel {
         let mut msgs = messages.to_vec();
         let reserve = params.max_tokens.min(512).min(self.ctx / 4).max(1);
         let render_prefixed = |m: &[Message], model: &Self| -> Vec<usize> {
-            let mut s = render_chatml_prompt(m, tools_json, model.default_system());
+            let mut s = render_chatml_prompt_with(m, tools_json, model.default_system(), model.tool_format);
             if !assistant_prefix.is_empty() {
                 s.push_str(assistant_prefix);
             }
@@ -1767,7 +1802,10 @@ impl ChatModel {
             || raw_text.contains(crate::config::markup::TOOLS_OPEN)
             || raw_text.contains("<tool ")
         {
-            let (prose, calls) = parse_qwen_tool_calls(&raw_text);
+            let (prose, calls) = match self.tool_format {
+                ToolFormat::Json => parse_qwen_tool_calls(&raw_text),
+                ToolFormat::Xml => parse_xml_tool_calls(&raw_text),
+            };
             if calls.is_empty() {
                 (raw_text, Vec::new())
             } else {
@@ -1801,6 +1839,144 @@ impl ChatModel {
 /// Renders a ChatML / Qwen2.5 tool-calling conversation into its exact prompt string
 /// (matching `Qwen2.5-Coder-Instruct`'s Jinja `chat_template` bit-for-bit).
 pub fn render_chatml_prompt(messages: &[Message], tools_json: &[String], default_system: &str) -> String {
+    render_chatml_prompt_with(messages, tools_json, default_system, ToolFormat::Json)
+}
+
+/// Renders one tool schema (OpenAI function JSON) in the Qwen3-Coder `<function>` layout.
+fn render_xml_tool_schema(tool_json: &str, out: &mut String) {
+    let Ok(j) = Json::parse(tool_json) else {
+        out.push('\n');
+        out.push_str(tool_json.trim());
+        return;
+    };
+    let f = j.get("function").unwrap_or(&j);
+    out.push_str("\n<function>\n<name>");
+    out.push_str(f.get("name").and_then(Json::as_str).unwrap_or(""));
+    out.push_str("</name>");
+    if let Some(d) = f.get("description").and_then(Json::as_str) {
+        out.push_str("\n<description>");
+        out.push_str(d.trim());
+        out.push_str("</description>");
+    }
+    out.push_str("\n<parameters>");
+    if let Some(props) = f.get("parameters").and_then(|p| p.get("properties")).and_then(Json::as_obj) {
+        for (pname, pf) in props {
+            out.push_str("\n<parameter>\n<name>");
+            out.push_str(pname);
+            out.push_str("</name>");
+            if let Some(t) = pf.get("type").and_then(Json::as_str) {
+                out.push_str("\n<type>");
+                out.push_str(t);
+                out.push_str("</type>");
+            }
+            if let Some(d) = pf.get("description").and_then(Json::as_str) {
+                out.push_str("\n<description>");
+                out.push_str(d.trim());
+                out.push_str("</description>");
+            }
+            out.push_str("\n</parameter>");
+        }
+    }
+    if let Some(req) = f.get("parameters").and_then(|p| p.get("required")) {
+        out.push_str("\n<required>");
+        out.push_str(&req.stringify());
+        out.push_str("</required>");
+    }
+    out.push_str("\n</parameters>\n</function>");
+}
+
+/// Renders one assistant tool call in the Qwen3-Coder layout; arguments must be a JSON object.
+fn render_xml_tool_call(tc: &ToolCall, out: &mut String) {
+    out.push_str("\n<tool_call>\n<function=");
+    out.push_str(&tc.name);
+    out.push('>');
+    if let Some(args) = Json::parse(&tc.arguments).ok().as_ref().and_then(Json::as_obj) {
+        for (k, v) in args {
+            out.push_str("\n<parameter=");
+            out.push_str(k);
+            out.push_str(">\n");
+            match v {
+                Json::Str(s) => out.push_str(s),
+                other => out.push_str(&other.stringify()),
+            }
+            out.push_str("\n</parameter>");
+        }
+    }
+    out.push_str("\n</function>\n</tool_call>");
+}
+
+const XML_TOOL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
+
+/// Parses Qwen3-Coder `<tool_call><function=name><parameter=k>v</parameter>...</function></tool_call>`
+/// blocks; parameter values that are valid JSON literals/objects are kept as such, others become strings.
+pub fn parse_xml_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
+    let mut prose = String::new();
+    let mut calls = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(rel) = text[cursor..].find(OPEN) {
+        let start = cursor + rel;
+        prose.push_str(&text[cursor..start]);
+        let body_start = start + OPEN.len();
+        let body_end = text[body_start..].find(CLOSE).map_or(text.len(), |e| body_start + e);
+        let body = &text[body_start..body_end];
+        if let Some(call) = parse_xml_function_block(body, calls.len()) {
+            calls.push(call);
+        } else {
+            prose.push_str(&text[start..body_end]);
+        }
+        cursor = (body_end + CLOSE.len()).min(text.len());
+    }
+    prose.push_str(&text[cursor..]);
+    (prose.trim().to_string(), calls)
+}
+
+fn parse_xml_function_block(body: &str, idx: usize) -> Option<ToolCall> {
+    let fn_start = body.find("<function=")? + "<function=".len();
+    let name_end = fn_start + body[fn_start..].find('>')?;
+    let name = body[fn_start..name_end].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut rest = &body[name_end + 1..];
+    let mut args = String::from("{");
+    let mut first = true;
+    while let Some(p) = rest.find("<parameter=") {
+        let k_start = p + "<parameter=".len();
+        let Some(k_len) = rest[k_start..].find('>') else { break };
+        let key = rest[k_start..k_start + k_len].trim();
+        let v_start = k_start + k_len + 1;
+        let v_end = rest[v_start..].find("</parameter>").map_or(rest.len(), |e| v_start + e);
+        let raw = rest[v_start..v_end].strip_prefix('\n').unwrap_or(&rest[v_start..v_end]);
+        let raw = raw.strip_suffix('\n').unwrap_or(raw);
+        if !first {
+            args.push(',');
+        }
+        first = false;
+        args.push_str(&quote(key));
+        args.push(':');
+        let t = raw.trim();
+        let literal = (t.starts_with('{') || t.starts_with('[') || t == "true" || t == "false" || t == "null"
+            || t.parse::<f64>().is_ok())
+            && Json::parse(t).is_ok();
+        if literal {
+            args.push_str(t);
+        } else {
+            args.push_str(&quote(raw));
+        }
+        rest = &rest[(v_end + "</parameter>".len()).min(rest.len())..];
+    }
+    args.push('}');
+    Some(ToolCall { id: format!("call_{idx}"), name, arguments: args })
+}
+
+pub fn render_chatml_prompt_with(
+    messages: &[Message],
+    tools_json: &[String],
+    default_system: &str,
+    fmt: ToolFormat,
+) -> String {
     let mut out = String::new();
     let (sys_content, start_idx) = if messages.first().is_some_and(|m| m.role == "system") {
         (messages[0].content.as_str(), 1usize)
@@ -1810,7 +1986,14 @@ pub fn render_chatml_prompt(messages: &[Message], tools_json: &[String], default
 
     out.push_str("<|im_start|>system\n");
     out.push_str(sys_content);
-    if !tools_json.is_empty() {
+    if !tools_json.is_empty() && fmt == ToolFormat::Xml {
+        out.push_str("\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        for tool in tools_json {
+            render_xml_tool_schema(tool, &mut out);
+        }
+        out.push_str("\n</tools>");
+        out.push_str(XML_TOOL_INSTRUCTIONS);
+    } else if !tools_json.is_empty() {
         out.push_str(
             "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>",
         );
@@ -1832,6 +2015,10 @@ pub fn render_chatml_prompt(messages: &[Message], tools_json: &[String], default
                 out.push_str(&m.content);
             }
             for tc in &m.tool_calls {
+                if fmt == ToolFormat::Xml {
+                    render_xml_tool_call(tc, &mut out);
+                    continue;
+                }
                 let args_obj = if tc.arguments.trim().is_empty() {
                     "{}"
                 } else {
@@ -3261,6 +3448,30 @@ fn sample_residual_dist(p_dist: &[(usize, f32)], q_dist: &[(usize, f32)], rng: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_xml_tool_format_round_trip() {
+        let raw = "Let me write it.\n<tool_call>\n<function=write_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=content>\nprint(1)\n\nprint(2)\n</parameter>\n<parameter=count>\n3\n</parameter>\n</function>\n</tool_call>";
+        let (prose, calls) = parse_xml_tool_calls(raw);
+        assert_eq!(prose, "Let me write it.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(calls[0].arguments, "{\"path\":\"a.py\",\"content\":\"print(1)\\n\\nprint(2)\",\"count\":3}");
+
+        let tools = vec![r#"{"type":"function","function":{"name":"write_file","description":"Write a file.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Relative path"}},"required":["path"]}}}"#.to_string()];
+        let msgs = vec![
+            Message::new("user", "go"),
+            Message { role: "assistant".into(), content: String::new(), tool_calls: calls.clone(), tool_call_id: None },
+            Message::tool_result("call_0", "ok"),
+        ];
+        let p = render_chatml_prompt_with(&msgs, &tools, "sys", ToolFormat::Xml);
+        assert!(p.contains("<function>\n<name>write_file</name>\n<description>Write a file.</description>\n<parameters>\n<parameter>\n<name>path</name>\n<type>string</type>"));
+        assert!(p.contains("<required>[\"path\"]</required>"));
+        assert!(p.contains("<tool_call>\n<function=write_file>\n<parameter=path>\na.py\n</parameter>"));
+        assert!(p.contains("<parameter=count>\n3\n</parameter>\n</function>\n</tool_call><|im_end|>"));
+        assert!(p.contains("<tool_response>\nok\n</tool_response>"));
+        assert_eq!(ToolFormat::Xml.call_prefix(), "<tool_call>\n<function=");
+    }
 
     #[test]
     fn test_zero_alloc_topk_dist_matches_reference() {
