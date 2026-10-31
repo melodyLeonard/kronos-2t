@@ -681,16 +681,10 @@ impl ChatModel {
         let draft_layout = self.draft.as_ref().and_then(|d| d.engine.kv_blob_layout());
         let store = self.sessions.as_mut().unwrap();
         let mut source = KvSource::None;
-        let mut entry = store.take(id).map(|e| {
-            source = KvSource::Memory;
-            e
-        });
+        let mut entry = store.take(id).inspect(|_| source = KvSource::Memory);
         if entry.is_none() {
             if let Some(tl) = target_layout.as_ref() {
-                entry = store.load(id, tl, draft_layout.as_ref()).map(|e| {
-                    source = KvSource::Disk;
-                    e
-                });
+                entry = store.load(id, tl, draft_layout.as_ref()).inspect(|_| source = KvSource::Disk);
             }
         }
 
@@ -1756,9 +1750,9 @@ impl ChatModel {
                     }
 
                     accepted_in_round += 1;
-                    let stop_here = if is_stop(dj, self.im_end, &self.tok) {
-                        Some(FinishReason::Stop)
-                    } else if !emit_tok(dj, &self.tok, &mut reply, &mut raw_bytes, &mut emitted_bytes, &mut on_text) {
+                    let stop_here = if is_stop(dj, self.im_end, &self.tok)
+                        || !emit_tok(dj, &self.tok, &mut reply, &mut raw_bytes, &mut emitted_bytes, &mut on_text)
+                    {
                         Some(FinishReason::Stop)
                     } else if reply.len() >= max_new {
                         Some(FinishReason::Length)
