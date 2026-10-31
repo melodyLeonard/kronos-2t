@@ -6,8 +6,10 @@
 //!   `--api-key KEY`       require `Authorization: Bearer KEY`
 //!   `--workdir DIR`       workspace root for web agent tools and `/preview/*` (default temp dir)
 //!   `--state-dir DIR`     directory for persistent conversation and project state
+//!   `--kv-sessions N`     KV prefixes of the last N sessions kept in RAM, older spilled to `state-dir/kv` (default 3, 0 off)
 //!   `--cache-dir DIR`     optional directory to read/write compiled `.k2tb` caches
 //!   `--fp32-kv`           use an `FP32` KV cache instead of the default INT8 one
+//!   `--q4-kv`             4-bit Hadamard KV cache (`--q8-kv` restores INT8)
 //!   `--cpu`               force CPU inference (disables default Metal GPU backend for NF4)
 //!   `--metal`             require Metal GPU inference
 //!   `--draft DIR`         draft model for speculative decoding (`--draft-mode M`)
@@ -30,6 +32,7 @@ use kronos_2t::runtime::agent::{
     UNIFIED_SYSTEM_PROMPT,
 };
 use kronos_2t::runtime::attachments::{ingest_attachment, AttachmentIngestion};
+use kronos_2t::runtime::kv_sessions::KvSource;
 use kronos_2t::runtime::chat::{ChatModel, Completion, GenParams, Message, ToolCall};
 use kronos_2t::runtime::device::{global_device_manager, use_computer_tool_definition_json};
 use kronos_2t::util::json::{quote, Json};
@@ -569,9 +572,12 @@ fn format_live_turn_summary_json(lt: &LiveTurnBroadcast) -> String {
     )
 }
 
-fn usage(c: &Completion) -> String {
+fn usage(c: &Completion, kv: Option<(usize, KvSource)>) -> String {
+    let kv_json = kv.map_or(String::new(), |(n, src)| {
+        format!(r#","kv_restored_tokens":{n},"kv_source":{}"#, quote(src.as_str()))
+    });
     format!(
-        r#"{{"prompt_tokens":{},"prefilled_tokens":{},"completion_tokens":{},"total_tokens":{},"drafted_tokens":{},"accepted_tokens":{},"prefill_secs":{:.6},"decode_secs":{:.6},"prefill_unit":{}}}"#,
+        r#"{{"prompt_tokens":{},"prefilled_tokens":{},"completion_tokens":{},"total_tokens":{},"drafted_tokens":{},"accepted_tokens":{},"prefill_secs":{:.6},"decode_secs":{:.6},"prefill_unit":{}{kv_json}}}"#,
         c.prompt_tokens,
         c.prefilled_tokens,
         c.completion_tokens,
@@ -582,6 +588,15 @@ fn usage(c: &Completion) -> String {
         c.decode_secs,
         quote(c.prefill_unit),
     )
+}
+
+/// Session id from the JSON body (`session_id`) or the `X-Kronos-Session` header.
+fn request_session_id(body: &Json, req: &Request) -> Option<String> {
+    let raw = body
+        .get("session_id")
+        .and_then(Json::as_str)
+        .or_else(|| req.header("x-kronos-session"))?;
+    sanitize_session_id(raw).ok()
 }
 
 fn format_tool_calls_json(calls: &[ToolCall], include_index: bool) -> String {
@@ -598,7 +613,13 @@ fn format_tool_calls_json(calls: &[ToolCall], include_index: bool) -> String {
     format!("[{}]", items.join(","))
 }
 
-fn format_completion_response(id: &str, created: u64, model_name: &str, c: &Completion) -> String {
+fn format_completion_response(
+    id: &str,
+    created: u64,
+    model_name: &str,
+    c: &Completion,
+    kv: Option<(usize, KvSource)>,
+) -> String {
     let msg_json = if c.tool_calls.is_empty() {
         format!(r#"{{"role":"assistant","content":{}}}"#, quote(&c.text))
     } else {
@@ -612,7 +633,7 @@ fn format_completion_response(id: &str, created: u64, model_name: &str, c: &Comp
         r#"{{"id":"{id}","object":"chat.completion","created":{created},"model":{},"choices":[{{"index":0,"message":{msg_json},"finish_reason":"{}"}}],"usage":{}}}"#,
         quote(model_name),
         c.finish.as_str(),
-        usage(c)
+        usage(c, kv)
     )
 }
 
@@ -644,7 +665,9 @@ fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
     }
     let id = format!("chatcmpl-{}-{}", now(), srv.next_id.fetch_add(1, Ordering::Relaxed));
     let created = now();
+    let session_id = request_session_id(&body, req);
     let mut model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
+    let kv = session_id.as_deref().map(|sid| model.switch_session(sid));
 
     if !streaming {
         match model.generate_with_tools(&messages, &tools_json, &params, |_| true) {
@@ -660,7 +683,7 @@ fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
                     stream,
                     200,
                     "application/json",
-                    &format_completion_response(&id, created, &srv.name, &c),
+                    &format_completion_response(&id, created, &srv.name, &c, kv),
                 );
             }
             Err(e) => error(stream, 400, &e),
@@ -700,7 +723,7 @@ fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
                         .as_bytes(),
                     );
                 }
-                let tail = chunk("{}", &quote(c.finish.as_str()), &format!(r#","usage":{}"#, usage(&c)));
+                let tail = chunk("{}", &quote(c.finish.as_str()), &format!(r#","usage":{}"#, usage(&c, kv)));
                 let _ = stream.write_all(tail.as_bytes()).and_then(|_| stream.write_all(b"data: [DONE]\n\n"));
             }
             Err(e) => {
@@ -725,7 +748,7 @@ fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
                     "chat",
                 );
             }
-            chunk("{}", &quote(c.finish.as_str()), &format!(r#","usage":{}"#, usage(&c)))
+            chunk("{}", &quote(c.finish.as_str()), &format!(r#","usage":{}"#, usage(&c, kv)))
         }
         Err(e) => format!("data: {{\"error\":{{\"message\":{}}}}}\n\n", quote(&e)),
     };
@@ -833,6 +856,7 @@ struct StreamTurnSpec {
     raw_user_text: String,
     agent_label: String,
     parent_turn_id: u64,
+    session_id: Option<String>,
 }
 
 fn allocate_live_turn(srv: &Server, spec: &StreamTurnSpec) -> (u64, u64, String) {
@@ -908,6 +932,7 @@ fn execute_allocated_turn(
         raw_user_text: _,
         agent_label: _,
         parent_turn_id: _,
+        session_id,
     } = spec;
 
     let tracked_workdir = Mutex::new(workdir.clone());
@@ -1109,6 +1134,7 @@ fn execute_allocated_turn(
             raw_user_text: sub_task.to_string(),
             agent_label: sub_label.to_string(),
             parent_turn_id: live_turn_id,
+            session_id: None,
         };
         let (child_tid, child_ord, child_lbl) = allocate_live_turn(&srv_for_spawn, &sub_spec);
         let srv_child = Arc::clone(&srv_for_spawn);
@@ -1132,6 +1158,14 @@ fn execute_allocated_turn(
         }
     });
 
+    if let Some(sid) = session_id.as_deref() {
+        let (n, src) = srv.model.lock().unwrap_or_else(|p| p.into_inner()).switch_session(sid);
+        let _ = write_sse(&format!(
+            r#"{{"type":"kv_session","id":{},"restored_tokens":{n},"source":{}}}"#,
+            quote(sid),
+            quote(src.as_str())
+        ));
+    }
     let run_res = run_agent_turn_shared_with_spawner(
         &srv.model,
         &mut history,
@@ -1190,7 +1224,7 @@ fn execute_allocated_turn(
             }
             AgentEvent::StepStats { step, completion } => write_sse(&format!(
                 r#"{{"type":"step_stats","step":{step},"usage":{}}}"#,
-                usage(completion)
+                usage(completion, None)
             )),
             AgentEvent::ToolStart { step, call } => {
                 let next_r = if call.name == "use_computer" {
@@ -1375,6 +1409,7 @@ fn agent_chat_sse(srv: &Arc<Server>, stream: &mut TcpStream, req: &Request) {
             raw_user_text,
             agent_label,
             parent_turn_id: 0,
+            session_id: request_session_id(&body, req),
         },
     );
 }
@@ -1483,6 +1518,7 @@ fn unified_turn_sse(srv: &Arc<Server>, stream: &mut TcpStream, req: &Request) {
             raw_user_text,
             agent_label,
             parent_turn_id: 0,
+            session_id: request_session_id(&body, req),
         },
     );
 }
@@ -1554,6 +1590,7 @@ fn handle_agents_spawn(srv: &Arc<Server>, stream: &mut TcpStream, req: &Request)
             raw_user_text: prompt.to_string(),
             agent_label: label,
             parent_turn_id: 0,
+            session_id: None,
         };
         let (tid, ord, final_label) = allocate_live_turn(srv, &spec);
         let srv_bg = Arc::clone(srv);
@@ -2353,6 +2390,7 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
                 return error(&mut stream, 400, "missing `id` field");
             };
             let mut idx = srv.ui_index.lock().unwrap_or_else(|p| p.into_inner());
+            srv.model.lock().unwrap_or_else(|p| p.into_inner()).forget_session(id);
             match delete_session_record(&srv.state_dir, &mut idx, id) {
                 Ok(()) => {
                     drop(idx);
@@ -2770,6 +2808,8 @@ fn main() {
         eprintln!("bind {addr}: {e}");
         std::process::exit(1);
     });
+    let kv_sessions = num("--kv-sessions", 3.0) as usize;
+    model.enable_session_kv(kv_sessions, Some(&state_dir));
     let weights_gib = model.resident_weight_bytes() as f64 / (1u64 << 30) as f64;
     let kv_gib = model.kv_cache_bytes() as f64 / (1u64 << 30) as f64;
     let kv_tag = {
@@ -2801,7 +2841,7 @@ fn main() {
         media_seq: AtomicU64::new(1),
     });
     eprintln!(
-        "serving {} on http://{addr}/ (quick HUD http://{addr}/quick · weights {weights_gib:.2} GiB + {kv_tag} {kv_gib:.2} GiB @ ctx={ctx_sz} · workdir={})",
+        "serving {} on http://{addr}/ (quick HUD http://{addr}/quick · weights {weights_gib:.2} GiB + {kv_tag} {kv_gib:.2} GiB @ ctx={ctx_sz} · kv-sessions={kv_sessions} · workdir={})",
         srv.name,
         workdir.display()
     );
@@ -2884,7 +2924,7 @@ mod tests {
             decode_secs: 1.0,
             prefill_unit: "cpu",
         };
-        let wire = format_completion_response("chatcmpl-1", 1700000000, "qwen2.5-coder", &comp);
+        let wire = format_completion_response("chatcmpl-1", 1700000000, "qwen2.5-coder", &comp, None);
         let parsed = Json::parse(&wire).unwrap();
         let choice0 = &parsed.get("choices").unwrap().as_arr().unwrap()[0];
         assert_eq!(choice0.get("finish_reason").and_then(Json::as_str), Some("tool_calls"));

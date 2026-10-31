@@ -11,10 +11,13 @@ pub use crate::config::prompts::{CREATOR_PUBLIC_PROFILE, DEFAULT_SYSTEM, DEFAULT
 
 #[cfg(all(feature = "ane", target_os = "macos"))]
 use crate::config::limits::ANE_MIN_NEW_TOKENS;
+use crate::runtime::kv_sessions::{KvBlob, KvSource, SessionKvStore};
 
 
 
-use crate::config::limits::{SPEC_DRAFT_K_GREEDY, SPEC_DRAFT_K_INIT, SPEC_DRAFT_K_SAMPLE};
+use crate::config::limits::{
+    SPEC_DRAFT_K_GREEDY, SPEC_DRAFT_K_INIT, SPEC_DRAFT_K_SAMPLE, SPEC_LOOKUP_K_INIT, SPEC_LOOKUP_K_MAX,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCall {
@@ -428,6 +431,9 @@ pub struct ChatModel {
     scratch: ChatScratch,
     /// Lookup and draft speculation (off = plain token-by-token decoding).
     spec_enabled: bool,
+    /// Per-session KV prefixes (`--kv-sessions`), keyed by session id.
+    sessions: Option<SessionKvStore>,
+    active_session: Option<String>,
     pub name: String,
     #[cfg(all(feature = "ane", target_os = "macos"))]
     ane: Vec<(usize, crate::backend::coreml::CoreMlModel)>,
@@ -499,6 +505,8 @@ impl ChatModel {
             ctx,
             scratch: ChatScratch::new(vocab_size),
             spec_enabled: true,
+            sessions: None,
+            active_session: None,
             name,
             #[cfg(all(feature = "ane", target_os = "macos"))]
             ane: Vec::new(),
@@ -637,6 +645,137 @@ impl ChatModel {
     /// Enables or disables lookup and draft speculation; output is identical either way.
     pub fn set_speculation(&mut self, enabled: bool) {
         self.spec_enabled = enabled;
+    }
+
+    /// Keeps the KV prefix of the last `slots` sessions in RAM and spills older ones under `dir/kv`.
+    pub fn enable_session_kv(&mut self, slots: usize, dir: Option<&Path>) {
+        self.active_session = None;
+        if slots == 0 {
+            self.sessions = None;
+            return;
+        }
+        let tag = format!("{}:ctx{}", self.name, self.ctx);
+        self.sessions = Some(SessionKvStore::new(slots, dir.map(|d| d.join("kv")), tag));
+    }
+
+    pub fn session_kv_enabled(&self) -> bool {
+        self.sessions.is_some()
+    }
+
+    /// Bytes held by in-RAM session prefixes (excluding the live engine cache).
+    pub fn session_kv_bytes(&self) -> usize {
+        self.sessions.as_ref().map_or(0, SessionKvStore::resident_bytes)
+    }
+
+    /// Makes `id` the active session, restoring its KV prefix from RAM or disk when it is a
+    /// different session. Returns the restored token count and where it came from.
+    pub fn switch_session(&mut self, id: &str) -> (usize, KvSource) {
+        if self.sessions.is_none() {
+            return (0, KvSource::None);
+        }
+        if self.active_session.as_deref() == Some(id) {
+            return (self.cached.len(), KvSource::Active);
+        }
+        self.save_active_session();
+        let target_layout = self.engine.kv_blob_layout();
+        let draft_layout = self.draft.as_ref().and_then(|d| d.engine.kv_blob_layout());
+        let store = self.sessions.as_mut().unwrap();
+        let mut source = KvSource::None;
+        let mut entry = store.take(id).map(|e| {
+            source = KvSource::Memory;
+            e
+        });
+        if entry.is_none() {
+            if let Some(tl) = target_layout.as_ref() {
+                entry = store.load(id, tl, draft_layout.as_ref()).map(|e| {
+                    source = KvSource::Disk;
+                    e
+                });
+            }
+        }
+
+        self.engine.reset_context();
+        self.cached.clear();
+        self.jev_caches.clear();
+        if let Some(d) = self.draft.as_mut() {
+            d.engine.reset_context();
+            d.cached.clear();
+        }
+        let mut restored = 0usize;
+        if let Some(e) = entry.as_mut() {
+            let t = &e.target;
+            if self.engine.import_kv_positions(&t.layout, &t.data, t.len()) {
+                self.cached = t.tokens.clone();
+                restored = t.len();
+                if let (Some(d), Some(db)) = (self.draft.as_mut(), e.draft.as_ref()) {
+                    if d.engine.import_kv_positions(&db.layout, &db.data, db.len()) {
+                        d.cached = db.tokens.clone();
+                    } else {
+                        d.engine.reset_context();
+                    }
+                }
+                if e.draft.is_some() && self.draft.is_none() {
+                    e.draft = None;
+                }
+            } else {
+                entry = None;
+                source = KvSource::None;
+            }
+        }
+        let store = self.sessions.as_mut().unwrap();
+        if let Some(e) = entry {
+            store.insert(e);
+        }
+        self.active_session = Some(id.to_string());
+        store.evict_to_capacity(id);
+        (restored, source)
+    }
+
+    /// Drops the stored KV prefix of `id` from RAM and disk.
+    pub fn forget_session(&mut self, id: &str) {
+        if let Some(store) = self.sessions.as_mut() {
+            store.remove(id);
+        }
+        if self.active_session.as_deref() == Some(id) {
+            self.active_session = None;
+        }
+    }
+
+    /// Copies the live KV tail of the active session into its RAM entry and appends it on disk.
+    fn save_active_session(&mut self) {
+        let (Some(id), Some(store)) = (self.active_session.as_deref(), self.sessions.as_mut()) else {
+            return;
+        };
+        let Some(tl) = self.engine.kv_blob_layout() else { return };
+        let live = self.cached.len().min(self.engine.position());
+        let e = store.upsert(id, tl);
+        if e.target.layout != tl {
+            e.target = KvBlob::new(tl);
+        }
+        let common = e.target.common_prefix(&self.cached[..live]);
+        e.target.truncate(common);
+        if live > common {
+            let eng = &self.engine;
+            e.target.extend(&self.cached[common..live], |out| eng.export_kv_positions(common, live, out));
+        }
+        if let Some(d) = self.draft.as_ref() {
+            if let Some(dl) = d.engine.kv_blob_layout() {
+                let d_live = d.cached.len().min(d.engine.position());
+                let db = e.draft.get_or_insert_with(|| KvBlob::new(dl));
+                if db.layout != dl {
+                    *db = KvBlob::new(dl);
+                }
+                let dc = db.common_prefix(&d.cached[..d_live]);
+                db.truncate(dc);
+                if d_live > dc {
+                    let deng = &d.engine;
+                    db.extend(&d.cached[dc..d_live], |out| deng.export_kv_positions(dc, d_live, out));
+                }
+            }
+        }
+        if let Err(err) = store.persist_id(id) {
+            eprintln!("kv persist {id}: {err}");
+        }
     }
 
     pub fn detach_draft(&mut self) {
@@ -1757,6 +1896,7 @@ impl ChatModel {
             (raw_text, Vec::new())
         };
 
+        self.save_active_session();
         let completion_tokens = reply.len();
         Ok(Completion {
             text,

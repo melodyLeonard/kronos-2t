@@ -15,6 +15,7 @@ use crate::model::compiler::{
     compile_multiplane_ternary, FullRowGptqHessian,
 };
 use crate::kernels::hadamard::{fwht64_signed_inplace, ifwht64_signed_inplace};
+use crate::model::kv_blob::{KvBlobLayout, KvSlotPtrs};
 use crate::storage::mmap_pager::sys::RawMmap;
 use crate::storage::prefetch::SubspaceProjector;
 use crate::storage::safetensors::{JsonCursor, SafeTensorsStore};
@@ -5481,6 +5482,141 @@ impl RealLlamaEngine {
             }
         }
         self.ws.pos = total_pos.min(self.cfg.max_seq_len);
+    }
+}
+
+impl RealLlamaEngine {
+    fn cpu_kv_slot_ptrs(&self) -> Option<KvSlotPtrs> {
+        let q = self.ws.q8_kv.as_ref()?;
+        if q.ring_len > 0 {
+            return None;
+        }
+        let hd = q.head_dim;
+        Some(if q.bits == 8 {
+            KvSlotPtrs {
+                k_data: q.k_q8.as_ptr() as *mut u8,
+                v_data: q.v_q8.as_ptr() as *mut u8,
+                k_scale: q.k_scales.as_ptr() as *mut u8,
+                v_scale: q.v_scales.as_ptr() as *mut u8,
+                data_bytes: hd,
+                scale_bytes: std::mem::size_of::<f32>(),
+                cap: q.cap_seq_len,
+                heads: q.num_layers * q.num_kv_heads,
+            }
+        } else {
+            KvSlotPtrs {
+                k_data: q.k_q4.as_ptr() as *mut u8,
+                v_data: q.v_q4.as_ptr() as *mut u8,
+                k_scale: q.k_s16.as_ptr() as *mut u8,
+                v_scale: q.v_s16.as_ptr() as *mut u8,
+                data_bytes: hd / 2,
+                scale_bytes: (hd / 64) * std::mem::size_of::<u16>(),
+                cap: q.cap_seq_len,
+                heads: q.num_layers * q.num_kv_heads,
+            }
+        })
+    }
+
+    /// Token-major KV blob layout; `None` while a sliding-window ring buffer is active.
+    pub fn kv_blob_layout(&self) -> Option<KvBlobLayout> {
+        let cfg = &self.cfg;
+        let base = |backend: u8, bits: u8, bytes_per_pos: usize| KvBlobLayout {
+            backend,
+            bits,
+            layers: cfg.num_hidden_layers as u32,
+            kv_heads: cfg.num_key_value_heads as u32,
+            head_dim: cfg.head_dim() as u32,
+            bytes_per_pos: bytes_per_pos as u32,
+        };
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(gpu) = &self.metal {
+            let (bits, bpp) = gpu.kv_blob_layout()?;
+            return Some(base(1, bits, bpp));
+        }
+        if let Some(q) = &self.ws.q8_kv {
+            let p = self.cpu_kv_slot_ptrs()?;
+            return Some(base(0, q.bits, p.bytes_per_pos()));
+        }
+        Some(base(0, 32, 2 * cfg.num_hidden_layers * cfg.kv_dim() * std::mem::size_of::<f32>()))
+    }
+
+    /// Appends KV positions `lo..hi` (all `< position()`) to `out` in the [`kv_blob_layout`](Self::kv_blob_layout) layout.
+    pub fn export_kv_positions(&self, lo: usize, hi: usize, out: &mut Vec<u8>) -> bool {
+        if lo > hi || hi > self.ws.pos {
+            return false;
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(gpu) = &self.metal {
+            return gpu.kv_export_positions(lo, hi, out);
+        }
+        if self.ws.q8_kv.is_some() {
+            let Some(p) = self.cpu_kv_slot_ptrs() else { return false };
+            // SAFETY: `hi <= pos <= cap_seq_len` and the vectors cover `heads * cap` slots.
+            unsafe { p.export(lo, hi, out) };
+            return true;
+        }
+        if self.ws.k_cache.is_empty() {
+            return lo == hi;
+        }
+        let kvd = self.cfg.kv_dim();
+        let stride = self.cfg.max_seq_len * kvd;
+        for pos in lo..hi {
+            for l in 0..self.layers.len() {
+                let off = l * stride + pos * kvd;
+                for v in &self.ws.k_cache[off..off + kvd] {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                for v in &self.ws.v_cache[off..off + kvd] {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        true
+    }
+
+    /// Overwrites KV positions `0..n` from a token-major blob and sets `position() = n`.
+    pub fn import_kv_positions(&mut self, layout: &KvBlobLayout, data: &[u8], n: usize) -> bool {
+        if Some(*layout) != self.kv_blob_layout()
+            || n > self.cfg.max_seq_len
+            || data.len() < n * layout.bytes_per_pos as usize
+        {
+            return false;
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(gpu) = self.metal.as_mut() {
+            if !gpu.kv_import_positions(data, n) {
+                return false;
+            }
+            self.ws.pos = n;
+            return true;
+        }
+        if let Some(q) = self.ws.q8_kv.as_mut() {
+            q.ensure_seq_capacity(n, 0);
+            let Some(p) = self.cpu_kv_slot_ptrs() else { return false };
+            // SAFETY: capacity was grown to `n` and `data` holds `n` positions (checked above).
+            unsafe { p.import(data, n) };
+        } else {
+            self.ws.ensure_fp32_kv(&self.cfg);
+            let kvd = self.cfg.kv_dim();
+            let stride = self.cfg.max_seq_len * kvd;
+            let mut src = 0usize;
+            let f = |b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            for pos in 0..n {
+                for l in 0..self.layers.len() {
+                    let off = l * stride + pos * kvd;
+                    for v in &mut self.ws.k_cache[off..off + kvd] {
+                        *v = f(&data[src..src + 4]);
+                        src += 4;
+                    }
+                    for v in &mut self.ws.v_cache[off..off + kvd] {
+                        *v = f(&data[src..src + 4]);
+                        src += 4;
+                    }
+                }
+            }
+        }
+        self.ws.pos = n;
+        true
     }
 }
 
