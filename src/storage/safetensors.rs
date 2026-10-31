@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
-//! Zero-Copy Pure-Rust SafeTensors Loader (`BF16` / `F16` / `F32`, Zero External Dependencies).
+//! Zero-Copy Pure-Rust SafeTensors Loader (`BF16` / `F16` / `F32` / `F8_E4M3`, Zero External Dependencies).
+//!
+//! `F8_E4M3` tensors with a `<name>_scale_inv` companion are block-dequantized on read.
 //!
 //! Maps `.safetensors` files directly into virtual memory via [`crate::storage::mmap_pager::sys::RawMmap`]
 //! and parses the 8-byte little-endian header length + JSON tensor index without allocating raw
@@ -18,15 +20,91 @@ pub enum TensorDtype {
     BF16,
     F16,
     F32,
+    F8E4M3,
 }
 
 impl TensorDtype {
     pub fn byte_size(self) -> usize {
         match self {
+            Self::F8E4M3 => 1,
             Self::BF16 | Self::F16 => 2,
             Self::F32 => 4,
         }
     }
+}
+
+/// Suffix of the per-block inverse scale companion of a block-quantized tensor.
+pub const SCALE_INV_SUFFIX: &str = "_scale_inv";
+
+/// Per-block inverse scales over the last two dims: `w[.., r, c] = q[.., r, c] * s[.., r / br, c / bc]`.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockScale<'a> {
+    pub dtype: TensorDtype,
+    pub shape: &'a [usize],
+    pub raw_bytes: &'a [u8],
+    pub block: [usize; 2],
+}
+
+impl BlockScale<'_> {
+    fn value(&self, idx: usize) -> f32 {
+        let b = self.dtype.byte_size();
+        let mut v = [0.0f32];
+        decode_bytes_to_f32(self.dtype, &self.raw_bytes[idx * b..(idx + 1) * b], &mut v);
+        v[0]
+    }
+}
+
+/// Smallest power-of-two block `b` with `ceil(n / b) == blocks`.
+fn infer_block(n: usize, blocks: usize) -> Option<usize> {
+    if blocks == 0 {
+        return None;
+    }
+    let mut b = 1usize;
+    while b <= n.max(1) * 2 {
+        if n.div_ceil(b) == blocks {
+            return Some(b);
+        }
+        b *= 2;
+    }
+    None
+}
+
+fn make_block_scale<'a>(
+    shape: &[usize],
+    scale: TensorView<'a>,
+    block_hint: Option<[usize; 2]>,
+    name: &str,
+) -> Result<BlockScale<'a>, String> {
+    let r = shape.len();
+    if r < 2 || scale.shape.len() != r || shape[..r - 2] != scale.shape[..r - 2] {
+        return Err(format!(
+            "scale shape {:?} incompatible with '{name}' shape {:?}",
+            scale.shape, shape
+        ));
+    }
+    let (rows, cols) = (shape[r - 2], shape[r - 1]);
+    let (sr, sc) = (scale.shape[r - 2], scale.shape[r - 1]);
+    let block = match block_hint {
+        Some([br, bc]) if rows.div_ceil(br) == sr && cols.div_ceil(bc) == sc => [br, bc],
+        _ => match (infer_block(rows, sr), infer_block(cols, sc)) {
+            (Some(br), Some(bc)) => [br, bc],
+            _ => {
+                return Err(format!(
+                    "cannot infer block size for '{name}' {:?} from scale {:?}",
+                    shape, scale.shape
+                ))
+            }
+        },
+    };
+    if !matches!(scale.dtype, TensorDtype::F32 | TensorDtype::BF16 | TensorDtype::F16) {
+        return Err(format!("unsupported scale dtype {:?} for '{name}'", scale.dtype));
+    }
+    Ok(BlockScale {
+        dtype: scale.dtype,
+        shape: scale.shape,
+        raw_bytes: scale.raw_bytes,
+        block,
+    })
 }
 
 /// Metadata entry for a single tensor in the SafeTensors JSON header.
@@ -44,9 +122,41 @@ pub struct TensorView<'a> {
     pub dtype: TensorDtype,
     pub shape: &'a [usize],
     pub raw_bytes: &'a [u8],
+    pub scale: Option<BlockScale<'a>>,
 }
 
 impl<'a> TensorView<'a> {
+    /// Multiplies `dst` (flat elements starting at `start`) by their block scales.
+    fn apply_scale(&self, start: usize, dst: &mut [f32]) {
+        let Some(sc) = self.scale else { return };
+        let r = self.shape.len();
+        let (rows, cols) = (self.shape[r - 2], self.shape[r - 1]);
+        let (sr, scn) = (sc.shape[r - 2], sc.shape[r - 1]);
+        let [br, bc] = sc.block;
+        let mut row_scales = vec![0.0f32; scn];
+        let mut cur_row = usize::MAX;
+        let mut flat = start;
+        let mut done = 0usize;
+        while done < dst.len() {
+            let mat = flat / (rows * cols);
+            let rr = (flat / cols) % rows;
+            let c0 = flat % cols;
+            let take = (cols - c0).min(dst.len() - done);
+            let srow = mat * sr * scn + (rr / br) * scn;
+            if srow != cur_row {
+                for (j, v) in row_scales.iter_mut().enumerate() {
+                    *v = sc.value(srow + j);
+                }
+                cur_row = srow;
+            }
+            for (k, d) in dst[done..done + take].iter_mut().enumerate() {
+                *d *= row_scales[(c0 + k) / bc];
+            }
+            done += take;
+            flat += take;
+        }
+    }
+
     /// Total number of scalar elements across all dimensions.
     pub fn numel(&self) -> usize {
         self.shape.iter().product()
@@ -62,6 +172,7 @@ impl<'a> TensorView<'a> {
         let start = row * cols * elem_bytes;
         let end = start + cols * elem_bytes;
         decode_bytes_to_f32(self.dtype, &self.raw_bytes[start..end], dst);
+        self.apply_scale(row * cols, dst);
     }
 
     /// Decodes the entire tensor into a newly allocated `Vec<f32>`.
@@ -69,6 +180,7 @@ impl<'a> TensorView<'a> {
         let n = self.numel();
         let mut out = vec![0.0f32; n];
         decode_bytes_to_f32(self.dtype, self.raw_bytes, &mut out);
+        self.apply_scale(0, &mut out);
         out
     }
 
@@ -90,12 +202,16 @@ impl<'a> TensorView<'a> {
         let end = start + slice_bytes;
         let mut out = vec![0.0f32; inner_numel];
         decode_bytes_to_f32(self.dtype, &self.raw_bytes[start..end], &mut out);
+        self.apply_scale(outer_idx * inner_numel, &mut out);
         Ok(out)
     }
 
     /// Decodes the entire tensor directly into `BF16` (`Vec<u16>`) without an intermediate `Vec<f32>`.
     pub fn to_bf16_vec(&self) -> Vec<u16> {
         let n = self.numel();
+        if self.scale.is_some() || self.dtype == TensorDtype::F8E4M3 {
+            return self.to_f32_vec().into_iter().map(f32_to_bf16).collect();
+        }
         let mut out = Vec::with_capacity(n);
         match self.dtype {
             TensorDtype::BF16 => {
@@ -118,6 +234,7 @@ impl<'a> TensorView<'a> {
                     out.push(f32_to_bf16(v));
                 }
             }
+            TensorDtype::F8E4M3 => unreachable!(),
         }
         out
     }
@@ -143,8 +260,51 @@ fn f16_to_f32(bits: u16) -> f32 {
     }
 }
 
+const fn e4m3_to_f32_const(b: u8) -> f32 {
+    let neg = b & 0x80 != 0;
+    let exp = ((b >> 3) & 0x0F) as i32;
+    let mant = (b & 0x07) as u32;
+    let mag = if exp == 0x0F && mant == 0x07 {
+        f32::NAN
+    } else if exp == 0 {
+        // Subnormal: mant / 8 * 2^-6 == mant * 2^-9.
+        mant as f32 / 512.0
+    } else {
+        f32::from_bits((((exp - 7 + 127) as u32) << 23) | (mant << 20))
+    };
+    if neg {
+        -mag
+    } else {
+        mag
+    }
+}
+
+const fn build_e4m3_lut() -> [f32; 256] {
+    let mut lut = [0.0f32; 256];
+    let mut i = 0;
+    while i < 256 {
+        lut[i] = e4m3_to_f32_const(i as u8);
+        i += 1;
+    }
+    lut
+}
+
+static E4M3_LUT: [f32; 256] = build_e4m3_lut();
+
+/// Decodes one OCP `E4M3FN` byte (bias 7, no infinities, `S.1111.111` = NaN).
+#[inline]
+pub fn e4m3_to_f32(b: u8) -> f32 {
+    E4M3_LUT[b as usize]
+}
+
 fn decode_bytes_to_f32(dtype: TensorDtype, src: &[u8], dst: &mut [f32]) {
     match dtype {
+        TensorDtype::F8E4M3 => {
+            assert_eq!(src.len(), dst.len());
+            for (slot, &b) in dst.iter_mut().zip(src.iter()) {
+                *slot = E4M3_LUT[b as usize];
+            }
+        }
         TensorDtype::BF16 => {
             assert_eq!(src.len(), dst.len() * 2);
             for (slot, chunk) in dst.iter_mut().zip(src.chunks_exact(2)) {
@@ -215,8 +375,19 @@ impl SafeTensorsFile {
         self.mmap.as_slice().len()
     }
 
-    /// Borrows a zero-copy [`TensorView`] by exact tensor name.
+    /// Borrows a zero-copy [`TensorView`] by exact tensor name, attaching a same-file block scale.
     pub fn tensor(&self, name: &str) -> Result<TensorView<'_>, String> {
+        let mut tv = self.raw_tensor(name)?;
+        let scale_name = format!("{name}{SCALE_INV_SUFFIX}");
+        if self.tensors.contains_key(&scale_name) {
+            let sv = self.raw_tensor(&scale_name)?;
+            tv.scale = Some(make_block_scale(tv.shape, sv, None, name)?);
+        }
+        Ok(tv)
+    }
+
+    /// Borrows the stored tensor bytes without scale handling.
+    pub fn raw_tensor(&self, name: &str) -> Result<TensorView<'_>, String> {
         let meta = self
             .tensors
             .get(name)
@@ -227,6 +398,7 @@ impl SafeTensorsFile {
             dtype: meta.dtype,
             shape: &meta.shape,
             raw_bytes: &self.mmap.as_slice()[abs_start..abs_end],
+            scale: None,
         })
     }
 
@@ -268,11 +440,15 @@ impl SafeTensorsFile {
 pub struct SafeTensorsStore {
     shards: Vec<SafeTensorsFile>,
     weight_map: HashMap<String, usize>,
+    block_hint: Option<[usize; 2]>,
 }
 
 impl SafeTensorsStore {
     /// Opens `model_dir/model.safetensors` if present, otherwise `model_dir/model.safetensors.index.json`.
     pub fn open_dir(model_dir: &Path) -> io::Result<Self> {
+        let block_hint = fs::read_to_string(model_dir.join("config.json"))
+            .ok()
+            .and_then(|t| parse_weight_block_size(&t));
         let single = model_dir.join("model.safetensors");
         if single.exists() {
             let st = SafeTensorsFile::open(&single)?;
@@ -280,6 +456,7 @@ impl SafeTensorsStore {
             return Ok(Self {
                 shards: vec![st],
                 weight_map,
+                block_hint,
             });
         }
 
@@ -309,7 +486,11 @@ impl SafeTensorsStore {
             shards.push(SafeTensorsFile::open(&model_dir.join(shard_file))?);
         }
 
-        Ok(Self { shards, weight_map })
+        Ok(Self {
+            shards,
+            weight_map,
+            block_hint,
+        })
     }
 
     #[inline]
@@ -317,12 +498,27 @@ impl SafeTensorsStore {
         self.weight_map.contains_key(name)
     }
 
+    /// Tensor names excluding block-scale companions.
+    pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
+        self.weight_map
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| !k.ends_with(SCALE_INV_SUFFIX))
+    }
+
+    /// Borrows `name`, attaching its `<name>_scale_inv` companion (any shard) for dequantization.
     pub fn tensor(&self, name: &str) -> Result<TensorView<'_>, String> {
         let &shard_idx = self
             .weight_map
             .get(name)
             .ok_or_else(|| format!("missing tensor '{name}' in safetensors store"))?;
-        self.shards[shard_idx].tensor(name)
+        let mut tv = self.shards[shard_idx].raw_tensor(name)?;
+        let scale_name = format!("{name}{SCALE_INV_SUFFIX}");
+        if let Some(&si) = self.weight_map.get(&scale_name) {
+            let sv = self.shards[si].raw_tensor(&scale_name)?;
+            tv.scale = Some(make_block_scale(tv.shape, sv, self.block_hint, name)?);
+        }
+        Ok(tv)
     }
 
     pub fn release_tensor_pages(&self, name: &str) {
@@ -335,6 +531,22 @@ impl SafeTensorsStore {
         if let Some(&shard_idx) = self.weight_map.get(name) {
             self.shards[shard_idx].release_tensor_outer_slice_pages(name, outer_idx);
         }
+    }
+}
+
+/// Reads `quantization_config.weight_block_size` (`[br, bc]`) from a `config.json` body.
+fn parse_weight_block_size(config_json: &str) -> Option<[usize; 2]> {
+    let pos = config_json.find("\"weight_block_size\"")?;
+    let rest = &config_json[pos..];
+    let open = rest.find('[')?;
+    let close = rest.find(']')?;
+    let nums: Vec<usize> = rest[open + 1..close]
+        .split(',')
+        .filter_map(|t| t.trim().parse().ok())
+        .collect();
+    match nums.as_slice() {
+        [r, c] if *r > 0 && *c > 0 => Some([*r, *c]),
+        _ => None,
     }
 }
 
@@ -648,6 +860,7 @@ fn parse_tensor_meta(
                     "BF16" => TensorDtype::BF16,
                     "F16" => TensorDtype::F16,
                     "F32" => TensorDtype::F32,
+                    "F8_E4M3" => TensorDtype::F8E4M3,
                     other => {
                         return Err(format!("unsupported dtype '{other}' on '{tensor_name}'"));
                     }
