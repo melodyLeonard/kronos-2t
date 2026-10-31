@@ -14,6 +14,7 @@ import http.client
 import json
 import os
 import shutil
+import signal
 import socket
 import statistics
 import subprocess
@@ -352,6 +353,9 @@ def main():
     run = {"label": args.label, "commit": commit, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "tasks": []}
 
     server = Server(args, workroot)
+    # SIGTERM/SIGHUP on the runner must not leave the model server holding the GPU.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
     print(f"starting server on {server.url} (workroot {workroot})", flush=True)
     server.start()
     try:
