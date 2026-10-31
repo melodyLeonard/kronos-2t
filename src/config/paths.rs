@@ -8,6 +8,8 @@ pub const SESSIONS_DIR: &str = "sessions";
 pub const DEVICE_CONTEXT_DIR: &str = "device_context";
 pub const BIN_DIR: &str = "bin";
 pub const VOICE_SOCKET_FILE: &str = "voice.sock";
+/// Workspace subfolder holding full tool outputs that were capped in the prompt.
+pub const TOOL_OUTPUT_DIR: &str = ".kronos_tool_output";
 
 pub const CONVERSATION_MEMORY_FILE: &str = "conversation_memory.jsonl";
 pub const LEARNED_MEMORY_FILE: &str = "learned_user_memory.json";
