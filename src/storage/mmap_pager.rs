@@ -36,6 +36,7 @@ pub(crate) mod sys {
         ) -> *mut c_void;
         fn munmap(addr: *mut c_void, len: usize) -> i32;
         fn posix_madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+        fn mlock(addr: *const c_void, len: usize) -> i32;
     }
 
     pub struct RawMmap {
@@ -72,6 +73,16 @@ pub(crate) mod sys {
         pub fn as_slice(&self) -> &[u8] {
             // SAFETY: `self.ptr` points to a valid `self.len`-byte read-only kernel mapping.
             unsafe { std::slice::from_raw_parts(self.ptr.cast::<u8>(), self.len) }
+        }
+
+        /// Wires the whole mapping so the OS cannot evict it under memory pressure.
+        pub fn lock_resident(&self) -> io::Result<()> {
+            // SAFETY: `[self.ptr, self.len)` is a live mapping owned by `self`.
+            if unsafe { mlock(self.ptr, self.len) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
         }
 
         #[inline]

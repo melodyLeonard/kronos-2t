@@ -838,6 +838,26 @@ pub struct MetalLlamaEngine {
     lm_head: GpuNf4Matrix,
     kv: GpuKvCache,
     scratch: GpuScratch,
+    moe_hist: Option<MoeHist>,
+}
+
+/// Expert-routing histogram (`KRONOS_EXPERT_HIST=<csv path>`): per-layer ids kept per chunk
+/// so counts can be read back after the command buffer completes.
+struct MoeHist {
+    ids: MtlObj,
+    counts: Vec<u64>,
+    path: std::path::PathBuf,
+    chunks: usize,
+}
+
+impl MoeHist {
+    fn flush(&self, num_experts: usize) {
+        let mut out = String::from("layer,expert,count\n");
+        for (i, c) in self.counts.iter().enumerate() {
+            out.push_str(&format!("{},{},{c}\n", i / num_experts, i % num_experts));
+        }
+        let _ = std::fs::write(&self.path, out);
+    }
 }
 
 fn alloc_shared_buffer(device: Id, byte_len: usize, what: &str) -> Result<MtlObj, String> {
@@ -1131,6 +1151,15 @@ impl MetalLlamaEngine {
                 )?;
                 let init_scratch_toks = cfg.max_seq_len.clamp(16, prompt_chunk_gpu.min(256));
                 let scratch = GpuScratch::new(device.id(), cfg, init_scratch_toks, 8)?;
+                let moe_hist = match (moe_geom, std::env::var_os("KRONOS_EXPERT_HIST")) {
+                    (Some(g), Some(path)) => Some(MoeHist {
+                        ids: alloc_shared_buffer(device.id(), layers.len() * prompt_chunk_gpu * g.top_k * 4, "moe_hist_ids")?,
+                        counts: vec![0; layers.len() * cfg.num_experts],
+                        path: path.into(),
+                        chunks: 0,
+                    }),
+                    _ => None,
+                };
 
                 Ok(Self {
                     device,
@@ -1157,6 +1186,7 @@ impl MetalLlamaEngine {
                     lm_head,
                     kv,
                     scratch,
+                    moe_hist,
                 })
             })();
             objc_autoreleasePoolPop(pool);
@@ -1319,7 +1349,7 @@ impl MetalLlamaEngine {
         }
 
         // SAFETY: All Metal encoder bindings stay alive inside `self` until `waitUntilCompleted` returns.
-        unsafe {
+        let res = unsafe {
             let pool = objc_autoreleasePoolPush();
             let res = (|| -> Result<(), String> {
                 let st = sels();
@@ -1485,7 +1515,7 @@ impl MetalLlamaEngine {
                     );
 
                     if let Some(moe_layer) = &layer.moe {
-                        self.encode_moe_ffn(enc, cfg, layer, moe_layer, n_tok);
+                        self.encode_moe_ffn(enc, cfg, layer, moe_layer, n_tok, l_idx);
                         continue;
                     }
                     let (Some(gate_up_proj), Some(down_proj)) = (&layer.gate_up_proj, &layer.down_proj) else {
@@ -1584,15 +1614,43 @@ impl MetalLlamaEngine {
             })();
             objc_autoreleasePoolPop(pool);
             res
+        };
+        if res.is_ok() {
+            self.record_moe_hist(cfg, n_tok);
+        }
+        res
+    }
+
+    fn record_moe_hist(&mut self, cfg: &LlamaConfig, n_tok: usize) {
+        let Some(g) = self.moe else { return };
+        let stride = self.prompt_chunk_gpu * g.top_k;
+        let num_layers = self.layers.len();
+        let Some(h) = self.moe_hist.as_mut() else { return };
+        // SAFETY: `ids` holds `num_layers * stride` u32 written by the router kernel; the GPU is idle.
+        let ids = unsafe { std::slice::from_raw_parts(h.ids.contents_ptr().cast::<u32>(), num_layers * stride) };
+        for l in 0..num_layers {
+            for &e in &ids[l * stride..l * stride + n_tok * g.top_k] {
+                if (e as usize) < cfg.num_experts {
+                    h.counts[l * cfg.num_experts + e as usize] += 1;
+                }
+            }
+        }
+        h.chunks += 1;
+        if h.chunks % 64 == 0 {
+            h.flush(cfg.num_experts);
         }
     }
 
     /// Router top-k, grouped expert gate_up, SwiGLU+FWHT, grouped down and weighted combine into `hidden`.
-    unsafe fn encode_moe_ffn(&self, enc: Id, cfg: &LlamaConfig, layer: &GpuLayerWeights, moe: &GpuMoeLayer, n_tok: usize) {
+    unsafe fn encode_moe_ffn(&self, enc: Id, cfg: &LlamaConfig, layer: &GpuLayerWeights, moe: &GpuMoeLayer, n_tok: usize, l_idx: usize) {
         let st = sels();
         let g = self.moe.expect("MoE geometry");
         let h = cfg.hidden_size;
         let k = g.top_k;
+        let (ids_buf, ids_off) = match &self.moe_hist {
+            Some(hist) => (hist.ids.id(), l_idx * self.prompt_chunk_gpu * k * 4),
+            None => (self.scratch.moe_ids.id(), 0usize),
+        };
         let rp = MoeRouterParams {
             num_experts: cfg.num_experts as u32,
             h_dim: h as u32,
@@ -1637,7 +1695,7 @@ impl MetalLlamaEngine {
             msg_sel!(enc, st.set_buf, layer.post_attn_norm.id() => Id, 0usize => usize, 1usize => usize; ());
             msg_sel!(enc, st.set_buf, moe.router_w.id() => Id, 0usize => usize, 2usize => usize; ());
             msg_sel!(enc, st.set_buf, bias_id => Id, 0usize => usize, 3usize => usize; ());
-            msg_sel!(enc, st.set_buf, self.scratch.moe_ids.id() => Id, 0usize => usize, 4usize => usize; ());
+            msg_sel!(enc, st.set_buf, ids_buf => Id, ids_off => usize, 4usize => usize; ());
             msg_sel!(enc, st.set_buf, self.scratch.moe_w.id() => Id, 0usize => usize, 5usize => usize; ());
             msg_sel!(enc, st.set_bytes, (&rp as *const MoeRouterParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeRouterParams>() => usize, 6usize => usize; ());
             msg_sel!(enc, st.dispatch_tg, MtlSize::new(n_tok, 1, 1) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
@@ -1648,7 +1706,7 @@ impl MetalLlamaEngine {
             // gate_up for every (token, slot): moe_gu[(t*k+s)][2*d_ff].
             msg_sel!(enc, st.set_cps, self.pso_moe_gemv.id() => Id; ());
             msg_sel!(enc, st.set_buf, moe.shard.id() => Id, 0usize => usize, 0usize => usize; ());
-            msg_sel!(enc, st.set_buf, self.scratch.moe_ids.id() => Id, 0usize => usize, 1usize => usize; ());
+            msg_sel!(enc, st.set_buf, ids_buf => Id, ids_off => usize, 1usize => usize; ());
             msg_sel!(enc, st.set_buf, self.scratch.x_rot_f32.id() => Id, 0usize => usize, 2usize => usize; ());
             msg_sel!(enc, st.set_buf, self.scratch.moe_gu.id() => Id, 0usize => usize, 3usize => usize; ());
             msg_sel!(enc, st.set_bytes, (&gu as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 4usize => usize; ());
@@ -1660,7 +1718,7 @@ impl MetalLlamaEngine {
             // down for every (token, slot): moe_out[(t*k+s)][h].
             msg_sel!(enc, st.set_cps, self.pso_moe_gemv.id() => Id; ());
             msg_sel!(enc, st.set_buf, moe.shard.id() => Id, 0usize => usize, 0usize => usize; ());
-            msg_sel!(enc, st.set_buf, self.scratch.moe_ids.id() => Id, 0usize => usize, 1usize => usize; ());
+            msg_sel!(enc, st.set_buf, ids_buf => Id, ids_off => usize, 1usize => usize; ());
             msg_sel!(enc, st.set_buf, self.scratch.x_rot_f32.id() => Id, 0usize => usize, 2usize => usize; ());
             msg_sel!(enc, st.set_buf, self.scratch.moe_out.id() => Id, 0usize => usize, 3usize => usize; ());
             msg_sel!(enc, st.set_bytes, (&dn as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 4usize => usize; ());
@@ -3696,6 +3754,17 @@ kernel void causal_gqa_flash_q8_prefill(
 }
 "#;
 
+impl Drop for MetalLlamaEngine {
+    fn drop(&mut self) {
+        if let (Some(h), Some(g)) = (&self.moe_hist, self.moe) {
+            let _ = g;
+            if !h.counts.is_empty() {
+                h.flush(h.counts.len() / self.layers.len().max(1));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::model::real_llm::{argmax, RealLlamaEngine, RealWeightMode};
@@ -4084,11 +4153,16 @@ mod tests {
         bytes.extend_from_slice(&data);
         fs::write(dir.join("model.safetensors"), bytes).unwrap();
 
-        let mode = RealWeightMode::KronosNfGptq { bits: 4, scale_group_chunks: 2 };
         let calib = vec![
             (0..32).map(|i| (i * 5 + 1) % vocab).collect::<Vec<_>>(),
             (0..32).map(|i| (i * 7 + 3) % vocab).collect::<Vec<_>>(),
         ];
+        let modes = [
+            RealWeightMode::KronosNfGptq { bits: 4, scale_group_chunks: 2 },
+            RealWeightMode::KronosNfMixedGptq { attn_head_bits: 4, ffn_bits: 3, scale_group_chunks: 2 },
+        ];
+        for mode in modes {
+        eprintln!("moe parity mode {mode:?}");
         let core = dir.join("core.k2tb");
         let experts = dir.join("experts.k2tm");
         RealLlamaEngine::compile_streaming_moe_to_files(&dir, &core, &experts, mode, &calib, 2).unwrap();
@@ -4128,6 +4202,7 @@ mod tests {
             assert!(cos_d > 0.999 && kl_d < 0.01, "moe decode step {step}: cos={cos_d:.6}, kl={kl_d:.6}");
         }
         cpu_eng.set_num_threads(1);
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

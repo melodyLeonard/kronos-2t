@@ -739,8 +739,7 @@ impl SparseMoeRuntime {
 
         let backend = match policy {
             MoeExpertOpenPolicy::ForceZeroCopyMmap => {
-                let _ = nvme_io::clear_file_nocache(&probe_file);
-                let mmap = RawMmap::map_read_only(&probe_file, file_len)?;
+                let mmap = open_zero_copy_shard(&probe_file, file_len)?;
                 MoeExpertBackend::ZeroCopyMmap {
                     mmap,
                     header,
@@ -749,8 +748,7 @@ impl SparseMoeRuntime {
                 }
             }
             MoeExpertOpenPolicy::AutoBudget if file_len <= arena_budget => {
-                let _ = nvme_io::clear_file_nocache(&probe_file);
-                let mmap = RawMmap::map_read_only(&probe_file, file_len)?;
+                let mmap = open_zero_copy_shard(&probe_file, file_len)?;
                 MoeExpertBackend::ZeroCopyMmap {
                     mmap,
                     header,
@@ -1687,6 +1685,19 @@ unsafe fn dot_f32_moe_neon(a: &[f32], b: &[f32]) -> f32 {
         i += 1;
     }
     sum
+}
+
+/// Maps the expert shard read-only and wires it in RAM (`KRONOS_NO_WIRE=1` skips the wiring).
+/// An unwired shard gets evicted under memory pressure and refaulted from SSD mid-token.
+fn open_zero_copy_shard(file: &std::fs::File, len: usize) -> io::Result<RawMmap> {
+    let _ = nvme_io::clear_file_nocache(file);
+    let mmap = RawMmap::map_read_only(file, len)?;
+    if std::env::var_os("KRONOS_NO_WIRE").is_none() {
+        if let Err(e) = mmap.lock_resident() {
+            eprintln!("warning: could not wire {:.1} GiB expert shard ({e}); expect stalls under memory pressure", len as f64 / (1u64 << 30) as f64);
+        }
+    }
+    Ok(mmap)
 }
 
 #[cfg(test)]

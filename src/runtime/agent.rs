@@ -5118,8 +5118,13 @@ fn run_agent_turn_inner(
     let mut tracked_files: Vec<String> = Vec::new();
     let mut best_checkpoint: Option<WorkspaceCheckpoint> = None;
     let mut last_failed_cmd: Option<(usize, String, String)> = None;
+    let mut dup_cmd_blocks = 0usize;
+    let mut reads_since_mutation: Vec<String> = Vec::new();
 
     for step in 1..=cfg.max_steps {
+        if dup_cmd_blocks >= 3 {
+            return Err("stopped: re-ran the same failing command 3 times without editing any file".to_string());
+        }
         let mut comp_rep_opt = None;
         with_model(&mut |model| {
             comp_rep_opt = Some(compact_conversation_history(
@@ -5504,13 +5509,24 @@ fn run_agent_turn_inner(
                     ))
                 } else if let Some((fail_seq, ref prev_cmd, ref fail_tail)) = last_failed_cmd {
                     if fail_seq == last_mutation_seq && !cmd_key.is_empty() && prev_cmd == &cmd_key {
+                        dup_cmd_blocks += 1;
                         err_outcome(&format!(
-                            "error: blocked duplicate `run_command` (`{cmd_key}`) because this exact command already failed and no workspace files have been modified since that failure. Last failure output tail:\n{fail_tail}\nCall `edit_file` or `write_file` to fix the script on disk before running `{cmd_key}` again."
+                            "error: blocked duplicate `run_command` (`{cmd_key}`): it already failed and nothing on disk changed since (blocked {dup_cmd_blocks}x; the turn stops after 3). Last failure output tail:\n{fail_tail}\nRead the failing source with `read_file`, then fix it with `edit_file` or `write_file` before re-running."
                         ))
                     } else {
                         execute_tool(&active_workdir, tc, cfg.cmd_timeout_secs, step * 100 + idx)
                     }
                 } else {
+                    execute_tool(&active_workdir, tc, cfg.cmd_timeout_secs, step * 100 + idx)
+                }
+            } else if tc.name == "read_file" {
+                let key = tc.arguments.trim().to_string();
+                if reads_since_mutation.contains(&key) {
+                    err_outcome(
+                        "error: this file was already read since the last edit and is unchanged; fix it with `edit_file` or `write_file` instead of reading it again",
+                    )
+                } else {
+                    reads_since_mutation.push(key);
                     execute_tool(&active_workdir, tc, cfg.cmd_timeout_secs, step * 100 + idx)
                 }
             } else {
@@ -5527,6 +5543,8 @@ fn run_agent_turn_inner(
                 best_checkpoint = None;
                 unresolved_edits.clear();
                 last_failed_cmd = None;
+                dup_cmd_blocks = 0;
+                reads_since_mutation.clear();
                 if !on_event(AgentEvent::WorkspaceChanged {
                     workdir: &active_workdir,
                 }) {
@@ -5548,6 +5566,8 @@ fn run_agent_turn_inner(
                 if outcome.ok {
                     action_seq += 1;
                     last_mutation_seq = action_seq;
+                    dup_cmd_blocks = 0;
+                    reads_since_mutation.clear();
                     unresolved_edits.retain(|(p, _)| p != &target_path && p != &raw_target);
                     if !outcome.validation_ok {
                         consecutive_edit_failures += 1;
