@@ -558,7 +558,7 @@
     flex:1; resize:none; min-height:42px; max-height:200px; padding:10px 12px;
     border-radius:10px; line-height:1.45;
   }
-  #send {
+  #send, #stop {
     background:var(--accent); color:var(--accent-ink); border:none;
     height:42px; padding:0 18px; font-weight:600; flex-shrink:0;
   }
@@ -798,6 +798,7 @@
             <span id="voice-btn-label">Voice</span>
           </button>
           <button id="send" type="submit">Send</button>
+          <button id="stop" type="button" hidden>Stop</button>
         </div>
       </form>
     </section>
@@ -3237,10 +3238,12 @@ async function runUnifiedTurn(text, attachedItems) {
   if ($("maxtok").value !== "") payload.max_tokens = +$("maxtok").value;
 
   try {
+    turnAbort = new AbortController();
     const reqInit = {
       method: "POST",
       headers: headers(),
       body: JSON.stringify(payload),
+      signal: turnAbort.signal,
     };
     let r;
     try {
@@ -3273,6 +3276,7 @@ async function runUnifiedTurn(text, attachedItems) {
         const pill = det.querySelector(".pill.run");
         if (pill) { pill.className = "pill err"; pill.textContent = "interrupted"; }
       }
+      if (turnAbort && turnAbort.signal.aborted) return;
       throw new Error("Stream closed before turn completed — retry prompt");
     }
 
@@ -3294,6 +3298,16 @@ async function runUnifiedTurn(text, attachedItems) {
   }
 }
 
+$("stop").onclick = async () => {
+  $("stop").disabled = true;
+  try {
+    await fetch("/v1/turn/cancel", { method: "POST", headers: headers(), body: JSON.stringify({ turn_id: 0 }) });
+  } catch (_) {}
+  if (turnAbort) turnAbort.abort();
+  $("stop").disabled = false;
+};
+let turnAbort = null;
+
 $("form").onsubmit = async (e) => {
   e.preventDefault();
   const text = input.value.trim();
@@ -3304,10 +3318,14 @@ $("form").onsubmit = async (e) => {
   input.value = "";
   input.style.height = "auto";
   send.disabled = true;
+  send.hidden = true;
+  $("stop").hidden = false;
   try {
     await runUnifiedTurn(text, atts);
   } finally {
     send.disabled = false;
+    send.hidden = false;
+    $("stop").hidden = true;
     input.focus();
   }
 };

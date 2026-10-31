@@ -68,6 +68,7 @@ struct UiStateIndex {
 #[derive(Clone)]
 struct LiveTurnBroadcast {
     turn_id: u64,
+    cancelled: bool,
     agent_ord: u64,
     agent_label: String,
     parent_turn_id: u64,
@@ -851,6 +852,7 @@ fn allocate_live_turn(srv: &Server, spec: &StreamTurnSpec) -> (u64, u64, String)
     srv.register_project_path(&spec.workdir);
     let rec = LiveTurnBroadcast {
         turn_id: tid,
+        cancelled: false,
         agent_ord: ord,
         agent_label: label.clone(),
         parent_turn_id: spec.parent_turn_id,
@@ -913,9 +915,11 @@ fn execute_allocated_turn(
     let tracked_workdir = Mutex::new(workdir.clone());
 
     let mut write_sse = |payload: &str| -> bool {
+        let mut cancelled = false;
         {
             let mut turns = srv.live_turns.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(lt) = turns.iter_mut().find(|t| t.turn_id == live_turn_id) {
+                cancelled = lt.cancelled;
                 if payload.starts_with(r#"{"type":"workspace_changed""#) {
                     if let Ok(j) = Json::parse(payload) {
                         if let Some(wd) = j.get("workdir").and_then(Json::as_str) {
@@ -950,6 +954,9 @@ fn execute_allocated_turn(
                 }
                 lt.events.push(payload.to_string());
             }
+        }
+        if cancelled {
+            return false;
         }
         if let Some(ref mut s) = stream_opt {
             let frame = format!("data: {payload}\n\n");
@@ -2308,6 +2315,22 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
         ("POST", "/v1/agent/chat") => agent_chat_sse(srv, &mut stream, &req),
         ("POST", "/v1/turn") => unified_turn_sse(srv, &mut stream, &req),
         ("POST", "/v1/compact") => compact_history_http(srv, &mut stream, &req),
+        ("POST", "/v1/turn/cancel") => {
+            // `turn_id` 0 (or absent) cancels every active turn.
+            let want = std::str::from_utf8(&req.body)
+                .ok()
+                .and_then(|b| Json::parse(b).ok())
+                .and_then(|j| j.get("turn_id").and_then(Json::as_f64))
+                .unwrap_or(0.0) as u64;
+            let mut turns = srv.live_turns.lock().unwrap_or_else(|p| p.into_inner());
+            let mut n = 0usize;
+            for t in turns.iter_mut().filter(|t| t.active && (want == 0 || t.turn_id == want)) {
+                t.cancelled = true;
+                n += 1;
+            }
+            drop(turns);
+            respond(&mut stream, 200, "application/json", &format!(r#"{{"status":"cancelling","turns":{n}}}"#));
+        }
         ("GET", "/v1/sessions") => {
             let wd = srv.active_workdir();
             let idx = srv.ui_index.lock().unwrap_or_else(|p| p.into_inner());
@@ -2994,6 +3017,7 @@ mod tests {
         assert_eq!(decode_hex_utf8("2f746d702f64656d6f").as_deref(), Some("/tmp/demo"));
         assert_eq!(decode_hex_utf8("zz"), None);
         let summary = format_live_turn_summary_json(&LiveTurnBroadcast {
+            cancelled: false,
             turn_id: 42,
             agent_ord: 2,
             agent_label: "Task #2 · kronos-long-agent-eval".into(),

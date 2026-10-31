@@ -1175,7 +1175,8 @@ fn select_tools_kv_aware(
         };
         let keep = match name.as_str() {
             "write_file" => true,
-            "edit_file" | "read_file" => workspace_has_files || wants_switch || wants_cmd,
+            // Always offered: files written earlier in the same turn need edits, not rewrites.
+            "edit_file" | "read_file" => true,
             "list_dir" => (workspace_has_files && wants_search) || wants_cmd,
             "search_files" => wants_search,
             "switch_workspace" => wants_switch,
