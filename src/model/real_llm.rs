@@ -56,6 +56,8 @@ const KRONOS4_CACHE_MAGIC: &[u8] = b"K2TKRONOS4\n";
 
 /// Cache magic for pinned Sparse-MoE cores paired with `.k2tm` routed expert shards.
 const KRONOS5_CACHE_MAGIC: &[u8] = b"K2TKRONOS5\n";
+/// Dense cache with per-head q_norm/k_norm (Qwen3).
+const KRONOS6_CACHE_MAGIC: &[u8] = b"K2TKRONOS6\n";
 
 /// Little-endian cursor over a [`RealLlamaEngine::save_bipolar`] cache.
 struct CacheReader<'a> {
@@ -3392,10 +3394,13 @@ impl RealLlamaEngine {
             }
         };
 
+        let needs_v6 = self.layers.iter().any(|l| l.q_norm.is_some() || l.k_norm.is_some());
         let needs_v4 = self.embed_nf4.is_some();
         let needs_v3 = self.layers.iter().any(|l| l.qkv_bias.is_some())
             || !self.embed_bf16_rows.is_empty();
-        let version = if needs_v4 {
+        let version = if needs_v6 {
+            6u8
+        } else if needs_v4 {
             4u8
         } else if needs_v3 {
             3u8
@@ -3407,6 +3412,7 @@ impl RealLlamaEngine {
 
         let mut w = io::BufWriter::new(fs::File::create(path)?);
         w.write_all(match version {
+            6 => KRONOS6_CACHE_MAGIC,
             4 => KRONOS4_CACHE_MAGIC,
             3 => KRONOS3_CACHE_MAGIC,
             2 => KRONOS2_CACHE_MAGIC,
@@ -3419,6 +3425,10 @@ impl RealLlamaEngine {
             w_f32s(&mut w, &l.post_attn_norm)?;
             if version >= 3 {
                 w_f32s(&mut w, l.qkv_bias.as_deref().unwrap_or(&[]))?;
+            }
+            if version >= 6 {
+                w_f32s(&mut w, l.q_norm.as_deref().unwrap_or(&[]))?;
+                w_f32s(&mut w, l.k_norm.as_deref().unwrap_or(&[]))?;
             }
             for b in [&l.qkv_proj, &l.o_proj, &l.gate_up_proj, &l.down_proj] {
                 if version >= 2 {
@@ -3460,7 +3470,9 @@ impl RealLlamaEngine {
         let mmap = RawMmap::map_read_only(&file, len)?;
         let bytes = mmap.as_slice();
         let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
-        let (version, magic_len) = if bytes.starts_with(KRONOS4_CACHE_MAGIC) {
+        let (version, magic_len) = if bytes.starts_with(KRONOS6_CACHE_MAGIC) {
+            (6u8, KRONOS6_CACHE_MAGIC.len())
+        } else if bytes.starts_with(KRONOS4_CACHE_MAGIC) {
             (4u8, KRONOS4_CACHE_MAGIC.len())
         } else if bytes.starts_with(KRONOS3_CACHE_MAGIC) {
             (3u8, KRONOS3_CACHE_MAGIC.len())
@@ -3613,6 +3625,13 @@ impl RealLlamaEngine {
             } else {
                 None
             };
+            let (q_norm, k_norm) = if version >= 6 {
+                let q = rd.f32s()?;
+                let k = rd.f32s()?;
+                (Some(q).filter(|v| !v.is_empty()), Some(k).filter(|v| !v.is_empty()))
+            } else {
+                (None, None)
+            };
             layers.push(LlamaLayer {
                 input_norm,
                 post_attn_norm,
@@ -3620,8 +3639,8 @@ impl RealLlamaEngine {
                 down_inv_scale: None,
                 qkv_bias,
                 o_bias: None,
-                q_norm: None,
-                k_norm: None,
+                q_norm,
+                k_norm,
                 qkv_proj: r_mat(&mut rd)?,
                 o_proj: r_mat(&mut rd)?,
                 gate_up_proj: r_mat(&mut rd)?,
@@ -9697,5 +9716,46 @@ mod tests {
 
         q8_eng.set_num_threads(1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Needs models/Qwen3-0.6B with its compiled nf4g128 cache; prints FP32 vs compiled greedy text.
+    #[test]
+    #[ignore]
+    fn qwen3_dense_real_fp32_vs_compiled() {
+        use crate::model::bpe_tokenizer::BpeTokenizer;
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/Qwen3-0.6B");
+        let Ok(tok) = BpeTokenizer::from_model_dir(&dir) else { return };
+        let prompt = tok.encode("<|im_start|>user\nWrite a Python function that returns the n-th Fibonacci number.<|im_end|>\n<|im_start|>assistant\n");
+        let mut fp32 = RealLlamaEngine::load_fp32_reference(&dir, 512).unwrap();
+        fp32.set_num_threads(8);
+        let mut gen = |eng: &mut RealLlamaEngine, label: &str| {
+            let mut l = eng.forward_prompt(&prompt).to_vec();
+            let mut out = Vec::new();
+            for _ in 0..24 {
+                let t = argmax(&l);
+                out.push(t);
+                l = eng.forward_token(t).to_vec();
+            }
+            println!("{label}: {:?}", tok.decode(&out));
+            out
+        };
+        let a = gen(&mut fp32, "fp32    ");
+        let mode = RealWeightMode::KronosNfGptq { bits: 4, scale_group_chunks: 2 };
+        let mut from_ref = fp32.compile_from_reference(mode, None);
+        drop(fp32);
+        from_ref.repack_sdot();
+        from_ref.set_num_threads(8);
+        let r = gen(&mut from_ref, "ref-nf4 ");
+        println!("ref-compile matching prefix: {}/24", a.iter().zip(&r).take_while(|(x, y)| x == y).count());
+        drop(from_ref);
+        let cache = dir.join("kronos-nf4g128.k2tb");
+        if cache.is_file() {
+            let mut q = RealLlamaEngine::load_bipolar(&dir, &cache, 512).unwrap();
+            q.repack_sdot();
+            q.set_num_threads(8);
+            let b = gen(&mut q, "nf4g128 ");
+            let same = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+            println!("matching prefix tokens: {same}/24");
+        }
     }
 }
