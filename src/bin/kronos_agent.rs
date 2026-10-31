@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 //! Sandboxed tool-calling coding runner (`kronos_agent --model <dir> --workdir <dir> --prompt "..."` or `--server 127.0.0.1:18080`).
 
+use kronos_2t::config::limits::AGENT_COMPACT_BUDGET_TOKENS;
 use kronos_2t::runtime::agent::{
-    execute_tool, run_agent_turn, serialize_messages_json, tool_definitions_json, truncate_utf8,
+    build_workspace_context_block, cap_tool_result, compact_messages_with_budget, execute_tool,
+    remember_workspace_state, run_agent_turn, serialize_messages_json, tool_definitions_json, truncate_utf8,
     validate_workspace, AgentEvent, AgentTurnConfig, AGENT_SYSTEM_PROMPT,
 };
 use kronos_2t::runtime::chat::{ChatModel, FinishReason, GenParams, Message, ToolCall};
@@ -125,6 +127,24 @@ fn http_chat_step(
         .unwrap_or(0.0) as usize;
     let telemetry = format!("HTTP {prompt_tok} prompt tok · {comp_tok} gen tok in {dt:.2}s");
     Ok(StepReply { text, tool_calls, finish, telemetry })
+}
+
+/// Rough token estimate for the HTTP path, where no tokenizer is loaded.
+fn approx_prompt_tokens(msgs: &[Message]) -> usize {
+    msgs.iter()
+        .map(|m| {
+            m.content.len() / 4
+                + m.tool_calls.iter().map(|tc| tc.name.len() + tc.arguments.len() / 4).sum::<usize>()
+                + 6
+        })
+        .sum()
+}
+
+fn is_test_like_command(cmd: &str) -> bool {
+    let l = cmd.trim().to_ascii_lowercase();
+    ["python", "node ", "pytest", "cargo ", "npm ", "npx ", "sh ", "bash ", "./", "test", "verify", "check"]
+        .iter()
+        .any(|k| l.contains(k))
 }
 
 struct AgentConfig {
@@ -254,7 +274,28 @@ fn run_agent_goal(
             let t_goal = Instant::now();
             let mut touched_files = false;
             let mut repair_attempts = 0usize;
+            let mut edits_since_pass = false;
+            let mut passing_cmd: Option<String> = None;
+            if let Some(last_u) = history.iter_mut().rev().find(|m| m.role == "user") {
+                if !last_u.content.contains("[Workspace Status]") {
+                    let block = build_workspace_context_block(&cfg.workdir);
+                    last_u.content = format!("{block}\n\n{}", last_u.content);
+                }
+            }
             for step in 1..=cfg.max_steps {
+                let rep = compact_messages_with_budget(
+                    history,
+                    &cfg.workdir,
+                    false,
+                    AGENT_COMPACT_BUDGET_TOKENS,
+                    approx_prompt_tokens,
+                );
+                if rep.compacted {
+                    eprintln!(
+                        "  [context compacted: {} -> {} tokens ({} items pruned)]",
+                        rep.before_tokens, rep.after_tokens, rep.compacted_messages
+                    );
+                }
                 eprintln!("\n=== [Agent Step {step}/{}] ===", cfg.max_steps);
                 let mut reply = http_chat_step(addr, api_key.as_deref(), history, tools_json, &cfg.params)?;
                 eprintln!("  [{}]", reply.telemetry);
@@ -278,6 +319,7 @@ fn run_agent_goal(
                         "=== [Completed in {step} step(s), {:.2}s total] ===",
                         t_goal.elapsed().as_secs_f64()
                     );
+                    remember_workspace_state(&cfg.workdir);
                     return Ok(reply.text);
                 }
 
@@ -287,10 +329,8 @@ fn run_agent_goal(
                 history.push(Message::assistant_tool_calls(&reply.text, reply.tool_calls.clone()));
 
                 let mut active_workdir = cfg.workdir.clone();
+                let mut edit_failed = false;
                 for (idx, tc) in reply.tool_calls.iter().enumerate() {
-                    if matches!(tc.name.as_str(), "write_file" | "edit_file") {
-                        touched_files = true;
-                    }
                     let arg_preview = truncate_utf8(&tc.arguments, 140).replace('\n', "\\n");
                     eprintln!("  -> tool `{}`({arg_preview})", tc.name);
                     let outcome =
@@ -298,13 +338,41 @@ fn run_agent_goal(
                     if let Some(ref next_dir) = outcome.new_workdir {
                         active_workdir.clone_from(next_dir);
                     }
+                    if matches!(tc.name.as_str(), "write_file" | "edit_file") {
+                        touched_files = true;
+                        edits_since_pass = true;
+                        passing_cmd = None;
+                        edit_failed |= !outcome.ok || !outcome.validation_ok;
+                    } else if tc.name == "run_command" && outcome.ok && edits_since_pass {
+                        let cmd = Json::parse(&tc.arguments)
+                            .ok()
+                            .and_then(|j| j.get("cmd").and_then(Json::as_str).map(str::to_string))
+                            .unwrap_or_default();
+                        if is_test_like_command(&cmd) {
+                            passing_cmd = Some(cmd);
+                            edits_since_pass = false;
+                        }
+                    }
                     let res_preview = truncate_utf8(&outcome.output, 200).replace('\n', " | ");
                     eprintln!("     <- {res_preview}");
-                    history.push(Message::tool_result(&tc.id, &outcome.output));
+                    let capped = cap_tool_result(&active_workdir, step, idx, &tc.name, &outcome.output);
+                    history.push(Message::tool_result(&tc.id, &capped));
                 }
 
                 if reply.finish == FinishReason::Length {
                     eprintln!("  (warning: step hit max_tokens; continuing with executed tool calls)");
+                }
+                if let (false, false, Some(cmd)) = (edit_failed, edits_since_pass, passing_cmd.as_ref()) {
+                    if validate_workspace(&cfg.workdir).is_ok() {
+                        let summary = format!("Done: verification command `{cmd}` passed after the last edit.");
+                        history.push(Message::new("assistant", &summary));
+                        eprintln!(
+                            "=== [Completed in {step} step(s), {:.2}s total; stopped after passing verification] ===",
+                            t_goal.elapsed().as_secs_f64()
+                        );
+                        remember_workspace_state(&cfg.workdir);
+                        return Ok(summary);
+                    }
                 }
             }
             Err(format!("reached --max-steps {} without final response", cfg.max_steps))
