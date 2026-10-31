@@ -104,9 +104,12 @@ a mix of encyclopedic and web text works well) and caches it as
 [BENCHMARKS.md](BENCHMARKS.md) for the size, quality and speed of each.
 
 The KV cache is stored as int8 after a Hadamard rotation, about 4x smaller than FP32;
-`--fp32-kv` turns this off. On macOS, `nf4` and `nf4g128` models run on the Metal GPU by default
-(`--cpu` forces CPU execution). Pass `--draft models/<small-model>` to enable lossless speculative
-decoding with a smaller same-family draft model on CPU while the target runs on Metal:
+`--q4-kv` halves it again (4-bit, see [BENCHMARKS.md](BENCHMARKS.md) for the quality cost) and
+`--fp32-kv` turns it off. On macOS, `nf4` and `nf4g128` models run on the Metal GPU by default
+(`--cpu` forces CPU execution). Decoding is speculative when the text being generated already
+appears in the context (prompt lookup, up to 16 tokens per step), and `--draft models/<small-model>`
+adds a smaller same-family draft model on CPU for everything else, while the target runs on Metal.
+Both are verified in one batched pass and never change the greedy output:
 
 ```bash
 cargo run --release --bin kronos_chat -- models/Qwen2.5-Coder-14B-Instruct \
@@ -154,7 +157,10 @@ Endpoints: `POST /v1/chat/completions` (`stream: true` sends server-sent events)
 fields: `messages`, `tools`, `tool_choice`, `temperature`, `top_p`, `top_k`, `max_tokens`,
 `repetition_penalty`, `seed`, `stream`. The server binds to `127.0.0.1` by default; use
 `--host 0.0.0.0` and `--api-key` to expose it on a network. It runs one generation at a time and
-reuses the KV cache when a request extends the previous conversation.
+reuses the KV cache when a request extends the previous conversation. Requests may carry a
+`session_id` (or an `X-Kronos-Session` header): the processed prefix of the last `--kv-sessions`
+conversations (default 3) stays in RAM and older ones are written under `--state-dir/kv`, so
+switching conversations or restarting the server resumes without reprocessing the history.
 
 To embed Kronos in another Rust program, use `kronos_2t::chat::ChatModel` directly.
 
@@ -168,6 +174,9 @@ cargo run --release --bin wikitext_ppl -- models/SmolLM2-135M wiki.ids \
   --modes b4,p55454,b5,p66666 --calib-ids train.ids --calib-tokens 32768 \
   --cache-dir k2tb --sdot --speed --prefill
 ```
+
+`--q8-kv --q4-kv` scores every mode with both the int8 and the 4-bit KV cache, and
+`--kv-ctx 32768` fills that many positions and reports the measured KV bytes.
 
 Models are read from Hugging Face safetensors (`config.json`, `model.safetensors`,
 `vocab.json`, `merges.txt`). `wiki.ids` and `train.ids` hold one token id per line.
