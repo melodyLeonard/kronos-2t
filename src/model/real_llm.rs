@@ -9728,7 +9728,7 @@ mod tests {
         let prompt = tok.encode("<|im_start|>user\nWrite a Python function that returns the n-th Fibonacci number.<|im_end|>\n<|im_start|>assistant\n");
         let mut fp32 = RealLlamaEngine::load_fp32_reference(&dir, 512).unwrap();
         fp32.set_num_threads(8);
-        let mut gen = |eng: &mut RealLlamaEngine, label: &str| {
+        let gen = |eng: &mut RealLlamaEngine, label: &str| {
             let mut l = eng.forward_prompt(&prompt).to_vec();
             let mut out = Vec::new();
             for _ in 0..24 {
