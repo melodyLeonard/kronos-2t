@@ -1414,6 +1414,8 @@ pub struct RealLlamaEngine {
     rope_cos_sin: Vec<f32>,
     pool: Option<SpinThreadPool>,
     moe_runtime: Option<SparseMoeRuntime>,
+    /// Hot experts at other bits (`KRONOS_EXPERT_HOT_SHARD`), read by the Metal MoE path.
+    moe_hot: Option<crate::model::sparse_moe::HotExpertShard>,
     ws: LlamaWorkspace,
 }
 
@@ -1646,6 +1648,22 @@ impl RealLlamaEngine {
                 let (bytes, header, layout) = rt
                     .zero_copy_shard()
                     .ok_or("Metal MoE needs the zero-copy mmap expert backend (shard exceeds the memory budget)")?;
+                let alt = match &self.moe_hot {
+                    Some(h) => {
+                        if h.layout.scale_group_chunks != layout.scale_group_chunks || h.header.num_layers != header.num_layers {
+                            return Err("hot expert shard must match the base shard's layer count and scale groups".to_string());
+                        }
+                        Some(crate::backend::metal_gpu::MoeAltGeometry {
+                            bits: h.layout.bits,
+                            expert_bytes: h.layout.aligned_expert_bytes,
+                            gu_codebook_off: h.layout.gu_codebook_off,
+                            gu_pair_off: h.layout.gu_pair_off,
+                            dn_codebook_off: h.layout.dn_codebook_off,
+                            dn_pair_off: h.layout.dn_pair_off,
+                        })
+                    }
+                    None => None,
+                };
                 let geom = crate::backend::metal_gpu::MoeGeometry {
                     top_k: rt.top_k,
                     norm_topk: rt.norm_topk_prob,
@@ -1657,6 +1675,7 @@ impl RealLlamaEngine {
                     gu_pair_off: layout.gu_pair_off,
                     dn_codebook_off: layout.dn_codebook_off,
                     dn_pair_off: layout.dn_pair_off,
+                    alt,
                 };
                 Some((bytes, header, geom))
             } else {
@@ -1671,10 +1690,21 @@ impl RealLlamaEngine {
                     (Some(m), Some((bytes, header, geom))) => {
                         let per_layer = header.experts_per_layer * geom.expert_bytes;
                         let start = crate::model::moe_800b::K2TM_VM_PAGE_BYTES + m.moe_slot_idx * per_layer;
+                        let (alt_shard, tiers) = match (&self.moe_hot, &geom.alt) {
+                            (Some(h), Some(a)) => {
+                                let e = header.experts_per_layer;
+                                let per_alt = e * a.expert_bytes;
+                                let s0 = crate::model::moe_800b::K2TM_VM_PAGE_BYTES + m.moe_slot_idx * per_alt;
+                                (Some(&h.mmap.as_slice()[s0..s0 + per_alt]), Some(&h.tiers[m.moe_slot_idx * e..(m.moe_slot_idx + 1) * e]))
+                            }
+                            _ => (None, None),
+                        };
                         Some(crate::backend::metal_gpu::MoeLayerBorrow {
                             router_w: &m.router.weights,
                             router_bias: m.router.bias.as_deref(),
                             shard: &bytes[start..start + per_layer],
+                            alt_shard,
+                            tiers,
                         })
                     }
                     (Some(_), None) => return Err(format!("layer.{idx}: MoE layer without expert shard")),
@@ -1974,6 +2004,7 @@ impl RealLlamaEngine {
             rope_cos_sin,
             pool: None,
             moe_runtime,
+            moe_hot: None,
             ws,
         })
     }
@@ -2280,6 +2311,7 @@ impl RealLlamaEngine {
             rope_cos_sin: self.rope_cos_sin.clone(),
             pool: None,
             moe_runtime: None,
+            moe_hot: None,
             ws: LlamaWorkspace::new(&self.cfg),
         };
         eng.init_activation_scratch();
@@ -2569,6 +2601,7 @@ impl RealLlamaEngine {
             rope_cos_sin: self.rope_cos_sin.clone(),
             pool: None,
             moe_runtime: None,
+            moe_hot: None,
             ws: LlamaWorkspace::new(&self.cfg),
         }
     }
@@ -2835,6 +2868,7 @@ impl RealLlamaEngine {
             rope_cos_sin: self.rope_cos_sin.clone(),
             pool: None,
             moe_runtime: None,
+            moe_hot: None,
             ws: LlamaWorkspace::new(&self.cfg),
         };
         eng.init_activation_scratch();
@@ -3177,6 +3211,7 @@ impl RealLlamaEngine {
             rope_cos_sin,
             pool: None,
             moe_runtime: None,
+            moe_hot: None,
         };
         eng.init_activation_scratch();
         Ok(eng)
@@ -3716,6 +3751,7 @@ impl RealLlamaEngine {
             lm_head,
             pool: None,
             moe_runtime: None,
+            moe_hot: None,
         };
         eng.init_activation_scratch();
         Ok(eng)
@@ -4688,6 +4724,25 @@ impl RealLlamaEngine {
 
     /// Loads a hybrid Sparse-MoE engine from its `K2TKRONOS5\n` pinned core (`.k2tb`) and
     /// 16 KiB-aligned expert shard (`.k2tm`) under `policy` and the active [`MemoryBudgetProfile`].
+    /// Opens the optional hot-expert shard named by `KRONOS_EXPERT_HOT_SHARD` (needs the histogram
+    /// in `KRONOS_EXPERT_HOT` and the budget in `KRONOS_WIRE_GIB`).
+    fn open_hot_expert_shard(&mut self) -> io::Result<()> {
+        let Some(hot_path) = std::env::var_os("KRONOS_EXPERT_HOT_SHARD") else { return Ok(()) };
+        let csv = std::env::var("KRONOS_EXPERT_HOT")
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "KRONOS_EXPERT_HOT_SHARD needs KRONOS_EXPERT_HOT (histogram csv)"))?;
+        let gib: f64 = std::env::var("KRONOS_WIRE_GIB").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let hot = crate::model::sparse_moe::HotExpertShard::open(
+            Path::new(&hot_path),
+            self.cfg.hidden_size,
+            self.cfg.eff_moe_inter(),
+            self.cfg.num_experts,
+            &csv,
+            (gib * (1u64 << 30) as f64) as usize,
+        )?;
+        self.moe_hot = Some(hot);
+        Ok(())
+    }
+
     pub fn load_moe_from_files(
         model_dir: &Path,
         core_k2tb_path: &Path,
@@ -5011,6 +5066,7 @@ impl RealLlamaEngine {
             lm_head,
             pool: None,
             moe_runtime: None,
+            moe_hot: None,
         };
         eng.repack_sdot();
         if matches!(eng.cfg.head_dim(), 64 | 128) {
@@ -5036,6 +5092,7 @@ impl RealLlamaEngine {
             policy,
         )?;
         eng.moe_runtime = Some(moe_rt);
+        eng.open_hot_expert_shard()?;
         Ok(eng)
     }
 
@@ -5181,6 +5238,7 @@ impl RealLlamaEngine {
             lm_head,
             pool: None,
             moe_runtime: None,
+            moe_hot: None,
         };
         eng.repack_sdot();
         eng.set_default_p_cores();
@@ -5205,6 +5263,7 @@ impl RealLlamaEngine {
             policy,
         )?;
         eng.moe_runtime = Some(moe_rt);
+        eng.open_hot_expert_shard()?;
         Ok(eng)
     }
 

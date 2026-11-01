@@ -1694,7 +1694,8 @@ unsafe fn dot_f32_moe_neon(a: &[f32], b: &[f32]) -> f32 {
 fn open_zero_copy_shard(file: &std::fs::File, len: usize, header: &K2tmShardHeader) -> io::Result<RawMmap> {
     let _ = nvme_io::clear_file_nocache(file);
     let mmap = RawMmap::map_read_only(file, len)?;
-    if std::env::var_os("KRONOS_NO_WIRE").is_some() {
+    // With a hot-expert shard the wiring budget goes to that shard; this one stays pageable.
+    if std::env::var_os("KRONOS_NO_WIRE").is_some() || std::env::var_os("KRONOS_EXPERT_HOT_SHARD").is_some() {
         return Ok(mmap);
     }
     let hot = std::env::var("KRONOS_EXPERT_HOT").ok();
@@ -1708,12 +1709,13 @@ fn open_zero_copy_shard(file: &std::fs::File, len: usize, header: &K2tmShardHead
 }
 
 /// Wires the most-routed experts from a `layer,expert,count` histogram until `budget` bytes are wired.
-fn wire_hot_experts(mmap: &RawMmap, header: &K2tmShardHeader, csv: &str, budget: usize) {
+/// `(count, layer, expert)` rows of a `layer,expert,count` histogram, most-routed first.
+fn hot_expert_rows(header: &K2tmShardHeader, csv: &str) -> Vec<(u64, usize, usize)> {
     let text = match std::fs::read_to_string(csv) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("warning: cannot read expert histogram {csv}: {e}; wiring nothing");
-            return;
+            return Vec::new();
         }
     };
     let mut rows: Vec<(u64, usize, usize)> = text
@@ -1727,27 +1729,83 @@ fn wire_hot_experts(mmap: &RawMmap, header: &K2tmShardHeader, csv: &str, budget:
         })
         .collect();
     rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    rows
+}
+
+/// Flags (`layer * experts_per_layer + expert`) of the most-routed experts that fit `budget`
+/// bytes; `mmap` wires each selected record. Returns the flags and the covered routing share.
+fn select_hot_experts(mmap: Option<&RawMmap>, header: &K2tmShardHeader, csv: &str, budget: usize) -> (Vec<u8>, f64, usize) {
+    let rows = hot_expert_rows(header, csv);
     let total: u64 = rows.iter().map(|r| r.0).sum();
     let rec = header.aligned_expert_bytes;
-    let (mut wired, mut covered, mut n) = (0usize, 0u64, 0usize);
+    let all = header.num_layers * header.experts_per_layer;
+    let mut set = vec![0u8; all];
+    let (mut used, mut covered, mut n) = (0usize, 0u64, 0usize);
     for (count, layer, expert) in rows {
-        if wired + rec > budget {
+        if used + rec > budget {
             break;
         }
-        let off = K2TM_PAGE_BYTES + (layer * header.experts_per_layer + expert) * rec;
-        if mmap.lock_range(off, rec).is_err() {
+        let idx = layer * header.experts_per_layer + expert;
+        if mmap.is_some_and(|m| m.lock_range(K2TM_PAGE_BYTES + idx * rec, rec).is_err()) {
             break;
         }
-        wired += rec;
+        set[idx] = 1;
+        used += rec;
         covered += count;
         n += 1;
     }
-    let all = header.num_layers * header.experts_per_layer;
+    (set, if total > 0 { 100.0 * covered as f64 / total as f64 } else { 0.0 }, n)
+}
+
+fn wire_hot_experts(mmap: &RawMmap, header: &K2tmShardHeader, csv: &str, budget: usize) {
+    let (set, share, n) = select_hot_experts(Some(mmap), header, csv, budget);
+    let all = set.len();
     eprintln!(
-        "wired {n}/{all} experts ({:.2} GiB) covering {:.1}% of routed tokens; the rest page on demand",
-        wired as f64 / (1u64 << 30) as f64,
-        if total > 0 { 100.0 * covered as f64 / total as f64 } else { 0.0 }
+        "wired {n}/{all} experts ({:.2} GiB, {}-bit) covering {share:.1}% of routed tokens; the rest page on demand",
+        (n * header.aligned_expert_bytes) as f64 / (1u64 << 30) as f64,
+        header.bits,
     );
+}
+
+/// A second expert shard of the same model at different bits (`KRONOS_EXPERT_HOT_SHARD`). The
+/// most-routed experts that fit the budget are served from it and the rest from the base shard;
+/// the Metal backend copies both sets into one resident arena per layer, so neither mmap is wired.
+pub struct HotExpertShard {
+    pub mmap: RawMmap,
+    pub header: K2tmShardHeader,
+    pub layout: NfExpertByteLayout,
+    /// 1 where the expert is served from this shard, indexed `layer * experts_per_layer + expert`.
+    pub tiers: Vec<u8>,
+}
+
+impl HotExpertShard {
+    pub fn open(path: &Path, d_model: usize, d_ff: usize, num_experts: usize, csv: &str, budget: usize) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        if len < K2TM_PAGE_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "hot shard shorter than its header page"));
+        }
+        let mmap = RawMmap::map_read_only(&file, len)?;
+        let header = K2tmShardHeader::decode_page(&mmap.as_slice()[..K2TM_PAGE_BYTES])
+            .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+        if !(2..=5).contains(&header.bits) || header.d_model != d_model || header.d_ff_expert != d_ff || header.experts_per_layer != num_experts {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "hot shard geometry mismatch"));
+        }
+        let layout = nf_expert_byte_layout(d_model, d_ff, header.bits, header.scale_group_chunks.max(1));
+        if layout.aligned_expert_bytes != header.aligned_expert_bytes || len < header.total_file_bytes() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "hot shard record size mismatch"));
+        }
+        let _ = nvme_io::clear_file_nocache(&file);
+        let (tiers, share, n) = select_hot_experts(None, &header, csv, budget);
+        eprintln!(
+            "hot experts: {n}/{} at {}-bit ({:.2} GiB) covering {share:.1}% of routed tokens; the rest stay {}-bit",
+            tiers.len(),
+            header.bits,
+            (n * header.aligned_expert_bytes) as f64 / (1u64 << 30) as f64,
+            if header.bits == 4 { 3 } else { 4 },
+        );
+        Ok(Self { mmap, header, layout, tiers })
+    }
 }
 
 #[cfg(test)]

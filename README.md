@@ -38,7 +38,7 @@ Numbers, method and limitations: [BENCHMARKS.md](BENCHMARKS.md).
 
 ### Engineering iterations
 
-Eleven iterations took the engine from a multiplication-free ternary LUT-GEMV to a Metal
+Twelve iterations took the engine from a multiplication-free ternary LUT-GEMV to a Metal
 Sparse-MoE runtime with a GPU GPTQ compiler, E8 lattice 2-bit experts, calibrated single-pass
 decision primitives and conversation-aware serving. The design notes, with the formulas and the
 code paths for each step, are in [docs/ITERATIONS.md](docs/ITERATIONS.md).
@@ -183,6 +183,14 @@ coding work) and the rest page from disk on demand, which keeps the machine resp
 histogram comes from a run with `KRONOS_EXPERT_HIST=hist.csv` set; it is a `layer,expert,count`
 CSV and any representative workload will do.
 
+Mixed expert precision (Metal): `--moe-hot-shard models/.../kronos-moe-experts-nf4g128.k2tm`
+takes the most-routed experts that fit `--moe-wire-gib` from a second shard compiled at
+`nf4g128` and the rest from the `nf3nf4g128` shard, and copies each expert once into a resident
+per-layer arena (about 12.8 GiB for 9 GiB of 4-bit hot experts plus the 3-bit cold ones), so
+nothing pages during decode: 57.7 tok/s at short context and 49.2 tok/s at 6.6k tokens
+(60.3 and 45.1 with all experts 3-bit). Compile both modes once; the shards must share layer
+count and scale groups.
+
 The web UI at `http://127.0.0.1:18085/` chats, runs agent tasks against the workspace, runs
 parallel tasks, previews files and diffs, and mirrors tasks started from other clients;
 `/quick` is a one-line prompt HUD. Browser requests take the model ahead of API clients, and
@@ -194,6 +202,7 @@ switching conversations restores the KV cache instead of re-reading the history.
 | `KRONOS_COMPILE_BATCH=N` | experts per GPU compile dispatch (default 8) |
 | `KRONOS_EXPERT_HIST=FILE` | write the expert-routing histogram while serving |
 | `KRONOS_NO_WIRE=1` | never `mlock` the expert shard |
+| `KRONOS_EXPERT_HOT_SHARD=FILE` | hot-expert shard at other bits (`--moe-hot-shard`); needs `KRONOS_EXPERT_HOT` and `KRONOS_WIRE_GIB` |
 | `KRONOS_KV_SNAP_MIB=N` | RAM budget for conversation KV snapshots (default 1024) |
 | `KRONOS_DECODE_PROF=1` | print GPU time per kernel class every 32 decoded tokens |
 | `KRONOS_ATTN_SPLIT_MIN=N` | key positions per attention threadgroup during decode (default 128) |

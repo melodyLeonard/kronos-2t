@@ -12,6 +12,7 @@
 //!   `--q4-kv`             4-bit Hadamard KV cache (`--q8-kv` restores INT8)
 //!   `--cpu`               force CPU inference (disables default Metal GPU backend for NF4)
 //!   `--metal`             require Metal GPU inference
+//!   `--moe-hot-shard K2TM` second expert shard (e.g. nf4) that serves and wires the hot experts
 //!   `--moe-hot CSV`       expert-routing histogram (from `KRONOS_EXPERT_HIST`) used with
 //!   `--moe-wire-gib N`    to wire only the most-routed experts that fit N GiB; the rest page on demand
 //!   `--draft DIR`         draft model for speculative decoding (`--draft-mode M`)
@@ -2859,6 +2860,9 @@ fn main() {
     }
     if let Some(gib) = flag("--moe-wire-gib") {
         std::env::set_var("KRONOS_WIRE_GIB", gib);
+    }
+    if let Some(p) = flag("--moe-hot-shard") {
+        std::env::set_var("KRONOS_EXPERT_HOT_SHARD", p);
     }
     if let Some(mb_str) = flag("--memory-budget-mb") {
         let mb: usize = mb_str.parse().expect("numeric --memory-budget-mb");

@@ -294,6 +294,14 @@ struct MoeGemvParams {
     pair_off: u32,
     x_by_slot: u32,
     n_splits: u32,
+    has_alt: u32,
+    alt_bits: u32,
+    alt_chunk_bytes: u32,
+    alt_pair_total_bytes: u32,
+    alt_expert_bytes: u32,
+    alt_cb_off: u32,
+    alt_pair_off: u32,
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -385,6 +393,10 @@ struct GpuMoeLayer {
     shard: MtlObj,
     router_w: MtlObj,
     router_bias: Option<MtlObj>,
+    /// Mixed tiers: `shard` is then a resident arena holding each expert once; `rec_offs[e]` is its
+    /// byte offset and `tiers[e]` selects the geometry (1 = hot-shard bits).
+    rec_offs: Option<MtlObj>,
+    tiers: Option<MtlObj>,
 }
 
 pub(crate) struct GpuLayerWeights {
@@ -405,6 +417,9 @@ pub(crate) struct MoeLayerBorrow<'a> {
     pub router_bias: Option<&'a [f32]>,
     /// This layer's expert records, 16 KiB aligned, `num_experts * expert_bytes` long.
     pub shard: &'a [u8],
+    /// Same layer in the hot-expert shard, and one tier byte per expert (1 = hot shard).
+    pub alt_shard: Option<&'a [u8]>,
+    pub tiers: Option<&'a [u8]>,
 }
 
 pub(crate) struct LayerBorrow<'a> {
@@ -428,6 +443,18 @@ pub(crate) struct MoeGeometry {
     pub d_ff: usize,
     pub bits: usize,
     pub scale_group_chunks: usize,
+    pub expert_bytes: usize,
+    pub gu_codebook_off: usize,
+    pub gu_pair_off: usize,
+    pub dn_codebook_off: usize,
+    pub dn_pair_off: usize,
+    /// Geometry of the hot-expert shard when one is loaded.
+    pub alt: Option<MoeAltGeometry>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MoeAltGeometry {
+    pub bits: usize,
     pub expert_bytes: usize,
     pub gu_codebook_off: usize,
     pub gu_pair_off: usize,
@@ -1277,13 +1304,41 @@ impl MetalLlamaEngine {
                             if moe_geom.is_none() {
                                 return Err(format!("{pfx}: MoE layer without MoE geometry"));
                             }
+                            let geom = moe_geom.as_ref().unwrap();
+                            let (shard, rec_offs, tiers) = match (m.alt_shard, m.tiers, geom.alt) {
+                                (Some(alt), Some(tiers), Some(a)) => {
+                                    // One resident arena per layer: each expert once, at its tier's bits.
+                                    let n = tiers.len();
+                                    let mut offs = Vec::with_capacity(n);
+                                    let mut total = 0usize;
+                                    for &t in tiers {
+                                        offs.push(total as u32);
+                                        total += if t != 0 { a.expert_bytes } else { geom.expert_bytes };
+                                    }
+                                    let arena = alloc_shared_buffer(device.id(), total.max(16), &format!("{pfx}.experts_arena"))?;
+                                    // `arena` has `total` bytes; every source slice is inside its shard.
+                                    let dst = arena.contents_ptr().cast::<u8>();
+                                    for (e, &t) in tiers.iter().enumerate() {
+                                        let (src, len) = if t != 0 {
+                                            (&alt[e * a.expert_bytes..(e + 1) * a.expert_bytes], a.expert_bytes)
+                                        } else {
+                                            (&m.shard[e * geom.expert_bytes..(e + 1) * geom.expert_bytes], geom.expert_bytes)
+                                        };
+                                        std::ptr::copy_nonoverlapping(src.as_ptr(), dst.add(offs[e] as usize), len);
+                                    }
+                                    (arena, Some(upload_slice_buffer(device.id(), &offs, "rec_offs")?), Some(upload_slice_buffer(device.id(), tiers, "tiers")?))
+                                }
+                                _ => (wrap_slice_nocopy(device.id(), m.shard, &format!("{pfx}.experts"))?, None, None),
+                            };
                             Some(GpuMoeLayer {
-                                shard: wrap_slice_nocopy(device.id(), m.shard, &format!("{pfx}.experts"))?,
+                                shard,
                                 router_w: upload_slice_buffer(device.id(), m.router_w, "router_w")?,
                                 router_bias: match m.router_bias {
                                     Some(b) => Some(upload_slice_buffer(device.id(), b, "router_bias")?),
                                     None => None,
                                 },
+                                rec_offs,
+                                tiers,
                             })
                         }
                         None => None,
@@ -2044,9 +2099,12 @@ impl MetalLlamaEngine {
             _pad: 0,
         };
         let chunk_b = NfSdotMatrix::stripe_chunk_bytes(g.bits);
-        let gemv = |rows: usize, cols: usize, cb_off: usize, pair_off: usize, x_by_slot: bool| -> MoeGemvParams {
+        let alt_on = moe.rec_offs.is_some() && moe.tiers.is_some();
+        let gemv = |rows: usize, cols: usize, cb_off: usize, pair_off: usize, x_by_slot: bool, alt_offs: (usize, usize)| -> MoeGemvParams {
             let chunks = cols / 64;
             let sg = chunks.div_ceil(g.scale_group_chunks);
+            let (a_bits, a_bytes) = g.alt.map_or((0, 0), |a| (a.bits, a.expert_bytes));
+            let a_chunk_b = if a_bits > 0 { NfSdotMatrix::stripe_chunk_bytes(a_bits) } else { 0 };
             MoeGemvParams {
                 rows: rows as u32,
                 cols: cols as u32,
@@ -2064,10 +2122,22 @@ impl MetalLlamaEngine {
                 pair_off: pair_off as u32,
                 x_by_slot: u32::from(x_by_slot),
                 n_splits: 1,
+                has_alt: u32::from(alt_on && a_bits > 0),
+                alt_bits: a_bits as u32,
+                alt_chunk_bytes: a_chunk_b as u32,
+                alt_pair_total_bytes: (sg * 64 + chunks * 2 * a_chunk_b) as u32,
+                alt_expert_bytes: a_bytes as u32,
+                alt_cb_off: alt_offs.0 as u32,
+                alt_pair_off: alt_offs.1 as u32,
+                _pad: 0,
             }
         };
-        let mut gu = gemv(2 * g.d_ff, h, g.gu_codebook_off, g.gu_pair_off, false);
-        let mut dn = gemv(h, g.d_ff, g.dn_codebook_off, g.dn_pair_off, true);
+        let alt_gu = g.alt.map_or((0, 0), |a| (a.gu_codebook_off, a.gu_pair_off));
+        let alt_dn = g.alt.map_or((0, 0), |a| (a.dn_codebook_off, a.dn_pair_off));
+        let mut gu = gemv(2 * g.d_ff, h, g.gu_codebook_off, g.gu_pair_off, false, alt_gu);
+        let mut dn = gemv(h, g.d_ff, g.dn_codebook_off, g.dn_pair_off, true, alt_dn);
+        let rec_offs_id = moe.rec_offs.as_ref().map_or_else(|| self.dummy_buf.id(), MtlObj::id);
+        let tiers_id = moe.tiers.as_ref().map_or_else(|| self.dummy_buf.id(), MtlObj::id);
         if n_tok == 1 {
             gu.n_splits = gemv_splits(gu.num_pairs as usize * k, gu.num_scale_groups as usize) as u32;
             dn.n_splits = gemv_splits(dn.num_pairs as usize * k, dn.num_scale_groups as usize) as u32;
@@ -2124,6 +2194,8 @@ impl MetalLlamaEngine {
             msg_sel!(*enc, st.set_buf, self.scratch.x_rot_f32.id() => Id, 0usize => usize, 2usize => usize; ());
             msg_sel!(*enc, st.set_buf, self.scratch.moe_gu.id() => Id, 0usize => usize, 3usize => usize; ());
             msg_sel!(*enc, st.set_buf, self.scratch.moe_tiles.id() => Id, 0usize => usize, 6usize => usize; ());
+            msg_sel!(*enc, st.set_buf, rec_offs_id => Id, 0usize => usize, 7usize => usize; ());
+            msg_sel!(*enc, st.set_buf, tiers_id => Id, 0usize => usize, 8usize => usize; ());
             msg_sel!(*enc, st.set_bytes, (&gu as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 4usize => usize; ());
             msg_sel!(*enc, st.set_buf, self.scratch.moe_part.id() => Id, 0usize => usize, 5usize => usize; ());
             if n_tok == 1 {
@@ -2155,6 +2227,8 @@ impl MetalLlamaEngine {
             msg_sel!(*enc, st.set_buf, self.scratch.x_rot_f32.id() => Id, 0usize => usize, 2usize => usize; ());
             msg_sel!(*enc, st.set_buf, self.scratch.moe_out.id() => Id, 0usize => usize, 3usize => usize; ());
             msg_sel!(*enc, st.set_buf, self.scratch.moe_tiles.id() => Id, 0usize => usize, 6usize => usize; ());
+            msg_sel!(*enc, st.set_buf, rec_offs_id => Id, 0usize => usize, 7usize => usize; ());
+            msg_sel!(*enc, st.set_buf, tiers_id => Id, 0usize => usize, 8usize => usize; ());
             msg_sel!(*enc, st.set_bytes, (&dn as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 4usize => usize; ());
             msg_sel!(*enc, st.set_buf, self.scratch.moe_part.id() => Id, 0usize => usize, 5usize => usize; ());
             if n_tok == 1 {
@@ -2479,7 +2553,32 @@ struct MoeGemvParams {
     uint pair_off;
     uint x_by_slot;
     uint n_splits;
+    uint has_alt;              // 1 = shard is an arena: record at rec_offs[e], geometry by tiers[e]
+    uint alt_bits;
+    uint alt_chunk_bytes;
+    uint alt_pair_total_bytes;
+    uint alt_expert_bytes;
+    uint alt_cb_off;
+    uint alt_pair_off;
+    uint _pad;
 };
+
+// Per-expert record geometry: base shard or the hot-expert shard.
+struct ExpertGeo {
+    uint bits;
+    uint chunk_b;
+    uint pair_total;
+    uint pair_off;
+};
+
+inline ExpertGeo expert_geo(constant MoeGemvParams& p, bool alt) {
+    ExpertGeo g;
+    g.bits = alt ? p.alt_bits : p.bits;
+    g.chunk_b = alt ? p.alt_chunk_bytes : p.chunk_bytes;
+    g.pair_total = alt ? p.alt_pair_total_bytes : p.pair_total_bytes;
+    g.pair_off = alt ? p.alt_pair_off : p.pair_off;
+    return g;
+}
 
 struct MoeGroupParams {
     uint n_tok;
@@ -3141,6 +3240,8 @@ kernel void nf4_moe_gemv1(
     device float*       out    [[buffer(3)]],
     constant MoeGemvParams& p  [[buffer(4)]],
     device float*       part   [[buffer(5)]],
+    device const uint*  rec_offs  [[buffer(7)]],
+    device const uchar* tiers  [[buffer(8)]],
     uint3 tg      [[threadgroup_position_in_grid]],
     uint sg_id    [[simdgroup_index_in_threadgroup]],
     uint tid      [[thread_index_in_simdgroup]],
@@ -3153,12 +3254,15 @@ kernel void nf4_moe_gemv1(
     const uint per_split = (p.num_scale_groups + p.n_splits - 1u) / p.n_splits;
     const uint sg_lo = split * per_split;
     const uint sg_hi = min(p.num_scale_groups, sg_lo + per_split);
-    device const uchar* rec = shard + ulong(ids[slot]) * ulong(p.expert_bytes);
-    device const uint* cbw = (device const uint*)(rec + p.cb_off);
+    const uint e = ids[slot];
+    const bool alt = (p.has_alt != 0u) && (tiers[e] != 0u);
+    const ExpertGeo geo = expert_geo(p, alt);
+    device const uchar* rec = shard + ((p.has_alt != 0u) ? ulong(rec_offs[e]) : ulong(e) * ulong(p.expert_bytes));
+    device const uint* cbw = (device const uint*)(rec + (alt ? p.alt_cb_off : p.cb_off));
 
     threadgroup half2 l_pair[256];
     threadgroup float cb32_s[32];
-    init_nf_tables_cb(p.bits, cbw[0], cbw[1], cbw[2], cbw[3], tid_tg, l_pair, cb32_s);
+    init_nf_tables_cb(geo.bits, cbw[0], cbw[1], cbw[2], cbw[3], tid_tg, l_pair, cb32_s);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Lane = row of the 32-row stripe pair (0..15 stripe a, 16..31 stripe b); every lane walks
@@ -3166,13 +3270,13 @@ kernel void nf4_moe_gemv1(
     const uint r = tid & 15u;
     const bool stripe_b = tid >= 16u;
     const uint lane_lo = ((r >> 2u) << 3u) | (r & 3u);
-    const uint chunk_b = p.chunk_bytes;
+    const uint chunk_b = geo.chunk_b;
     const uint pair_chunk_b = 2u * chunk_b;
     const uint x_row = (p.x_by_slot != 0u) ? slot : tg.z;
     device const float* x = x_rot + ulong(x_row) * ulong(p.cols);
 
     float acc = 0.0f;
-    device const uchar* p_base = rec + p.pair_off + ulong(pair_idx) * ulong(p.pair_total_bytes);
+    device const uchar* p_base = rec + geo.pair_off + ulong(pair_idx) * ulong(geo.pair_total);
     const uint sg_stride = 64u + p.scale_group_chunks * pair_chunk_b;
     for (uint sg = sg_lo + sg_id; sg < sg_hi; sg += 4u) {
         device const uchar* sg_ptr = p_base + ulong(sg) * ulong(sg_stride);
@@ -3189,8 +3293,8 @@ kernel void nf4_moe_gemv1(
                 w0 = float4(float(d[kk * 8u + r]));
                 w1 = w0; w2 = w0; w3 = w0;
 #else
-                unpack_nf_8cols(d, p.bits, kk, lane_lo, l_pair, cb32_s, w0, w1);
-                unpack_nf_8cols(d, p.bits, kk, lane_lo | 4u, l_pair, cb32_s, w2, w3);
+                unpack_nf_8cols(d, geo.bits, kk, lane_lo, l_pair, cb32_s, w0, w1);
+                unpack_nf_8cols(d, geo.bits, kk, lane_lo | 4u, l_pair, cb32_s, w2, w3);
 #endif
 #if GEMV_EXP == 2 || GEMV_EXP == 3
                 sgacc += dot(w0, float4(1.0f)) + dot(w1, float4(1.0f)) + dot(w2, float4(1.0f)) + dot(w3, float4(1.0f));
@@ -3222,7 +3326,7 @@ kernel void nf4_moe_gemv1(
 template <uint T>
 inline void moe_tile_gemv(
     device const uchar* rec, device const float* x_rot, device float* out, device float* part,
-    constant MoeGemvParams& p, uint pair_idx, uint split, uint cnt,
+    constant MoeGemvParams& p, ExpertGeo geo, uint pair_idx, uint split, uint cnt,
     threadgroup const half2* l_pair, threadgroup const float* cb32_s,
     threadgroup const uint* slot_s, threadgroup const uint* xrow_s,
     threadgroup float (*tg_red)[16][32],
@@ -3234,12 +3338,12 @@ inline void moe_tile_gemv(
     const uint r = tid & 15u;
     const bool stripe_b = tid >= 16u;
     const uint lane_lo = ((r >> 2u) << 3u) | (r & 3u);
-    const uint chunk_b = p.chunk_bytes;
+    const uint chunk_b = geo.chunk_b;
     const uint pair_chunk_b = 2u * chunk_b;
     float acc[T];
     float sgacc[T];
     for (uint t = 0u; t < T; ++t) acc[t] = 0.0f;
-    device const uchar* p_base = rec + p.pair_off + ulong(pair_idx) * ulong(p.pair_total_bytes);
+    device const uchar* p_base = rec + geo.pair_off + ulong(pair_idx) * ulong(geo.pair_total);
     const uint sg_stride = 64u + p.scale_group_chunks * pair_chunk_b;
     for (uint sg = sg_lo + sg_id; sg < sg_hi; sg += 4u) {
         device const uchar* sg_ptr = p_base + ulong(sg) * ulong(sg_stride);
@@ -3251,8 +3355,8 @@ inline void moe_tile_gemv(
             device const uchar* d = sg_ptr + 64u + (c - c0) * pair_chunk_b + (stripe_b ? chunk_b : 0u);
             for (uint kk = 0u; kk < 4u; ++kk) {
                 float4 w0, w1, w2, w3;
-                unpack_nf_8cols(d, p.bits, kk, lane_lo, l_pair, cb32_s, w0, w1);
-                unpack_nf_8cols(d, p.bits, kk, lane_lo | 4u, l_pair, cb32_s, w2, w3);
+                unpack_nf_8cols(d, geo.bits, kk, lane_lo, l_pair, cb32_s, w0, w1);
+                unpack_nf_8cols(d, geo.bits, kk, lane_lo | 4u, l_pair, cb32_s, w2, w3);
                 const uint col = c * 64u + kk * 16u;
                 for (uint t = 0u; t < T; ++t) {
                     if (T == 1u || t < cnt) {
@@ -3295,6 +3399,8 @@ kernel void nf4_moe_gemv(
     constant MoeGemvParams& p     [[buffer(4)]],
     device float*       part      [[buffer(5)]],
     device const uint*  tiles     [[buffer(6)]],
+    device const uint*  rec_offs  [[buffer(7)]],
+    device const uchar* tiers     [[buffer(8)]],
     uint2 tg      [[threadgroup_position_in_grid]],
     uint sg_id    [[simdgroup_index_in_threadgroup]],
     uint tid      [[thread_index_in_simdgroup]],
@@ -3306,15 +3412,17 @@ kernel void nf4_moe_gemv(
     const uint e = tiles[tg.y * 3u];
     const uint off = tiles[tg.y * 3u + 1u];
     const uint cnt = tiles[tg.y * 3u + 2u];
-    device const uchar* rec = shard + ulong(e) * ulong(p.expert_bytes);
-    device const uint* cbw = (device const uint*)(rec + p.cb_off);
+    const bool alt = (p.has_alt != 0u) && (tiers[e] != 0u);
+    const ExpertGeo geo = expert_geo(p, alt);
+    device const uchar* rec = shard + ((p.has_alt != 0u) ? ulong(rec_offs[e]) : ulong(e) * ulong(p.expert_bytes));
+    device const uint* cbw = (device const uint*)(rec + (alt ? p.alt_cb_off : p.cb_off));
 
     threadgroup half2 l_pair[256];
     threadgroup float cb32_s[32];
     threadgroup uint slot_s[16];
     threadgroup uint xrow_s[16];
     threadgroup float tg_red[4][16][32];
-    init_nf_tables_cb(p.bits, cbw[0], cbw[1], cbw[2], cbw[3], tid_tg, l_pair, cb32_s);
+    init_nf_tables_cb(geo.bits, cbw[0], cbw[1], cbw[2], cbw[3], tid_tg, l_pair, cb32_s);
     if (tid_tg < 16u) {
         uint slot = (tid_tg < cnt) ? grp_slots[off + tid_tg] : 0u;
         slot_s[tid_tg] = slot;
@@ -3322,11 +3430,11 @@ kernel void nf4_moe_gemv(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (cnt <= 1u) {
-        moe_tile_gemv<1>(rec, x_rot, out, part, p, pair_idx, split, cnt, l_pair, cb32_s, slot_s, xrow_s, tg_red, sg_id, tid);
+        moe_tile_gemv<1>(rec, x_rot, out, part, p, geo, pair_idx, split, cnt, l_pair, cb32_s, slot_s, xrow_s, tg_red, sg_id, tid);
     } else if (cnt <= 4u) {
-        moe_tile_gemv<4>(rec, x_rot, out, part, p, pair_idx, split, cnt, l_pair, cb32_s, slot_s, xrow_s, tg_red, sg_id, tid);
+        moe_tile_gemv<4>(rec, x_rot, out, part, p, geo, pair_idx, split, cnt, l_pair, cb32_s, slot_s, xrow_s, tg_red, sg_id, tid);
     } else {
-        moe_tile_gemv<16>(rec, x_rot, out, part, p, pair_idx, split, cnt, l_pair, cb32_s, slot_s, xrow_s, tg_red, sg_id, tid);
+        moe_tile_gemv<16>(rec, x_rot, out, part, p, geo, pair_idx, split, cnt, l_pair, cb32_s, slot_s, xrow_s, tg_red, sg_id, tid);
     }
 }
 
@@ -5308,10 +5416,10 @@ mod tests {
             RealWeightMode::KronosNfGptq { bits: 4, scale_group_chunks: 2 },
             RealWeightMode::KronosNfMixedGptq { attn_head_bits: 4, ffn_bits: 3, scale_group_chunks: 2 },
         ];
-        for mode in modes {
+        for (mi, mode) in modes.into_iter().enumerate() {
         eprintln!("moe parity mode {mode:?}");
-        let core = dir.join("core.k2tb");
-        let experts = dir.join("experts.k2tm");
+        let core = dir.join(format!("core{mi}.k2tb"));
+        let experts = dir.join(format!("experts{mi}.k2tm"));
         RealLlamaEngine::compile_streaming_moe_to_files(&dir, &core, &experts, mode, &calib, 2).unwrap();
         let mut cpu_eng =
             RealLlamaEngine::load_moe_from_files(&dir, &core, &experts, 256, MoeExpertOpenPolicy::ForceZeroCopyMmap).unwrap();
@@ -5349,6 +5457,56 @@ mod tests {
             assert!(cos_d > 0.999 && kl_d < 0.01, "moe decode step {step}: cos={cos_d:.6}, kl={kl_d:.6}");
         }
         cpu_eng.set_num_threads(1);
+        }
+
+        // Hot-expert shard: experts flagged by the histogram are read from a second shard.
+        {
+            let core3 = dir.join("core1.k2tb");
+            let experts3 = dir.join("experts1.k2tm");
+            let experts4 = dir.join("experts0.k2tm");
+            let csv = dir.join("hist.csv");
+            let mut hist = String::from("layer,expert,count\n");
+            for l in 0..nl {
+                for e in 0..n_exp {
+                    hist.push_str(&format!("{l},{e},{}\n", if e < 2 { 5 } else { 1 }));
+                }
+            }
+            fs::write(&csv, hist).unwrap();
+            let load_gpu = |hot: &Path, gib: f64| {
+                std::env::set_var("KRONOS_EXPERT_HOT_SHARD", hot);
+                std::env::set_var("KRONOS_EXPERT_HOT", &csv);
+                std::env::set_var("KRONOS_WIRE_GIB", format!("{gib}"));
+                let mut g = RealLlamaEngine::load_moe_from_files(&dir, &core3, &experts3, 256, MoeExpertOpenPolicy::ForceZeroCopyMmap).unwrap();
+                std::env::remove_var("KRONOS_EXPERT_HOT_SHARD");
+                std::env::remove_var("KRONOS_EXPERT_HOT");
+                std::env::remove_var("KRONOS_WIRE_GIB");
+                g.enable_metal().expect("Metal MoE with hot shard");
+                g
+            };
+            let mut plain = RealLlamaEngine::load_moe_from_files(&dir, &core3, &experts3, 256, MoeExpertOpenPolicy::ForceZeroCopyMmap).unwrap();
+            plain.enable_metal().unwrap();
+            // Same shard as hot shard: bit-identical to the plain engine.
+            let mut same = load_gpu(&experts3, 1.0);
+            // nf4 shard for the two most-routed experts per layer (budget = 4 records).
+            let rec4 = fs::metadata(&experts4).unwrap().len() as f64 / (1.0 + (nl * n_exp) as f64) / (1u64 << 30) as f64;
+            let mut mixed = load_gpu(&experts4, rec4 * 4.5);
+            let toks: Vec<usize> = (0..70).map(|i| (i * 11 + 2) % vocab).collect();
+            let lp = plain.forward_prompt(&toks).to_vec();
+            let ls = same.forward_prompt(&toks).to_vec();
+            let lm = mixed.forward_prompt(&toks).to_vec();
+            assert_eq!(lp, ls, "hot shard with identical records changed the logits");
+            let (cos_m, kl_m) = (cosine_sim(&lp, &lm), kl_divergence_nats(&lp, &lm));
+            eprintln!("mixed nf3/nf4 experts vs nf3: cos={cos_m:.6} kl={kl_m:.6}");
+            assert!(lm.iter().all(|v| v.is_finite()) && cos_m > 0.99 && kl_m < 0.05, "mixed experts: cos={cos_m:.6} kl={kl_m:.6}");
+            assert_ne!(lp, lm, "nf4 hot experts were not used");
+            for step in 0..4 {
+                let tok = (step * 17 + 9) % vocab;
+                let a = plain.forward_token(tok).to_vec();
+                let b = same.forward_token(tok).to_vec();
+                let c = mixed.forward_token(tok).to_vec();
+                assert_eq!(a, b);
+                assert!(cosine_sim(&a, &c) > 0.99, "mixed decode step {step}");
+            }
         }
         let _ = fs::remove_dir_all(&dir);
     }
