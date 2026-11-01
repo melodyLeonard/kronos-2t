@@ -21,6 +21,18 @@ Numbers, method and limitations: [BENCHMARKS.md](BENCHMARKS.md).
 | Kronos Bipolar-6 | 100.2 MiB | 0.006 | 352 tok/s | 1185 tok/s |
 | llama.cpp Q6_K | 130.3 MiB | 0.007 | 377 tok/s | 612 tok/s |
 
+### In use
+
+![Kronos web UI: the agent builds a tip calculator from one prompt and previews it](docs/images/kronos-web.png)
+
+Web UI, Qwen3-Coder-30B on a 24 GB M4 Pro. One prompt builds this tip calculator in 35 s: the agent
+writes the file, recovers from a cut-off reply, runs its checks and shows the page in the preview.
+
+<img src="docs/images/kronos-mobile.png" width="280" alt="Kronos iOS test app answering a coding prompt in the iPhone simulator">
+
+iOS test app in the iPhone simulator, on the Mac CPU, with Qwen3-0.6B inside the app. `/no_think`
+tells the model to skip its reasoning step; the app still shows the empty tags.
+
 ### How it works
 
 - **Rotation.** Weights and activations are rotated with a signed 64-point Walsh-Hadamard
