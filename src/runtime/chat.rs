@@ -970,7 +970,11 @@ impl ChatModel {
 
     /// CPU threads the engine uses (the Metal path keeps the default pool size).
     pub fn num_threads(&self) -> usize {
-        self.engine.num_threads()
+        if self.engine.is_metal_enabled() {
+            crate::kernels::thread_pool::default_inference_threads()
+        } else {
+            self.engine.num_threads()
+        }
     }
 
     pub fn context_size(&self) -> usize {

@@ -274,6 +274,10 @@ fn restart_server(srv: &Server, args: Vec<String>) -> Result<(), String> {
     let mut cmd = std::process::Command::new(&srv.launch_exe);
     cmd.args(&args[1..]);
     cmd.stdin(std::process::Stdio::null());
+    // Flags set these for this process; the child's own flags must decide them.
+    for v in ["KRONOS_EXPERT_HOT_SHARD", "KRONOS_EXPERT_HOT", "KRONOS_WIRE_GIB"] {
+        cmd.env_remove(v);
+    }
     cmd.spawn().map_err(|e| format!("spawn {}: {e}", srv.launch_exe.display()))?;
     eprintln!("restarting with: {}", args[1..].join(" "));
     std::thread::spawn(|| {
