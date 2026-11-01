@@ -45,15 +45,75 @@
     border-right:1px solid var(--sb-line); display:flex; flex-direction:column;
     user-select:none; z-index:4; transition:margin-left .18s ease;
   }
-  #sidebar.collapsed { display:none; }
-  .sb-top { padding:12px 12px 8px; display:flex; flex-direction:column; gap:6px; }
-  #btn-new-conv {
-    width:100%; display:flex; align-items:center; gap:9px; padding:8px 12px;
-    background:rgba(255,255,255,0.04); color:var(--sb-text);
-    border:1px solid var(--sb-line); border-radius:10px; font-weight:600; font-size:13.5px;
-    text-align:left;
+  #sidebar.collapsed { width:56px; min-width:56px; }
+  #sidebar.collapsed #sb-search-wrap, #sidebar.collapsed .sb-section-hdr, #sidebar.collapsed #sb-scroll,
+  #sidebar.collapsed #add-proj-box, #sidebar.collapsed .sb-shortcut-hint, #sidebar.collapsed .sb-ib-badge { display:none; }
+  #sidebar.collapsed .sb-iconrow { flex-direction:column; align-items:center; }
+  #sidebar.collapsed .sb-footer { justify-content:center; }
+  .sb-iconrow { display:flex; align-items:center; gap:4px; padding:10px 10px 6px; }
+  .sb-ib {
+    width:34px; height:34px; display:inline-flex; align-items:center; justify-content:center;
+    background:transparent; border:none; border-radius:9px; color:#c8cbd4; padding:0; position:relative;
   }
-  #btn-new-conv:hover { background:var(--sb-hover); border-color:rgba(255,255,255,0.18); }
+  .sb-ib:hover, .sb-ib.active { background:var(--sb-hover); color:#fff; }
+  .sb-ib.primary { background:rgba(255,255,255,0.08); color:#fff; }
+  .sb-ib.primary:hover { background:rgba(255,255,255,0.14); }
+  .sb-ib-badge {
+    position:absolute; top:3px; right:3px; min-width:14px; height:14px; padding:0 3px;
+    font:9.5px ui-monospace, SFMono-Regular, Menlo, monospace; line-height:14px; text-align:center;
+    border-radius:999px; background:var(--sb-panel); color:var(--sb-muted);
+  }
+  .sb-grow { flex:1; }
+  .hdr-ib {
+    width:32px; height:32px; display:inline-flex; align-items:center; justify-content:center;
+    padding:0; border-radius:9px; color:var(--muted); position:relative;
+  }
+  .hdr-ib:hover { color:var(--text); }
+  .hdr-ib.active { border-color:var(--accent); color:var(--accent); }
+  .hdr-ib .cnt {
+    position:absolute; top:-5px; right:-5px; min-width:15px; height:15px; padding:0 4px;
+    font:10px ui-monospace, SFMono-Regular, Menlo, monospace; line-height:15px; text-align:center;
+    border-radius:999px; background:var(--accent); color:var(--accent-ink);
+  }
+  .hdr-ib .cnt:empty, .hdr-ib .cnt.zero { display:none; }
+  .srv-row { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:6px 0; font-size:12px; }
+  .srv-row select { width:160px; font-size:12px; padding:4px 7px; }
+  .srv-stat { font-size:11px; color:var(--muted); line-height:1.5; margin:4px 0 6px; }
+  .srv-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
+  .btn-danger { border-color:#ef4444; color:#ef4444; }
+  .btn-danger:hover:not(:disabled) { background:rgba(239,68,68,0.1); border-color:#ef4444; }
+  .btn-accent { background:var(--accent); color:var(--accent-ink); border-color:var(--accent); }
+  #srv-overlay {
+    position:fixed; inset:0; background:rgba(0,0,0,0.58); display:none; align-items:center;
+    justify-content:center; z-index:60; color:#fff; font-size:14px; flex-direction:column; gap:10px;
+  }
+  #srv-overlay.open { display:flex; }
+  #srv-overlay .spin {
+    width:26px; height:26px; border:3px solid rgba(255,255,255,0.25); border-top-color:#fff;
+    border-radius:50%; animation:srvspin .9s linear infinite;
+  }
+  @keyframes srvspin { to { transform:rotate(360deg); } }
+  /* Code view: syntax tokens and lint gutter */
+  .tok-kw { color:#7c3aed; } .tok-str { color:#15803d; } .tok-num { color:#b45309; }
+  .tok-cmt { color:#6b7280; font-style:italic; } .tok-fn { color:#1d4ed8; } .tok-type { color:#0f766e; }
+  .tok-op { color:#0e7490; } .tok-tag { color:#be123c; } .tok-attr { color:#b45309; } .tok-dec { color:#a16207; }
+  @media (prefers-color-scheme: dark) {
+    .tok-kw { color:#c678dd; } .tok-str { color:#98c379; } .tok-num { color:#d19a66; }
+    .tok-cmt { color:#7f848e; } .tok-fn { color:#61afef; } .tok-type { color:#e5c07b; }
+    .tok-op { color:#56b6c2; } .tok-tag { color:#e06c75; } .tok-attr { color:#d19a66; } .tok-dec { color:#e5c07b; }
+  }
+  #code-view .ln {
+    display:inline-block; width:3.4em; margin-right:12px; color:var(--muted); text-align:right;
+    user-select:none; opacity:.75;
+  }
+  #code-view .ln.err { color:#ef4444; opacity:1; font-weight:600; }
+  #code-view .line.err { background:rgba(239,68,68,0.10); }
+  #lint-bar {
+    display:none; padding:6px 12px; font-size:12px; background:var(--err-bg); color:var(--err-fg);
+    border-bottom:1px solid var(--line); white-space:pre-wrap;
+  }
+  #lint-bar.open { display:block; }
+  .sb-top { padding:12px 12px 8px; display:flex; flex-direction:column; gap:6px; }
   .sb-nav-btn {
     width:100%; display:flex; align-items:center; justify-content:space-between; gap:9px;
     padding:7px 10px; background:transparent; color:#c8cbd4; border:none; border-radius:8px;
@@ -652,23 +712,24 @@
 </head>
 <body>
 <aside id="sidebar">
-  <div class="sb-top">
-    <button id="btn-new-conv" type="button" title="Start a new conversation (Cmd+N)">
-      <span>+</span><span>New Conversation</span>
+  <div class="sb-iconrow">
+    <button id="btn-new-conv" class="sb-ib primary" type="button" title="New conversation (Cmd+N)" aria-label="New conversation">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
     </button>
-    <button id="nav-history" class="sb-nav-btn" type="button" title="Search and filter conversation history">
-      <span class="sb-nav-left">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></svg>
-        <span>Conversation History</span>
-      </span>
-      <span class="sb-badge" id="sb-total-sessions">0</span>
+    <button id="nav-history" class="sb-ib" type="button" title="Search conversations" aria-label="Search conversations">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <span class="sb-ib-badge" id="sb-total-sessions">0</span>
     </button>
-    <button id="nav-changes" class="sb-nav-btn" type="button" title="Inspect historical diffs and revert file checkpoints">
-      <span class="sb-nav-left">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 15h6"/><path d="M12 12v6"/></svg>
-        <span>Historical Changes</span>
-      </span>
-      <span class="sb-badge" id="sb-total-changes">0</span>
+    <button id="nav-changes" class="sb-ib" type="button" title="File changes and checkpoints" aria-label="File changes">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M9 15h6M9 11h6"/></svg>
+      <span class="sb-ib-badge" id="sb-total-changes">0</span>
+    </button>
+    <button id="btn-add-proj" class="sb-ib" type="button" title="Open or create a project folder" aria-label="Open project folder">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 11v6M9 14h6"/></svg>
+    </button>
+    <span class="sb-grow"></span>
+    <button id="sb-collapse" class="sb-ib" type="button" title="Collapse sidebar (Cmd+B)" aria-label="Collapse sidebar">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/></svg>
     </button>
   </div>
 
@@ -680,7 +741,6 @@
     <span>Projects</span>
     <div class="sb-hdr-actions">
       <button id="btn-filter-proj" class="sb-icon-btn" type="button" title="Filter conversations">≡</button>
-      <button id="btn-add-proj" class="sb-icon-btn" type="button" title="Open or create project workspace folder">+</button>
     </div>
   </div>
 
@@ -695,18 +755,34 @@
   <div id="sb-scroll"></div>
 
   <div class="sb-footer">
-    <button id="sb-settings-btn" type="button">
+    <button id="sb-settings-btn" class="sb-ib" type="button" title="Settings: model, effort, server, routing" aria-label="Settings">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.85 1 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-      <span>Settings</span>
     </button>
-    <span class="sb-shortcut-hint" title="Global macOS Quick Prompt shortcut">⌥Space</span>
+    <span class="sb-shortcut-hint" title="Global macOS Quick Prompt shortcut (kronos_menubar)">⌥Space</span>
   </div>
 </aside>
 
 <div id="settings-popover">
   <div class="settings-hdr">
-    <span>Kronos Engine Settings</span>
+    <span>Settings</span>
     <button id="settings-close" class="mini-btn" type="button">Close</button>
+  </div>
+  <div class="dev-ctx-box" id="srv-box">
+    <div class="srv-stat" id="srv-stat">Loading server status…</div>
+    <div class="srv-row"><span>Model</span><select id="srv-model"></select></div>
+    <div class="srv-row"><span>Mode</span><select id="srv-mode"></select></div>
+    <div class="srv-row" title="Effort sets CPU threads, context window and the RAM wired for experts">
+      <span>Effort</span>
+      <select id="srv-effort">
+        <option value="low">Low · less RAM and CPU</option>
+        <option value="balanced">Balanced</option>
+        <option value="high">High · all cores, full context</option>
+      </select>
+    </div>
+    <div class="srv-actions">
+      <button id="srv-apply" class="mini-btn btn-accent" type="button" title="Restart the server with the selected model, mode and effort">Apply and restart</button>
+      <button id="srv-stop" class="mini-btn btn-danger" type="button" title="Stop the Kronos server process">Stop server</button>
+    </div>
   </div>
   <div class="dev-ctx-box">
     <label title="Build a sub-millisecond memory-mapped index of local documents, certificates, apps, projects, and watched media">
@@ -752,10 +828,19 @@
       <span class="model" id="model">connecting…</span>
     </div>
     <span class="ctx-pill" id="ctx-meter" title="Active prompt tokens / context capacity">ctx 0 / 16.4k</span>
-    <button id="device-hdr-btn" type="button" title="Configure Device Context memory artifact and macOS Computer Use">Device: OFF</button>
-    <button id="compact-btn" type="button" title="Compact older history while preserving workspace state">Compact</button>
-    <button id="parallel-hdr-btn" type="button" title="Spawn a parallel background Kronos agent in its own workspace">+ Parallel Task</button>
-    <button id="ws-toggle" type="button" title="Open or close workspace preview and diff inspector">Workspace (<span id="ws-count">0</span>)</button>
+    <button id="device-hdr-btn" class="hdr-ib" type="button" title="Device context: off" aria-label="Device context">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+    </button>
+    <button id="compact-btn" class="hdr-ib" type="button" title="Compact older history while keeping workspace state" aria-label="Compact history">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h10"/><path d="m18 15 2 2 2-2M20 11v6"/></svg>
+    </button>
+    <button id="parallel-hdr-btn" class="hdr-ib" type="button" title="Start a parallel background task in its own workspace" aria-label="Parallel task">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h7v12H4zM13 6h7v12h-7z"/><path d="M7.5 10v4M16.5 10v4M5.5 12h4M14.5 12h4"/></svg>
+    </button>
+    <button id="ws-toggle" class="hdr-ib" type="button" title="Workspace: preview, code and changes" aria-label="Workspace">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m8 8-4 4 4 4M16 8l4 4-4 4M13 5l-2 14"/></svg>
+      <span class="cnt" id="ws-count">0</span>
+    </button>
   </header>
 
   <div id="layout">
@@ -838,6 +923,7 @@
             <span id="code-path">no file selected</span>
             <span id="code-status" class="pill run">empty</span>
           </div>
+          <div id="lint-bar"></div>
           <pre id="code-view"></pre>
         </div>
         <div id="changes-wrap"></div>
@@ -845,6 +931,8 @@
     </aside>
   </div>
 </div>
+
+<div id="srv-overlay"><div class="spin"></div><div id="srv-overlay-msg">Restarting Kronos…</div></div>
 
 <div id="dev-profile-modal">
   <div class="dev-modal-card">
@@ -1036,6 +1124,62 @@ function renderEmptyState() {
   log.appendChild(wrap);
 }
 
+/* Server: status, model, effort, restart, stop */
+let srvModels = null;
+async function loadServerPanel() {
+  try {
+    const [st, ml] = await Promise.all([
+      fetch("/v1/admin/status", { headers: headers() }).then(r => r.json()),
+      fetch("/v1/admin/models", { headers: headers() }).then(r => r.json()),
+    ]);
+    srvModels = ml.models || [];
+    $("srv-stat").textContent = `${st.model} · ${st.mode} · ctx ${st.ctx} · ${st.threads}/${st.cores} threads · weights ${st.weights_gib} GiB · KV ${st.kv_gib} GiB · effort ${st.effort}${st.hot_shard ? " · nf4 hot experts" : ""} · up ${Math.round(st.uptime_s / 60)} min`;
+    const ms = $("srv-model");
+    ms.innerHTML = srvModels.map(m => `<option value="${escHtml(m.dir)}"${m.current ? " selected" : ""}>${escHtml(m.name)}</option>`).join("");
+    const fillModes = () => {
+      const m = srvModels.find(x => x.dir === ms.value);
+      $("srv-mode").innerHTML = (m ? m.modes : []).map(x => `<option value="${escHtml(x.mode)}"${(m.current && x.mode === st.mode) ? " selected" : ""}>${escHtml(x.mode)}${x.moe ? " · MoE" : ""} · ${(x.bytes / 1073741824).toFixed(1)} GiB</option>`).join("");
+    };
+    fillModes();
+    ms.onchange = fillModes;
+    if (["low", "balanced", "high"].includes(st.effort)) $("srv-effort").value = st.effort;
+  } catch (e) {
+    $("srv-stat").textContent = "Server status unavailable";
+  }
+}
+async function waitForServer(msg) {
+  const ov = $("srv-overlay");
+  $("srv-overlay-msg").textContent = msg;
+  ov.classList.add("open");
+  const t0 = Date.now();
+  let wentDown = false;
+  while (Date.now() - t0 < 10 * 60 * 1000) {
+    await new Promise(r => setTimeout(r, 1500));
+    try {
+      const r = await fetch("/v1/models", { headers: headers(), cache: "no-store" });
+      if (r.ok && wentDown) { location.reload(); return; }
+    } catch (e) { wentDown = true; }
+    $("srv-overlay-msg").textContent = `${msg} (${Math.round((Date.now() - t0) / 1000)} s)`;
+  }
+  $("srv-overlay-msg").textContent = "The server did not come back; start it from a terminal.";
+}
+$("srv-apply").onclick = async () => {
+  const body = { model_dir: $("srv-model").value, mode: $("srv-mode").value, effort: $("srv-effort").value };
+  if (!confirm(`Restart Kronos with ${body.mode} at effort ${body.effort}? Running turns stop and the model reloads (about a minute).`)) return;
+  const r = await fetch("/v1/admin/restart", { method: "POST", headers: headers(), body: JSON.stringify(body) });
+  if (!r.ok) { alert(await r.text()); return; }
+  $("settings-popover").classList.remove("open");
+  waitForServer("Restarting Kronos with the selected model…");
+};
+$("srv-stop").onclick = async () => {
+  if (!confirm("Stop the Kronos server? The web UI goes offline until you start it again.")) return;
+  const r = await fetch("/v1/admin/stop", { method: "POST", headers: headers(), body: "{}" });
+  if (!r.ok) { alert(await r.text()); return; }
+  $("settings-popover").classList.remove("open");
+  const ov = $("srv-overlay"); ov.classList.add("open"); ov.querySelector(".spin").style.display = "none";
+  $("srv-overlay-msg").textContent = "Kronos server stopped. Start it again from a terminal or the menu bar app.";
+};
+
 /* Sidebar & Settings toggles */
 function toggleSidebar(force) {
   const sb = $("sidebar");
@@ -1044,10 +1188,12 @@ function toggleSidebar(force) {
   store("kronos-sb-collapsed", collapsed ? "1" : "0");
 }
 $("sidebar-toggle").onclick = () => toggleSidebar();
+$("sb-collapse").onclick = () => toggleSidebar();
 
 $("sb-settings-btn").onclick = (e) => {
   e.stopPropagation();
-  $("settings-popover").classList.toggle("open");
+  const open = $("settings-popover").classList.toggle("open");
+  if (open) loadServerPanel();
 };
 $("device-hdr-btn").onclick = (e) => {
   e.stopPropagation();
@@ -1056,7 +1202,7 @@ $("device-hdr-btn").onclick = (e) => {
 $("settings-close").onclick = () => $("settings-popover").classList.remove("open");
 window.addEventListener("click", (e) => {
   const pop = $("settings-popover");
-  if (pop.classList.contains("open") && !pop.contains(e.target) && e.target !== $("sb-settings-btn") && e.target !== $("device-hdr-btn")) {
+  if (pop.classList.contains("open") && !pop.contains(e.target) && !$("sb-settings-btn").contains(e.target) && !$("device-hdr-btn").contains(e.target)) {
     pop.classList.remove("open");
   }
 });
@@ -1068,10 +1214,10 @@ function renderDeviceStatus(st) {
   const btn = $("device-hdr-btn");
   btn.classList.toggle("active", !!st.enabled);
   if (st.enabled) {
-    btn.textContent = `Device · ${st.indexed_entries || 0} items`;
+    btn.title = `Device context: on · ${st.indexed_entries || 0} items`;
     $("dev-ctx-stats").textContent = `${st.indexed_entries || 0} items (${st.apps_count || 0} apps, ${st.docs_count || 0} docs, ${st.media_count || 0} media) · built in ${(st.build_ms || 0).toFixed(1)} ms · ${st.learned_facts_count || 0} learned facts`;
   } else {
-    btn.textContent = "Device: OFF";
+    btn.title = "Device context: off";
     $("dev-ctx-stats").textContent = st.indexed_entries > 0
       ? `Paused (${st.indexed_entries} cached items on disk)`
       : "Turn on to index local documents, certificates, apps, and watched media";
@@ -1382,9 +1528,99 @@ async function loadSelectedFile(relPath) {
     const j = await r.json();
     $("code-path").textContent = `${j.path} (${j.bytes} B)`;
     $("code-status").className = "pill " + (j.validation_ok ? "ok" : "warn");
-    $("code-status").textContent = j.validation_ok ? "valid" : j.validation_msg;
-    $("code-view").textContent = j.content || "";
+    $("code-status").textContent = j.validation_ok ? "valid" : "lint";
+    renderCodeView(j.content || "", pathExtLower(j.path), j.validation_ok ? "" : (j.validation_msg || ""));
   } catch (e) {}
+}
+
+/* Syntax highlighting: a small tokenizer per language family; everything is escaped first. */
+const HL_LANGS = {
+  py: { kw: "and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield True False None self", cmt: "#", str3: true, dec: "@" },
+  js: { kw: "async await break case catch class const continue debugger default delete do else export extends finally for function if import in instanceof let new of return static super switch this throw try typeof var void while with yield true false null undefined", cmt: "//", block: true, tmpl: true },
+  rs: { kw: "as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while", cmt: "//", block: true, types: true },
+  sh: { kw: "if then else elif fi for while do done case esac in function return exit export local echo set", cmt: "#" },
+  css: { kw: "", cmt: "", block: true, css: true },
+  html: { html: true },
+  json: { kw: "true false null", json: true },
+  md: { md: true },
+  toml: { kw: "true false", cmt: "#" }, yaml: { kw: "true false null", cmt: "#" },
+};
+HL_LANGS.ts = HL_LANGS.jsx = HL_LANGS.tsx = HL_LANGS.mjs = HL_LANGS.cjs = HL_LANGS.js;
+HL_LANGS.c = HL_LANGS.cpp = HL_LANGS.h = HL_LANGS.java = HL_LANGS.go = HL_LANGS.swift = HL_LANGS.kt = { kw: HL_LANGS.rs.kw + " int float double char void bool long unsigned include define var func package nil", cmt: "//", block: true, types: true };
+HL_LANGS.zsh = HL_LANGS.bash = HL_LANGS.sh; HL_LANGS.htm = HL_LANGS.html; HL_LANGS.yml = HL_LANGS.yaml;
+HL_LANGS.markdown = HL_LANGS.md;
+function escHtml(t) { return t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+function highlightCode(src, ext) {
+  const L = HL_LANGS[ext];
+  if (!L) return escHtml(src);
+  if (L.html) return highlightMarkup(src);
+  if (L.md) return escHtml(src).replace(/^(#{1,6} .*)$/gm, '<span class="tok-kw">$1</span>').replace(/(`[^`\n]+`)/g, '<span class="tok-str">$1</span>').replace(/^(\s*[-*] )/gm, '<span class="tok-op">$1</span>');
+  const kw = new Set((L.kw || "").split(/\s+/).filter(Boolean));
+  let out = "", i = 0, n = src.length;
+  const push = (cls, text) => { out += cls ? `<span class="${cls}">${escHtml(text)}</span>` : escHtml(text); };
+  while (i < n) {
+    const c = src[i], c2 = src.substr(i, 2), c3 = src.substr(i, 3);
+    if (L.cmt && (c === L.cmt || (L.cmt === "//" && c2 === "//"))) { let j = src.indexOf("\n", i); if (j < 0) j = n; push("tok-cmt", src.slice(i, j)); i = j; continue; }
+    if (L.block && c2 === "/*") { let j = src.indexOf("*/", i + 2); j = j < 0 ? n : j + 2; push("tok-cmt", src.slice(i, j)); i = j; continue; }
+    if (L.str3 && (c3 === '"""' || c3 === "'''")) { let j = src.indexOf(c3, i + 3); j = j < 0 ? n : j + 3; push("tok-str", src.slice(i, j)); i = j; continue; }
+    if (c === '"' || c === "'" || (L.tmpl && c === "`")) { let j = i + 1; while (j < n && src[j] !== c && src[j] !== "\n") { if (src[j] === "\\") j++; j++; } j = Math.min(n, j + 1); push("tok-str", src.slice(i, j)); i = j; continue; }
+    if (L.dec && c === "@") { let j = i + 1; while (j < n && /[\w.]/.test(src[j])) j++; push("tok-dec", src.slice(i, j)); i = j; continue; }
+    if (/[0-9]/.test(c) && (i === 0 || !/[\w]/.test(src[i - 1]))) { let j = i; while (j < n && /[0-9a-fA-Fxob_.]/.test(src[j])) j++; push("tok-num", src.slice(i, j)); i = j; continue; }
+    if (/[A-Za-z_$]/.test(c)) {
+      let j = i; while (j < n && /[\w$]/.test(src[j])) j++;
+      const w = src.slice(i, j);
+      let k = j; while (k < n && src[k] === " ") k++;
+      if (kw.has(w)) push("tok-kw", w);
+      else if (src[k] === "(") push("tok-fn", w);
+      else if (L.types && /^[A-Z]/.test(w)) push("tok-type", w);
+      else if ((L.css || L.json) && src[k] === ":") push("tok-attr", w);
+      else push("", w);
+      i = j; continue;
+    }
+    if (L.css && (c === "." || c === "#") && /[A-Za-z_-]/.test(src[i + 1] || "")) { let j = i + 1; while (j < n && /[\w-]/.test(src[j])) j++; push("tok-tag", src.slice(i, j)); i = j; continue; }
+    if ("+-*/=<>!&|^%?:;,.(){}[]".includes(c)) { push(/[=<>!&|^%?+\-*/]/.test(c) ? "tok-op" : "", c); i++; continue; }
+    push("", c); i++;
+  }
+  return out;
+}
+function highlightMarkup(src) {
+  let out = "", i = 0; const n = src.length;
+  while (i < n) {
+    if (src.startsWith("<!--", i)) { let j = src.indexOf("-->", i); j = j < 0 ? n : j + 3; out += `<span class="tok-cmt">${escHtml(src.slice(i, j))}</span>`; i = j; continue; }
+    const m = /^<(\/?)([A-Za-z][\w:-]*)/.exec(src.slice(i));
+    if (m) {
+      let j = src.indexOf(">", i); j = j < 0 ? n : j + 1;
+      const tag = src.slice(i, j);
+      const inner = tag.replace(/^<\/?[\w:-]+/, "").replace(/\/?>$/, "");
+      const attrs = escHtml(inner).replace(/([\w:-]+)(=)("[^"]*"|'[^']*')/g, '<span class="tok-attr">$1</span>$2<span class="tok-str">$3</span>');
+      out += `<span class="tok-tag">&lt;${m[1]}${escHtml(m[2])}</span>${attrs}<span class="tok-tag">${tag.endsWith("/>") ? "/&gt;" : "&gt;"}</span>`;
+      i = j;
+      const low = m[2].toLowerCase();
+      if (!m[1] && (low === "script" || low === "style")) {
+        const close = src.toLowerCase().indexOf("</" + low, i);
+        const end = close < 0 ? n : close;
+        out += highlightCode(src.slice(i, end), low === "script" ? "js" : "css");
+        i = end;
+      }
+      continue;
+    }
+    let j = src.indexOf("<", i + 1); if (j < 0) j = n;
+    out += escHtml(src.slice(i, j)); i = j;
+  }
+  return out;
+}
+/* A lint message naming "line N" marks that line in the gutter. */
+function renderCodeView(text, ext, lintMsg) {
+  const errLine = (() => { const m = /line\s+(\d+)/i.exec(lintMsg || ""); return m ? +m[1] : 0; })();
+  const bar = $("lint-bar");
+  bar.textContent = lintMsg || "";
+  bar.classList.toggle("open", !!lintMsg);
+  const lines = highlightCode(text, ext).split("\n");
+  const w = String(lines.length).length;
+  $("code-view").innerHTML = lines.map((l, i) => {
+    const no = i + 1, err = no === errLine;
+    return `<span class="line${err ? " err" : ""}"><span class="ln${err ? " err" : ""}">${String(no).padStart(w)}</span>${l}</span>`;
+  }).join("\n");
 }
 
 function pathExtLower(p) {
@@ -1542,6 +1778,7 @@ async function refreshWorkspace(reloadIframe) {
     wsDeliverables = Array.isArray(j.deliverables) ? j.deliverables : [];
     previewPath = j.preview_path || "";
     $("ws-count").textContent = String(wsFiles.length);
+    $("ws-count").classList.toggle("zero", wsFiles.length === 0);
     const sel = $("file-select");
     const prevVal = sel.value;
     sel.innerHTML = "";

@@ -111,6 +111,176 @@ struct Server {
     gate: ModelGate,
     /// Hash of the chat page last served; the page reloads itself when it changes.
     ui_stamp: AtomicU64,
+    /// How this process was started, so the UI can restart it with another model or effort.
+    launch_exe: PathBuf,
+    launch_args: Vec<String>,
+    started_at: Instant,
+}
+
+/// Effort presets: share of the CPU threads, context window, wired expert GiB, hot nf4 shard.
+const EFFORTS: [(&str, f64, usize, f64, bool); 3] = [
+    ("low", 0.5, 8192, 4.0, false),
+    ("balanced", 0.75, 16384, 6.0, false),
+    ("high", 1.0, 32768, 9.0, true),
+];
+
+fn arg_value(args: &[String], name: &str) -> Option<String> {
+    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+}
+
+/// Removes `name` (and its value when `has_value`) from `args`.
+fn strip_arg(args: &mut Vec<String>, name: &str, has_value: bool) {
+    while let Some(i) = args.iter().position(|a| a == name) {
+        args.remove(i);
+        if has_value && i < args.len() {
+            args.remove(i);
+        }
+    }
+}
+
+/// Compiled modes in a model directory: `kronos-<mode>.k2tb` or `kronos-moe-core-<mode>.k2tb`.
+fn compiled_modes(dir: &Path) -> Vec<(String, bool, u64)> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(dir) else { return out };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(stem) = name.strip_suffix(".k2tb") else { continue };
+        let (mode, moe) = if let Some(m) = stem.strip_prefix("kronos-moe-core-") {
+            (m.to_string(), true)
+        } else if let Some(m) = stem.strip_prefix("kronos-") {
+            (m.to_string(), false)
+        } else {
+            continue;
+        };
+        let mut bytes = e.metadata().map_or(0, |m| m.len());
+        if moe {
+            bytes += fs::metadata(dir.join(format!("kronos-moe-experts-{mode}.k2tm"))).map_or(0, |m| m.len());
+        }
+        out.push((mode, moe, bytes));
+    }
+    out.sort();
+    out
+}
+
+/// Models next to the running one (its parent directory) that have a compiled cache.
+fn admin_models_json(srv: &Server) -> String {
+    let cur_dir = PathBuf::from(&srv.launch_args[1]);
+    let root = cur_dir.parent().map_or_else(|| cur_dir.clone(), Path::to_path_buf);
+    let mut dirs: Vec<PathBuf> = fs::read_dir(&root)
+        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .unwrap_or_default();
+    dirs.sort();
+    let mut items = Vec::new();
+    for d in dirs {
+        let modes = compiled_modes(&d);
+        if modes.is_empty() {
+            continue;
+        }
+        let modes_json: Vec<String> = modes
+            .iter()
+            .map(|(m, moe, b)| format!(r#"{{"mode":{},"moe":{moe},"bytes":{b}}}"#, quote(m)))
+            .collect();
+        let hot = d.join("kronos-moe-experts-nf4g128.k2tm").exists();
+        items.push(format!(
+            r#"{{"dir":{},"name":{},"current":{},"hot_nf4_shard":{hot},"modes":[{}]}}"#,
+            quote(&d.to_string_lossy()),
+            quote(&d.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()),
+            d == cur_dir,
+            modes_json.join(",")
+        ));
+    }
+    format!(r#"{{"root":{},"models":[{}]}}"#, quote(&root.to_string_lossy()), items.join(","))
+}
+
+fn current_effort(args: &[String]) -> &'static str {
+    let ctx = arg_value(args, "--ctx").and_then(|v| v.parse::<usize>().ok());
+    let wire = arg_value(args, "--moe-wire-gib").and_then(|v| v.parse::<f64>().ok());
+    for (name, _, e_ctx, e_wire, _) in EFFORTS {
+        if ctx == Some(e_ctx) && (wire.is_none() || wire == Some(e_wire)) {
+            return name;
+        }
+    }
+    "custom"
+}
+
+fn admin_status_json(srv: &Server) -> String {
+    let (weights, kv, threads, ctx) = {
+        let m = srv.model.lock().unwrap_or_else(|p| p.into_inner());
+        (m.resident_weight_bytes(), m.kv_cache_bytes(), m.num_threads(), m.context_size())
+    };
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    let effort_json: Vec<String> = EFFORTS
+        .iter()
+        .map(|(n, f, c, w, h)| format!(r#"{{"name":{},"threads":{},"ctx":{c},"wire_gib":{w},"hot_shard":{h}}}"#, quote(n), ((cores as f64 * f).round() as usize).max(1)))
+        .collect();
+    format!(
+        r#"{{"model":{},"model_dir":{},"mode":{},"ctx":{ctx},"threads":{threads},"cores":{cores},"weights_gib":{:.2},"kv_gib":{:.2},"effort":{},"hot_shard":{},"uptime_s":{:.0},"pid":{},"efforts":[{}]}}"#,
+        quote(&srv.name),
+        quote(&srv.launch_args[1]),
+        quote(&arg_value(&srv.launch_args, "--mode").unwrap_or_else(|| "p55454".to_string())),
+        weights as f64 / (1u64 << 30) as f64,
+        kv as f64 / (1u64 << 30) as f64,
+        quote(current_effort(&srv.launch_args)),
+        arg_value(&srv.launch_args, "--moe-hot-shard").is_some(),
+        srv.started_at.elapsed().as_secs_f64(),
+        std::process::id(),
+        effort_json.join(",")
+    )
+}
+
+/// Launch arguments for a restart with another model directory, mode or effort preset.
+fn restart_args(srv: &Server, model_dir: Option<&str>, mode: Option<&str>, effort: Option<&str>) -> Result<Vec<String>, String> {
+    let mut args = srv.launch_args.clone();
+    if let Some(d) = model_dir {
+        if !Path::new(d).join("config.json").exists() {
+            return Err(format!("{d} has no config.json"));
+        }
+        args[1] = d.to_string();
+    }
+    let dir = PathBuf::from(&args[1]);
+    if let Some(m) = mode {
+        if !compiled_modes(&dir).iter().any(|(cm, _, _)| cm == m) {
+            return Err(format!("mode {m} is not compiled in {}", dir.display()));
+        }
+        strip_arg(&mut args, "--mode", true);
+        args.extend(["--mode".to_string(), m.to_string()]);
+    }
+    if let Some(e) = effort {
+        let Some(&(_, frac, ctx, wire, hot)) = EFFORTS.iter().find(|p| p.0 == e) else {
+            return Err(format!("unknown effort {e}"));
+        };
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        for (name, has_value) in [("--threads", true), ("--ctx", true), ("--moe-wire-gib", true), ("--moe-hot-shard", true)] {
+            strip_arg(&mut args, name, has_value);
+        }
+        args.extend(["--threads".to_string(), ((cores as f64 * frac).round() as usize).max(1).to_string()]);
+        args.extend(["--ctx".to_string(), ctx.to_string()]);
+        if arg_value(&args, "--moe-hot").is_some() {
+            args.extend(["--moe-wire-gib".to_string(), wire.to_string()]);
+            let shard = dir.join("kronos-moe-experts-nf4g128.k2tm");
+            let cur_mode = arg_value(&args, "--mode").unwrap_or_default();
+            if hot && shard.exists() && !cur_mode.starts_with("nf4") {
+                args.extend(["--moe-hot-shard".to_string(), shard.to_string_lossy().to_string()]);
+            }
+        }
+    }
+    strip_arg(&mut args, "--takeover", false);
+    args.push("--takeover".to_string());
+    Ok(args)
+}
+
+/// Starts the replacement process (it waits for this one to release the port) and exits.
+fn restart_server(srv: &Server, args: Vec<String>) -> Result<(), String> {
+    let mut cmd = std::process::Command::new(&srv.launch_exe);
+    cmd.args(&args[1..]);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.spawn().map_err(|e| format!("spawn {}: {e}", srv.launch_exe.display()))?;
+    eprintln!("restarting with: {}", args[1..].join(" "));
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(400));
+        std::process::exit(0);
+    });
+    Ok(())
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -2484,6 +2654,35 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
             drop(turns);
             respond_bytes(&mut stream, 200, "application/json", &format!("x-kronos-ui: {:x}\r\n", srv.ui_stamp.load(Ordering::Relaxed)), body.as_bytes());
         }
+        ("GET", "/v1/admin/status") => respond(&mut stream, 200, "application/json", &admin_status_json(srv)),
+        ("GET", "/v1/admin/models") => respond(&mut stream, 200, "application/json", &admin_models_json(srv)),
+        ("POST", "/v1/admin/restart") | ("POST", "/v1/admin/stop") => {
+            // Browser tabs only (or the API key when one is configured): these end the process.
+            if req.header("x-kronos-tab").is_none() && srv.api_key.is_none() {
+                return error(&mut stream, 403, "admin actions are accepted from the Kronos web UI only");
+            }
+            if req.path == "/v1/admin/stop" {
+                respond(&mut stream, 200, "application/json", r#"{"ok":true,"stopping":true}"#);
+                eprintln!("stop requested from the web UI");
+                std::thread::spawn(|| {
+                    std::thread::sleep(Duration::from_millis(300));
+                    std::process::exit(0);
+                });
+                return;
+            }
+            let body = std::str::from_utf8(&req.body).ok().and_then(|s| Json::parse(s).ok());
+            let get = |k: &str| body.as_ref().and_then(|b| b.get(k).and_then(Json::as_str).map(str::to_string));
+            let (md, mode, effort) = (get("model_dir"), get("mode"), get("effort"));
+            match restart_args(srv, md.as_deref(), mode.as_deref(), effort.as_deref()).and_then(|a| restart_server(srv, a.clone()).map(|()| a)) {
+                Ok(a) => respond(
+                    &mut stream,
+                    200,
+                    "application/json",
+                    &format!(r#"{{"ok":true,"restarting":true,"args":[{}]}}"#, a[1..].iter().map(|x| quote(x)).collect::<Vec<_>>().join(",")),
+                ),
+                Err(e) => error(&mut stream, 400, &e),
+            }
+        }
         ("GET", "/v1/models") => respond(
             &mut stream,
             200,
@@ -3003,10 +3202,23 @@ fn main() {
         flag("--host").unwrap_or_else(|| kronos_2t::config::server::DEFAULT_HOST.into()),
         num("--port", f64::from(kronos_2t::config::server::DEFAULT_PORT)) as u16
     );
-    let listener = TcpListener::bind(&addr).unwrap_or_else(|e| {
-        eprintln!("bind {addr}: {e}");
-        std::process::exit(1);
-    });
+    let takeover = args.iter().any(|a| a == "--takeover");
+    let listener = {
+        let t0 = Instant::now();
+        loop {
+            match TcpListener::bind(&addr) {
+                Ok(l) => break l,
+                Err(e) if takeover && t0.elapsed() < Duration::from_secs(120) => {
+                    let _ = e;
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(e) => {
+                    eprintln!("bind {addr}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
     let kv_sessions = num("--kv-sessions", 3.0) as usize;
     model.enable_session_kv(kv_sessions, Some(&state_dir));
     let weights_gib = model.resident_weight_bytes() as f64 / (1u64 << 30) as f64;
@@ -3040,6 +3252,9 @@ fn main() {
         media_seq: AtomicU64::new(1),
         gate: ModelGate::new(),
         ui_stamp: AtomicU64::new(fnv1a64(CHAT_PAGE.as_bytes())),
+        launch_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from(&args[0])),
+        launch_args: args.clone(),
+        started_at: Instant::now(),
     });
     eprintln!(
         "serving {} on http://{addr}/ (quick HUD http://{addr}/quick · weights {weights_gib:.2} GiB + {kv_tag} {kv_gib:.2} GiB @ ctx={ctx_sz} · kv-sessions={kv_sessions} · workdir={})",

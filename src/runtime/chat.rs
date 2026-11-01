@@ -968,6 +968,11 @@ impl ChatModel {
         Ok(())
     }
 
+    /// CPU threads the engine uses (the Metal path keeps the default pool size).
+    pub fn num_threads(&self) -> usize {
+        self.engine.num_threads()
+    }
+
     pub fn context_size(&self) -> usize {
         self.ctx
     }

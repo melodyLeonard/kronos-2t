@@ -193,9 +193,24 @@ nothing pages during decode: 57.7 tok/s at short context and 49.2 tok/s at 6.6k 
 count and scale groups.
 
 The web UI at `http://127.0.0.1:18085/` chats, runs agent tasks against the workspace, runs
-parallel tasks, previews files and diffs, and mirrors tasks started from other clients;
-`/quick` is a one-line prompt HUD. Browser requests take the model ahead of API clients, and
-switching conversations restores the KV cache instead of re-reading the history.
+parallel tasks, previews files with syntax highlighting and lint markers, shows diffs, and
+mirrors tasks started from other clients; `/quick` is a one-line prompt HUD. Browser requests
+take the model ahead of API clients, and switching conversations restores the KV cache instead
+of re-reading the history.
+
+Settings (gear icon in the sidebar) shows the running model, context, threads and resident
+memory, and can restart the server with another compiled model or mode, or another effort
+level, and can stop it. Effort maps to resources: `low` uses half the cores, an 8k context and
+4 GiB of wired experts; `balanced` three quarters, 16k and 6 GiB; `high` all cores, 32k, 9 GiB
+and the nf4 hot-expert shard when one is compiled. A restart launches a new `kronos_server`
+with the adjusted arguments, which takes over the port once the old process exits; the page
+waits and reloads. The endpoints are `GET /v1/admin/status`, `GET /v1/admin/models` (compiled
+models next to the running one), `POST /v1/admin/restart {model_dir, mode, effort}` and
+`POST /v1/admin/stop`; the last two are accepted from the web UI (or with the API key) only.
+
+Menu bar app: `cargo run --release --bin kronos_menubar -- --url http://127.0.0.1:18085`
+adds Kronos to the macOS menu bar with the floating Quick Prompt window on `⌥Space` or `⌘⇧K`.
+It is a separate process; pass the port the server listens on (the default is 18080).
 
 | Environment variable | Effect |
 |---|---|
