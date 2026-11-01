@@ -3,3 +3,4 @@
 *.k2t
 .DS_Store
 __pycache__/
+eval/results/*.json

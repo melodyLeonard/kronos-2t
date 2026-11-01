@@ -189,6 +189,40 @@ cargo run --release --bin wikitext_ppl -- models/SmolLM2-135M wiki.ids \
 Models are read from Hugging Face safetensors (`config.json`, `model.safetensors`,
 `vocab.json`, `merges.txt`). `wiki.ids` and `train.ids` hold one token id per line.
 
+### Running the 30B MoE on a 24 GB Mac
+
+```bash
+hf download Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 --local-dir models/Qwen3-Coder-30B-A3B-Instruct-FP8
+cargo run --release --bin kronos_server -- models/Qwen3-Coder-30B-A3B-Instruct-FP8 \
+  --mode nf3nf4g128 --calib calib.txt --compile-only            # once, ~12 min on the GPU
+cargo run --release --bin kronos_server -- models/Qwen3-Coder-30B-A3B-Instruct-FP8 \
+  --mode nf3nf4g128 --ctx 32768 --metal --port 18085 \
+  --workdir ./workspace --state-dir ./state \
+  --moe-hot hist.csv --moe-wire-gib 9
+```
+
+`nf3nf4g128` (3-bit experts, 4-bit attention) is a 10.6 GiB expert shard plus a 0.8 GiB core;
+`nf4g128` is 14.0 GiB. Without `--moe-hot` the whole shard is wired in RAM. With it, only the
+most-routed experts that fit `--moe-wire-gib` are wired (9 GiB covers 97% of routed tokens on
+coding work) and the rest page from disk on demand, which keeps the machine responsive. The
+histogram comes from a run with `KRONOS_EXPERT_HIST=hist.csv` set; it is a `layer,expert,count`
+CSV and any representative workload will do.
+
+The web UI at `http://127.0.0.1:18085/` chats, runs agent tasks against the workspace, runs
+parallel tasks, previews files and diffs, and mirrors tasks started from other clients;
+`/quick` is a one-line prompt HUD. Browser requests take the model ahead of API clients, and
+switching conversations restores the KV cache instead of re-reading the history.
+
+| Environment variable | Effect |
+|---|---|
+| `KRONOS_COMPILE_CPU=1` | compile MoE experts on the CPU instead of Metal |
+| `KRONOS_COMPILE_BATCH=N` | experts per GPU compile dispatch (default 8) |
+| `KRONOS_EXPERT_HIST=FILE` | write the expert-routing histogram while serving |
+| `KRONOS_NO_WIRE=1` | never `mlock` the expert shard |
+| `KRONOS_KV_SNAP_MIB=N` | RAM budget for conversation KV snapshots (default 1024) |
+| `KRONOS_DECODE_PROF=1` | print GPU time per kernel class every 32 decoded tokens |
+| `KRONOS_ATTN_SPLIT_MIN=N` | key positions per attention threadgroup during decode (default 128) |
+
 ### Sparse-MoE, Edge-20B budget suite, and iOS static library
 
 `src/model/sparse_moe.rs`, `src/model/memory_budget.rs`, `src/runtime/jev.rs`, and `src/ffi/mobile_ffi.rs` compile and run Hugging Face SafeTensors Sparse-MoE models (`Qwen2MoeForCausalLM`, `MixtralForCausalLM`, `GptOssForCausalLM`) into `.k2tb` trunk + 16 KB-aligned `.k2tm` expert shards under `Edge8G` (`5.00 GiB`) and `Mobile5G` (`4.90 GiB`) RAM envelopes:
