@@ -2607,6 +2607,11 @@ fn exec_write_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
             }
         }
     }
+    if let Some(prev) = &prev_opt {
+        if let Some(msg) = rewrite_drops_code(rel, prev, &final_content) {
+            return err_outcome(&msg);
+        }
+    }
     match fs::write(&target, final_content.as_bytes()) {
         Ok(()) => {
             let clean_rel = relative_display_in_workdir(workdir, &target, rel);
@@ -2623,6 +2628,58 @@ fn exec_write_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
         }
         Err(e) => err_outcome(&format!("error writing `{rel}`: {e}")),
     }
+}
+
+/// Top-level definition names (`def`, `class`, `function`, `fn`, `struct`, `const/let/var x =`, …).
+fn top_level_names(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let mut words = line.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty());
+        let mut name = None;
+        while let Some(w) = words.next() {
+            match w {
+                "def" | "class" | "function" | "fn" | "struct" | "enum" | "trait" | "interface" | "const" | "let" | "var" | "type" => {
+                    name = words.next().map(str::to_string);
+                    break;
+                }
+                "export" | "async" | "pub" | "default" | "static" | "unsafe" | "extern" | "abstract" => continue,
+                _ => break,
+            }
+        }
+        if let Some(n) = name {
+            if !n.is_empty() && !n.chars().all(|c| c.is_ascii_digit()) && !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
+/// Rejects a `write_file` of an existing file that drops top-level definitions or more than a
+/// quarter of its lines: rewrites from memory lose code the user did not ask to remove.
+fn rewrite_drops_code(rel: &str, before: &str, after: &str) -> Option<String> {
+    let before_lines = before.lines().count();
+    let after_lines = after.lines().count();
+    if before_lines < 12 {
+        return None;
+    }
+    let after_names = top_level_names(after);
+    let dropped: Vec<String> = top_level_names(before).into_iter().filter(|n| !after_names.contains(n)).collect();
+    let shrunk = after_lines * 4 < before_lines * 3;
+    if dropped.is_empty() && !shrunk {
+        return None;
+    }
+    let what = if dropped.is_empty() {
+        String::new()
+    } else {
+        format!(" and drops the definitions {}", dropped.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", "))
+    };
+    Some(format!(
+        "error: `write_file` would replace `{rel}` ({before_lines} lines) with {after_lines} lines{what}. Nothing was written. Keep every existing definition: for a targeted change call `edit_file` with a short unique `old_text` (use `read_file` to copy the exact text), or pass the complete file to `write_file`."
+    ))
 }
 
 /// Suggests `edit_file` when a `write_file` rewrote an existing file but changed only a few lines.
@@ -2930,11 +2987,11 @@ fn exec_edit_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
                 numbered.push_str(&format!("{:>4} | {}\n", idx + 1, line));
             }
             return err_outcome(&format!(
-                "error: `old_text` not found in `{rel}`{hint}. Use `write_file` to replace `{rel}` completely, or pass exact lines from `{rel}` below to `edit_file`:\n{numbered}"
+                "error: `old_text` not found in `{rel}`{hint}. Nothing changed. Copy the exact lines from `{rel}` below into `old_text` and call `edit_file` again; do not rewrite the file:\n{numbered}"
             ));
         }
         return err_outcome(&format!(
-            "error: `old_text` not found in `{rel}`{hint}; call `read_file` to inspect exact text or `write_file` to replace the file"
+            "error: `old_text` not found in `{rel}`{hint}; call `read_file` on the region, then `edit_file` again with the exact text"
         ));
     }
 
@@ -5077,6 +5134,21 @@ fn is_verification_or_test_command(cmd: &str) -> bool {
 }
 
 /// Final summary when a verification command passed after the last edit, so no extra model step is spent.
+/// True when the last line of a tool-less reply announces work still to do ("Let me …", "I'll …").
+fn reply_announces_action(text: &str) -> bool {
+    let last = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('<'))
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    ["let me ", "let's ", "i'll ", "i will ", "now i ", "now let", "next, i", "first, i", "i need to ", "i'm going to "]
+        .iter()
+        .any(|p| last.starts_with(p) || last.contains(&format!(". {p}")))
+        && !last.contains("done")
+}
+
 fn early_finish_after_verified_edit(
     edits_clean: bool,
     last_mutation_seq: usize,
@@ -5543,6 +5615,22 @@ fn run_agent_turn_inner(
             let had_fence = aborted_fence_prose
                 || comp.text.contains("```")
                 || comp.text.contains(crate::config::markup::TOOL_CALL_OPEN);
+            // A reply that ends by announcing an action, or in a cut-off `<tool_call>`, is not final.
+            let dangling_call = comp.text.contains(crate::config::markup::TOOL_CALL_OPEN)
+                && !comp.text.contains(crate::config::markup::TOOL_CALL_CLOSE);
+            if (dangling_call || reply_announces_action(&comp.text)) && can_repair && !active_tools.is_empty() && !finalize_only {
+                repair_attempts += 1;
+                consecutive_no_tool_steps += 1;
+                let what = if dangling_call { "ended in an incomplete `<tool_call>`" } else { "announced an action" };
+                if !on_event(AgentEvent::ValidationRepair { step, report: &format!("reply {what} but no tool ran") }) {
+                    return Err("cancelled".to_string());
+                }
+                let directive = format!(
+                    "[Repair Required — attempt {repair_attempts}] Your reply {what}, but no tool call ran, so nothing happened. Start your very next token with `<tool_call>` and the complete JSON for that action (`read_file`, `edit_file`, `write_file` or `run_command`)."
+                );
+                append_repair_directive_to_history(history, &comp.text, &directive);
+                continue;
+            }
             if !unresolved_edits.is_empty() && can_repair {
                 repair_attempts += 1;
                 consecutive_no_tool_steps += 1;
@@ -6119,6 +6207,20 @@ pub fn serialize_messages_json(messages: &[Message]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rewrite_guard_and_announce_detection() {
+        let before = "'use strict';\nfunction mean(xs) {}\nfunction median(xs) {}\nconst K = 1;\nmodule.exports = { mean, median };\n".repeat(3);
+        assert_eq!(top_level_names("def a():\n    def inner():\nclass B:\nexport async function c() {}\npub fn d() {}\nlet e = 1;"), vec!["a", "B", "c", "d", "e"]);
+        let after = before.replace("function median(xs) {}\n", "");
+        let msg = rewrite_drops_code("stats.js", &before, &after).unwrap();
+        assert!(msg.contains("`median`") && msg.contains("Nothing was written"), "{msg}");
+        assert!(rewrite_drops_code("stats.js", &before, &before.replace("const K = 1", "const K = 2")).is_none());
+        assert!(rewrite_drops_code("small.py", "a = 1\nb = 2\n", "a = 1\n").is_none());
+        assert!(reply_announces_action("The output is wrong.\n\nLet me first examine the function.\n<tool_call>"));
+        assert!(reply_announces_action("I'll fix the window calculation next."));
+        assert!(!reply_announces_action("Done: fixed `rolling_average`; the window now averages the last `window` values."));
+    }
+
     #[test]
     fn failing_test_names_from_unittest_and_pytest() {
         let out = "test_a (m.T.test_a) ... FAIL\ntest_b (m.T.test_b) ... ok\nERROR: test_c (m.T.test_c)\nFAILED tests/test_x.py::TestY::test_d - assert 1 == 2\nRan 4 tests in 0.003s";

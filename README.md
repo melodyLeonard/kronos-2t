@@ -38,7 +38,7 @@ Numbers, method and limitations: [BENCHMARKS.md](BENCHMARKS.md).
 
 ### Engineering iterations
 
-Twelve iterations took the engine from a multiplication-free ternary LUT-GEMV to a Metal
+Thirteen iterations took the engine from a multiplication-free ternary LUT-GEMV to a Metal
 Sparse-MoE runtime with a GPU GPTQ compiler, E8 lattice 2-bit experts, calibrated single-pass
 decision primitives and conversation-aware serving. The design notes, with the formulas and the
 code paths for each step, are in [docs/ITERATIONS.md](docs/ITERATIONS.md).
@@ -82,8 +82,9 @@ context and 45.1 tok/s at 6.6k tokens, prefills at 270 to 330 tok/s, and reaches
 code edits where prompt lookup drafts copied text (`KRONOS_SPEC=0` disables speculation).
 Agent steps keep the generated token ids of every assistant message, so a step prefills only
 its tool result (35 to 170 tokens) instead of re-encoding the previous turn; the 10-task agent
-suite on the 30B nf3 runs with 200 s of prefill and 305 s of decode (was 1,041 s and 912 s) at
-the same 6/10 pass rate.
+suite on the 30B nf3 runs with about 200 s of prefill and 300 s of decode (was 1,041 s and
+912 s). Rewrites that drop definitions are refused and replies that only announce an action are
+sent back for the tool call; the suite passes 8/10 in two consecutive runs (was 6/10).
 `KRONOS_DECODE_PROF=1` prints the GPU time per kernel class.
 
 The KV cache is stored as int8 after a Hadamard rotation, about 4x smaller than FP32;
