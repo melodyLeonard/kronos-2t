@@ -532,7 +532,7 @@ static const CGFloat kSidebarWidth = 296.0;
     brandLbl.translatesAutoresizingMaskIntoConstraints = NO;
     brandLbl.text = @"Kronos";
     brandLbl.textColor = kronosSidebarText();
-    brandLbl.font = [UIFont systemFontOfSize:19.0 weight:UIFontWeightBold];
+    brandLbl.font = [UIFont systemFontOfSize:22.0 weight:UIFontWeightBold];
     [self.sidebarPanel addSubview:brandLbl];
 
     UIButton *closeBtn = [KronosTapButton tapButton];
@@ -550,10 +550,11 @@ static const CGFloat kSidebarWidth = 296.0;
     [newConvBtn setImage:[UIImage systemImageNamed:@"plus" withConfiguration:cfg] forState:UIControlStateNormal];
     newConvBtn.tintColor = kronosSidebarText();
     [newConvBtn setTitleColor:kronosSidebarText() forState:UIControlStateNormal];
-    newConvBtn.titleLabel.font = [UIFont systemFontOfSize:14.5 weight:UIFontWeightSemibold];
+    newConvBtn.titleLabel.font = [UIFont systemFontOfSize:16.0 weight:UIFontWeightSemibold];
     newConvBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
+    newConvBtn.contentEdgeInsets = UIEdgeInsetsMake(0, 14, 0, 14);
     newConvBtn.backgroundColor = kronosSidebarPanel();
-    newConvBtn.layer.cornerRadius = 11.0;
+    newConvBtn.layer.cornerRadius = 14.0;
     newConvBtn.layer.borderWidth = 1.0;
     newConvBtn.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.09].CGColor;
     [newConvBtn addTarget:self action:@selector(newConversationFromSidebar) forControlEvents:UIControlEventTouchUpInside];
@@ -562,7 +563,7 @@ static const CGFloat kSidebarWidth = 296.0;
     UIView *searchBox = [[UIView alloc] init];
     searchBox.translatesAutoresizingMaskIntoConstraints = NO;
     searchBox.backgroundColor = kronosSidebarPanel();
-    searchBox.layer.cornerRadius = 9.0;
+    searchBox.layer.cornerRadius = 12.0;
     [self.sidebarPanel addSubview:searchBox];
 
     UIImageView *mag = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"magnifyingglass"]];
@@ -573,7 +574,7 @@ static const CGFloat kSidebarWidth = 296.0;
     self.sidebarSearchField = [[UITextField alloc] init];
     self.sidebarSearchField.translatesAutoresizingMaskIntoConstraints = NO;
     self.sidebarSearchField.textColor = kronosSidebarText();
-    self.sidebarSearchField.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightRegular];
+    self.sidebarSearchField.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightRegular];
     self.sidebarSearchField.attributedPlaceholder = [[NSAttributedString alloc] initWithString:@"Search conversations..."
                                                                                     attributes:@{NSForegroundColorAttributeName: kronosSidebarMuted()}];
     self.sidebarSearchField.clearButtonMode = UITextFieldViewModeWhileEditing;
@@ -587,8 +588,10 @@ static const CGFloat kSidebarWidth = 296.0;
     [filesRow setImage:[UIImage systemImageNamed:@"folder"] forState:UIControlStateNormal];
     filesRow.tintColor = kronosAccentColor();
     [filesRow setTitleColor:kronosSidebarText() forState:UIControlStateNormal];
-    filesRow.titleLabel.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightMedium];
+    filesRow.titleLabel.font = [UIFont systemFontOfSize:15.5 weight:UIFontWeightMedium];
     filesRow.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
+    filesRow.contentEdgeInsets = UIEdgeInsetsMake(0, 14, 0, 8);
+    filesRow.layer.cornerRadius = 12.0;
     [filesRow addTarget:self action:@selector(openWorkspaceFilesTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.sidebarPanel addSubview:filesRow];
 
@@ -596,20 +599,26 @@ static const CGFloat kSidebarWidth = 296.0;
     self.workspaceCountBadge.translatesAutoresizingMaskIntoConstraints = NO;
     self.workspaceCountBadge.text = @"0";
     self.workspaceCountBadge.textColor = kronosSidebarMuted();
-    self.workspaceCountBadge.font = [UIFont monospacedSystemFontOfSize:11.5 weight:UIFontWeightSemibold];
+    self.workspaceCountBadge.font = [UIFont monospacedSystemFontOfSize:12.0 weight:UIFontWeightSemibold];
+    self.workspaceCountBadge.textAlignment = NSTextAlignmentCenter;
+    self.workspaceCountBadge.backgroundColor = kronosSidebarPanel();
+    self.workspaceCountBadge.layer.cornerRadius = 11.0;
+    self.workspaceCountBadge.clipsToBounds = YES;
     [self.sidebarPanel addSubview:self.workspaceCountBadge];
 
     UILabel *sectionHdr = [[UILabel alloc] init];
     sectionHdr.translatesAutoresizingMaskIntoConstraints = NO;
-    sectionHdr.text = @"RECENT CONVERSATIONS";
+    sectionHdr.attributedText = [[NSAttributedString alloc] initWithString:@"RECENT CONVERSATIONS" attributes:@{NSKernAttributeName: @0.6}];
     sectionHdr.textColor = kronosSidebarMuted();
-    sectionHdr.font = [UIFont systemFontOfSize:11.0 weight:UIFontWeightSemibold];
+    sectionHdr.font = [UIFont systemFontOfSize:12.0 weight:UIFontWeightSemibold];
     [self.sidebarPanel addSubview:sectionHdr];
 
     self.conversationsTable = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
     self.conversationsTable.translatesAutoresizingMaskIntoConstraints = NO;
     self.conversationsTable.backgroundColor = [UIColor clearColor];
     self.conversationsTable.separatorStyle = UITableViewCellSeparatorStyleNone;
+    self.conversationsTable.rowHeight = 64.0;
+    self.conversationsTable.contentInset = UIEdgeInsetsMake(0, 0, 12, 0);
     self.conversationsTable.dataSource = self;
     self.conversationsTable.delegate = self;
     [self.sidebarPanel addSubview:self.conversationsTable];
@@ -617,7 +626,7 @@ static const CGFloat kSidebarWidth = 296.0;
     UIControl *settingsFooter = [[KronosPressControl alloc] init];
     settingsFooter.translatesAutoresizingMaskIntoConstraints = NO;
     settingsFooter.backgroundColor = kronosSidebarPanel();
-    settingsFooter.layer.cornerRadius = 12.0;
+    settingsFooter.layer.cornerRadius = 14.0;
     settingsFooter.layer.borderWidth = 1.0;
     settingsFooter.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.08].CGColor;
     [settingsFooter addTarget:self action:@selector(openSettingsFromSidebar) forControlEvents:UIControlEventTouchUpInside];
@@ -630,9 +639,9 @@ static const CGFloat kSidebarWidth = 296.0;
 
     UILabel *footerTitle = [[UILabel alloc] init];
     footerTitle.translatesAutoresizingMaskIntoConstraints = NO;
-    footerTitle.text = @"Settings & Device Context";
+    footerTitle.text = @"Settings";
     footerTitle.textColor = kronosSidebarText();
-    footerTitle.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightSemibold];
+    footerTitle.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold];
     [settingsFooter addSubview:footerTitle];
 
     self.sidebarSettingsSubtitle = [[UILabel alloc] init];
@@ -661,68 +670,70 @@ static const CGFloat kSidebarWidth = 296.0;
         [self.sidebarPanel.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
         [self.sidebarPanel.widthAnchor constraintEqualToConstant:kSidebarWidth],
 
-        [brandLbl.topAnchor constraintEqualToAnchor:safe.topAnchor constant:12.0],
-        [brandLbl.leadingAnchor constraintEqualToAnchor:self.sidebarPanel.leadingAnchor constant:16.0],
+        [brandLbl.topAnchor constraintEqualToAnchor:safe.topAnchor constant:18.0],
+        [brandLbl.leadingAnchor constraintEqualToAnchor:self.sidebarPanel.leadingAnchor constant:20.0],
 
         [closeBtn.centerYAnchor constraintEqualToAnchor:brandLbl.centerYAnchor],
-        [closeBtn.trailingAnchor constraintEqualToAnchor:self.sidebarPanel.trailingAnchor constant:-10.0],
+        [closeBtn.trailingAnchor constraintEqualToAnchor:self.sidebarPanel.trailingAnchor constant:-14.0],
         [closeBtn.widthAnchor constraintEqualToConstant:40.0],
         [closeBtn.heightAnchor constraintEqualToConstant:40.0],
 
-        [newConvBtn.topAnchor constraintEqualToAnchor:brandLbl.bottomAnchor constant:14.0],
-        [newConvBtn.leadingAnchor constraintEqualToAnchor:self.sidebarPanel.leadingAnchor constant:14.0],
-        [newConvBtn.trailingAnchor constraintEqualToAnchor:self.sidebarPanel.trailingAnchor constant:-14.0],
-        [newConvBtn.heightAnchor constraintEqualToConstant:42.0],
+        [newConvBtn.topAnchor constraintEqualToAnchor:brandLbl.bottomAnchor constant:20.0],
+        [newConvBtn.leadingAnchor constraintEqualToAnchor:self.sidebarPanel.leadingAnchor constant:16.0],
+        [newConvBtn.trailingAnchor constraintEqualToAnchor:self.sidebarPanel.trailingAnchor constant:-16.0],
+        [newConvBtn.heightAnchor constraintEqualToConstant:50.0],
 
-        [searchBox.topAnchor constraintEqualToAnchor:newConvBtn.bottomAnchor constant:10.0],
+        [searchBox.topAnchor constraintEqualToAnchor:newConvBtn.bottomAnchor constant:12.0],
         [searchBox.leadingAnchor constraintEqualToAnchor:newConvBtn.leadingAnchor],
         [searchBox.trailingAnchor constraintEqualToAnchor:newConvBtn.trailingAnchor],
-        [searchBox.heightAnchor constraintEqualToConstant:36.0],
+        [searchBox.heightAnchor constraintEqualToConstant:44.0],
 
-        [mag.leadingAnchor constraintEqualToAnchor:searchBox.leadingAnchor constant:10.0],
+        [mag.leadingAnchor constraintEqualToAnchor:searchBox.leadingAnchor constant:14.0],
         [mag.centerYAnchor constraintEqualToAnchor:searchBox.centerYAnchor],
-        [mag.widthAnchor constraintEqualToConstant:15.0],
-        [mag.heightAnchor constraintEqualToConstant:15.0],
+        [mag.widthAnchor constraintEqualToConstant:17.0],
+        [mag.heightAnchor constraintEqualToConstant:17.0],
 
-        [self.sidebarSearchField.leadingAnchor constraintEqualToAnchor:mag.trailingAnchor constant:7.0],
-        [self.sidebarSearchField.trailingAnchor constraintEqualToAnchor:searchBox.trailingAnchor constant:-8.0],
+        [self.sidebarSearchField.leadingAnchor constraintEqualToAnchor:mag.trailingAnchor constant:10.0],
+        [self.sidebarSearchField.trailingAnchor constraintEqualToAnchor:searchBox.trailingAnchor constant:-12.0],
         [self.sidebarSearchField.centerYAnchor constraintEqualToAnchor:searchBox.centerYAnchor],
 
-        [filesRow.topAnchor constraintEqualToAnchor:searchBox.bottomAnchor constant:10.0],
+        [filesRow.topAnchor constraintEqualToAnchor:searchBox.bottomAnchor constant:14.0],
         [filesRow.leadingAnchor constraintEqualToAnchor:self.sidebarPanel.leadingAnchor constant:16.0],
         [filesRow.trailingAnchor constraintEqualToAnchor:self.workspaceCountBadge.leadingAnchor constant:-8.0],
-        [filesRow.heightAnchor constraintEqualToConstant:36.0],
+        [filesRow.heightAnchor constraintEqualToConstant:46.0],
 
         [self.workspaceCountBadge.centerYAnchor constraintEqualToAnchor:filesRow.centerYAnchor],
-        [self.workspaceCountBadge.trailingAnchor constraintEqualToAnchor:self.sidebarPanel.trailingAnchor constant:-18.0],
+        [self.workspaceCountBadge.trailingAnchor constraintEqualToAnchor:self.sidebarPanel.trailingAnchor constant:-20.0],
+        [self.workspaceCountBadge.heightAnchor constraintEqualToConstant:22.0],
+        [self.workspaceCountBadge.widthAnchor constraintGreaterThanOrEqualToConstant:30.0],
 
-        [sectionHdr.topAnchor constraintEqualToAnchor:filesRow.bottomAnchor constant:12.0],
-        [sectionHdr.leadingAnchor constraintEqualToAnchor:self.sidebarPanel.leadingAnchor constant:16.0],
+        [sectionHdr.topAnchor constraintEqualToAnchor:filesRow.bottomAnchor constant:22.0],
+        [sectionHdr.leadingAnchor constraintEqualToAnchor:self.sidebarPanel.leadingAnchor constant:22.0],
 
-        [self.conversationsTable.topAnchor constraintEqualToAnchor:sectionHdr.bottomAnchor constant:6.0],
-        [self.conversationsTable.leadingAnchor constraintEqualToAnchor:self.sidebarPanel.leadingAnchor constant:8.0],
-        [self.conversationsTable.trailingAnchor constraintEqualToAnchor:self.sidebarPanel.trailingAnchor constant:-8.0],
-        [self.conversationsTable.bottomAnchor constraintEqualToAnchor:settingsFooter.topAnchor constant:-8.0],
+        [self.conversationsTable.topAnchor constraintEqualToAnchor:sectionHdr.bottomAnchor constant:10.0],
+        [self.conversationsTable.leadingAnchor constraintEqualToAnchor:self.sidebarPanel.leadingAnchor constant:12.0],
+        [self.conversationsTable.trailingAnchor constraintEqualToAnchor:self.sidebarPanel.trailingAnchor constant:-12.0],
+        [self.conversationsTable.bottomAnchor constraintEqualToAnchor:settingsFooter.topAnchor constant:-12.0],
 
-        [settingsFooter.leadingAnchor constraintEqualToAnchor:self.sidebarPanel.leadingAnchor constant:12.0],
-        [settingsFooter.trailingAnchor constraintEqualToAnchor:self.sidebarPanel.trailingAnchor constant:-12.0],
-        [settingsFooter.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-10.0],
-        [settingsFooter.heightAnchor constraintEqualToConstant:52.0],
+        [settingsFooter.leadingAnchor constraintEqualToAnchor:self.sidebarPanel.leadingAnchor constant:16.0],
+        [settingsFooter.trailingAnchor constraintEqualToAnchor:self.sidebarPanel.trailingAnchor constant:-16.0],
+        [settingsFooter.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-16.0],
+        [settingsFooter.heightAnchor constraintEqualToConstant:62.0],
 
-        [footerGear.leadingAnchor constraintEqualToAnchor:settingsFooter.leadingAnchor constant:12.0],
+        [footerGear.leadingAnchor constraintEqualToAnchor:settingsFooter.leadingAnchor constant:16.0],
         [footerGear.centerYAnchor constraintEqualToAnchor:settingsFooter.centerYAnchor],
-        [footerGear.widthAnchor constraintEqualToConstant:20.0],
-        [footerGear.heightAnchor constraintEqualToConstant:20.0],
+        [footerGear.widthAnchor constraintEqualToConstant:22.0],
+        [footerGear.heightAnchor constraintEqualToConstant:22.0],
 
-        [footerTitle.topAnchor constraintEqualToAnchor:settingsFooter.topAnchor constant:9.0],
-        [footerTitle.leadingAnchor constraintEqualToAnchor:footerGear.trailingAnchor constant:10.0],
+        [footerTitle.topAnchor constraintEqualToAnchor:settingsFooter.topAnchor constant:12.0],
+        [footerTitle.leadingAnchor constraintEqualToAnchor:footerGear.trailingAnchor constant:12.0],
         [footerTitle.trailingAnchor constraintEqualToAnchor:footerChev.leadingAnchor constant:-6.0],
 
         [self.sidebarSettingsSubtitle.topAnchor constraintEqualToAnchor:footerTitle.bottomAnchor constant:2.0],
         [self.sidebarSettingsSubtitle.leadingAnchor constraintEqualToAnchor:footerTitle.leadingAnchor],
         [self.sidebarSettingsSubtitle.trailingAnchor constraintEqualToAnchor:footerTitle.trailingAnchor],
 
-        [footerChev.trailingAnchor constraintEqualToAnchor:settingsFooter.trailingAnchor constant:-12.0],
+        [footerChev.trailingAnchor constraintEqualToAnchor:settingsFooter.trailingAnchor constant:-16.0],
         [footerChev.centerYAnchor constraintEqualToAnchor:settingsFooter.centerYAnchor],
         [footerChev.widthAnchor constraintEqualToConstant:11.0],
         [footerChev.heightAnchor constraintEqualToConstant:14.0],
@@ -873,19 +884,26 @@ static const CGFloat kSidebarWidth = 296.0;
     if (cell == nil) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"ConvCell"];
         cell.backgroundColor = [UIColor clearColor];
-        cell.layer.cornerRadius = 10.0;
-        cell.clipsToBounds = YES;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        // Rounded row card with a 3 pt gap to its neighbours.
+        cell.contentView.layer.cornerRadius = 12.0;
+        cell.contentView.clipsToBounds = YES;
+        cell.contentView.directionalLayoutMargins = NSDirectionalEdgeInsetsMake(10, 14, 10, 14);
+        cell.preservesSuperviewLayoutMargins = NO;
+        cell.contentView.preservesSuperviewLayoutMargins = NO;
+        cell.textLabel.numberOfLines = 1;
     }
+    cell.contentView.frame = CGRectInset(cell.bounds, 0, 3);
     NSDictionary *conv = self.filteredConversations[(NSUInteger)indexPath.row];
     BOOL isActive = [conv[@"id"] isEqual:self.activeConversation[@"id"]];
     cell.contentView.backgroundColor = isActive ? kronosSidebarActive() : [UIColor clearColor];
     cell.textLabel.text = conv[@"title"] ?: @"New conversation";
     cell.textLabel.textColor = kronosSidebarText();
-    cell.textLabel.font = [UIFont systemFontOfSize:14.0 weight:isActive ? UIFontWeightSemibold : UIFontWeightRegular];
+    cell.textLabel.font = [UIFont systemFontOfSize:15.5 weight:isActive ? UIFontWeightSemibold : UIFontWeightMedium];
     NSTimeInterval ts = [conv[@"updatedAt"] doubleValue];
     cell.detailTextLabel.text = kronosRelativeDateString(ts);
     cell.detailTextLabel.textColor = kronosSidebarMuted();
-    cell.detailTextLabel.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightRegular];
+    cell.detailTextLabel.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightRegular];
     return cell;
 }
 
