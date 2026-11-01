@@ -5131,6 +5131,86 @@ fn exec_spawn_agent(
     }
 }
 
+/// Names of failing tests from unittest / pytest output, sorted and joined; falls back to the
+/// output with digits removed so timing lines do not break the match.
+fn failing_test_signature(output: &str) -> String {
+    let names = failing_test_names(output);
+    if !names.is_empty() {
+        return names.join(",");
+    }
+    output.chars().filter(|c| !c.is_ascii_digit()).collect()
+}
+
+/// `(test_name, module_hint)` pairs: unittest `FAIL: test_x (mod.Class.test_x)` / `test_x (mod.Class.test_x) ... FAIL`,
+/// pytest `FAILED path/test_mod.py::Class::test_x`.
+fn failing_test_names(output: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let l = line.trim();
+        let cand = if let Some(rest) = l.strip_prefix("FAIL: ").or_else(|| l.strip_prefix("ERROR: ")) {
+            rest.split(" (").next().map(str::to_string)
+        } else if l.ends_with("... FAIL") || l.ends_with("... ERROR") {
+            l.split(" (").next().map(str::to_string)
+        } else if let Some(rest) = l.strip_prefix("FAILED ") {
+            rest.split_whitespace().next().and_then(|p| p.rsplit("::").next()).map(str::to_string)
+        } else {
+            None
+        };
+        if let Some(n) = cand {
+            let n = n.trim().to_string();
+            if n.starts_with("test") && !names.contains(&n) {
+                names.push(n);
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Source of the failing test functions found under `workdir` (files named `test*.py` / `*_test.py`),
+/// capped to 40 lines each and 2400 bytes in total.
+fn failing_test_sources(workdir: &Path, output: &str) -> String {
+    let names = failing_test_names(output);
+    if names.is_empty() {
+        return String::new();
+    }
+    let files: Vec<PathBuf> = list_workspace_files(workdir)
+        .into_iter()
+        .map(|e| e.path)
+        .filter(|p| {
+            let base = Path::new(p).file_name().and_then(|f| f.to_str()).unwrap_or("");
+            base.ends_with(".py") && (base.starts_with("test") || base.ends_with("_test.py"))
+        })
+        .map(|p| workdir.join(p))
+        .collect();
+    let mut out = String::new();
+    for name in &names {
+        let needle = format!("def {name}(");
+        for f in &files {
+            let Ok(text) = fs::read_to_string(f) else { continue };
+            let lines: Vec<&str> = text.lines().collect();
+            let Some(start) = lines.iter().position(|l| l.trim_start().starts_with(&needle)) else { continue };
+            let indent = lines[start].len() - lines[start].trim_start().len();
+            let mut end = start + 1;
+            while end < lines.len() && end - start < 40 {
+                let l = lines[end];
+                let li = l.len() - l.trim_start().len();
+                if !l.trim().is_empty() && li <= indent && (l.trim_start().starts_with("def ") || l.trim_start().starts_with("class ") || l.trim_start().starts_with('@')) {
+                    break;
+                }
+                end += 1;
+            }
+            let rel = f.strip_prefix(workdir).unwrap_or(f).display();
+            out.push_str(&format!("--- {rel}:{}\n{}\n", start + 1, lines[start..end].join("\n")));
+            break;
+        }
+        if out.len() > 2400 {
+            break;
+        }
+    }
+    truncate_utf8(&out, 2400)
+}
+
 fn extract_tail_lines(text: &str, max_lines: usize, max_bytes: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(max_lines);
@@ -5314,6 +5394,12 @@ fn run_agent_turn_inner(
     let mut last_failed_cmd: Option<(usize, String, String)> = None;
     let mut dup_cmd_blocks = 0usize;
     let mut reads_since_mutation: Vec<String> = Vec::new();
+    // Failing-test signature of the last failing test run: (signature, full output, cycles, step).
+    let mut fail_loop: Option<(String, String, usize, usize)> = None;
+    // Identical tool calls with identical results across consecutive steps.
+    let mut last_step_sig: Option<u64> = None;
+    let mut step_repeats = 0usize;
+    let mut finalize_only = false;
 
     for step in 1..=cfg.max_steps {
         if dup_cmd_blocks >= 3 {
@@ -5355,6 +5441,7 @@ fn run_agent_turn_inner(
         let mut last_prog_target = String::new();
         let mut step_params = cfg.params.clone();
         let force_tool_prefix = if !active_tools.is_empty()
+            && !finalize_only
             && ((!used_any_tools && cfg.expect_tool_call)
                 || consecutive_no_tool_steps > 0
                 || !unresolved_edits.is_empty())
@@ -5400,7 +5487,7 @@ fn run_agent_turn_inner(
         with_model(&mut |model| {
             comp_res = Some(model.generate_with_tools_prefixed(
                 history,
-                render_tools,
+                if finalize_only { &[] } else { render_tools },
                 force_tool_prefix,
                 &step_params,
                 |piece| {
@@ -5555,7 +5642,7 @@ fn run_agent_turn_inner(
             }
 
             let needs_tool_kick = cfg.expect_tool_call && !used_any_tools;
-            if (!jev_eval.passed || needs_tool_kick) && !active_tools.is_empty() && can_repair {
+            if (!jev_eval.passed || needs_tool_kick) && !active_tools.is_empty() && can_repair && !finalize_only {
                 let mut rolled_back = false;
                 if let Some(ref prev) = best_checkpoint {
                     if prev.workdir == active_workdir
@@ -5639,6 +5726,10 @@ fn run_agent_turn_inner(
             }
 
             history.push(Message::new("assistant", &comp.text));
+            {
+                let tools_now: &[String] = if finalize_only { &[] } else { render_tools };
+                with_model(&mut |m| m.remember_generated(history, tools_now));
+            }
 
             let mut final_rolled_back = false;
             if let Some(ref prev) = best_checkpoint {
@@ -5675,8 +5766,13 @@ fn run_agent_turn_inner(
         }
         let assistant_msg_idx = history.len();
         history.push(Message::assistant_tool_calls("", comp.tool_calls.clone()));
+        {
+            let tools_now: &[String] = if finalize_only { &[] } else { render_tools };
+            with_model(&mut |m| m.remember_generated(history, tools_now));
+        }
 
         let mut batch_blocker: Option<String> = None;
+        let mut step_sig = String::new();
         for (idx, tc) in comp.tool_calls.iter().enumerate() {
             let is_file_mutation = matches!(tc.name.as_str(), "write_file" | "edit_file");
             if is_file_mutation {
@@ -5693,6 +5789,7 @@ fn run_agent_turn_inner(
             if !on_event(AgentEvent::ToolStart { step, call: tc }) {
                 return Err("cancelled".to_string());
             }
+            let mut result_note: Option<String> = None;
             let outcome = if tc.name == "spawn_agent" {
                 exec_spawn_agent(&active_workdir, &tc.arguments, spawner)
             } else if tc.name == "run_command" {
@@ -5818,6 +5915,7 @@ fn run_agent_turn_inner(
                 if outcome.ok {
                     last_failed_cmd = None;
                     if is_verification_or_test_command(&cmd_str) {
+                        fail_loop = None;
                         action_seq += 1;
                         last_passing_test_seq = action_seq;
                         last_passing_test_cmd = cmd_str.clone();
@@ -5827,6 +5925,29 @@ fn run_agent_turn_inner(
                         && !outcome.output.starts_with("skipped `run_command`")
                     {
                         let tail = extract_tail_lines(&outcome.output, 14, 1400);
+                        if is_verification_or_test_command(&cmd_str) {
+                            let sig = failing_test_signature(&outcome.output);
+                            let (cycles, prev_step, identical) = match &fail_loop {
+                                Some((ps, pout, c, st)) if *ps == sig => (c + 1, *st, *pout == outcome.output),
+                                _ => (1, step, false),
+                            };
+                            if identical {
+                                result_note = Some(format!(
+                                    "\n[same failing tests and identical output as after step {prev_step}; the last edit changed nothing the tests check]"
+                                ));
+                            }
+                            if cycles == 3 || cycles == 6 {
+                                let src = failing_test_sources(&active_workdir, &outcome.output);
+                                if !src.is_empty() {
+                                    let mut n = result_note.take().unwrap_or_default();
+                                    n.push_str(&format!(
+                                        "\n[{cycles} edit/test cycles with the same failing tests. Source of the failing tests; make the code satisfy exactly these assertions:]\n{src}"
+                                    ));
+                                    result_note = Some(n);
+                                }
+                            }
+                            fail_loop = Some((sig, outcome.output.clone(), cycles, step));
+                        }
                         last_failed_cmd = Some((last_mutation_seq, cmd_str, tail));
                     }
                     if batch_blocker.is_none() {
@@ -5842,8 +5963,33 @@ fn run_agent_turn_inner(
             }) {
                 return Err("cancelled".to_string());
             }
-            let capped = cap_tool_result(&active_workdir, step, idx, &tc.name, &outcome.output);
+            step_sig.push_str(&tc.name);
+            step_sig.push_str(&tc.arguments);
+            step_sig.push_str(&outcome.output);
+            let mut capped = cap_tool_result(&active_workdir, step, idx, &tc.name, &outcome.output);
+            if let Some(note) = result_note {
+                capped.push_str(&note);
+            }
             history.push(Message::tool_result(&tc.id, &capped));
+        }
+        {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            step_sig.hash(&mut h);
+            let sig = h.finish();
+            step_repeats = if last_step_sig == Some(sig) { step_repeats + 1 } else { 0 };
+            last_step_sig = Some(sig);
+        }
+        if step_repeats >= 1 {
+            if let Some(last_tool) = history.last_mut().filter(|m| m.role == "tool") {
+                last_tool.content.push_str(&format!(
+                    "\n[This exact tool call and result repeated {} times. Do not call it again: make a different change, or write the final answer now.]",
+                    step_repeats + 1
+                ));
+            }
+            if step_repeats >= 2 {
+                finalize_only = true;
+            }
         }
 
         if let Some(final_text) = early_finish_after_verified_edit(
@@ -5973,6 +6119,21 @@ pub fn serialize_messages_json(messages: &[Message]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failing_test_names_from_unittest_and_pytest() {
+        let out = "test_a (m.T.test_a) ... FAIL\ntest_b (m.T.test_b) ... ok\nERROR: test_c (m.T.test_c)\nFAILED tests/test_x.py::TestY::test_d - assert 1 == 2\nRan 4 tests in 0.003s";
+        assert_eq!(failing_test_names(out), vec!["test_a", "test_c", "test_d"]);
+        assert_eq!(failing_test_signature("Ran 1 test in 0.1s\nFAILED"), "Ran  test in .s\nFAILED");
+        let dir = std::env::temp_dir().join(format!("kronos_ft_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("test_m.py"), "import unittest\nclass T(unittest.TestCase):\n    def test_a(self):\n        x = 1\n        self.assertEqual(x, 2)\n\n    def test_b(self):\n        pass\n").unwrap();
+        let src = failing_test_sources(&dir, "FAIL: test_a (test_m.T.test_a)");
+        assert!(src.starts_with("--- test_m.py:3\n    def test_a(self):"), "{src}");
+        assert!(src.contains("assertEqual(x, 2)") && !src.contains("test_b"), "{src}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     #[test]

@@ -2685,6 +2685,7 @@ function createTurnStreamContext(text, attachedItems, isMirrored, liveTurnId, ag
 function applyTurnStreamEvent(ctx, j) {
   if (!ctx || !j) return;
   if (j.type === "error") {
+    if (Array.isArray(j.messages)) sessionHistory = j.messages;
     throw new Error(j.message === "cancelled" ? "stopped" : (j.message || "turn failed"));
   }
   if (j.type === "route") {

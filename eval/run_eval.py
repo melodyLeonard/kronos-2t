@@ -202,6 +202,8 @@ def sse_agent_turn(base, payload, deadline):
                     turn["context_tokens"] = ev.get("context_tokens")
                 elif kind == "error":
                     turn["error"] = ev.get("message")
+                    if ev.get("messages"):
+                        turn["messages"] = ev.get("messages")
             if done:
                 break
         if done:
@@ -257,13 +259,15 @@ def run_conversation_task(server, task, run_root):
         turn["turn"] = i
         turns.append(turn)
         print(f"    turn {i:2d}: first_token {turn['first_token_s']}s wall {turn['wall_s']}s steps {len(turn['steps'])} prompt_tok {[s.get('prompt_tokens') for s in turn['steps']]}", flush=True)
+        if turn["messages"] is not None:
+            history = turn["messages"]
         if turn["messages"] is None or turn["error"]:
             # Keep the history consistent even if the server failed this turn.
-            history.append({"role": "assistant", "content": turn.get("final_text") or "(no reply)"})
+            if not history or history[-1].get("role") != "assistant":
+                history.append({"role": "assistant", "content": turn.get("final_text") or "(no reply)"})
             if time.monotonic() > deadline:
                 break
             continue
-        history = turn["messages"]
     passed, detail = run_check(task["dir"], wd, task["check"])
     return {"turns": turns, "passed": passed, "check_output": detail, "workdir": wd}
 

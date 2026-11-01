@@ -27,4 +27,5 @@ Per task the runner records pass/fail, wall time, steps, prompt and completion t
 (from `step_stats`), first-token latency per turn (request send to first `text`/`tool_start`
 event), compactions, and the server's peak RSS from `ps -o rss`. Output: `results/<label>.md`
 (tracked) and `results/<label>.json` with the full transcripts (ignored by git). `--tasks 01,08`
-selects tasks; `--server-url http://127.0.0.1:18085` reuses a running server.
+selects tasks; `--server-url http://127.0.0.1:18085` reuses a running server. A failed turn's `error` event carries the server-side
+history (`messages`), which the runner adopts so compactions survive a failed turn.

@@ -1418,7 +1418,12 @@ fn execute_allocated_turn(
             Ok(final_text)
         }
         Err(e) => {
-            let err_json = format!(r#"{{"type":"error","message":{}}}"#, quote(&e));
+            // The server-side history (compacted, with tool steps) so clients keep it on failure too.
+            let err_json = format!(
+                r#"{{"type":"error","message":{},"messages":{}}}"#,
+                quote(&e),
+                serialize_messages_json(&history)
+            );
             let _ = write_sse(&err_json);
             Err(e)
         }
@@ -2977,6 +2982,8 @@ fn main() {
                 mgr.update_config(Some(true), None, true);
             }
         });
+        // Agent turns start from AGENT_SYSTEM_PROMPT; warm it first so it lands in the snapshot LRU.
+        model.prewarm_prefix(AGENT_SYSTEM_PROMPT, &warm_tools);
         prewarmed_tokens = model.prewarm_prefix(&warm_sys, &warm_tools);
         let _ = vj.join();
         let _ = sj.join();

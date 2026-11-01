@@ -38,7 +38,7 @@ Numbers, method and limitations: [BENCHMARKS.md](BENCHMARKS.md).
 
 ### Engineering iterations
 
-Ten iterations took the engine from a multiplication-free ternary LUT-GEMV to a Metal
+Eleven iterations took the engine from a multiplication-free ternary LUT-GEMV to a Metal
 Sparse-MoE runtime with a GPU GPTQ compiler, E8 lattice 2-bit experts, calibrated single-pass
 decision primitives and conversation-aware serving. The design notes, with the formulas and the
 code paths for each step, are in [docs/ITERATIONS.md](docs/ITERATIONS.md).
@@ -80,6 +80,10 @@ loading the model. Qwen3-Coder-30B-A3B (`nf3nf4g128`): 12.3 min on an M4 Pro ver
 CPU (`nf4g128`). On the same machine the compiled 30B decodes at 60.3 tok/s with a short
 context and 45.1 tok/s at 6.6k tokens, prefills at 270 to 330 tok/s, and reaches 65.5 tok/s on
 code edits where prompt lookup drafts copied text (`KRONOS_SPEC=0` disables speculation).
+Agent steps keep the generated token ids of every assistant message, so a step prefills only
+its tool result (35 to 170 tokens) instead of re-encoding the previous turn; the 10-task agent
+suite on the 30B nf3 runs with 200 s of prefill and 305 s of decode (was 1,041 s and 912 s) at
+the same 6/10 pass rate.
 `KRONOS_DECODE_PROF=1` prints the GPU time per kernel class.
 
 The KV cache is stored as int8 after a Hadamard rotation, about 4x smaller than FP32;
@@ -194,6 +198,7 @@ switching conversations restores the KV cache instead of re-reading the history.
 | `KRONOS_DECODE_PROF=1` | print GPU time per kernel class every 32 decoded tokens |
 | `KRONOS_ATTN_SPLIT_MIN=N` | key positions per attention threadgroup during decode (default 128) |
 | `KRONOS_ATTN_MMA=0` | per-head decode attention instead of the grouped simdgroup-matrix kernel |
+| `KRONOS_KV_DEBUG=1` | log per request how many prompt tokens came from the KV cache and how many were prefilled |
 
 ### Sparse-MoE, Edge-20B budget suite, and iOS static library
 

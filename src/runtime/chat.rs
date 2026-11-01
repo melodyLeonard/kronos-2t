@@ -518,6 +518,10 @@ pub struct ChatModel {
     jev_caches: Vec<(Vec<usize>, crate::model::real_llm::KvPrefixSnapshot)>,
     /// KV snapshots of recent conversations, so switching back restores instead of re-prefilling.
     conv_snaps: ConvSnapshots,
+    /// Generated token ids per assistant message, keyed by the hash of the canonical ChatML text up to
+    /// and including it, so the re-rendered history reuses the KV written during decoding.
+    gen_memo: Vec<(u64, Vec<usize>)>,
+    last_gen: Option<Vec<usize>>,
     ctx: usize,
     scratch: ChatScratch,
     /// Lookup and draft speculation (off = plain token-by-token decoding).
@@ -595,6 +599,8 @@ impl ChatModel {
             cached: Vec::new(),
             jev_caches: Vec::with_capacity(2),
             conv_snaps: ConvSnapshots::new(),
+            gen_memo: Vec::new(),
+            last_gen: None,
             ctx,
             scratch: ChatScratch::new(vocab_size),
             spec_enabled: true,
@@ -1175,17 +1181,8 @@ impl ChatModel {
             return Some(res);
         }
 
-        if metal_active {
-            let common = self.align_kv(&raw_tokens);
-            let tail = &raw_tokens[common..];
-            let res = {
-                let logits = self.engine.forward_prompt(tail);
-                score_logits(logits)
-            };
-            self.cached.extend_from_slice(tail);
-            return Some(res);
-        }
-
+        // Metal included: the scorer overwrites only the first `tokens.len()` KV positions, which are
+        // snapshotted and restored, so the conversation KV (and `self.cached`) stay intact.
         let saved_total = self.cached.len();
         eval_with_jev_prefix(
             &mut self.engine,
@@ -1204,15 +1201,12 @@ impl ChatModel {
         if tokens.is_empty() || tokens.len() >= self.ctx {
             return 0;
         }
-        let mut common = self.cached.iter().zip(&tokens).take_while(|(a, b)| a == b).count();
+        let common = self.cached.iter().zip(&tokens).take_while(|(a, b)| a == b).count();
         if common == tokens.len() {
             return tokens.len();
         }
-        if !self.engine.can_truncate_kv_to(common) {
-            common = 0;
-        }
-        self.engine.truncate_context(common);
-        self.cached.truncate(common);
+        // Snapshots a different warmed prefix instead of discarding it.
+        let common = self.align_kv(&tokens);
         let tail = &tokens[common..];
         if self.engine.is_metal_enabled() && self.draft.is_some() {
             let t_eng = &mut self.engine;
@@ -1324,8 +1318,73 @@ impl ChatModel {
     /// Renders a ChatML / Qwen2.5 tool-calling prompt (including `<tools>` system block,
     /// `<tool_call>` assistant turns, and grouped `<tool_response>` user turns) into token IDs.
     pub fn render_with_tools(&self, messages: &[Message], tools_json: &[String]) -> Vec<usize> {
-        let prompt_str = render_chatml_prompt_with(messages, tools_json, self.default_system(), self.tool_format);
-        self.tok.encode(&prompt_str)
+        self.render_tokens(messages, tools_json, "")
+    }
+
+    /// Token-level render: assistant messages whose generated ids are memoised are spliced in as
+    /// decoded, everything else is encoded from the canonical ChatML text.
+    fn render_tokens(&self, messages: &[Message], tools_json: &[String], assistant_prefix: &str) -> Vec<usize> {
+        use std::hash::{Hash, Hasher};
+        let mut ids = Vec::new();
+        let mut buf = String::new();
+        let mut hits = 0usize;
+        let mut ctx_hash = std::collections::hash_map::DefaultHasher::new();
+        render_chatml_pieces(messages, tools_json, self.default_system(), self.tool_format, &mut |piece| match piece {
+            ChatPiece::Text(t) => {
+                t.hash(&mut ctx_hash);
+                buf.push_str(t);
+            }
+            ChatPiece::Assistant(m) => {
+                let mut seg = String::new();
+                push_assistant_segment(m, self.tool_format, &mut seg);
+                seg.hash(&mut ctx_hash);
+                let key = ctx_hash.clone().finish();
+                match self.gen_memo.iter().rev().find(|(k, _)| *k == key) {
+                    Some((_, toks)) => {
+                        hits += 1;
+                        buf.push_str("<|im_start|>assistant\n");
+                        ids.extend(self.tok.encode(&buf));
+                        buf.clear();
+                        ids.extend_from_slice(toks);
+                        buf.push_str("<|im_end|>\n");
+                    }
+                    None => buf.push_str(&seg),
+                }
+            }
+        });
+        buf.push_str(assistant_prefix);
+        ids.extend(self.tok.encode(&buf));
+        if std::env::var_os("KRONOS_KV_DEBUG").is_some() {
+            let n_asst = messages.iter().filter(|m| m.role == "assistant").count();
+            eprintln!("[kv] render {} tokens, {hits}/{n_asst} assistant messages from generated ids", ids.len());
+        }
+        ids
+    }
+
+    /// Records the ids generated by the last `generate_with_tools*` call as the rendering of the
+    /// last message of `messages` (the history entry built from that completion), while the KV
+    /// cache still holds them. `tools_json` must be what the next render will use.
+    pub fn remember_generated(&mut self, messages: &[Message], tools_json: &[String]) {
+        use std::hash::{Hash, Hasher};
+        let Some(gen) = self.last_gen.take() else { return };
+        if messages.last().is_none_or(|m| m.role != "assistant") || gen.is_empty() || !self.cached.ends_with(&gen) {
+            return;
+        }
+        let mut ctx_hash = std::collections::hash_map::DefaultHasher::new();
+        let mut key = 0u64;
+        render_chatml_pieces(messages, tools_json, self.default_system(), self.tool_format, &mut |piece| match piece {
+            ChatPiece::Text(t) => t.hash(&mut ctx_hash),
+            ChatPiece::Assistant(m) => {
+                let mut seg = String::new();
+                push_assistant_segment(m, self.tool_format, &mut seg);
+                seg.hash(&mut ctx_hash);
+                key = ctx_hash.clone().finish();
+            }
+        });
+        if self.gen_memo.len() >= 512 {
+            self.gen_memo.remove(0);
+        }
+        self.gen_memo.push((key, gen));
     }
 
     /// Aligns the target KV cache with `prompt`: keeps the common prefix, snapshots a long context
@@ -1451,13 +1510,8 @@ impl ChatModel {
     ) -> Result<Completion, String> {
         let mut msgs = messages.to_vec();
         let reserve = params.max_tokens.min(512).min(self.ctx / 4).max(1);
-        let render_prefixed = |m: &[Message], model: &Self| -> Vec<usize> {
-            let mut s = render_chatml_prompt_with(m, tools_json, model.default_system(), model.tool_format);
-            if !assistant_prefix.is_empty() {
-                s.push_str(assistant_prefix);
-            }
-            model.tok.encode(&s)
-        };
+        self.last_gen = None;
+        let render_prefixed = |m: &[Message], model: &Self| -> Vec<usize> { model.render_tokens(m, tools_json, assistant_prefix) };
         let mut prompt = render_prefixed(&msgs, self);
         while prompt.len() + reserve > self.ctx {
             let first = usize::from(msgs.first().is_some_and(|m| m.role == "system"));
@@ -1482,6 +1536,9 @@ impl ChatModel {
 
         // Reuse the cached prefix; at least one prompt token must run to produce logits.
         let mut common = self.align_kv(&prompt);
+        if std::env::var_os("KRONOS_KV_DEBUG").is_some() {
+            eprintln!("[kv] prompt {} tokens, {} cached, {} to prefill", prompt.len(), common, prompt.len() - common);
+        }
         let t0 = Instant::now();
         let mut prefill_unit = if self.engine.is_metal_enabled() {
             "metal"
@@ -2003,6 +2060,13 @@ impl ChatModel {
 
         self.save_active_session();
         let completion_tokens = reply.len();
+        // Everything after `<|im_start|>assistant\n` in the KV cache: forced prefix + reply.
+        let base_len = if assistant_prefix.is_empty() { prompt.len() } else { self.render_tokens(&msgs, tools_json, "").len() };
+        if base_len <= prompt.len() {
+            let mut gen = prompt[base_len..].to_vec();
+            gen.extend_from_slice(&reply);
+            self.last_gen = Some(gen);
+        }
         Ok(Completion {
             text,
             token_ids: reply,
@@ -2155,12 +2219,65 @@ fn parse_xml_function_block(body: &str, idx: usize) -> Option<ToolCall> {
     Some(ToolCall { id: format!("call_{idx}"), name, arguments: args })
 }
 
+enum ChatPiece<'a> {
+    Text(&'a str),
+    Assistant(&'a Message),
+}
+
+/// Canonical ChatML text of an assistant message, `<|im_start|>assistant` through `<|im_end|>\n`.
+fn push_assistant_segment(m: &Message, fmt: ToolFormat, out: &mut String) {
+    if m.tool_calls.is_empty() {
+        out.push_str(crate::config::markup::IM_START);
+        out.push_str("assistant\n");
+        out.push_str(&m.content);
+        out.push_str("<|im_end|>\n");
+        return;
+    }
+    out.push_str("<|im_start|>assistant");
+    if !m.content.is_empty() {
+        out.push('\n');
+        out.push_str(&m.content);
+    }
+    for tc in &m.tool_calls {
+        if fmt == ToolFormat::Xml {
+            render_xml_tool_call(tc, out);
+            continue;
+        }
+        let args_obj = if tc.arguments.trim().is_empty() {
+            "{}"
+        } else {
+            tc.arguments.trim()
+        };
+        out.push_str("\n<tool_call>\n{\"name\": ");
+        out.push_str(&quote(&tc.name));
+        out.push_str(", \"arguments\": ");
+        out.push_str(args_obj);
+        out.push_str("}\n</tool_call>");
+    }
+    out.push_str("<|im_end|>\n");
+}
+
 pub fn render_chatml_prompt_with(
     messages: &[Message],
     tools_json: &[String],
     default_system: &str,
     fmt: ToolFormat,
 ) -> String {
+    let mut out = String::new();
+    render_chatml_pieces(messages, tools_json, default_system, fmt, &mut |piece| match piece {
+        ChatPiece::Text(t) => out.push_str(t),
+        ChatPiece::Assistant(m) => push_assistant_segment(m, fmt, &mut out),
+    });
+    out
+}
+
+fn render_chatml_pieces(
+    messages: &[Message],
+    tools_json: &[String],
+    default_system: &str,
+    fmt: ToolFormat,
+    sink: &mut dyn FnMut(ChatPiece<'_>),
+) {
     let mut out = String::new();
     let (sys_content, start_idx) = if messages.first().is_some_and(|m| m.role == "system") {
         (messages[0].content.as_str(), 1usize)
@@ -2192,29 +2309,10 @@ pub fn render_chatml_prompt_with(
     out.push_str("<|im_end|>\n");
 
     for (idx, m) in messages.iter().enumerate().skip(start_idx) {
-        if m.role == "assistant" && !m.tool_calls.is_empty() {
-            out.push_str("<|im_start|>assistant");
-            if !m.content.is_empty() {
-                out.push('\n');
-                out.push_str(&m.content);
-            }
-            for tc in &m.tool_calls {
-                if fmt == ToolFormat::Xml {
-                    render_xml_tool_call(tc, &mut out);
-                    continue;
-                }
-                let args_obj = if tc.arguments.trim().is_empty() {
-                    "{}"
-                } else {
-                    tc.arguments.trim()
-                };
-                out.push_str("\n<tool_call>\n{\"name\": ");
-                out.push_str(&quote(&tc.name));
-                out.push_str(", \"arguments\": ");
-                out.push_str(args_obj);
-                out.push_str("}\n</tool_call>");
-            }
-            out.push_str("<|im_end|>\n");
+        if m.role == "assistant" {
+            sink(ChatPiece::Text(&out));
+            out.clear();
+            sink(ChatPiece::Assistant(m));
         } else if m.role == "tool" {
             let prev_is_tool = idx > start_idx && messages[idx - 1].role == "tool";
             if !prev_is_tool {
@@ -2236,7 +2334,7 @@ pub fn render_chatml_prompt_with(
         }
     }
     out.push_str("<|im_start|>assistant\n");
-    out
+    sink(ChatPiece::Text(&out));
 }
 
 /// Escapes raw control bytes (`\n`, `\r`, `\t`), single-line code string `\n` escapes (`split('\n')`,
