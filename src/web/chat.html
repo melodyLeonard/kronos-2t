@@ -3139,6 +3139,8 @@ async function pollLiveTurn() {
       livePollInitialized = true;
       return;
     }
+    // A pin to a turn the server no longer lists would keep asking from index 0; follow what it returned.
+    if (pinnedTurnId && j.turn_id !== pinnedTurnId) pinnedTurnId = 0;
     if (j.origin === CLIENT_TAB_ID && !pinnedTurnId) {
       mirroredTurnId = j.turn_id;
       mirroredNextIndex = j.next_index || 0;
@@ -3189,7 +3191,10 @@ async function pollLiveTurn() {
     }
 
     if (mirroredCtx && Array.isArray(j.events) && j.events.length > 0) {
-      for (const ev of j.events) {
+      // Skip events already applied when the server replays from an earlier index.
+      const base = Math.max(0, (j.next_index || j.events.length) - j.events.length);
+      const skip = Math.max(0, mirroredNextIndex - base);
+      for (const ev of j.events.slice(skip)) {
         try {
           applyTurnStreamEvent(mirroredCtx, ev);
         } catch (err) {
@@ -3198,7 +3203,7 @@ async function pollLiveTurn() {
           mirroredCtx.proseBox.textContent = "Error: " + err.message;
         }
       }
-      mirroredNextIndex = j.next_index || mirroredNextIndex;
+      mirroredNextIndex = Math.max(mirroredNextIndex, j.next_index || 0);
     }
 
     if (mirroredCtx && Array.isArray(j.deliverables) && j.deliverables.length > 0 && mirroredCtx.deliverables.length === 0) {
