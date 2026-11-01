@@ -1046,6 +1046,11 @@ static inline NSString *kronosExtractFallbackFileIfNeeded(NSString *userText, NS
 - (void)stopListeningAndCommit:(BOOL)shouldCommit;
 - (void)speakText:(NSString *)text;
 - (void)stopSpeaking;
+/// Called on the main queue when spoken output finishes or is cancelled.
+@property (nonatomic, copy) void (^onSpeechFinished)(void);
+@end
+
+@interface KronosVoiceController () <AVSpeechSynthesizerDelegate>
 @end
 
 @implementation KronosVoiceController
@@ -1056,6 +1061,7 @@ static inline NSString *kronosExtractFallbackFileIfNeeded(NSString *userText, NS
             ?: [[SFSpeechRecognizer alloc] init];
         _audioEngine = [[AVAudioEngine alloc] init];
         _synthesizer = [[AVSpeechSynthesizer alloc] init];
+        _synthesizer.delegate = self;
         _voiceOutputEnabled = [KronosMobileSettings sharedSettings].spokenRepliesEnabled;
     }
     return self;
@@ -1065,6 +1071,17 @@ static inline NSString *kronosExtractFallbackFileIfNeeded(NSString *userText, NS
     if (self.synthesizer.isSpeaking) {
         [self.synthesizer stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
     }
+}
+- (void)notifySpeechFinished {
+    void (^cb)(void) = self.onSpeechFinished;
+    if (cb == nil) return;
+    dispatch_async(dispatch_get_main_queue(), cb);
+}
+- (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer didFinishSpeechUtterance:(AVSpeechUtterance *)utterance {
+    [self notifySpeechFinished];
+}
+- (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer didCancelSpeechUtterance:(AVSpeechUtterance *)utterance {
+    [self notifySpeechFinished];
 }
 
 - (void)speakText:(NSString *)text {

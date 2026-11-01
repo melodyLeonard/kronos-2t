@@ -78,6 +78,8 @@ static inline NSString *kronosCleanDraftOutput(NSString *raw) {
 @property (nonatomic, strong) NSLayoutConstraint *inputHeightConstraint;
 @property (nonatomic, strong) UIButton *micButton;
 @property (nonatomic, strong) UIButton *sendButton;
+/// The bubble speaker button whose text is being read aloud.
+@property (nonatomic, weak) KronosTapButton *activeSpeakButton;
 
 @property (nonatomic, strong) UIView *sidebarBackdrop;
 @property (nonatomic, strong) UIView *sidebarPanel;
@@ -175,7 +177,7 @@ static const CGFloat kSidebarWidth = 296.0;
     hairline.backgroundColor = kronosLineColor();
     [bar addSubview:hairline];
 
-    self.sidebarButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.sidebarButton = [KronosTapButton tapButton];
     self.sidebarButton.translatesAutoresizingMaskIntoConstraints = NO;
     UIImageSymbolConfiguration *symCfg = [UIImageSymbolConfiguration configurationWithPointSize:17.0 weight:UIImageSymbolWeightMedium];
     [self.sidebarButton setImage:[UIImage systemImageNamed:@"sidebar.left" withConfiguration:symCfg] forState:UIControlStateNormal];
@@ -209,7 +211,7 @@ static const CGFloat kSidebarWidth = 296.0;
     [self.headerSubtitleLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
     [centerStack addArrangedSubview:self.headerSubtitleLabel];
 
-    self.ttsToggleButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.ttsToggleButton = [KronosTapButton tapButton];
     self.ttsToggleButton.translatesAutoresizingMaskIntoConstraints = NO;
     UIImageSymbolConfiguration *spkCfg = [UIImageSymbolConfiguration configurationWithPointSize:15.0 weight:UIImageSymbolWeightMedium];
     [self.ttsToggleButton setImage:[UIImage systemImageNamed:@"speaker.slash" withConfiguration:spkCfg] forState:UIControlStateNormal];
@@ -218,7 +220,7 @@ static const CGFloat kSidebarWidth = 296.0;
     [self.ttsToggleButton addTarget:self action:@selector(ttsToggleTapped) forControlEvents:UIControlEventTouchUpInside];
     [bar addSubview:self.ttsToggleButton];
 
-    self.settingsButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.settingsButton = [KronosTapButton tapButton];
     self.settingsButton.translatesAutoresizingMaskIntoConstraints = NO;
     UIImageSymbolConfiguration *gearCfg = [UIImageSymbolConfiguration configurationWithPointSize:15.5 weight:UIImageSymbolWeightMedium];
     [self.settingsButton setImage:[UIImage systemImageNamed:@"gearshape" withConfiguration:gearCfg] forState:UIControlStateNormal];
@@ -227,7 +229,7 @@ static const CGFloat kSidebarWidth = 296.0;
     [self.settingsButton addTarget:self action:@selector(openSettingsTapped) forControlEvents:UIControlEventTouchUpInside];
     [bar addSubview:self.settingsButton];
 
-    self.plusNewChatButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.plusNewChatButton = [KronosTapButton tapButton];
     self.plusNewChatButton.translatesAutoresizingMaskIntoConstraints = NO;
     UIImageSymbolConfiguration *plusCfg = [UIImageSymbolConfiguration configurationWithPointSize:15.5 weight:UIImageSymbolWeightSemibold];
     [self.plusNewChatButton setImage:[UIImage systemImageNamed:@"plus" withConfiguration:plusCfg] forState:UIControlStateNormal];
@@ -308,7 +310,7 @@ static const CGFloat kSidebarWidth = 296.0;
 
     UIImageSymbolConfiguration *iconCfg = [UIImageSymbolConfiguration configurationWithPointSize:18.0 weight:UIImageSymbolWeightMedium];
 
-    self.attachButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.attachButton = [KronosTapButton tapButton];
     self.attachButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.attachButton setImage:[UIImage systemImageNamed:@"plus" withConfiguration:iconCfg] forState:UIControlStateNormal];
     self.attachButton.tintColor = kronosMutedColor();
@@ -337,7 +339,7 @@ static const CGFloat kSidebarWidth = 296.0;
     self.placeholderLabel.font = [UIFont systemFontOfSize:16.0 weight:UIFontWeightRegular];
     [capsule addSubview:self.placeholderLabel];
 
-    self.micButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.micButton = [KronosTapButton tapButton];
     self.micButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.micButton setImage:[UIImage systemImageNamed:@"mic.fill" withConfiguration:iconCfg] forState:UIControlStateNormal];
     self.micButton.tintColor = kronosMutedColor();
@@ -347,7 +349,7 @@ static const CGFloat kSidebarWidth = 296.0;
     [capsule addSubview:self.micButton];
 
     UIImageSymbolConfiguration *sendCfg = [UIImageSymbolConfiguration configurationWithPointSize:28.0 weight:UIImageSymbolWeightSemibold];
-    self.sendButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.sendButton = [KronosTapButton tapButton];
     self.sendButton.translatesAutoresizingMaskIntoConstraints = NO;
     [self.sendButton setImage:[UIImage systemImageNamed:@"arrow.up.circle.fill" withConfiguration:sendCfg] forState:UIControlStateNormal];
     self.sendButton.tintColor = kronosAccentColor();
@@ -468,7 +470,7 @@ static const CGFloat kSidebarWidth = 296.0;
     brandLbl.font = [UIFont systemFontOfSize:19.0 weight:UIFontWeightBold];
     [self.sidebarPanel addSubview:brandLbl];
 
-    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButton *closeBtn = [KronosTapButton tapButton];
     closeBtn.translatesAutoresizingMaskIntoConstraints = NO;
     UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:16.5 weight:UIImageSymbolWeightMedium];
     [closeBtn setImage:[UIImage systemImageNamed:@"sidebar.left" withConfiguration:cfg] forState:UIControlStateNormal];
@@ -477,7 +479,7 @@ static const CGFloat kSidebarWidth = 296.0;
     [closeBtn addTarget:self action:@selector(closeSidebarAnimated) forControlEvents:UIControlEventTouchUpInside];
     [self.sidebarPanel addSubview:closeBtn];
 
-    UIButton *newConvBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButton *newConvBtn = [KronosTapButton tapButton];
     newConvBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [newConvBtn setTitle:@"  New conversation" forState:UIControlStateNormal];
     [newConvBtn setImage:[UIImage systemImageNamed:@"plus" withConfiguration:cfg] forState:UIControlStateNormal];
@@ -514,7 +516,7 @@ static const CGFloat kSidebarWidth = 296.0;
     [self.sidebarSearchField addTarget:self action:@selector(searchFieldChanged:) forControlEvents:UIControlEventEditingChanged];
     [searchBox addSubview:self.sidebarSearchField];
 
-    UIButton *filesRow = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButton *filesRow = [KronosTapButton tapButton];
     filesRow.translatesAutoresizingMaskIntoConstraints = NO;
     [filesRow setTitle:@"  Workspace files" forState:UIControlStateNormal];
     [filesRow setImage:[UIImage systemImageNamed:@"folder"] forState:UIControlStateNormal];
@@ -547,7 +549,7 @@ static const CGFloat kSidebarWidth = 296.0;
     self.conversationsTable.delegate = self;
     [self.sidebarPanel addSubview:self.conversationsTable];
 
-    UIControl *settingsFooter = [[UIControl alloc] init];
+    UIControl *settingsFooter = [[KronosPressControl alloc] init];
     settingsFooter.translatesAutoresizingMaskIntoConstraints = NO;
     settingsFooter.backgroundColor = kronosSidebarPanel();
     settingsFooter.layer.cornerRadius = 12.0;
@@ -997,7 +999,7 @@ static const CGFloat kSidebarWidth = 296.0;
 
     for (NSUInteger i = 0; i < suggestions.count; i++) {
         NSArray<NSString *> *s = suggestions[i];
-        UIButton *card = [UIButton buttonWithType:UIButtonTypeSystem];
+        UIButton *card = [KronosTapButton tapButton];
         card.translatesAutoresizingMaskIntoConstraints = NO;
         card.tag = (NSInteger)(5000 + i);
         [card setImage:[UIImage systemImageNamed:s[0]] forState:UIControlStateNormal];
@@ -1230,7 +1232,7 @@ static const CGFloat kSidebarWidth = 296.0;
         subLbl.font = [UIFont systemFontOfSize:11.0 weight:UIFontWeightRegular];
         [chip addSubview:subLbl];
 
-        UIButton *rm = [UIButton buttonWithType:UIButtonTypeSystem];
+        UIButton *rm = [KronosTapButton tapButton];
         rm.translatesAutoresizingMaskIntoConstraints = NO;
         rm.tag = (NSInteger)(7000 + i);
         [rm setImage:[UIImage systemImageNamed:@"xmark.circle.fill"] forState:UIControlStateNormal];
@@ -1287,6 +1289,8 @@ static const CGFloat kSidebarWidth = 296.0;
 }
 
 - (void)ttsToggleTapped {
+    [[[UISelectionFeedbackGenerator alloc] init] selectionChanged];
+    if ([self.ttsToggleButton isKindOfClass:[KronosTapButton class]]) [(KronosTapButton *)self.ttsToggleButton bounce];
     self.voiceController.voiceOutputEnabled = !self.voiceController.voiceOutputEnabled;
     [KronosMobileSettings sharedSettings].spokenRepliesEnabled = self.voiceController.voiceOutputEnabled;
     [[KronosMobileSettings sharedSettings] save];
@@ -1298,12 +1302,15 @@ static const CGFloat kSidebarWidth = 296.0;
 
 - (void)voiceControllerDidChangeListening:(BOOL)isListening statusText:(NSString *)status {
     UIImageSymbolConfiguration *iconCfg = [UIImageSymbolConfiguration configurationWithPointSize:18.0 weight:UIImageSymbolWeightMedium];
+    KronosTapButton *mic = [self.micButton isKindOfClass:[KronosTapButton class]] ? (KronosTapButton *)self.micButton : nil;
     if (isListening) {
         [self.micButton setImage:[UIImage systemImageNamed:@"waveform" withConfiguration:iconCfg] forState:UIControlStateNormal];
         self.micButton.tintColor = [UIColor whiteColor];
         self.micButton.backgroundColor = [UIColor colorWithRed:0.88 green:0.26 blue:0.28 alpha:1.0];
         self.headerSubtitleLabel.text = status ?: @"Listening...";
+        mic.pulsing = YES;
     } else {
+        mic.pulsing = NO;
         [self.micButton setImage:[UIImage systemImageNamed:@"mic.fill" withConfiguration:iconCfg] forState:UIControlStateNormal];
         self.micButton.tintColor = kronosMutedColor();
         self.micButton.backgroundColor = [UIColor clearColor];
@@ -1520,14 +1527,14 @@ static const CGFloat kSidebarWidth = 296.0;
     nameLbl.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightSemibold];
     [hdr addSubview:nameLbl];
 
-    UIButton *speakBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButton *speakBtn = [KronosTapButton tapButton];
     speakBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [speakBtn setImage:[UIImage systemImageNamed:@"speaker.wave.2"] forState:UIControlStateNormal];
     speakBtn.tintColor = kronosMutedColor();
     [speakBtn addTarget:self action:@selector(speakBubbleTapped:) forControlEvents:UIControlEventTouchUpInside];
     [hdr addSubview:speakBtn];
 
-    UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButton *copyBtn = [KronosTapButton tapButton];
     copyBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [copyBtn setImage:[UIImage systemImageNamed:@"doc.on.doc"] forState:UIControlStateNormal];
     copyBtn.tintColor = kronosMutedColor();
@@ -1584,7 +1591,7 @@ static const CGFloat kSidebarWidth = 296.0;
 
 - (void)addActionPillWithTitle:(NSString *)title previewFile:(NSString *)previewFile toStack:(UIStackView *)stack {
     if (title.length == 0 || stack == nil) return;
-    UIButton *pill = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButton *pill = [KronosTapButton tapButton];
     pill.translatesAutoresizingMaskIntoConstraints = NO;
     NSString *fullLabel = previewFile.length > 0
         ? [NSString stringWithFormat:@"  %@ · Tap to open", title]
@@ -1644,7 +1651,7 @@ static const CGFloat kSidebarWidth = 296.0;
 
 - (void)addWhatsAppOpenDraftButtonToStack:(UIStackView *)stack {
     if (stack == nil) return;
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButton *btn = [KronosTapButton tapButton];
     btn.translatesAutoresizingMaskIntoConstraints = NO;
     [btn setImage:[UIImage systemImageNamed:@"paperplane.fill"] forState:UIControlStateNormal];
     [btn setTitle:@"  Open Draft in WhatsApp (Review & Tap Send)" forState:UIControlStateNormal];
@@ -1660,7 +1667,7 @@ static const CGFloat kSidebarWidth = 296.0;
 
 - (void)addLinkedInPublishButtonsToStack:(UIStackView *)stack {
     if (stack == nil) return;
-    UIButton *shareBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButton *shareBtn = [KronosTapButton tapButton];
     shareBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [shareBtn setImage:[UIImage systemImageNamed:@"square.and.arrow.up"] forState:UIControlStateNormal];
     [shareBtn setTitle:@"  Publish on LinkedIn (Review & Post)" forState:UIControlStateNormal];
@@ -1673,7 +1680,7 @@ static const CGFloat kSidebarWidth = 296.0;
     [shareBtn addTarget:self action:@selector(presentLinkedInComposerForCurrentDraft) forControlEvents:UIControlEventTouchUpInside];
     [stack addArrangedSubview:shareBtn];
 
-    UIButton *feedBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButton *feedBtn = [KronosTapButton tapButton];
     feedBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [feedBtn setImage:[UIImage systemImageNamed:@"arrow.up.right.square"] forState:UIControlStateNormal];
     [feedBtn setTitle:@"  Open LinkedIn Feed (Draft Copied to Clipboard)" forState:UIControlStateNormal];
@@ -1730,18 +1737,44 @@ static const CGFloat kSidebarWidth = 296.0;
     UIView *cur = sender;
     while (cur != nil && [cur viewWithTag:3301] == nil) cur = cur.superview;
     UILabel *body = (UILabel *)[cur viewWithTag:3301];
-    if (body.text.length > 0) {
-        [UIPasteboard generalPasteboard].string = body.text;
+    if (body.text.length == 0) return;
+    [UIPasteboard generalPasteboard].string = body.text;
+    [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeSuccess];
+    if ([sender isKindOfClass:[KronosTapButton class]]) {
+        [(KronosTapButton *)sender flashSymbol:@"checkmark" tint:kronosAccentColor()];
     }
+    kronosShowToast(self.view, @"Copied");
 }
 
+/// Speaks the bubble, or stops if this bubble is the one speaking; the icon pulses while audio plays.
 - (void)speakBubbleTapped:(UIButton *)sender {
     UIView *cur = sender;
     while (cur != nil && [cur viewWithTag:3301] == nil) cur = cur.superview;
     UILabel *body = (UILabel *)[cur viewWithTag:3301];
-    if (body.text.length > 0) {
-        [self.voiceController speakText:body.text];
+    KronosTapButton *btn = [sender isKindOfClass:[KronosTapButton class]] ? (KronosTapButton *)sender : nil;
+    if (self.activeSpeakButton == btn && btn != nil) {
+        [self.voiceController stopSpeaking];
+        return;
     }
+    if (body.text.length == 0) return;
+    [self clearSpeakingState];
+    self.activeSpeakButton = btn;
+    [btn setImage:[UIImage systemImageNamed:@"speaker.wave.2.fill"] forState:UIControlStateNormal];
+    btn.tintColor = kronosAccentColor();
+    btn.pulsing = YES;
+    __weak typeof(self) weakSelf = self;
+    self.voiceController.onSpeechFinished = ^{ [weakSelf clearSpeakingState]; };
+    [self.voiceController speakText:body.text];
+}
+
+- (void)clearSpeakingState {
+    KronosTapButton *btn = self.activeSpeakButton;
+    if (btn != nil) {
+        btn.pulsing = NO;
+        [btn setImage:[UIImage systemImageNamed:@"speaker.wave.2"] forState:UIControlStateNormal];
+        btn.tintColor = kronosMutedColor();
+    }
+    self.activeSpeakButton = nil;
 }
 
 #pragma mark - Submission, Agentic WhatsApp & LinkedIn Workflows, Strict Messaging Lookup & Chat Execution

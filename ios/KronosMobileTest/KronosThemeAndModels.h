@@ -49,6 +49,145 @@ static inline UIColor *kronosSidebarActive(void) { return [UIColor colorWithRed:
 static inline UIColor *kronosSidebarText(void)   { return [UIColor colorWithRed:0.925 green:0.925 blue:0.937 alpha:1.0]; }
 static inline UIColor *kronosSidebarMuted(void)  { return [UIColor colorWithRed:0.557 green:0.573 blue:0.624 alpha:1.0]; }
 
+#pragma mark - Tactile controls
+
+/// A button that answers every touch: it shrinks and dims while pressed, springs back on release,
+/// taps the haptic engine, can flash a confirmation symbol, and can pulse while an action runs.
+@interface KronosTapButton : UIButton
+@property (nonatomic, assign) BOOL pulsing;
+@property (nonatomic, strong) UIImpactFeedbackGenerator *haptic;
++ (instancetype)tapButton;
+- (void)flashSymbol:(NSString *)symbolName tint:(UIColor *)tint;
+- (void)bounce;
+@end
+
+@implementation KronosTapButton
++ (instancetype)tapButton {
+    KronosTapButton *b = [[KronosTapButton alloc] initWithFrame:CGRectZero];
+    return b;
+}
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.adjustsImageWhenHighlighted = NO;
+        self.haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+        [self addTarget:self action:@selector(kronosPressDown) forControlEvents:UIControlEventTouchDown | UIControlEventTouchDragEnter];
+        [self addTarget:self action:@selector(kronosPressUp) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel | UIControlEventTouchDragExit];
+        [self addTarget:self action:@selector(kronosTapped) forControlEvents:UIControlEventTouchUpInside];
+    }
+    return self;
+}
+- (void)kronosPressDown {
+    [self.haptic prepare];
+    [UIView animateWithDuration:0.09 delay:0 options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionAllowUserInteraction animations:^{
+        self.transform = CGAffineTransformMakeScale(0.88, 0.88);
+        self.alpha = 0.72;
+    } completion:nil];
+}
+- (void)kronosPressUp {
+    [UIView animateWithDuration:0.32 delay:0 usingSpringWithDamping:0.55 initialSpringVelocity:4.0
+                        options:UIViewAnimationOptionAllowUserInteraction animations:^{
+        self.transform = CGAffineTransformIdentity;
+        self.alpha = 1.0;
+    } completion:nil];
+}
+- (void)kronosTapped {
+    [self.haptic impactOccurred];
+}
+- (void)bounce {
+    [UIView animateWithDuration:0.1 animations:^{ self.transform = CGAffineTransformMakeScale(1.18, 1.18); } completion:^(BOOL f) {
+        [UIView animateWithDuration:0.3 delay:0 usingSpringWithDamping:0.5 initialSpringVelocity:3.0 options:0 animations:^{
+            self.transform = CGAffineTransformIdentity;
+        } completion:nil];
+    }];
+}
+/// Shows `symbolName` in `tint` for a moment (a checkmark after copying), then restores the icon.
+- (void)flashSymbol:(NSString *)symbolName tint:(UIColor *)tint {
+    UIImage *restore = [self imageForState:UIControlStateNormal];
+    UIColor *restoreTint = self.tintColor;
+    UIImageSymbolConfiguration *cfg = restore.symbolConfiguration ?: [UIImageSymbolConfiguration configurationWithPointSize:15.0 weight:UIImageSymbolWeightMedium];
+    [self setImage:[UIImage systemImageNamed:symbolName withConfiguration:cfg] forState:UIControlStateNormal];
+    self.tintColor = tint;
+    [self bounce];
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) me = weakSelf;
+        if (me == nil) return;
+        [UIView transitionWithView:me duration:0.2 options:UIViewAnimationOptionTransitionCrossDissolve animations:^{
+            [me setImage:restore forState:UIControlStateNormal];
+            me.tintColor = restoreTint;
+        } completion:nil];
+    });
+}
+- (void)setPulsing:(BOOL)pulsing {
+    if (_pulsing == pulsing) return;
+    _pulsing = pulsing;
+    [self.layer removeAnimationForKey:@"kronosPulse"];
+    if (pulsing) {
+        CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"transform.scale"];
+        a.fromValue = @1.0; a.toValue = @1.16; a.duration = 0.55; a.autoreverses = YES; a.repeatCount = HUGE_VALF;
+        a.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        [self.layer addAnimation:a forKey:@"kronosPulse"];
+    }
+}
+@end
+
+/// A tappable row (sidebar footer, cards) with the same press feedback as `KronosTapButton`.
+@interface KronosPressControl : UIControl
+@end
+@implementation KronosPressControl
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        [self addTarget:self action:@selector(kronosDown) forControlEvents:UIControlEventTouchDown | UIControlEventTouchDragEnter];
+        [self addTarget:self action:@selector(kronosUp) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel | UIControlEventTouchDragExit];
+        [self addTarget:self action:@selector(kronosHaptic) forControlEvents:UIControlEventTouchUpInside];
+    }
+    return self;
+}
+- (void)kronosDown {
+    [UIView animateWithDuration:0.09 delay:0 options:UIViewAnimationOptionAllowUserInteraction animations:^{
+        self.transform = CGAffineTransformMakeScale(0.97, 0.97); self.alpha = 0.8;
+    } completion:nil];
+}
+- (void)kronosUp {
+    [UIView animateWithDuration:0.28 delay:0 usingSpringWithDamping:0.6 initialSpringVelocity:3.0 options:UIViewAnimationOptionAllowUserInteraction animations:^{
+        self.transform = CGAffineTransformIdentity; self.alpha = 1.0;
+    } completion:nil];
+}
+- (void)kronosHaptic {
+    [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
+}
+@end
+
+/// A short pill at the bottom of `host` ("Copied"), fading after 1.4 s.
+static inline void kronosShowToast(UIView *host, NSString *text) {
+    if (host == nil) return;
+    UILabel *pill = [[UILabel alloc] init];
+    pill.translatesAutoresizingMaskIntoConstraints = NO;
+    pill.text = text;
+    pill.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
+    pill.textColor = [UIColor whiteColor];
+    pill.textAlignment = NSTextAlignmentCenter;
+    pill.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.92];
+    pill.layer.cornerRadius = 15.0;
+    pill.clipsToBounds = YES;
+    pill.alpha = 0.0;
+    [host addSubview:pill];
+    [NSLayoutConstraint activateConstraints:@[
+        [pill.centerXAnchor constraintEqualToAnchor:host.centerXAnchor],
+        [pill.bottomAnchor constraintEqualToAnchor:host.safeAreaLayoutGuide.bottomAnchor constant:-84.0],
+        [pill.heightAnchor constraintEqualToConstant:30.0],
+        [pill.widthAnchor constraintGreaterThanOrEqualToConstant:84.0],
+    ]];
+    pill.transform = CGAffineTransformMakeTranslation(0, 10);
+    [UIView animateWithDuration:0.18 animations:^{ pill.alpha = 1.0; pill.transform = CGAffineTransformIdentity; }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [UIView animateWithDuration:0.22 animations:^{ pill.alpha = 0.0; pill.transform = CGAffineTransformMakeTranslation(0, 8); }
+                         completion:^(BOOL f) { [pill removeFromSuperview]; }];
+    });
+}
+
 static NSString *const kKronosCreatorProfileFacts =
     @"[Verified Public Profile — Use ONLY these exact facts. Pronouns for Melody Leonard are strictly he/him/his. He is a Software Engineer, NEVER a musician, songwriter, or actor.]\n"
      "- Full name: Melody Leonard (Melody Leonard Oparaugo), pronouns: he / him / his\n"
