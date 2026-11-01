@@ -433,6 +433,59 @@ impl ChatScratch {
     }
 }
 
+/// Byte-budgeted LRU of KV snapshots keyed by their token prefix.
+struct ConvSnapshots {
+    entries: Vec<(Vec<usize>, crate::model::real_llm::KvPrefixSnapshot, u64)>,
+    budget_bytes: usize,
+    clock: u64,
+}
+
+impl ConvSnapshots {
+    /// Switching conversations is only worth a snapshot when the lost prefix is at least this long.
+    const MIN_TOKENS: usize = 256;
+
+    fn new() -> Self {
+        let mib = std::env::var("KRONOS_KV_SNAP_MIB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1024);
+        Self { entries: Vec::new(), budget_bytes: mib << 20, clock: 0 }
+    }
+
+    fn common_prefix(a: &[usize], b: &[usize]) -> usize {
+        a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    }
+
+    /// Index and usable length of the snapshot sharing the longest prefix with `prompt`.
+    fn best(&self, prompt: &[usize]) -> Option<(usize, usize)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .map(|(i, (toks, _, _))| (i, Self::common_prefix(toks, prompt)))
+            .max_by_key(|&(_, n)| n)
+            .filter(|&(_, n)| n > 0)
+    }
+
+    fn touch(&mut self, i: usize) {
+        self.clock += 1;
+        self.entries[i].2 = self.clock;
+    }
+
+    fn insert(&mut self, toks: Vec<usize>, snap: crate::model::real_llm::KvPrefixSnapshot) {
+        if snap.byte_len() == 0 || snap.byte_len() > self.budget_bytes {
+            return;
+        }
+        // A snapshot that is a prefix of a stored one adds nothing; one that extends a stored one replaces it.
+        if self.entries.iter().any(|(t, _, _)| t.len() >= toks.len() && t[..toks.len()] == toks[..]) {
+            return;
+        }
+        self.entries.retain(|(t, _, _)| !(t.len() <= toks.len() && toks[..t.len()] == t[..]));
+        while self.entries.iter().map(|e| e.1.byte_len()).sum::<usize>() + snap.byte_len() > self.budget_bytes {
+            let Some(oldest) = self.entries.iter().enumerate().min_by_key(|(_, e)| e.2).map(|(i, _)| i) else { break };
+            self.entries.remove(oldest);
+        }
+        self.clock += 1;
+        self.entries.push((toks, snap, self.clock));
+    }
+}
+
 pub struct ChatModel {
     engine: RealLlamaEngine,
     draft: Option<DraftEngine>,
@@ -443,6 +496,8 @@ pub struct ChatModel {
     cached: Vec<usize>,
     /// Small 2-slot LRU KV prefix cache (`<= 80` tokens/slot) accelerating repeated `Kronos-Jev` calls.
     jev_caches: Vec<(Vec<usize>, crate::model::real_llm::KvPrefixSnapshot)>,
+    /// KV snapshots of recent conversations, so switching back restores instead of re-prefilling.
+    conv_snaps: ConvSnapshots,
     ctx: usize,
     scratch: ChatScratch,
     pub name: String,
@@ -514,6 +569,7 @@ impl ChatModel {
             im_end,
             cached: Vec::new(),
             jev_caches: Vec::with_capacity(2),
+            conv_snaps: ConvSnapshots::new(),
             ctx,
             scratch: ChatScratch::new(vocab_size),
             name,
@@ -528,6 +584,7 @@ impl ChatModel {
         self.engine.enable_q8_kv_cache(enable);
         self.cached.clear();
         self.jev_caches.clear();
+        self.conv_snaps.entries.clear();
         if let Some(d) = self.draft.as_mut() {
             d.engine.enable_q8_kv_cache(enable);
             d.cached.clear();
@@ -543,6 +600,7 @@ impl ChatModel {
         self.engine.set_kv_bits(bits);
         self.cached.clear();
         self.jev_caches.clear();
+        self.conv_snaps.entries.clear();
         if let Some(d) = self.draft.as_mut() {
             d.engine.set_kv_bits(bits);
             d.cached.clear();
@@ -558,6 +616,7 @@ impl ChatModel {
         self.engine.set_kv_sliding_window(window, sink_tokens);
         self.cached.clear();
         self.jev_caches.clear();
+        self.conv_snaps.entries.clear();
         if let Some(d) = self.draft.as_mut() {
             d.engine.set_kv_sliding_window(window, sink_tokens);
             d.cached.clear();
@@ -581,6 +640,7 @@ impl ChatModel {
         self.engine.enable_metal()?;
         self.cached.clear();
         self.jev_caches.clear();
+        self.conv_snaps.entries.clear();
         let target_bits = if self.engine.kv_bits() == 4 { 4 } else { 8 };
         let target_win = self.engine.kv_sliding_window();
         if let Some(d) = self.draft.as_mut() {
@@ -613,6 +673,7 @@ impl ChatModel {
         self.engine.disable_metal();
         self.cached.clear();
         self.jev_caches.clear();
+        self.conv_snaps.entries.clear();
         if let Some(d) = self.draft.as_mut() {
             d.engine.disable_metal();
             d.cached.clear();
@@ -659,6 +720,7 @@ impl ChatModel {
     pub fn detach_draft(&mut self) {
         self.draft = None;
         self.jev_caches.clear();
+        self.conv_snaps.entries.clear();
     }
 
     /// Attaches a draft model for lossless speculative decoding.
@@ -732,6 +794,7 @@ impl ChatModel {
             crate::kernels::thread_pool::SpinThreadPool::park_idle_workers();
         }
         self.jev_caches.clear();
+        self.conv_snaps.entries.clear();
         self.draft = Some(DraftEngine {
             engine: draft_eng,
             cached: Vec::new(),
@@ -955,18 +1018,7 @@ impl ChatModel {
         }
 
         if metal_active {
-            let mut common = self
-                .cached
-                .iter()
-                .zip(&raw_tokens)
-                .take_while(|(a, b)| a == b)
-                .count();
-            common = common.min(raw_tokens.len().saturating_sub(1));
-            if !self.engine.can_truncate_kv_to(common) {
-                common = 0;
-            }
-            self.engine.truncate_context(common);
-            self.cached.truncate(common);
+            let common = self.align_kv(&raw_tokens);
             let tail = &raw_tokens[common..];
             let res = {
                 let logits = self.engine.forward_prompt(tail);
@@ -1118,6 +1170,36 @@ impl ChatModel {
         self.tok.encode(&prompt_str)
     }
 
+    /// Aligns the target KV cache with `prompt`: keeps the common prefix, snapshots a long context
+    /// being left behind, and restores a stored snapshot when it covers more of `prompt`.
+    /// Returns the number of cached tokens to reuse (at most `prompt.len() - 1`).
+    fn align_kv(&mut self, prompt: &[usize]) -> usize {
+        let mut common = ConvSnapshots::common_prefix(&self.cached, prompt);
+        common = common.min(prompt.len().saturating_sub(1));
+        if !self.engine.can_truncate_kv_to(common) {
+            common = 0;
+        }
+        let leaving = self.cached.len().saturating_sub(common);
+        if leaving >= ConvSnapshots::MIN_TOKENS {
+            if let Some(snap) = self.engine.save_kv_prefix(self.cached.len()) {
+                self.conv_snaps.insert(self.cached.clone(), snap);
+            }
+        }
+        if let Some((i, n)) = self.conv_snaps.best(prompt) {
+            let n = n.min(prompt.len().saturating_sub(1));
+            if n >= common + ConvSnapshots::MIN_TOKENS {
+                self.engine.restore_kv_prefix_slice(&self.conv_snaps.entries[i].1, n, n);
+                self.cached.clear();
+                self.cached.extend_from_slice(&prompt[..n]);
+                self.conv_snaps.touch(i);
+                common = n;
+            }
+        }
+        self.engine.truncate_context(common);
+        self.cached.truncate(common);
+        common
+    }
+
     /// Prefills `messages` (reusing any hot KV prefix) and returns `(first_greedy_token, prefilled_tokens)`.
     pub fn prefill_messages(&mut self, messages: &[Message]) -> Result<(usize, usize), String> {
         let prompt = self.render(messages);
@@ -1131,18 +1213,7 @@ impl ChatModel {
                 self.ctx
             ));
         }
-        let mut common = self
-            .cached
-            .iter()
-            .zip(&prompt)
-            .take_while(|(a, b)| a == b)
-            .count();
-        common = common.min(prompt.len() - 1);
-        if !self.engine.can_truncate_kv_to(common) {
-            common = 0;
-        }
-        self.engine.truncate_context(common);
-        self.cached.truncate(common);
+        let common = self.align_kv(&prompt);
         let tail = &prompt[common..];
         let vocab = self.engine.cfg.vocab_size;
         let logits = self.engine.forward_prompt(tail);
@@ -1251,13 +1322,7 @@ impl ChatModel {
         let vocab = self.engine.cfg.vocab_size;
 
         // Reuse the cached prefix; at least one prompt token must run to produce logits.
-        let mut common = self.cached.iter().zip(&prompt).take_while(|(a, b)| a == b).count();
-        common = common.min(prompt.len() - 1);
-        if !self.engine.can_truncate_kv_to(common) {
-            common = 0;
-        }
-        self.engine.truncate_context(common);
-        self.cached.truncate(common);
+        let mut common = self.align_kv(&prompt);
         let t0 = Instant::now();
         let mut prefill_unit = if self.engine.is_metal_enabled() {
             "metal"

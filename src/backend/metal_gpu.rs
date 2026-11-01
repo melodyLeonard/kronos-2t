@@ -1211,6 +1211,92 @@ impl MetalLlamaEngine {
     }
 
     #[inline]
+    /// Copies the first `n` KV slots of every (layer, head) out of the GPU cache.
+    /// `None` in sliding-window mode, where slots wrap.
+    pub(crate) fn save_kv_prefix(&self, n: usize) -> Option<crate::model::real_llm::KvPrefixSnapshot> {
+        let kv = &self.kv;
+        if kv.ring_len != 0 {
+            return None;
+        }
+        let n = n.min(kv.cap_seq_len);
+        let heads = kv.num_layers * kv.num_kv_heads;
+        let data_bytes = if kv.bits == 4 { kv.head_dim / 2 } else { kv.head_dim };
+        let sc_bytes = kv.groups_per_head * if kv.bits == 4 { 2 } else { 4 };
+        let mut out = [
+            vec![0u8; heads * n * data_bytes],
+            vec![0u8; heads * n * data_bytes],
+            vec![0u8; heads * n * sc_bytes],
+            vec![0u8; heads * n * sc_bytes],
+        ];
+        let srcs = [
+            (kv.k_data.contents_ptr(), data_bytes),
+            (kv.v_data.contents_ptr(), data_bytes),
+            (kv.k_scales.contents_ptr(), sc_bytes),
+            (kv.v_scales.contents_ptr(), sc_bytes),
+        ];
+        for (dst, (src, b)) in out.iter_mut().zip(srcs) {
+            for h in 0..heads {
+                // SAFETY: shared buffers hold `heads * cap_seq_len` slots and the GPU is idle between commands.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.add(h * kv.cap_seq_len * b), dst.as_mut_ptr().add(h * n * b), n * b);
+                }
+            }
+        }
+        let [k_data, v_data, k_scales, v_scales] = out;
+        Some(crate::model::real_llm::KvPrefixSnapshot::Metal {
+            bits: kv.bits,
+            slots_per_head: n,
+            k_data,
+            v_data,
+            k_scales,
+            v_scales,
+        })
+    }
+
+    /// Writes the first `copy` slots of a [`KvPrefixSnapshot::Metal`] back into the GPU cache.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn restore_kv_prefix(
+        &mut self,
+        bits: u8,
+        slots_per_head: usize,
+        k_data: &[u8],
+        v_data: &[u8],
+        k_scales: &[u8],
+        v_scales: &[u8],
+        copy: usize,
+    ) -> Result<(), String> {
+        let cp = copy.min(slots_per_head);
+        if cp == 0 {
+            return Ok(());
+        }
+        if bits != self.kv.bits || self.kv.ring_len != 0 {
+            return Err("KV snapshot does not match the GPU cache layout".into());
+        }
+        self.kv.ensure_seq_capacity(self.device.id(), cp, 0)?;
+        let kv = &self.kv;
+        let heads = kv.num_layers * kv.num_kv_heads;
+        let data_bytes = if kv.bits == 4 { kv.head_dim / 2 } else { kv.head_dim };
+        let sc_bytes = kv.groups_per_head * if kv.bits == 4 { 2 } else { 4 };
+        let pairs: [(&[u8], *mut u8, usize); 4] = [
+            (k_data, kv.k_data.contents_ptr(), data_bytes),
+            (v_data, kv.v_data.contents_ptr(), data_bytes),
+            (k_scales, kv.k_scales.contents_ptr(), sc_bytes),
+            (v_scales, kv.v_scales.contents_ptr(), sc_bytes),
+        ];
+        for (src, dst, b) in pairs {
+            if src.len() < heads * slots_per_head * b {
+                return Err("KV snapshot is truncated".into());
+            }
+            for h in 0..heads {
+                // SAFETY: capacity ensured above; shared buffers are idle between commands.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr().add(h * slots_per_head * b), dst.add(h * kv.cap_seq_len * b), cp * b);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn can_truncate_kv_to(&self, cur_pos: usize, target_len: usize) -> bool {
         if target_len >= cur_pos || self.kv.ring_len == 0 {
             return true;

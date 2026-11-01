@@ -5343,16 +5343,49 @@ pub enum KvPrefixSnapshot {
         k: Vec<f32>,
         v: Vec<f32>,
     },
+    /// Raw Metal KV slots (`[head][slot]` data and group scales).
+    Metal {
+        bits: u8,
+        slots_per_head: usize,
+        k_data: Vec<u8>,
+        v_data: Vec<u8>,
+        k_scales: Vec<u8>,
+        v_scales: Vec<u8>,
+    },
+}
+
+impl KvPrefixSnapshot {
+    /// Tokens held by the snapshot.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Q8 { slots_per_head, .. } | Self::Q4 { slots_per_head, .. } | Self::Metal { slots_per_head, .. } => *slots_per_head,
+            Self::Fp32 { len, .. } => *len,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Heap bytes held by the snapshot.
+    pub fn byte_len(&self) -> usize {
+        match self {
+            Self::Q8 { k_q8, v_q8, k_scales, v_scales, .. } => k_q8.len() + v_q8.len() + 4 * (k_scales.len() + v_scales.len()),
+            Self::Q4 { k_q4, v_q4, k_s16, v_s16, .. } => k_q4.len() + v_q4.len() + 2 * (k_s16.len() + v_s16.len()),
+            Self::Fp32 { k, v, .. } => 4 * (k.len() + v.len()),
+            Self::Metal { k_data, v_data, k_scales, v_scales, .. } => k_data.len() + v_data.len() + k_scales.len() + v_scales.len(),
+        }
+    }
 }
 
 impl RealLlamaEngine {
     /// Saves the first `n` CPU KV-cache positions (`None` on Metal-backed engines).
     pub fn save_kv_prefix(&self, n: usize) -> Option<KvPrefixSnapshot> {
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if self.metal.is_some() {
-            return None;
-        }
         let len = n.min(self.ws.pos);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(gpu) = &self.metal {
+            return gpu.save_kv_prefix(len);
+        }
         if let Some(q) = self.ws.q8_kv.as_ref() {
             let heads = q.num_layers * q.num_kv_heads;
             let hd = q.head_dim;
@@ -5579,6 +5612,29 @@ impl RealLlamaEngine {
                                 .copy_from_slice(&v_s16[src * gph64..(src + cp) * gph64]);
                         }
                     }
+                }
+            }
+            KvPrefixSnapshot::Metal {
+                bits,
+                slots_per_head,
+                k_data,
+                v_data,
+                k_scales,
+                v_scales,
+            } => {
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                if let Some(gpu) = self.metal.as_mut() {
+                    if let Err(e) = gpu.restore_kv_prefix(*bits, *slots_per_head, k_data, v_data, k_scales, v_scales, copy_slots) {
+                        eprintln!("warning: KV snapshot restore failed: {e}");
+                        self.ws.pos = 0;
+                        return;
+                    }
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                {
+                    let _ = (bits, slots_per_head, k_data, v_data, k_scales, v_scales);
+                    self.ws.pos = 0;
+                    return;
                 }
             }
             KvPrefixSnapshot::Fp32 { len, k, v } => {
