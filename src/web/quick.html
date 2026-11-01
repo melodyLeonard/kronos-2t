@@ -501,7 +501,7 @@ ansWrap.addEventListener("scroll", () => {
 });
 function scrollAns(force = false) {
   if (force) ansPinned = true;
-  if (ansPinned) scrollAns();
+  if (ansPinned) ansWrap.scrollTop = ansWrap.scrollHeight;
 }
 let quickSessionId = "";
 let quickTitle = "";
