@@ -908,6 +908,8 @@ pub struct MetalLlamaEngine {
     pso_gemm_mma: MtlObj,
     pso_rope_kv: MtlObj,
     pso_gqa_decode: MtlObj,
+    pso_gqa_mma128: MtlObj,
+    pso_gqa_mma64: MtlObj,
     pso_gqa_prefill: MtlObj,
     pso_moe_router: MtlObj,
     pso_moe_router_logits: MtlObj,
@@ -932,6 +934,8 @@ pub struct MetalLlamaEngine {
     prof: Option<DecodeProf>,
     /// Positions per attention split during decode (`KRONOS_ATTN_SPLIT_MIN`, default 256).
     attn_split_min: usize,
+    /// Grouped-query decode attention on simdgroup matrices (`KRONOS_ATTN_MMA=0` disables).
+    attn_mma: bool,
 }
 
 /// Expert-routing histogram (`KRONOS_EXPERT_HIST=<csv path>`): per-layer ids kept per chunk
@@ -1221,6 +1225,8 @@ impl MetalLlamaEngine {
                 let pso_gemm_mma = build_pipeline(device.id(), library.id(), "nf4_gemm_mma")?;
                 let pso_rope_kv = build_pipeline(device.id(), library.id(), "qkv_rope_kv_store")?;
                 let pso_gqa_decode = build_pipeline(device.id(), library.id(), "causal_gqa_flash_q8_decode")?;
+                let pso_gqa_mma128 = build_pipeline(device.id(), library.id(), "gqa_decode_q8_mma128")?;
+                let pso_gqa_mma64 = build_pipeline(device.id(), library.id(), "gqa_decode_q8_mma64")?;
                 let pso_gqa_prefill = build_pipeline(device.id(), library.id(), "causal_gqa_flash_q8_prefill")?;
                 let pso_moe_router = build_pipeline(device.id(), library.id(), "moe_router_topk")?;
                 let pso_moe_router_logits = build_pipeline(device.id(), library.id(), "moe_router_logits")?;
@@ -1311,6 +1317,7 @@ impl MetalLlamaEngine {
                 )?;
                 let init_scratch_toks = cfg.max_seq_len.clamp(16, prompt_chunk_gpu.min(256));
                 let scratch = GpuScratch::new(device.id(), cfg, init_scratch_toks, 8)?;
+                let attn_mma = std::env::var("KRONOS_ATTN_MMA").map_or(true, |v| v != "0");
                 let attn_split_min = std::env::var("KRONOS_ATTN_SPLIT_MIN")
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
@@ -1348,6 +1355,8 @@ impl MetalLlamaEngine {
                     pso_gemm_mma,
                     pso_rope_kv,
                     pso_gqa_decode,
+                    pso_gqa_mma128,
+                    pso_gqa_mma64,
                     pso_gqa_prefill,
                     pso_moe_router,
                     pso_moe_router_logits,
@@ -1370,6 +1379,7 @@ impl MetalLlamaEngine {
                     moe_hist,
                     prof,
                     attn_split_min,
+                    attn_mma,
                 })
             })();
             objc_autoreleasePoolPop(pool);
@@ -1747,7 +1757,16 @@ impl MetalLlamaEngine {
                     if prof_on { self.prof_cut(&mut cmd, &mut enc, "rope_kv_store"); }
                     // 4. Causal GQA online-softmax FlashAttention / FlashDecoding over Q8_0 / Q4 KV cache.
                     {
-                        let pso = if n_tok <= GEMV_MAX_TOKENS {
+                        // Decode on Q8 KV with <= 8 query heads per KV head: one threadgroup per KV head
+                        // scores the whole group on simdgroup matrices (K/V read once per group).
+                        let mma_attn = self.attn_mma
+                            && n_tok <= GEMV_MAX_TOKENS
+                            && self.kv.bits == 8
+                            && kv_group <= 8
+                            && (head_dim == 128 || head_dim == 64);
+                        let pso = if mma_attn {
+                            if head_dim == 128 { self.pso_gqa_mma128.id() } else { self.pso_gqa_mma64.id() }
+                        } else if n_tok <= GEMV_MAX_TOKENS {
                             self.pso_gqa_decode.id()
                         } else {
                             self.pso_gqa_prefill.id()
@@ -1764,8 +1783,9 @@ impl MetalLlamaEngine {
                         let (n_splits, split_len) = if n_tok <= GEMV_MAX_TOKENS {
                             let seq = pos0 + n_tok;
                             let act = if self.kv.window_size > 0 { seq.min(self.kv.window_size) } else { seq };
-                            let ns = (act / self.attn_split_min).clamp(1, ATTN_MAX_SPLITS);
-                            (ns, act.div_ceil(ns).div_ceil(4) * 4)
+                            let split_min = if mma_attn { (self.attn_split_min / 4).max(8) } else { self.attn_split_min };
+                            let ns = (act / split_min).clamp(1, ATTN_MAX_SPLITS);
+                            (ns, act.div_ceil(ns).div_ceil(8) * 8)
                         } else {
                             (1usize, 0usize)
                         };
@@ -1799,7 +1819,9 @@ impl MetalLlamaEngine {
                             ()
                         );
                         msg_sel!(enc, st.set_buf, self.scratch.attn_part.id() => Id, 0usize => usize, 7usize => usize; ());
-                        let (grid_x, grid_y) = if n_tok <= GEMV_MAX_TOKENS {
+                        let (grid_x, grid_y) = if mma_attn {
+                            (num_kv_heads, n_tok)
+                        } else if n_tok <= GEMV_MAX_TOKENS {
                             (num_q_heads, n_tok)
                         } else {
                             (num_q_heads, n_tok.div_ceil(32))
@@ -4235,6 +4257,262 @@ kernel void causal_gqa_flash_q8_decode(
             dst[i3] = r3;
         }
     }
+}
+
+// Grouped-query decode attention on Q8 KV: one threadgroup per (KV head, token, split). Each SIMD
+// group takes 8 keys per step, forms S^T = K * Q^T for all (<= 8) query heads of the group with
+// simdgroup matrices, runs the online softmax per head, then O += P * V. K/V are expanded to half in
+// threadgroup memory once per group instead of once per query head; S and O accumulate in float.
+// Partials and the epilogue match `causal_gqa_flash_q8_decode`.
+template <uint HD>
+inline void gqa_decode_mma_body(
+    device const float* qkv,
+    device const char* k_q8,
+    device const float* k_scales,
+    device const char* v_q8,
+    device const float* v_scales,
+    device float* attn_out,
+    constant GqaFlashParams& p,
+    device float* attn_part,
+    uint3 tg_pos,
+    uint sg_id,
+    uint lane,
+    threadgroup half* q_s,
+    threadgroup half (*kv_s)[8u * HD],
+    threadgroup float (*s_s)[64],
+    threadgroup half (*p_s)[64],
+    threadgroup float (*d_s)[64],
+    threadgroup float (*o_s)[8u * HD],
+    threadgroup float (*ml_s)[16])
+{
+    constexpr uint NT = HD / 8u;    // 8x8 tiles along head_dim
+    constexpr uint NCH = HD / 16u;  // char4 per lane: a lane converts one quarter of a key row
+    const uint kvh = tg_pos.x;
+    const uint t = tg_pos.y;
+    const uint split = tg_pos.z;
+    if (kvh >= p.num_kv_heads || t >= p.n_tok) return;
+    const uint G = p.kv_group;
+    const uint seq_len = p.pos0 + t + 1u;
+    const uint act_len = (p.window_size > 0u && seq_len > p.window_size) ? p.window_size : seq_len;
+    const uint tail_start = (p.window_size > 0u && seq_len > p.window_size)
+        ? (seq_len - (p.window_size - p.sink_tokens))
+        : p.sink_tokens;
+    const ulong head_base_slot = ulong(p.layer_idx * p.num_kv_heads + kvh) * ulong(p.kv_cap);
+    const uint idx_begin = (p.n_splits > 1u) ? split * p.split_len : 0u;
+    const uint idx_end = (p.n_splits > 1u) ? min(act_len, idx_begin + p.split_len) : act_len;
+
+    const uint tid = sg_id * 32u + lane;
+    // Q rows = query heads of this KV group (zero padded to 8), pre-scaled.
+    for (uint i = tid; i < 8u * HD; i += 128u) {
+        uint h = i / HD;
+        uint d = i - h * HD;
+        float v = 0.0f;
+        if (h < G) v = qkv[ulong(t) * ulong(p.qkv_rows) + ulong((kvh * G + h) * HD + d)] * p.attn_scale;
+        q_s[i] = half(v);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_half8x8 qT[NT];
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < NT; ++j) simdgroup_load(qT[j], q_s + j * 8u, HD, ulong2(0, 0), true);
+
+    simdgroup_float8x8 O[NT];
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < NT; ++j) O[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+    const uint h = lane >> 2u;          // softmax lane -> head (4 lanes per head, 2 keys each)
+    const uint k0 = (lane & 3u) * 2u;
+    const uint key_ln = lane >> 2u;     // load lane -> key row
+    const uint dq = (lane & 3u) * (HD / 4u);
+    const uint grp = dq >> 5u;
+    float m_h = -1e30f;
+    float l_h = 0.0f;
+    threadgroup half* ks = kv_s[sg_id];
+    threadgroup float* ss = s_s[sg_id];
+    threadgroup half* ps = p_s[sg_id];
+    threadgroup float* ds = d_s[sg_id];
+
+    for (uint base = idx_begin + sg_id * 8u; base < idx_end; base += 32u) {
+        const uint idx = base + key_ln;
+        const bool valid = idx < idx_end;
+        ulong slot = 0ul;
+        if (valid) {
+            uint pos = (idx < p.sink_tokens) ? idx : (tail_start + idx - p.sink_tokens);
+            slot = head_base_slot + ulong(kv_slot_of_pos(pos, p.sink_tokens, p.ring_len));
+        }
+        threadgroup half4* row4 = (threadgroup half4*)(ks + key_ln * HD + dq);
+        if (valid) {
+            device const char4* kp = (device const char4*)(k_q8 + slot * ulong(HD) + dq);
+            float sc = k_scales[slot * ulong(HD / 32u) + grp];
+#pragma clang loop unroll(full)
+            for (uint c = 0u; c < NCH; ++c) row4[c] = half4(float4(kp[c]) * sc);
+        } else {
+#pragma clang loop unroll(full)
+            for (uint c = 0u; c < NCH; ++c) row4[c] = half4(0.0h);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // S^T (keys x heads) = K (keys x dims) * Q^T (dims x heads).
+        simdgroup_float8x8 sT = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < NT; ++j) {
+            simdgroup_half8x8 kt;
+            simdgroup_load(kt, ks + j * 8u, HD);
+            simdgroup_multiply_accumulate(sT, kt, qT[j], sT);
+        }
+        simdgroup_store(sT, ss, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Online softmax per head.
+        const bool v0 = (base + k0) < idx_end;
+        const bool v1 = (base + k0 + 1u) < idx_end;
+        float s0 = v0 ? ss[k0 * 8u + h] : -1e30f;
+        float s1 = v1 ? ss[(k0 + 1u) * 8u + h] : -1e30f;
+        float bm = max(s0, s1);
+        bm = max(bm, simd_shuffle_xor(bm, 1u));
+        bm = max(bm, simd_shuffle_xor(bm, 2u));
+        const float m_new = max(m_h, bm);
+        float alpha = (l_h == 0.0f || h >= G) ? 1.0f : exp(m_h - m_new);
+        float p0 = v0 ? exp(s0 - m_new) : 0.0f;
+        float p1 = v1 ? exp(s1 - m_new) : 0.0f;
+        float psum = p0 + p1;
+        psum += simd_shuffle_xor(psum, 1u);
+        psum += simd_shuffle_xor(psum, 2u);
+        l_h = l_h * alpha + psum;
+        m_h = m_new;
+        ps[k0 * 8u + h] = half(p0);
+        ps[(k0 + 1u) * 8u + h] = half(p1);
+
+        // Rescale the O rows whose running max moved: O = diag(alpha) * O.
+        if (simd_any(alpha != 1.0f)) {
+            const uint e0 = lane * 2u;
+            const uint r0 = e0 >> 3u;
+            const uint c0 = e0 & 7u;
+            float ar = simd_shuffle(alpha, ushort(r0 * 4u));
+            ds[e0] = (r0 == c0) ? ar : 0.0f;
+            ds[e0 + 1u] = (r0 == c0 + 1u) ? ar : 0.0f;
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_float8x8 D;
+            simdgroup_load(D, ds, 8);
+#pragma clang loop unroll(full)
+            for (uint j = 0u; j < NT; ++j) {
+                simdgroup_float8x8 tmp;
+                simdgroup_multiply(tmp, D, O[j]);
+                O[j] = tmp;
+            }
+        }
+
+        // V rows into the same buffer, then O (heads x dims) += P (heads x keys) * V (keys x dims).
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (valid) {
+            device const char4* vp = (device const char4*)(v_q8 + slot * ulong(HD) + dq);
+            float sc = v_scales[slot * ulong(HD / 32u) + grp];
+#pragma clang loop unroll(full)
+            for (uint c = 0u; c < NCH; ++c) row4[c] = half4(float4(vp[c]) * sc);
+        } else {
+#pragma clang loop unroll(full)
+            for (uint c = 0u; c < NCH; ++c) row4[c] = half4(0.0h);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_half8x8 P;
+        simdgroup_load(P, ps, 8, ulong2(0, 0), true);
+#pragma clang loop unroll(full)
+        for (uint j = 0u; j < NT; ++j) {
+            simdgroup_half8x8 vt;
+            simdgroup_load(vt, ks + j * 8u, HD);
+            simdgroup_multiply_accumulate(O[j], P, vt, O[j]);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+#pragma clang loop unroll(full)
+    for (uint j = 0u; j < NT; ++j) simdgroup_store(O[j], o_s[sg_id] + j * 8u, HD);
+    if ((lane & 3u) == 0u) {
+        ml_s[sg_id][h] = m_h;
+        ml_s[sg_id][8u + h] = l_h;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Merge the four SIMD groups; SIMD group g finishes heads 2g and 2g+1.
+    for (uint hh = 0u; hh < 2u; ++hh) {
+        const uint hq = sg_id * 2u + hh;
+        if (hq >= G) break;
+        float mg = -1e30f;
+        for (uint g = 0u; g < 4u; ++g) if (ml_s[g][8u + hq] > 0.0f) mg = max(mg, ml_s[g][hq]);
+        float w[4];
+        float lt = 0.0f;
+        for (uint g = 0u; g < 4u; ++g) {
+            w[g] = (ml_s[g][8u + hq] > 0.0f) ? exp(ml_s[g][hq] - mg) : 0.0f;
+            lt += ml_s[g][8u + hq] * w[g];
+        }
+        float r[HD / 32u];
+#pragma clang loop unroll(full)
+        for (uint q = 0u; q < HD / 32u; ++q) {
+            uint d = q * 32u + lane;
+            r[q] = o_s[0][hq * HD + d] * w[0] + o_s[1][hq * HD + d] * w[1] + o_s[2][hq * HD + d] * w[2] + o_s[3][hq * HD + d] * w[3];
+        }
+        const uint qh = kvh * G + hq;
+        if (p.n_splits > 1u) {
+            device float* part = attn_part + (ulong(t * p.num_q_heads + qh) * ulong(p.n_splits) + ulong(split)) * ulong(HD + 2u);
+            if (lane == 0u) { part[0] = mg; part[1] = lt; }
+#pragma clang loop unroll(full)
+            for (uint q = 0u; q < HD / 32u; ++q) part[2u + q * 32u + lane] = r[q];
+        } else {
+            const float inv_l = 1.0f / lt;
+#pragma clang loop unroll(full)
+            for (uint q = 0u; q < HD / 32u; ++q) r[q] *= inv_l;
+            device float* dst = attn_out + ulong(t) * ulong(p.h_dim) + ulong(qh * HD);
+#pragma clang loop unroll(full)
+            for (uint q = 0u; q < HD / 32u; ++q) dst[q * 32u + lane] = r[q];
+        }
+    }
+}
+
+kernel void gqa_decode_q8_mma128(
+    device const float* qkv      [[buffer(0)]],
+    device const uchar* k_raw    [[buffer(1)]],
+    device const uchar* ks_raw   [[buffer(2)]],
+    device const uchar* v_raw    [[buffer(3)]],
+    device const uchar* vs_raw   [[buffer(4)]],
+    device float*       attn_out [[buffer(5)]],
+    constant GqaFlashParams& p   [[buffer(6)]],
+    device float*       attn_part [[buffer(7)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint sg_id   [[simdgroup_index_in_threadgroup]],
+    uint lane    [[thread_index_in_simdgroup]])
+{
+    threadgroup half  q_s[8u * 128u];
+    threadgroup half  kv_s[4][8u * 128u];
+    threadgroup float s_s[4][64];
+    threadgroup half  p_s[4][64];
+    threadgroup float d_s[4][64];
+    threadgroup float o_s[4][8u * 128u];
+    threadgroup float ml_s[4][16];
+    gqa_decode_mma_body<128>(qkv, (device const char*)k_raw, (device const float*)ks_raw, (device const char*)v_raw,
+        (device const float*)vs_raw, attn_out, p, attn_part, tg_pos, sg_id, lane, q_s, kv_s, s_s, p_s, d_s, o_s, ml_s);
+}
+
+kernel void gqa_decode_q8_mma64(
+    device const float* qkv      [[buffer(0)]],
+    device const uchar* k_raw    [[buffer(1)]],
+    device const uchar* ks_raw   [[buffer(2)]],
+    device const uchar* v_raw    [[buffer(3)]],
+    device const uchar* vs_raw   [[buffer(4)]],
+    device float*       attn_out [[buffer(5)]],
+    constant GqaFlashParams& p   [[buffer(6)]],
+    device float*       attn_part [[buffer(7)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint sg_id   [[simdgroup_index_in_threadgroup]],
+    uint lane    [[thread_index_in_simdgroup]])
+{
+    threadgroup half  q_s[8u * 64u];
+    threadgroup half  kv_s[4][8u * 64u];
+    threadgroup float s_s[4][64];
+    threadgroup half  p_s[4][64];
+    threadgroup float d_s[4][64];
+    threadgroup float o_s[4][8u * 64u];
+    threadgroup float ml_s[4][16];
+    gqa_decode_mma_body<64>(qkv, (device const char*)k_raw, (device const float*)ks_raw, (device const char*)v_raw,
+        (device const float*)vs_raw, attn_out, p, attn_part, tg_pos, sg_id, lane, q_s, kv_s, s_s, p_s, d_s, o_s, ml_s);
 }
 
 // Merges the per-split partials of `causal_gqa_flash_q8_decode`: four SIMD groups each fold a

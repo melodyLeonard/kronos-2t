@@ -38,7 +38,7 @@ Numbers, method and limitations: [BENCHMARKS.md](BENCHMARKS.md).
 
 ### Engineering iterations
 
-Nine iterations took the engine from a multiplication-free ternary LUT-GEMV to a Metal
+Ten iterations took the engine from a multiplication-free ternary LUT-GEMV to a Metal
 Sparse-MoE runtime with a GPU GPTQ compiler, E8 lattice 2-bit experts, calibrated single-pass
 decision primitives and conversation-aware serving. The design notes, with the formulas and the
 code paths for each step, are in [docs/ITERATIONS.md](docs/ITERATIONS.md).
@@ -77,8 +77,8 @@ Sparse-MoE checkpoints compile their experts on the Metal GPU when one is presen
 to the CPU GPTQ path; `KRONOS_COMPILE_CPU=1` forces CPU, `KRONOS_COMPILE_BATCH=N` sets experts
 per dispatch). `kronos_server <dir> --mode M --calib FILE --compile-only` compiles without
 loading the model. Qwen3-Coder-30B-A3B (`nf3nf4g128`): 12.3 min on an M4 Pro versus 48 min on
-CPU (`nf4g128`). On the same machine the compiled 30B decodes at 59.5 tok/s with a short
-context and 40.7 tok/s at 6.6k tokens, prefills at 270 to 330 tok/s, and reaches 65.5 tok/s on
+CPU (`nf4g128`). On the same machine the compiled 30B decodes at 60.3 tok/s with a short
+context and 45.1 tok/s at 6.6k tokens, prefills at 270 to 330 tok/s, and reaches 65.5 tok/s on
 code edits where prompt lookup drafts copied text (`KRONOS_SPEC=0` disables speculation).
 `KRONOS_DECODE_PROF=1` prints the GPU time per kernel class.
 
@@ -193,6 +193,7 @@ switching conversations restores the KV cache instead of re-reading the history.
 | `KRONOS_KV_SNAP_MIB=N` | RAM budget for conversation KV snapshots (default 1024) |
 | `KRONOS_DECODE_PROF=1` | print GPU time per kernel class every 32 decoded tokens |
 | `KRONOS_ATTN_SPLIT_MIN=N` | key positions per attention threadgroup during decode (default 128) |
+| `KRONOS_ATTN_MMA=0` | per-head decode attention instead of the grouped simdgroup-matrix kernel |
 
 ### Sparse-MoE, Edge-20B budget suite, and iOS static library
 
