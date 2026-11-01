@@ -328,8 +328,14 @@ struct GqaFlashParams {
     window_size: u32,
     sink_tokens: u32,
     ring_len: u32,
+    n_splits: u32,
+    split_len: u32,
     _pad: u32,
+    _pad2: u32,
 }
+
+/// Max sequence splits for flash-decoding attention (one threadgroup per split).
+const ATTN_MAX_SPLITS: usize = 64;
 
 pub(crate) struct GpuNf4Matrix {
     pair_buf: MtlObj,
@@ -746,6 +752,8 @@ struct GpuScratch {
     moe_w: MtlObj,
     moe_gu: MtlObj,
     moe_out: MtlObj,
+    moe_logits: MtlObj,
+    attn_part: MtlObj,
 }
 
 impl GpuScratch {
@@ -771,6 +779,12 @@ impl GpuScratch {
             logits: alloc_shared_buffer(device, nl * cfg.vocab_size * f32_b, "sc.logits")?,
             moe_ids: alloc_shared_buffer(device, (n * moe_k).max(1) * 4, "sc.moe_ids")?,
             moe_w: alloc_shared_buffer(device, (n * moe_k).max(1) * f32_b, "sc.moe_w")?,
+            moe_logits: alloc_shared_buffer(device, n * 1024 * f32_b, "sc.moe_logits")?,
+            attn_part: alloc_shared_buffer(
+                device,
+                GEMV_MAX_TOKENS * cfg.num_attention_heads * ATTN_MAX_SPLITS * (cfg.head_dim() + 2) * f32_b,
+                "sc.attn_part",
+            )?,
             moe_gu: alloc_shared_buffer(device, (n * moe_k * 2 * moe_ff).max(1) * f32_b, "sc.moe_gu")?,
             moe_out: alloc_shared_buffer(device, (n * moe_k * cfg.hidden_size).max(1) * f32_b, "sc.moe_out")?,
         })
@@ -801,6 +815,7 @@ impl GpuScratch {
             self.gate_up = alloc_shared_buffer(device, n * 2 * cfg.intermediate_size * f32_b, "sc.gate_up")?;
             self.moe_ids = alloc_shared_buffer(device, (n * moe_k).max(1) * 4, "sc.moe_ids")?;
             self.moe_w = alloc_shared_buffer(device, (n * moe_k).max(1) * f32_b, "sc.moe_w")?;
+            self.moe_logits = alloc_shared_buffer(device, n * 1024 * f32_b, "sc.moe_logits")?;
             self.moe_gu = alloc_shared_buffer(device, (n * moe_k * 2 * moe_ff).max(1) * f32_b, "sc.moe_gu")?;
             self.moe_out = alloc_shared_buffer(device, (n * moe_k * cfg.hidden_size).max(1) * f32_b, "sc.moe_out")?;
             self.cap_tokens = n;
@@ -828,6 +843,8 @@ pub struct MetalLlamaEngine {
     pso_gqa_decode: MtlObj,
     pso_gqa_prefill: MtlObj,
     pso_moe_router: MtlObj,
+    pso_moe_router_logits: MtlObj,
+    pso_gqa_reduce: MtlObj,
     pso_moe_gemv: MtlObj,
     pso_moe_combine: MtlObj,
     moe: Option<MoeGeometry>,
@@ -840,10 +857,51 @@ pub struct MetalLlamaEngine {
     kv: GpuKvCache,
     scratch: GpuScratch,
     moe_hist: Option<MoeHist>,
+    /// `KRONOS_DECODE_PROF=1`: per-kernel-class GPU time for single-token steps.
+    prof: Option<DecodeProf>,
+    /// Positions per attention split during decode (`KRONOS_ATTN_SPLIT_MIN`, default 256).
+    attn_split_min: usize,
 }
 
 /// Expert-routing histogram (`KRONOS_EXPERT_HIST=<csv path>`): per-layer ids kept per chunk
 /// so counts can be read back after the command buffer completes.
+struct DecodeProf {
+    sel_start: usize,
+    sel_end: usize,
+    acc: std::sync::Mutex<Vec<(&'static str, usize, f64)>>,
+    tokens: std::sync::atomic::AtomicUsize,
+}
+
+impl DecodeProf {
+    fn add(&self, label: &'static str, secs: f64) {
+        let mut acc = self.acc.lock().unwrap_or_else(|p| p.into_inner());
+        match acc.iter_mut().find(|e| e.0 == label) {
+            Some(e) => {
+                e.1 += 1;
+                e.2 += secs;
+            }
+            None => acc.push((label, 1, secs)),
+        }
+    }
+
+    fn report(&self) {
+        let n = self.tokens.load(std::sync::atomic::Ordering::Relaxed).max(1) as f64;
+        let mut acc = self.acc.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        acc.sort_by(|a, b| b.2.total_cmp(&a.2));
+        let total: f64 = acc.iter().map(|e| e.2).sum();
+        let mut line = format!("[decode-prof] {n:.0} tokens, GPU {:.1} ms/tok:", total / n * 1e3);
+        for (label, count, secs) in &acc {
+            line.push_str(&format!(
+                " {label} {:.2}ms ({:.0}%, {:.0} dispatches)",
+                secs / n * 1e3,
+                secs / total * 100.0,
+                *count as f64 / n
+            ));
+        }
+        eprintln!("{line}");
+    }
+}
+
 struct MoeHist {
     ids: MtlObj,
     counts: Vec<u64>,
@@ -1022,6 +1080,9 @@ impl MetalLlamaEngine {
         kv_sinks: usize,
         moe_geom: Option<MoeGeometry>,
     ) -> Result<Self, String> {
+        if moe_geom.is_some() && cfg.num_experts > 1024 {
+            return Err("Metal MoE router supports up to 1024 experts".to_string());
+        }
         if !cfg.hidden_size.is_multiple_of(64) || !cfg.intermediate_size.is_multiple_of(64) {
             return Err("Metal backend requires hidden_size and intermediate_size divisible by 64".to_string());
         }
@@ -1070,6 +1131,8 @@ impl MetalLlamaEngine {
                 let pso_gqa_decode = build_pipeline(device.id(), library.id(), "causal_gqa_flash_q8_decode")?;
                 let pso_gqa_prefill = build_pipeline(device.id(), library.id(), "causal_gqa_flash_q8_prefill")?;
                 let pso_moe_router = build_pipeline(device.id(), library.id(), "moe_router_topk")?;
+                let pso_moe_router_logits = build_pipeline(device.id(), library.id(), "moe_router_logits")?;
+                let pso_gqa_reduce = build_pipeline(device.id(), library.id(), "gqa_decode_reduce")?;
                 let pso_moe_gemv = build_pipeline(device.id(), library.id(), "nf4_moe_gemv")?;
                 let pso_moe_combine = build_pipeline(device.id(), library.id(), "moe_combine")?;
 
@@ -1152,6 +1215,17 @@ impl MetalLlamaEngine {
                 )?;
                 let init_scratch_toks = cfg.max_seq_len.clamp(16, prompt_chunk_gpu.min(256));
                 let scratch = GpuScratch::new(device.id(), cfg, init_scratch_toks, 8)?;
+                let attn_split_min = std::env::var("KRONOS_ATTN_SPLIT_MIN")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(128)
+                    .max(4);
+                let prof = std::env::var_os("KRONOS_DECODE_PROF").map(|_| DecodeProf {
+                    sel_start: sel_registerName(c"GPUStartTime".as_ptr()) as usize,
+                    sel_end: sel_registerName(c"GPUEndTime".as_ptr()) as usize,
+                    acc: std::sync::Mutex::new(Vec::new()),
+                    tokens: std::sync::atomic::AtomicUsize::new(0),
+                });
                 let moe_hist = match (moe_geom, std::env::var_os("KRONOS_EXPERT_HIST")) {
                     (Some(g), Some(path)) => Some(MoeHist {
                         ids: alloc_shared_buffer(device.id(), layers.len() * prompt_chunk_gpu * g.top_k * 4, "moe_hist_ids")?,
@@ -1176,6 +1250,8 @@ impl MetalLlamaEngine {
                     pso_gqa_decode,
                     pso_gqa_prefill,
                     pso_moe_router,
+                    pso_moe_router_logits,
+                    pso_gqa_reduce,
                     pso_moe_gemv,
                     pso_moe_combine,
                     moe: moe_geom,
@@ -1188,6 +1264,8 @@ impl MetalLlamaEngine {
                     kv,
                     scratch,
                     moe_hist,
+                    prof,
+                    attn_split_min,
                 })
             })();
             objc_autoreleasePoolPop(pool);
@@ -1440,14 +1518,15 @@ impl MetalLlamaEngine {
             let pool = objc_autoreleasePoolPush();
             let res = (|| -> Result<(), String> {
                 let st = sels();
-                let cmd: Id = msg_sel!(self.queue.id(), st.cmd_buffer; Id);
+                let mut cmd: Id = msg_sel!(self.queue.id(), st.cmd_buffer; Id);
                 if cmd.is_null() {
                     return Err("MTLCommandQueue commandBuffer returned nil".to_string());
                 }
-                let enc: Id = msg_sel!(cmd, st.compute_enc; Id);
+                let mut enc: Id = msg_sel!(cmd, st.compute_enc; Id);
                 if enc.is_null() {
                     return Err("MTLCommandBuffer computeCommandEncoder returned nil".to_string());
                 }
+                let prof_on = self.prof.is_some() && n_tok == 1;
 
                 let kv_cap = self.kv.cap_seq_len as u32;
 
@@ -1466,6 +1545,7 @@ impl MetalLlamaEngine {
                         use_mma,
                     );
 
+                    if prof_on { self.prof_cut(&mut cmd, &mut enc, "norm_fwht"); }
                     // 2. Fused QKV projection (+ optional Qwen2 QKV bias).
                     self.encode_nf4_proj(
                         enc,
@@ -1476,6 +1556,7 @@ impl MetalLlamaEngine {
                         n_tok,
                     );
 
+                    if prof_on { self.prof_cut(&mut cmd, &mut enc, "qkv_proj"); }
                     // 3. NeoX RoPE on Q/K + Q8_0 / Hadamard-NF4 group-32 KV cache write.
                     {
                         msg_sel!(enc, st.set_cps, self.pso_rope_kv.id() => Id; ());
@@ -1525,6 +1606,7 @@ impl MetalLlamaEngine {
                         );
                     }
 
+                    if prof_on { self.prof_cut(&mut cmd, &mut enc, "rope_kv_store"); }
                     // 4. Causal GQA online-softmax FlashAttention / FlashDecoding over Q8_0 / Q4 KV cache.
                     {
                         let pso = if n_tok <= GEMV_MAX_TOKENS {
@@ -1539,6 +1621,16 @@ impl MetalLlamaEngine {
                         msg_sel!(enc, st.set_buf, self.kv.v_data.id() => Id, 0usize => usize, 3usize => usize; ());
                         msg_sel!(enc, st.set_buf, self.kv.v_scales.id() => Id, 0usize => usize, 4usize => usize; ());
                         msg_sel!(enc, st.set_buf, self.scratch.attn_out.id() => Id, 0usize => usize, 5usize => usize; ());
+                        // Flash-decoding: split the sequence over threadgroups and merge, so long
+                        // contexts do not serialize inside one threadgroup per head.
+                        let (n_splits, split_len) = if n_tok <= GEMV_MAX_TOKENS {
+                            let seq = pos0 + n_tok;
+                            let act = if self.kv.window_size > 0 { seq.min(self.kv.window_size) } else { seq };
+                            let ns = (act / self.attn_split_min).clamp(1, ATTN_MAX_SPLITS);
+                            (ns, act.div_ceil(ns).div_ceil(4) * 4)
+                        } else {
+                            (1usize, 0usize)
+                        };
                         let gp = GqaFlashParams {
                             num_q_heads: num_q_heads as u32,
                             num_kv_heads: num_kv_heads as u32,
@@ -1555,7 +1647,10 @@ impl MetalLlamaEngine {
                             window_size: self.kv.window_size as u32,
                             sink_tokens: self.kv.sink_tokens as u32,
                             ring_len: self.kv.ring_len as u32,
+                            n_splits: n_splits as u32,
+                            split_len: split_len as u32,
                             _pad: 0,
+                            _pad2: 0,
                         };
                         msg_sel!(
                             enc,
@@ -1565,6 +1660,7 @@ impl MetalLlamaEngine {
                             6usize => usize;
                             ()
                         );
+                        msg_sel!(enc, st.set_buf, self.scratch.attn_part.id() => Id, 0usize => usize, 7usize => usize; ());
                         let (grid_x, grid_y) = if n_tok <= GEMV_MAX_TOKENS {
                             (num_q_heads, n_tok)
                         } else {
@@ -1573,12 +1669,33 @@ impl MetalLlamaEngine {
                         msg_sel!(
                             enc,
                             st.dispatch_tg,
-                            MtlSize::new(grid_x, grid_y, 1) => MtlSize,
+                            MtlSize::new(grid_x, grid_y, n_splits) => MtlSize,
                             MtlSize::new(128, 1, 1) => MtlSize;
                             ()
                         );
+                        if n_splits > 1 {
+                            msg_sel!(enc, st.set_cps, self.pso_gqa_reduce.id() => Id; ());
+                            msg_sel!(enc, st.set_buf, self.scratch.attn_part.id() => Id, 0usize => usize, 0usize => usize; ());
+                            msg_sel!(enc, st.set_buf, self.scratch.attn_out.id() => Id, 0usize => usize, 1usize => usize; ());
+                            msg_sel!(
+                                enc,
+                                st.set_bytes,
+                                (&gp as *const GqaFlashParams).cast::<c_void>() => *const c_void,
+                                std::mem::size_of::<GqaFlashParams>() => usize,
+                                2usize => usize;
+                                ()
+                            );
+                            msg_sel!(
+                                enc,
+                                st.dispatch_tg,
+                                MtlSize::new(num_q_heads, n_tok, 1) => MtlSize,
+                                MtlSize::new(128, 1, 1) => MtlSize;
+                                ()
+                            );
+                        }
                     }
 
+                    if prof_on { self.prof_cut(&mut cmd, &mut enc, "attention"); }
                     // 5. Signed FWHT-64 on `attn_out` + `o_proj` fused with `+ hidden` residual.
                     self.encode_norm_fwht(
                         enc,
@@ -1601,8 +1718,9 @@ impl MetalLlamaEngine {
                         n_tok,
                     );
 
+                    if prof_on { self.prof_cut(&mut cmd, &mut enc, "o_proj"); }
                     if let Some(moe_layer) = &layer.moe {
-                        self.encode_moe_ffn(enc, cfg, layer, moe_layer, n_tok, l_idx);
+                        self.encode_moe_ffn(&mut cmd, &mut enc, prof_on, cfg, layer, moe_layer, n_tok, l_idx);
                         continue;
                     }
                     let (Some(gate_up_proj), Some(down_proj)) = (&layer.gate_up_proj, &layer.down_proj) else {
@@ -1654,6 +1772,7 @@ impl MetalLlamaEngine {
                     );
                 }
 
+                if prof_on { self.prof_cut(&mut cmd, &mut enc, "ffn_dense"); }
                 // 8. Final RMSNorm + signed FWHT-64 + `lm_head` (last token only or full verification batch).
                 if logits_tokens > 0 {
                     let src_tok_off = if logits_tokens == 1 {
@@ -1685,6 +1804,15 @@ impl MetalLlamaEngine {
                     );
                 }
 
+                if prof_on {
+                    self.prof_cut(&mut cmd, &mut enc, "lm_head");
+                    if let Some(prof) = &self.prof {
+                        let n = prof.tokens.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n % 32 == 0 {
+                            prof.report();
+                        }
+                    }
+                }
                 msg_sel!(enc, st.end_enc; ());
                 msg_sel!(cmd, st.commit; ());
                 msg_sel!(cmd, st.wait_done; ());
@@ -1729,7 +1857,8 @@ impl MetalLlamaEngine {
     }
 
     /// Router top-k, grouped expert gate_up, SwiGLU+FWHT, grouped down and weighted combine into `hidden`.
-    unsafe fn encode_moe_ffn(&self, enc: Id, cfg: &LlamaConfig, layer: &GpuLayerWeights, moe: &GpuMoeLayer, n_tok: usize, l_idx: usize) {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn encode_moe_ffn(&self, cmd: &mut Id, enc: &mut Id, prof_on: bool, cfg: &LlamaConfig, layer: &GpuLayerWeights, moe: &GpuMoeLayer, n_tok: usize, l_idx: usize) {
         let st = sels();
         let g = self.moe.expect("MoE geometry");
         let h = cfg.hidden_size;
@@ -1777,47 +1906,75 @@ impl MetalLlamaEngine {
         // SAFETY: valid encoder; all buffers are owned by `self` or borrowed for the engine's lifetime.
         unsafe {
             // Router: RMSNorm(hidden) -> softmax over experts -> top-k ids and weights.
-            msg_sel!(enc, st.set_cps, self.pso_moe_router.id() => Id; ());
-            msg_sel!(enc, st.set_buf, self.scratch.hidden.id() => Id, 0usize => usize, 0usize => usize; ());
-            msg_sel!(enc, st.set_buf, layer.post_attn_norm.id() => Id, 0usize => usize, 1usize => usize; ());
-            msg_sel!(enc, st.set_buf, moe.router_w.id() => Id, 0usize => usize, 2usize => usize; ());
-            msg_sel!(enc, st.set_buf, bias_id => Id, 0usize => usize, 3usize => usize; ());
-            msg_sel!(enc, st.set_buf, ids_buf => Id, ids_off => usize, 4usize => usize; ());
-            msg_sel!(enc, st.set_buf, self.scratch.moe_w.id() => Id, 0usize => usize, 5usize => usize; ());
-            msg_sel!(enc, st.set_bytes, (&rp as *const MoeRouterParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeRouterParams>() => usize, 6usize => usize; ());
-            msg_sel!(enc, st.dispatch_tg, MtlSize::new(n_tok, 1, 1) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            msg_sel!(*enc, st.set_cps, self.pso_moe_router_logits.id() => Id; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.hidden.id() => Id, 0usize => usize, 0usize => usize; ());
+            msg_sel!(*enc, st.set_buf, layer.post_attn_norm.id() => Id, 0usize => usize, 1usize => usize; ());
+            msg_sel!(*enc, st.set_buf, moe.router_w.id() => Id, 0usize => usize, 2usize => usize; ());
+            msg_sel!(*enc, st.set_buf, bias_id => Id, 0usize => usize, 3usize => usize; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.moe_logits.id() => Id, 0usize => usize, 4usize => usize; ());
+            msg_sel!(*enc, st.set_bytes, (&rp as *const MoeRouterParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeRouterParams>() => usize, 5usize => usize; ());
+            msg_sel!(*enc, st.dispatch_tg, MtlSize::new(cfg.num_experts.div_ceil(4), n_tok, 1) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            msg_sel!(*enc, st.set_cps, self.pso_moe_router.id() => Id; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.moe_logits.id() => Id, 0usize => usize, 0usize => usize; ());
+            msg_sel!(*enc, st.set_buf, ids_buf => Id, ids_off => usize, 1usize => usize; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.moe_w.id() => Id, 0usize => usize, 2usize => usize; ());
+            msg_sel!(*enc, st.set_bytes, (&rp as *const MoeRouterParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeRouterParams>() => usize, 3usize => usize; ());
+            msg_sel!(*enc, st.dispatch_tg, MtlSize::new(n_tok, 1, 1) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            if prof_on { self.prof_cut(cmd, enc, "moe_router"); }
 
             // Post-attention RMSNorm + FWHT -> x_rot rows [n_tok][h].
-            self.encode_norm_fwht(enc, self.scratch.hidden.id(), 0, layer.post_attn_norm.id(), h, n_tok, cfg.rms_norm_eps, 0, false, false);
+            self.encode_norm_fwht(*enc, self.scratch.hidden.id(), 0, layer.post_attn_norm.id(), h, n_tok, cfg.rms_norm_eps, 0, false, false);
+            if prof_on { self.prof_cut(cmd, enc, "moe_norm_fwht"); }
 
             // gate_up for every (token, slot): moe_gu[(t*k+s)][2*d_ff].
-            msg_sel!(enc, st.set_cps, self.pso_moe_gemv.id() => Id; ());
-            msg_sel!(enc, st.set_buf, moe.shard.id() => Id, 0usize => usize, 0usize => usize; ());
-            msg_sel!(enc, st.set_buf, ids_buf => Id, ids_off => usize, 1usize => usize; ());
-            msg_sel!(enc, st.set_buf, self.scratch.x_rot_f32.id() => Id, 0usize => usize, 2usize => usize; ());
-            msg_sel!(enc, st.set_buf, self.scratch.moe_gu.id() => Id, 0usize => usize, 3usize => usize; ());
-            msg_sel!(enc, st.set_bytes, (&gu as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 4usize => usize; ());
-            msg_sel!(enc, st.dispatch_tg, MtlSize::new(gu.num_pairs as usize, k, n_tok) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            msg_sel!(*enc, st.set_cps, self.pso_moe_gemv.id() => Id; ());
+            msg_sel!(*enc, st.set_buf, moe.shard.id() => Id, 0usize => usize, 0usize => usize; ());
+            msg_sel!(*enc, st.set_buf, ids_buf => Id, ids_off => usize, 1usize => usize; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.x_rot_f32.id() => Id, 0usize => usize, 2usize => usize; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.moe_gu.id() => Id, 0usize => usize, 3usize => usize; ());
+            msg_sel!(*enc, st.set_bytes, (&gu as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 4usize => usize; ());
+            msg_sel!(*enc, st.dispatch_tg, MtlSize::new(gu.num_pairs as usize, k, n_tok) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            if prof_on { self.prof_cut(cmd, enc, "moe_gate_up"); }
 
             // SwiGLU + FWHT over n_tok*k rows of width d_ff -> x_rot rows [(t*k+s)][d_ff].
-            self.encode_norm_fwht(enc, self.scratch.moe_gu.id(), 0, self.dummy_buf.id(), g.d_ff, n_tok * k, cfg.rms_norm_eps, 2, false, false);
+            self.encode_norm_fwht(*enc, self.scratch.moe_gu.id(), 0, self.dummy_buf.id(), g.d_ff, n_tok * k, cfg.rms_norm_eps, 2, false, false);
+            if prof_on { self.prof_cut(cmd, enc, "moe_swiglu_fwht"); }
 
             // down for every (token, slot): moe_out[(t*k+s)][h].
-            msg_sel!(enc, st.set_cps, self.pso_moe_gemv.id() => Id; ());
-            msg_sel!(enc, st.set_buf, moe.shard.id() => Id, 0usize => usize, 0usize => usize; ());
-            msg_sel!(enc, st.set_buf, ids_buf => Id, ids_off => usize, 1usize => usize; ());
-            msg_sel!(enc, st.set_buf, self.scratch.x_rot_f32.id() => Id, 0usize => usize, 2usize => usize; ());
-            msg_sel!(enc, st.set_buf, self.scratch.moe_out.id() => Id, 0usize => usize, 3usize => usize; ());
-            msg_sel!(enc, st.set_bytes, (&dn as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 4usize => usize; ());
-            msg_sel!(enc, st.dispatch_tg, MtlSize::new(dn.num_pairs as usize, k, n_tok) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            msg_sel!(*enc, st.set_cps, self.pso_moe_gemv.id() => Id; ());
+            msg_sel!(*enc, st.set_buf, moe.shard.id() => Id, 0usize => usize, 0usize => usize; ());
+            msg_sel!(*enc, st.set_buf, ids_buf => Id, ids_off => usize, 1usize => usize; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.x_rot_f32.id() => Id, 0usize => usize, 2usize => usize; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.moe_out.id() => Id, 0usize => usize, 3usize => usize; ());
+            msg_sel!(*enc, st.set_bytes, (&dn as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 4usize => usize; ());
+            msg_sel!(*enc, st.dispatch_tg, MtlSize::new(dn.num_pairs as usize, k, n_tok) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            if prof_on { self.prof_cut(cmd, enc, "moe_down"); }
 
             // hidden[t] += sum_s w[t][s] * moe_out[t][s].
-            msg_sel!(enc, st.set_cps, self.pso_moe_combine.id() => Id; ());
-            msg_sel!(enc, st.set_buf, self.scratch.moe_out.id() => Id, 0usize => usize, 0usize => usize; ());
-            msg_sel!(enc, st.set_buf, self.scratch.moe_w.id() => Id, 0usize => usize, 1usize => usize; ());
-            msg_sel!(enc, st.set_buf, self.scratch.hidden.id() => Id, 0usize => usize, 2usize => usize; ());
-            msg_sel!(enc, st.set_bytes, (&rp as *const MoeRouterParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeRouterParams>() => usize, 6usize => usize; ());
-            msg_sel!(enc, st.dispatch_tg, MtlSize::new(n_tok, 1, 1) => MtlSize, MtlSize::new(256, 1, 1) => MtlSize; ());
+            msg_sel!(*enc, st.set_cps, self.pso_moe_combine.id() => Id; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.moe_out.id() => Id, 0usize => usize, 0usize => usize; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.moe_w.id() => Id, 0usize => usize, 1usize => usize; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.hidden.id() => Id, 0usize => usize, 2usize => usize; ());
+            msg_sel!(*enc, st.set_bytes, (&rp as *const MoeRouterParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeRouterParams>() => usize, 6usize => usize; ());
+            msg_sel!(*enc, st.dispatch_tg, MtlSize::new(n_tok, 1, 1) => MtlSize, MtlSize::new(256, 1, 1) => MtlSize; ());
+            if prof_on { self.prof_cut(cmd, enc, "moe_combine"); }
+        }
+    }
+
+    /// Profiling only: closes the current command buffer, records its GPU time under `label`,
+    /// and opens a fresh buffer and encoder.
+    unsafe fn prof_cut(&self, cmd: &mut Id, enc: &mut Id, label: &'static str) {
+        let Some(prof) = &self.prof else { return };
+        let st = sels();
+        unsafe {
+            msg_sel!(*enc, st.end_enc; ());
+            msg_sel!(*cmd, st.commit; ());
+            msg_sel!(*cmd, st.wait_done; ());
+            let t0: f64 = msg_sel!(*cmd, prof.sel_start as Sel; f64);
+            let t1: f64 = msg_sel!(*cmd, prof.sel_end as Sel; f64);
+            prof.add(label, (t1 - t0).max(0.0));
+            *cmd = msg_sel!(self.queue.id(), st.cmd_buffer; Id);
+            *enc = msg_sel!(*cmd, st.compute_enc; Id);
         }
     }
 
@@ -2107,7 +2264,10 @@ struct GqaFlashParams {
     uint window_size;
     uint sink_tokens;
     uint ring_len;
+    uint n_splits;
+    uint split_len;
     uint _pad;
+    uint _pad2;
 };
 
 constant float KV_INV_SQRT32 = 0.17677669529663689f;
@@ -2553,22 +2713,22 @@ inline void init_nf_tables_cb(
 }
 
 // One threadgroup per token: RMSNorm, router logits, softmax over all experts, top-k.
-kernel void moe_router_topk(
+// Router logits: one SIMD group per expert row, four experts per threadgroup, coalesced float4 loads.
+kernel void moe_router_logits(
     device const float* hidden   [[buffer(0)]],
     device const float* norm_w   [[buffer(1)]],
     device const float* router_w [[buffer(2)]],
     device const float* router_b [[buffer(3)]],
-    device uint*        ids_out  [[buffer(4)]],
-    device float*       w_out    [[buffer(5)]],
-    constant MoeRouterParams& p  [[buffer(6)]],
-    uint t     [[threadgroup_position_in_grid]],
+    device float*       logits   [[buffer(4)]],
+    constant MoeRouterParams& p  [[buffer(5)]],
+    uint2 tg   [[threadgroup_position_in_grid]],
     uint tid   [[thread_index_in_threadgroup]],
     uint sg_id [[simdgroup_index_in_threadgroup]],
     uint lane  [[thread_index_in_simdgroup]])
 {
+    const uint t = tg.y;
     if (t >= p.n_tok) return;
     threadgroup float red[4];
-    threadgroup float logits[1024];
     const uint h = p.h_dim;
     device const float* x = hidden + ulong(t) * ulong(h);
     float sq = 0.0f;
@@ -2580,41 +2740,82 @@ kernel void moe_router_topk(
     if (lane == 0u) red[sg_id] = sq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float inv = rsqrt((red[0] + red[1] + red[2] + red[3]) / float(h) + p.eps);
-    for (uint e = tid; e < p.num_experts; e += 128u) {
-        device const float* w = router_w + ulong(e) * ulong(h);
-        float acc = 0.0f;
-        for (uint i = 0u; i < h; ++i) {
-            acc += (x[i] * inv * norm_w[i]) * w[i];
-        }
-        if (p.has_bias != 0u) acc += router_b[e];
-        logits[e] = acc;
+    const uint e = tg.x * 4u + sg_id;
+    if (e >= p.num_experts) return;
+    device const float4* w4 = (device const float4*)(router_w + ulong(e) * ulong(h));
+    device const float4* x4 = (device const float4*)x;
+    device const float4* n4 = (device const float4*)norm_w;
+    const uint h4 = h >> 2u;
+    float acc = 0.0f;
+    for (uint i = lane; i < h4; i += 32u) acc += dot(w4[i], x4[i] * n4[i]);
+    acc = simd_sum(acc);
+    if (lane == 0u) logits[t * p.num_experts + e] = acc * inv + ((p.has_bias != 0u) ? router_b[e] : 0.0f);
+}
+
+// Softmax over the expert logits and top-k selection; ties go to the lowest expert index.
+kernel void moe_router_topk(
+    device const float* logits_in [[buffer(0)]],
+    device uint*        ids_out   [[buffer(1)]],
+    device float*       w_out     [[buffer(2)]],
+    constant MoeRouterParams& p   [[buffer(3)]],
+    uint t     [[threadgroup_position_in_grid]],
+    uint tid   [[thread_index_in_threadgroup]],
+    uint sg_id [[simdgroup_index_in_threadgroup]],
+    uint lane  [[thread_index_in_simdgroup]])
+{
+    if (t >= p.n_tok) return;
+    threadgroup float redz[4];
+    threadgroup float redv[4];
+    threadgroup uint  redi[4];
+    threadgroup float logits[1024];
+    const uint E = p.num_experts;
+    float lm = -1e30f;
+    for (uint e = tid; e < E; e += 128u) {
+        float v = logits_in[t * E + e];
+        logits[e] = v;
+        lm = max(lm, v);
     }
+    lm = simd_max(lm);
+    if (lane == 0u) redv[sg_id] = lm;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u) {
-        const uint E = p.num_experts;
-        float m = logits[0];
-        for (uint e = 1u; e < E; ++e) m = max(m, logits[e]);
-        float z = 0.0f;
-        for (uint e = 0u; e < E; ++e) {
-            float pe = exp(logits[e] - m);
-            logits[e] = pe;
-            z += pe;
+    const float m = max(max(redv[0], redv[1]), max(redv[2], redv[3]));
+    float lz = 0.0f;
+    for (uint e = tid; e < E; e += 128u) {
+        float pe = exp(logits[e] - m);
+        logits[e] = pe;
+        lz += pe;
+    }
+    lz = simd_sum(lz);
+    if (lane == 0u) redz[sg_id] = lz;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float z = redz[0] + redz[1] + redz[2] + redz[3];
+    float sel_sum = 0.0f;
+    for (uint s = 0u; s < p.top_k; ++s) {
+        float bv = -1.0f;
+        uint be = 0xFFFFFFFFu;
+        for (uint e = tid; e < E; e += 128u) {
+            float v = logits[e];
+            if (v > bv) { bv = v; be = e; }
         }
-        float sel_sum = 0.0f;
-        for (uint s = 0u; s < p.top_k; ++s) {
-            uint best = 0u;
-            float bv = -1.0f;
-            for (uint e = 0u; e < E; ++e) {
-                if (logits[e] > bv) { bv = logits[e]; best = e; }
-            }
-            logits[best] = -2.0f;
-            ids_out[t * p.top_k + s] = best;
-            w_out[t * p.top_k + s] = bv / z;
-            sel_sum += bv / z;
+        float mv = simd_max(bv);
+        uint mi = simd_min((bv == mv) ? be : 0xFFFFFFFFu);
+        if (lane == 0u) { redv[sg_id] = mv; redi[sg_id] = mi; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float gbv = redv[0];
+        uint gbe = redi[0];
+        for (uint g = 1u; g < 4u; ++g) {
+            if (redv[g] > gbv || (redv[g] == gbv && redi[g] < gbe)) { gbv = redv[g]; gbe = redi[g]; }
         }
-        if (p.norm_topk != 0u && sel_sum > 0.0f) {
-            for (uint s = 0u; s < p.top_k; ++s) w_out[t * p.top_k + s] /= sel_sum;
+        if (tid == 0u) {
+            logits[gbe] = -2.0f;
+            ids_out[t * p.top_k + s] = gbe;
+            w_out[t * p.top_k + s] = gbv / z;
         }
+        sel_sum += gbv / z;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u && p.norm_topk != 0u && sel_sum > 0.0f) {
+        for (uint s = 0u; s < p.top_k; ++s) w_out[t * p.top_k + s] /= sel_sum;
     }
 }
 
@@ -3329,12 +3530,14 @@ kernel void causal_gqa_flash_q8_decode(
     device const uchar* vs_raw   [[buffer(4)]],
     device float*       attn_out [[buffer(5)]],
     constant GqaFlashParams& p   [[buffer(6)]],
-    uint2 tg_pos [[threadgroup_position_in_grid]],
+    device float*       attn_part [[buffer(7)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
     uint sg_id   [[simdgroup_index_in_threadgroup]],
     uint lane    [[thread_index_in_simdgroup]])
 {
     const uint qh = tg_pos.x;
     const uint t = tg_pos.y;
+    const uint split = tg_pos.z;
     if (qh >= p.num_q_heads || t >= p.n_tok) return;
 
     const uint hd = p.head_dim;
@@ -3345,6 +3548,18 @@ kernel void causal_gqa_flash_q8_decode(
         ? (seq_len - (p.window_size - p.sink_tokens))
         : p.sink_tokens;
     const ulong head_base_slot = ulong(p.layer_idx * p.num_kv_heads + kvh) * ulong(p.kv_cap);
+    const uint idx_begin = (p.n_splits > 1u) ? split * p.split_len : 0u;
+    const uint idx_end = (p.n_splits > 1u) ? min(act_len, idx_begin + p.split_len) : act_len;
+    device float* part = attn_part + (ulong(t * p.num_q_heads + qh) * ulong(p.n_splits) + ulong(split)) * ulong(hd + 2u);
+    if (p.n_splits > 1u && idx_begin >= act_len) {
+        if (sg_id == 0u) {
+            if (lane == 0u) { part[0] = -1e30f; part[1] = 0.0f; }
+            part[2u + lane] = 0.0f;
+            part[2u + 32u + lane] = 0.0f;
+            if (hd == 128u) { part[2u + 64u + lane] = 0.0f; part[2u + 96u + lane] = 0.0f; }
+        }
+        return;
+    }
     device const float* q_ptr = qkv + ulong(t) * ulong(p.qkv_rows) + ulong(qh * hd);
 
     float q0 = q_ptr[lane] * p.attn_scale;
@@ -3362,7 +3577,7 @@ kernel void causal_gqa_flash_q8_decode(
         device const ushort* ksp = (device const ushort*)ks_raw;
         device const ushort* vsp = (device const ushort*)vs_raw;
         if (hd == 128u) {
-            for (uint idx = sg_id; idx < act_len; idx += 4u) {
+            for (uint idx = idx_begin + sg_id; idx < idx_end; idx += 4u) {
                 uint pos = (idx < p.sink_tokens) ? idx : (tail_start + idx - p.sink_tokens);
                 uint s_pos = kv_slot_of_pos(pos, p.sink_tokens, p.ring_len);
                 ulong slot = head_base_slot + ulong(s_pos);
@@ -3398,7 +3613,7 @@ kernel void causal_gqa_flash_q8_decode(
                 o3 = o3 * alpha + (pw * vs.w) * KV_NF4_CB[(uint(vp[48u + b_idx]) >> shift) & 0xFu];
             }
         } else {
-            for (uint idx = sg_id; idx < act_len; idx += 4u) {
+            for (uint idx = idx_begin + sg_id; idx < idx_end; idx += 4u) {
                 uint pos = (idx < p.sink_tokens) ? idx : (tail_start + idx - p.sink_tokens);
                 uint s_pos = kv_slot_of_pos(pos, p.sink_tokens, p.ring_len);
                 ulong slot = head_base_slot + ulong(s_pos);
@@ -3427,32 +3642,63 @@ kernel void causal_gqa_flash_q8_decode(
         device const char* v_q8 = (device const char*)v_raw;
         device const float* v_scales = (device const float*)vs_raw;
         if (hd == 128u) {
-            for (uint idx = sg_id; idx < act_len; idx += 4u) {
-                uint pos = (idx < p.sink_tokens) ? idx : (tail_start + idx - p.sink_tokens);
-                uint s_pos = kv_slot_of_pos(pos, p.sink_tokens, p.ring_len);
-                ulong slot = head_base_slot + ulong(s_pos);
-                device const char* kp = k_q8 + slot * 128ul;
-                float4 ks = *(device const float4*)(k_scales + slot * 4ul);
-                float dot_p = q0 * (float(kp[lane]) * ks.x)
-                            + q1 * (float(kp[32u + lane]) * ks.y)
-                            + q2 * (float(kp[64u + lane]) * ks.z)
-                            + q3 * (float(kp[96u + lane]) * ks.w);
-                float score = simd_sum(dot_p);
-                float m_new = (l_val == 0.0f) ? score : max(m_val, score);
-                float alpha = (l_val == 0.0f) ? 0.0f : exp(m_val - m_new);
-                float pw = exp(score - m_new);
-                l_val = l_val * alpha + pw;
+            // Block of 32 keys per SIMD group step: lane = key for the scores (one reduction per block),
+            // lane = 4 dims for the value accumulation.
+            threadgroup float q_s[4][128];
+            q_s[sg_id][lane] = q0;
+            q_s[sg_id][32u + lane] = q1;
+            q_s[sg_id][64u + lane] = q2;
+            q_s[sg_id][96u + lane] = q3;
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup const float4* q4 = (threadgroup const float4*)q_s[sg_id];
+            const uint grp = lane >> 3u;
+            float4 o4 = float4(0.0f);
+            for (uint blk = idx_begin + sg_id * 32u; blk < idx_end; blk += 128u) {
+                uint idx = blk + lane;
+                bool valid = idx < idx_end;
+                uint s_pos = 0u;
+                float score = -1e30f;
+                if (valid) {
+                    uint pos = (idx < p.sink_tokens) ? idx : (tail_start + idx - p.sink_tokens);
+                    s_pos = kv_slot_of_pos(pos, p.sink_tokens, p.ring_len);
+                    ulong slot = head_base_slot + ulong(s_pos);
+                    device const char4* kp4 = (device const char4*)(k_q8 + slot * 128ul);
+                    float4 ks = *(device const float4*)(k_scales + slot * 4ul);
+                    float4 acc = float4(0.0f);
+                    for (uint j = 0u; j < 8u; ++j) {
+                        acc.x += dot(float4(kp4[j]), q4[j]);
+                        acc.y += dot(float4(kp4[8u + j]), q4[8u + j]);
+                        acc.z += dot(float4(kp4[16u + j]), q4[16u + j]);
+                        acc.w += dot(float4(kp4[24u + j]), q4[24u + j]);
+                    }
+                    score = dot(acc, ks);
+                }
+                float m_new = max(m_val, simd_max(score));
+                float alpha = exp(m_val - m_new);
+                float pw = valid ? exp(score - m_new) : 0.0f;
+                l_val = l_val * alpha + simd_sum(pw);
                 m_val = m_new;
-
-                device const char* vp = v_q8 + slot * 128ul;
-                float4 vs = *(device const float4*)(v_scales + slot * 4ul);
-                o0 = o0 * alpha + (pw * vs.x) * float(vp[lane]);
-                o1 = o1 * alpha + (pw * vs.y) * float(vp[32u + lane]);
-                o2 = o2 * alpha + (pw * vs.z) * float(vp[64u + lane]);
-                o3 = o3 * alpha + (pw * vs.w) * float(vp[96u + lane]);
+                o4 *= alpha;
+                uint n_valid = min(32u, idx_end - blk);
+                for (uint i = 0u; i < n_valid; ++i) {
+                    float p_i = simd_broadcast(pw, ushort(i));
+                    uint sp_i = simd_broadcast(s_pos, ushort(i));
+                    ulong slot_i = head_base_slot + ulong(sp_i);
+                    char4 v = ((device const char4*)(v_q8 + slot_i * 128ul))[lane];
+                    float vs = v_scales[slot_i * 4ul + ulong(grp)];
+                    o4 += (p_i * vs) * float4(v);
+                }
             }
+            // Back to the per-lane layout used by the epilogue: lane holds dims lane, 32+lane, 64+lane, 96+lane.
+            threadgroup float o_s[4][128];
+            ((threadgroup float4*)o_s[sg_id])[lane] = o4;
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            o0 = o_s[sg_id][lane];
+            o1 = o_s[sg_id][32u + lane];
+            o2 = o_s[sg_id][64u + lane];
+            o3 = o_s[sg_id][96u + lane];
         } else {
-            for (uint idx = sg_id; idx < act_len; idx += 4u) {
+            for (uint idx = idx_begin + sg_id; idx < idx_end; idx += 4u) {
                 uint pos = (idx < p.sink_tokens) ? idx : (tail_start + idx - p.sink_tokens);
                 uint s_pos = kv_slot_of_pos(pos, p.sink_tokens, p.ring_len);
                 ulong slot = head_base_slot + ulong(s_pos);
@@ -3499,7 +3745,22 @@ kernel void causal_gqa_flash_q8_decode(
         float w1 = (tg_l[1] > 0.0f) ? exp(tg_m[1] - m_glob) : 0.0f;
         float w2 = (tg_l[2] > 0.0f) ? exp(tg_m[2] - m_glob) : 0.0f;
         float w3 = (tg_l[3] > 0.0f) ? exp(tg_m[3] - m_glob) : 0.0f;
-        float inv_l = 1.0f / (tg_l[0] * w0 + tg_l[1] * w1 + tg_l[2] * w2 + tg_l[3] * w3);
+        float l_tot = tg_l[0] * w0 + tg_l[1] * w1 + tg_l[2] * w2 + tg_l[3] * w3;
+        if (p.n_splits > 1u) {
+            // Partial result for `gqa_decode_reduce`: running max, running sum, unnormalized numerator.
+            if (lane == 0u) { part[0] = m_glob; part[1] = l_tot; }
+            part[2u + lane] = tg_o[0][lane] * w0 + tg_o[1][lane] * w1 + tg_o[2][lane] * w2 + tg_o[3][lane] * w3;
+            uint j1 = 32u + lane;
+            part[2u + j1] = tg_o[0][j1] * w0 + tg_o[1][j1] * w1 + tg_o[2][j1] * w2 + tg_o[3][j1] * w3;
+            if (hd == 128u) {
+                uint j2 = 64u + lane;
+                uint j3 = 96u + lane;
+                part[2u + j2] = tg_o[0][j2] * w0 + tg_o[1][j2] * w1 + tg_o[2][j2] * w2 + tg_o[3][j2] * w3;
+                part[2u + j3] = tg_o[0][j3] * w0 + tg_o[1][j3] * w1 + tg_o[2][j3] * w2 + tg_o[3][j3] * w3;
+            }
+            return;
+        }
+        float inv_l = 1.0f / l_tot;
 
         device float* dst = attn_out + ulong(t) * ulong(p.h_dim) + ulong(qh * hd);
         float r0 = (tg_o[0][lane] * w0 + tg_o[1][lane] * w1 + tg_o[2][lane] * w2 + tg_o[3][lane] * w3) * inv_l;
@@ -3524,6 +3785,77 @@ kernel void causal_gqa_flash_q8_decode(
             dst[i3] = r3;
         }
     }
+}
+
+// Merges the per-split partials of `causal_gqa_flash_q8_decode`: four SIMD groups each fold a
+// strided subset of splits with an online log-sum-exp merge, then combine through threadgroup memory.
+kernel void gqa_decode_reduce(
+    device const float* attn_part [[buffer(0)]],
+    device float*       attn_out  [[buffer(1)]],
+    constant GqaFlashParams& p    [[buffer(2)]],
+    uint2 tg_pos [[threadgroup_position_in_grid]],
+    uint sg_id   [[simdgroup_index_in_threadgroup]],
+    uint lane    [[thread_index_in_simdgroup]])
+{
+    const uint qh = tg_pos.x;
+    const uint t = tg_pos.y;
+    if (qh >= p.num_q_heads || t >= p.n_tok) return;
+    const uint hd = p.head_dim;
+    device const float* base = attn_part + ulong(t * p.num_q_heads + qh) * ulong(p.n_splits) * ulong(hd + 2u);
+    float m = -1e30f, l = 0.0f;
+    float r0 = 0.0f, r1 = 0.0f, r2 = 0.0f, r3 = 0.0f;
+    for (uint s = sg_id; s < p.n_splits; s += 4u) {
+        device const float* ps = base + ulong(s) * ulong(hd + 2u);
+        float ms = ps[0];
+        float ls = ps[1];
+        if (ls <= 0.0f) continue;
+        float m_new = max(m, ms);
+        float a = exp(m - m_new);
+        float b = exp(ms - m_new);
+        l = l * a + ls * b;
+        r0 = r0 * a + ps[2u + lane] * b;
+        r1 = r1 * a + ps[2u + 32u + lane] * b;
+        if (hd == 128u) {
+            r2 = r2 * a + ps[2u + 64u + lane] * b;
+            r3 = r3 * a + ps[2u + 96u + lane] * b;
+        }
+        m = m_new;
+    }
+    threadgroup float tg_m[4];
+    threadgroup float tg_l[4];
+    threadgroup float tg_o[4][128];
+    if (lane == 0u) { tg_m[sg_id] = m; tg_l[sg_id] = l; }
+    tg_o[sg_id][lane] = r0;
+    tg_o[sg_id][32u + lane] = r1;
+    if (hd == 128u) { tg_o[sg_id][64u + lane] = r2; tg_o[sg_id][96u + lane] = r3; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_id != 0u) return;
+    float m_glob = -1e30f;
+    for (uint g = 0u; g < 4u; ++g) if (tg_l[g] > 0.0f) m_glob = max(m_glob, tg_m[g]);
+    float w0 = (tg_l[0] > 0.0f) ? exp(tg_m[0] - m_glob) : 0.0f;
+    float w1 = (tg_l[1] > 0.0f) ? exp(tg_m[1] - m_glob) : 0.0f;
+    float w2 = (tg_l[2] > 0.0f) ? exp(tg_m[2] - m_glob) : 0.0f;
+    float w3 = (tg_l[3] > 0.0f) ? exp(tg_m[3] - m_glob) : 0.0f;
+    float inv_l = 1.0f / (tg_l[0] * w0 + tg_l[1] * w1 + tg_l[2] * w2 + tg_l[3] * w3);
+    float o0 = (tg_o[0][lane] * w0 + tg_o[1][lane] * w1 + tg_o[2][lane] * w2 + tg_o[3][lane] * w3) * inv_l;
+    uint i1 = 32u + lane;
+    float o1 = (tg_o[0][i1] * w0 + tg_o[1][i1] * w1 + tg_o[2][i1] * w2 + tg_o[3][i1] * w3) * inv_l;
+    float o2 = 0.0f, o3 = 0.0f;
+    if (hd == 128u) {
+        uint i2 = 64u + lane;
+        uint i3 = 96u + lane;
+        o2 = (tg_o[0][i2] * w0 + tg_o[1][i2] * w1 + tg_o[2][i2] * w2 + tg_o[3][i2] * w3) * inv_l;
+        o3 = (tg_o[0][i3] * w0 + tg_o[1][i3] * w1 + tg_o[2][i3] * w2 + tg_o[3][i3] * w3) * inv_l;
+    }
+    if (p.kv_bits == 4u) {
+        o0 = simd_ifwht32(o0, lane);
+        o1 = simd_ifwht32(o1, lane);
+        if (hd == 128u) { o2 = simd_ifwht32(o2, lane); o3 = simd_ifwht32(o3, lane); }
+    }
+    device float* dst = attn_out + ulong(t) * ulong(p.h_dim) + ulong(qh * hd);
+    dst[lane] = o0;
+    dst[i1] = o1;
+    if (hd == 128u) { dst[64u + lane] = o2; dst[96u + lane] = o3; }
 }
 
 kernel void causal_gqa_flash_q8_prefill(
