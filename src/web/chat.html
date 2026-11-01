@@ -854,6 +854,15 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const log = $("log"), input = $("input"), send = $("send"), attTray = $("att-tray");
+// Follow the stream only while the user is at the bottom; scrolling up releases the pin.
+let logPinned = true;
+log.addEventListener("scroll", () => {
+  logPinned = log.scrollHeight - log.scrollTop - log.clientHeight < 48;
+});
+function scrollLog(force = false) {
+  if (force) logPinned = true;
+  if (logPinned) log.scrollTop = log.scrollHeight;
+}
 
 let currentSessionId = "";
 let currentSessionTitle = "";
@@ -2089,7 +2098,7 @@ async function loadSessionById(id, switchProj = true) {
     }
     rebuildSessionChanges();
     renderSidebar();
-    log.scrollTop = log.scrollHeight;
+    scrollLog(true);
 
     // Adaptive workspace pane when restoring a session: open only if this session modified files
     if (!userClosedWs && sessionChanges.length > 0) {
@@ -2486,7 +2495,7 @@ function appendCompactionNotice(beforeTok, afterTok, count) {
   b.className = "compact-banner";
   b.textContent = `Context compacted: ${beforeTok} -> ${afterTok} tokens (${count} older items summarized · workspace files synced)`;
   log.appendChild(b);
-  log.scrollTop = log.scrollHeight;
+  scrollLog();
 }
 
 $("compact-btn").onclick = async () => {
@@ -2510,7 +2519,7 @@ $("compact-btn").onclick = async () => {
       b.className = "compact-banner";
       b.textContent = `Context already compact (${j.after_tokens} / ${j.context_limit} tokens)`;
       log.appendChild(b);
-      log.scrollTop = log.scrollHeight;
+      scrollLog();
     }
   } catch (e) {
   } finally {
@@ -2546,7 +2555,7 @@ function userBubble(text, attachments) {
     d.appendChild(t);
   }
   log.appendChild(d);
-  log.scrollTop = log.scrollHeight;
+  scrollLog();
   return d;
 }
 
@@ -2618,7 +2627,7 @@ function createTurnStreamContext(text, attachedItems, isMirrored, liveTurnId, ag
   card.appendChild(stepsBox);
   card.appendChild(proseBox);
   log.appendChild(card);
-  log.scrollTop = log.scrollHeight;
+  scrollLog(!isMirrored);
 
   const turnBadges = [];
   if (!isMirrored && pendingVoiceBadge) {
@@ -2901,7 +2910,7 @@ function applyTurnStreamEvent(ctx, j) {
       ctx.proseBox.textContent = "Workspace updated and verified.";
     }
   }
-  log.scrollTop = log.scrollHeight;
+  scrollLog();
 }
 
 async function finalizeTurnStreamContext(ctx) {
@@ -2945,7 +2954,7 @@ async function finalizeTurnStreamContext(ctx) {
   s.className = "stats";
   s.textContent = statsText;
   log.appendChild(s);
-  log.scrollTop = log.scrollHeight;
+  scrollLog();
 
   if (ctx.liveTurnId && !currentSessionId) {
     currentSessionId = "sess_live_" + ctx.liveTurnId;

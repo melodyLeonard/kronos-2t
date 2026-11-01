@@ -494,6 +494,15 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const qInput = $("q-input"), qSend = $("q-send"), qVoice = $("q-voice"), tray = $("tray"), ansWrap = $("answer-wrap");
+// Follow the stream only while the user is at the bottom; scrolling up releases the pin.
+let ansPinned = true;
+ansWrap.addEventListener("scroll", () => {
+  ansPinned = ansWrap.scrollHeight - ansWrap.scrollTop - ansWrap.clientHeight < 48;
+});
+function scrollAns(force = false) {
+  if (force) ansPinned = true;
+  if (ansPinned) scrollAns();
+}
 let quickSessionId = "";
 let quickTitle = "";
 let quickCreatedAt = 0;
@@ -821,7 +830,7 @@ $("sess-select").onchange = async () => {
       }
     }
     ansWrap.classList.toggle("open", ansWrap.children.length > 0);
-    ansWrap.scrollTop = ansWrap.scrollHeight;
+    scrollAns();
     syncPanelHeight();
   } catch (e) {}
 };
@@ -1167,7 +1176,7 @@ $("q-form").onsubmit = async (e) => {
   rEl.className = "q-turn-reply";
   rEl.textContent = "…";
   ansWrap.appendChild(rEl);
-  ansWrap.scrollTop = ansWrap.scrollHeight;
+  scrollAns(true);
   syncPanelHeight();
 
   $("q-status").textContent = "Generating…";
@@ -1251,7 +1260,7 @@ $("q-form").onsubmit = async (e) => {
         } else if (j.type === "text") {
           prose += j.delta;
           rEl.innerHTML = renderMd(prose);
-          ansWrap.scrollTop = ansWrap.scrollHeight;
+          scrollAns();
           syncPanelHeight();
         } else if (j.type === "tool_progress") {
           $("q-status").textContent = `Drafting ${j.name} ${j.target || ""} (${j.bytes} B)…`;
