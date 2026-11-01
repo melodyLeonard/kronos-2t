@@ -267,7 +267,7 @@
     if (section == 2) {
         return @"Connects over local Wi-Fi to your Mac Kronos 14B server for desktop context and high-accuracy local reasoning, falling back automatically to the on-device Qwen2.5-1.5B-Instruct Metal engine when offline.";
     }
-    return @"Controls spoken replies and automatic submission when you pause speaking.";
+    return @"Controls spoken replies and whether a pause ends the recording. Nothing is sent until you press Send.";
 }
 
 - (UISwitch *)makeSwitchWithTag:(NSInteger)tag isOn:(BOOL)isOn {
@@ -344,8 +344,8 @@
         cell.imageView.image = [UIImage systemImageNamed:@"speaker.wave.2.fill"];
         cell.accessoryView = [self makeSwitchWithTag:103 isOn:s.spokenRepliesEnabled];
     } else if (indexPath.section == 3 && indexPath.row == 1) {
-        cell.textLabel.text = @"Auto-Send Voice After Pause";
-        cell.detailTextLabel.text = @"Submit spoken prompt after a brief pause";
+        cell.textLabel.text = @"Stop Listening After Pause";
+        cell.detailTextLabel.text = @"Finish the transcript after a brief pause; you press Send";
         cell.imageView.image = [UIImage systemImageNamed:@"mic.badge.plus"];
         cell.accessoryView = [self makeSwitchWithTag:104 isOn:s.autoSendVoiceAfterPause];
     }
@@ -1029,6 +1029,8 @@ static inline NSString *kronosExtractFallbackFileIfNeeded(NSString *userText, NS
 - (void)voiceControllerDidChangeListening:(BOOL)isListening statusText:(NSString *)status;
 - (void)voiceControllerDidTranscribePartial:(NSString *)transcript;
 - (void)voiceControllerDidFinishUtterance:(NSString *)finalTranscript;
+@optional
+- (void)voiceControllerDidUpdateLevel:(float)level;
 @end
 
 @interface KronosVoiceController : NSObject
@@ -1043,7 +1045,10 @@ static inline NSString *kronosExtractFallbackFileIfNeeded(NSString *userText, NS
 @property (nonatomic, assign) BOOL isListening;
 @property (nonatomic, assign) BOOL voiceOutputEnabled;
 - (void)toggleListening;
+/// Stops the microphone; with `shouldCommit` the final transcript goes to the delegate (into the composer).
 - (void)stopListeningAndCommit:(BOOL)shouldCommit;
+/// Stops the microphone and drops the transcript.
+- (void)discardListening;
 - (void)speakText:(NSString *)text;
 - (void)stopSpeaking;
 /// Called on the main queue when spoken output finishes or is cancelled.
@@ -1180,6 +1185,21 @@ static inline NSString *kronosExtractFallbackFileIfNeeded(NSString *userText, NS
     [inputNode installTapOnBus:0 bufferSize:1024 format:recordingFormat block:^(AVAudioPCMBuffer *buffer, AVAudioTime *when) {
         (void)when;
         [weakSelf.recognitionRequest appendAudioPCMBuffer:buffer];
+        // RMS of the first channel, mapped to a 0..1 level for the waveform.
+        float level = 0.0f;
+        if (buffer.floatChannelData != NULL && buffer.frameLength > 0) {
+            const float *ch = buffer.floatChannelData[0];
+            double acc = 0.0;
+            for (AVAudioFrameCount i = 0; i < buffer.frameLength; i++) acc += (double)ch[i] * (double)ch[i];
+            float rms = (float)sqrt(acc / (double)buffer.frameLength);
+            level = MIN(1.0f, rms * 9.0f);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) me = weakSelf;
+            if (me != nil && me.isListening && [me.delegate respondsToSelector:@selector(voiceControllerDidUpdateLevel:)]) {
+                [me.delegate voiceControllerDidUpdateLevel:level];
+            }
+        });
     }];
 
     [self.audioEngine prepare];
@@ -1215,6 +1235,11 @@ static inline NSString *kronosExtractFallbackFileIfNeeded(NSString *userText, NS
             }
         });
     }];
+}
+
+- (void)discardListening {
+    self.latestTranscript = @"";
+    [self stopListeningAndCommit:NO];
 }
 
 - (void)stopListeningAndCommit:(BOOL)shouldCommit {

@@ -69,6 +69,13 @@ static inline NSString *kronosCleanDraftOutput(NSString *raw) {
 @property (nonatomic, strong) UIView *welcomeView;
 
 @property (nonatomic, strong) UIView *composerContainer;
+/// Recording strip above the composer: discard, timer, live waveform, stop.
+@property (nonatomic, strong) UIView *voiceBar;
+@property (nonatomic, strong) NSLayoutConstraint *voiceBarHeight;
+@property (nonatomic, strong) UILabel *voiceTimerLabel;
+@property (nonatomic, strong) KronosLevelWaveView *voiceWave;
+@property (nonatomic, strong) NSTimer *voiceClock;
+@property (nonatomic, assign) NSTimeInterval voiceStartedAt;
 @property (nonatomic, strong) UIScrollView *attachmentsStrip;
 @property (nonatomic, strong) UIStackView *attachmentsStack;
 @property (nonatomic, strong) NSLayoutConstraint *attachmentsHeightConstraint;
@@ -300,6 +307,61 @@ static const CGFloat kSidebarWidth = 296.0;
     self.attachmentsStack.spacing = 8.0;
     [self.attachmentsStrip addSubview:self.attachmentsStack];
 
+    self.voiceBar = [[UIView alloc] init];
+    self.voiceBar.translatesAutoresizingMaskIntoConstraints = NO;
+    self.voiceBar.backgroundColor = kronosSubtleColor();
+    self.voiceBar.layer.cornerRadius = 16.0;
+    self.voiceBar.clipsToBounds = YES;
+    self.voiceBar.hidden = YES;
+    [self.composerContainer addSubview:self.voiceBar];
+
+    KronosTapButton *voiceTrash = [KronosTapButton tapButton];
+    voiceTrash.translatesAutoresizingMaskIntoConstraints = NO;
+    [voiceTrash setImage:[UIImage systemImageNamed:@"trash" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:18.0 weight:UIImageSymbolWeightRegular]] forState:UIControlStateNormal];
+    voiceTrash.tintColor = kronosMutedColor();
+    voiceTrash.accessibilityLabel = @"Discard recording";
+    [voiceTrash addTarget:self action:@selector(voiceDiscardTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.voiceBar addSubview:voiceTrash];
+
+    self.voiceTimerLabel = [[UILabel alloc] init];
+    self.voiceTimerLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.voiceTimerLabel.text = @"0:00";
+    self.voiceTimerLabel.textColor = kronosTextColor();
+    self.voiceTimerLabel.font = [UIFont monospacedDigitSystemFontOfSize:15.0 weight:UIFontWeightMedium];
+    [self.voiceBar addSubview:self.voiceTimerLabel];
+
+    self.voiceWave = [[KronosLevelWaveView alloc] init];
+    self.voiceWave.translatesAutoresizingMaskIntoConstraints = NO;
+    self.voiceWave.tintColor = kronosAccentColor();
+    [self.voiceBar addSubview:self.voiceWave];
+
+    KronosTapButton *voiceStop = [KronosTapButton tapButton];
+    voiceStop.translatesAutoresizingMaskIntoConstraints = NO;
+    [voiceStop setImage:[UIImage systemImageNamed:@"stop.circle.fill" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:26.0 weight:UIImageSymbolWeightRegular]] forState:UIControlStateNormal];
+    voiceStop.tintColor = [UIColor colorWithRed:0.88 green:0.26 blue:0.28 alpha:1.0];
+    voiceStop.accessibilityLabel = @"Stop recording and keep the text";
+    [voiceStop addTarget:self action:@selector(voiceStopTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.voiceBar addSubview:voiceStop];
+
+    self.voiceBarHeight = [self.voiceBar.heightAnchor constraintEqualToConstant:0.0];
+    [NSLayoutConstraint activateConstraints:@[
+        self.voiceBarHeight,
+        [voiceTrash.leadingAnchor constraintEqualToAnchor:self.voiceBar.leadingAnchor constant:10.0],
+        [voiceTrash.centerYAnchor constraintEqualToAnchor:self.voiceBar.centerYAnchor],
+        [voiceTrash.widthAnchor constraintEqualToConstant:36.0],
+        [voiceTrash.heightAnchor constraintEqualToConstant:36.0],
+        [self.voiceTimerLabel.leadingAnchor constraintEqualToAnchor:voiceTrash.trailingAnchor constant:6.0],
+        [self.voiceTimerLabel.centerYAnchor constraintEqualToAnchor:self.voiceBar.centerYAnchor],
+        [self.voiceWave.leadingAnchor constraintEqualToAnchor:self.voiceTimerLabel.trailingAnchor constant:10.0],
+        [self.voiceWave.trailingAnchor constraintEqualToAnchor:voiceStop.leadingAnchor constant:-10.0],
+        [self.voiceWave.centerYAnchor constraintEqualToAnchor:self.voiceBar.centerYAnchor],
+        [self.voiceWave.heightAnchor constraintEqualToConstant:30.0],
+        [voiceStop.trailingAnchor constraintEqualToAnchor:self.voiceBar.trailingAnchor constant:-8.0],
+        [voiceStop.centerYAnchor constraintEqualToAnchor:self.voiceBar.centerYAnchor],
+        [voiceStop.widthAnchor constraintEqualToConstant:40.0],
+        [voiceStop.heightAnchor constraintEqualToConstant:40.0],
+    ]];
+
     UIView *capsule = [[UIView alloc] init];
     capsule.translatesAutoresizingMaskIntoConstraints = NO;
     capsule.backgroundColor = kronosPanelColor();
@@ -379,7 +441,10 @@ static const CGFloat kSidebarWidth = 296.0;
         [self.attachmentsStack.trailingAnchor constraintEqualToAnchor:self.attachmentsStrip.contentLayoutGuide.trailingAnchor],
         [self.attachmentsStack.heightAnchor constraintEqualToAnchor:self.attachmentsStrip.frameLayoutGuide.heightAnchor],
 
-        [capsule.topAnchor constraintEqualToAnchor:self.attachmentsStrip.bottomAnchor constant:6.0],
+        [self.voiceBar.topAnchor constraintEqualToAnchor:self.attachmentsStrip.bottomAnchor constant:6.0],
+        [self.voiceBar.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12.0],
+        [self.voiceBar.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12.0],
+        [capsule.topAnchor constraintEqualToAnchor:self.voiceBar.bottomAnchor constant:6.0],
         [capsule.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12.0],
         [capsule.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12.0],
         [capsule.bottomAnchor constraintEqualToAnchor:kb.topAnchor constant:-8.0],
@@ -1303,6 +1368,29 @@ static const CGFloat kSidebarWidth = 296.0;
 - (void)voiceControllerDidChangeListening:(BOOL)isListening statusText:(NSString *)status {
     UIImageSymbolConfiguration *iconCfg = [UIImageSymbolConfiguration configurationWithPointSize:18.0 weight:UIImageSymbolWeightMedium];
     KronosTapButton *mic = [self.micButton isKindOfClass:[KronosTapButton class]] ? (KronosTapButton *)self.micButton : nil;
+    [self.voiceClock invalidate];
+    self.voiceClock = nil;
+    if (isListening) {
+        self.voiceStartedAt = [NSDate timeIntervalSinceReferenceDate];
+        self.voiceTimerLabel.text = @"0:00";
+        [self.voiceWave reset];
+        __weak typeof(self) weakSelf = self;
+        self.voiceClock = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+            __strong typeof(weakSelf) me = weakSelf;
+            if (me == nil) return;
+            NSInteger sec = (NSInteger)([NSDate timeIntervalSinceReferenceDate] - me.voiceStartedAt);
+            me.voiceTimerLabel.text = [NSString stringWithFormat:@"%ld:%02ld", (long)(sec / 60), (long)(sec % 60)];
+        }];
+    }
+    BOOL showBar = isListening;
+    if (self.voiceBar.hidden == showBar) {
+        self.voiceBar.hidden = NO;
+        [UIView animateWithDuration:0.22 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+            self.voiceBarHeight.constant = showBar ? 52.0 : 0.0;
+            self.voiceBar.alpha = showBar ? 1.0 : 0.0;
+            [self.view layoutIfNeeded];
+        } completion:^(BOOL f) { self.voiceBar.hidden = !showBar; }];
+    }
     if (isListening) {
         [self.micButton setImage:[UIImage systemImageNamed:@"waveform" withConfiguration:iconCfg] forState:UIControlStateNormal];
         self.micButton.tintColor = [UIColor whiteColor];
@@ -1323,13 +1411,28 @@ static const CGFloat kSidebarWidth = 296.0;
     [self textViewDidChange:self.inputTextView];
 }
 
+/// The transcript stays in the composer; nothing is sent until the user presses Send.
 - (void)voiceControllerDidFinishUtterance:(NSString *)finalTranscript {
+    self.inputTextView.text = finalTranscript ?: @"";
+    [self textViewDidChange:self.inputTextView];
+    if (finalTranscript.length > 0) {
+        self.lastTurnWasSpoken = YES;
+        if ([self.sendButton isKindOfClass:[KronosTapButton class]]) [(KronosTapButton *)self.sendButton bounce];
+    }
+}
+
+- (void)voiceControllerDidUpdateLevel:(float)level {
+    [self.voiceWave pushLevel:level];
+}
+
+- (void)voiceDiscardTapped {
+    [self.voiceController discardListening];
     self.inputTextView.text = @"";
     [self textViewDidChange:self.inputTextView];
-    if (finalTranscript.length > 0 && !self.isGenerating) {
-        self.lastTurnWasSpoken = YES;
-        [self submitUserPrompt:finalTranscript];
-    }
+}
+
+- (void)voiceStopTapped {
+    [self.voiceController stopListeningAndCommit:YES];
 }
 
 #pragma mark - Engine & Workspace Files
@@ -1422,7 +1525,7 @@ static const CGFloat kSidebarWidth = 296.0;
 - (void)sendOrStopTapped {
     if (self.voiceController.isListening) {
         [self.voiceController stopListeningAndCommit:YES];
-        return;
+        // Falls through: the final transcript is now in the composer and Send means send.
     }
     if (self.isGenerating) {
         atomic_store(&_cancelFlag, true);

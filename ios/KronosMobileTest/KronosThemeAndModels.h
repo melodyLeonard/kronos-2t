@@ -159,6 +159,52 @@ static inline UIColor *kronosSidebarMuted(void)  { return [UIColor colorWithRed:
 }
 @end
 
+/// Scrolling bar waveform of recent microphone levels (0..1), newest on the right.
+@interface KronosLevelWaveView : UIView
+@property (nonatomic, strong) NSMutableArray<NSNumber *> *levels;
+@property (nonatomic, assign) NSUInteger capacity;
+- (void)pushLevel:(float)level;
+- (void)reset;
+@end
+@implementation KronosLevelWaveView
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        _levels = [NSMutableArray array];
+        _capacity = 44;
+        self.backgroundColor = [UIColor clearColor];
+        self.contentMode = UIViewContentModeRedraw;
+    }
+    return self;
+}
+- (void)pushLevel:(float)level {
+    [self.levels addObject:@(MAX(0.0f, MIN(1.0f, level)))];
+    while (self.levels.count > self.capacity) [self.levels removeObjectAtIndex:0];
+    [self setNeedsDisplay];
+}
+- (void)reset {
+    [self.levels removeAllObjects];
+    [self setNeedsDisplay];
+}
+- (void)drawRect:(CGRect)rect {
+    CGContextRef ctx = UIGraphicsGetCurrentContext();
+    CGFloat w = self.bounds.size.width, h = self.bounds.size.height;
+    CGFloat step = w / (CGFloat)self.capacity;
+    CGFloat barW = MAX(2.0, step * 0.55);
+    NSUInteger n = self.levels.count;
+    [self.tintColor setFill];
+    for (NSUInteger i = 0; i < self.capacity; i++) {
+        float lv = 0.0f;
+        NSInteger idx = (NSInteger)i - (NSInteger)(self.capacity - n);
+        if (idx >= 0) lv = self.levels[(NSUInteger)idx].floatValue;
+        CGFloat bh = MAX(3.0, lv * h);
+        CGRect r = CGRectMake(i * step + (step - barW) / 2.0, (h - bh) / 2.0, barW, bh);
+        [[UIBezierPath bezierPathWithRoundedRect:r cornerRadius:barW / 2.0] fill];
+    }
+    (void)ctx;
+}
+@end
+
 /// A short pill at the bottom of `host` ("Copied"), fading after 1.4 s.
 static inline void kronosShowToast(UIView *host, NSString *text) {
     if (host == nil) return;
