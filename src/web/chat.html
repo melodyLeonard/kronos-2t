@@ -1792,6 +1792,8 @@ async function deleteSessionById(id) {
 }
 
 function startNewConversation(focusComposer = true) {
+  // Leaving a conversation ends its in-flight turn; otherwise the composer stays on Stop.
+  if (localTurnInFlight) stopLocalTurn();
   currentSessionId = "";
   currentSessionTitle = "";
   currentCreatedAt = 0;
@@ -2050,6 +2052,7 @@ function renderSavedTurnDom(t) {
 
 async function loadSessionById(id, switchProj = true) {
   if (!id) return;
+  if (localTurnInFlight && id !== currentSessionId) stopLocalTurn();
   pinnedTurnId = 0;
   mirroredCtx = null;
   try {
@@ -3225,6 +3228,7 @@ async function runUnifiedTurn(text, attachedItems) {
     $("conv-heading").textContent = currentSessionTitle;
   }
   const prevLen = sessionHistory.length;
+  const turnHistory = sessionHistory;
   sessionHistory.push({ role: "user", content: text });
   userBubble(text, attachedItems);
 
@@ -3294,8 +3298,9 @@ async function runUnifiedTurn(text, attachedItems) {
     ctx.routePill.className = "pill err";
     ctx.routePill.textContent = "error";
     ctx.proseBox.textContent = "Error: " + err.message;
-    sessionHistory.length = prevLen;
-    if (!ctx.gotDone) {
+    // Only rewind the history this turn appended to; the user may have switched conversations.
+    if (sessionHistory === turnHistory) sessionHistory.length = prevLen;
+    if (!ctx.gotDone && sessionHistory === turnHistory) {
       if (!input.value && text) input.value = text;
       if (pendingAttachments.length === 0 && attachedItems.length > 0) {
         pendingAttachments = attachedItems.slice();
@@ -3307,14 +3312,15 @@ async function runUnifiedTurn(text, attachedItems) {
   }
 }
 
-$("stop").onclick = async () => {
+async function stopLocalTurn() {
   $("stop").disabled = true;
+  if (turnAbort) turnAbort.abort();
   try {
     await fetch("/v1/turn/cancel", { method: "POST", headers: headers(), body: JSON.stringify({ turn_id: 0 }) });
   } catch (_) {}
-  if (turnAbort) turnAbort.abort();
   $("stop").disabled = false;
-};
+}
+$("stop").onclick = stopLocalTurn;
 let turnAbort = null;
 
 $("form").onsubmit = async (e) => {
