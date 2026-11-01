@@ -69,7 +69,6 @@ static inline UIColor *kronosSidebarMuted(void)  { return [UIColor colorWithRed:
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
-        self.adjustsImageWhenHighlighted = NO;
         self.haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
         [self addTarget:self action:@selector(kronosPressDown) forControlEvents:UIControlEventTouchDown | UIControlEventTouchDragEnter];
         [self addTarget:self action:@selector(kronosPressUp) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel | UIControlEventTouchDragExit];
