@@ -744,6 +744,20 @@ pub fn structural_route_logits(
         "compile ",
         "center the ",
         "align ",
+        "set ",
+        "change ",
+        "replace ",
+        "increase ",
+        "decrease ",
+        "bump ",
+        "enable ",
+        "disable ",
+        "turn on ",
+        "turn off ",
+        "insert ",
+        "append ",
+        "remove ",
+        "delete ",
     ];
     if action_phrases.iter().any(|p| {
         lower.starts_with(p)

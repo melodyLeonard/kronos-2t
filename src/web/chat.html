@@ -892,6 +892,7 @@ let livePollBusy = false;
 let livePollInitialized = false;
 let mirroredTurnId = 0;
 let mirroredNextIndex = 0;
+let uiStamp = "";
 let mirroredCtx = null;
 let pinnedTurnId = 0;
 let liveAgents = [];
@@ -3131,6 +3132,12 @@ async function pollLiveTurn() {
     const reqSince = (reqTid && reqTid === mirroredTurnId) ? mirroredNextIndex : 0;
     const r = await fetch(`/v1/turn/live?turn_id=${reqTid}&since=${reqSince}`, { headers: headers() });
     if (!r.ok) return;
+    // The server stamps the page it serves; pick up a changed page instead of running stale script.
+    const stamp = r.headers.get("x-kronos-ui");
+    if (stamp) {
+      if (!uiStamp) uiStamp = stamp;
+      else if (stamp !== uiStamp && !localTurnInFlight) { location.reload(); return; }
+    }
     const j = await r.json();
     if (j && Array.isArray(j.agents)) {
       renderMultiAgentBar(j.agents);

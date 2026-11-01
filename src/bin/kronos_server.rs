@@ -27,7 +27,7 @@
 use kronos_2t::runtime::agent::{
     build_unified_system_prompt, classify_turn_intent, compact_conversation_history,
     is_multi_agent_prompt, list_workspace_files, mime_type_for_path, resolve_jailed_path,
-    run_agent_turn_prioritized, serialize_messages_json, spawn_agent_tool_definition_json,
+    run_agent_turn_with_lock, serialize_messages_json, spawn_agent_tool_definition_json,
     tool_definitions_json, truncate_utf8, validate_file, AgentEvent, AgentTurnConfig,
     FileChangeDiff, SubAgentSpawner, TurnRoute, AGENT_SYSTEM_PROMPT, MAX_READ_BYTES,
     UNIFIED_SYSTEM_PROMPT,
@@ -42,8 +42,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kronos_2t::config::server::{MAX_BODY_BYTES as MAX_BODY, MAX_HEADER_BYTES as MAX_HEADER, MAX_REVERT_SNAPSHOT_BYTES};
@@ -101,27 +102,77 @@ struct Server {
     turn_seq: AtomicU64,
     agent_seq: AtomicU64,
     media_seq: AtomicU64,
-    /// Quick chat turns waiting for the model; agent tool loops yield between steps while it is non-zero.
-    quick_waiting: AtomicUsize,
+    gate: ModelGate,
+    /// Hash of the chat page last served; the page reloads itself when it changes.
+    ui_stamp: AtomicU64,
 }
 
-/// Marks a quick interactive turn as waiting until dropped.
-struct QuickTicket<'a>(&'a AtomicUsize);
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
+}
 
-impl<'a> QuickTicket<'a> {
-    fn new(flag: &'a AtomicUsize) -> Self {
-        flag.fetch_add(1, Ordering::AcqRel);
-        Self(flag)
+/// Hands out the model in arrival order, interactive requests (browser tabs) ahead of
+/// external API and background agent steps, so a short question never starves behind a tool loop.
+struct ModelGate {
+    queue: Mutex<(VecDeque<u64>, VecDeque<u64>)>,
+    cv: Condvar,
+    next_ticket: AtomicU64,
+}
+
+impl ModelGate {
+    fn new() -> Self {
+        Self { queue: Mutex::new((VecDeque::new(), VecDeque::new())), cv: Condvar::new(), next_ticket: AtomicU64::new(1) }
     }
 }
 
-impl Drop for QuickTicket<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+fn clock_hms() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let local = secs as i64 + localtime_offset_secs();
+    format!("{:02}:{:02}:{:02}", local.rem_euclid(86_400) / 3600, local.rem_euclid(3600) / 60, local.rem_euclid(60))
+}
+
+fn localtime_offset_secs() -> i64 {
+    unsafe extern "C" {
+        fn time(t: *mut i64) -> i64;
+        fn localtime_r(t: *const i64, out: *mut [u8; 128]) -> *mut [u8; 128];
+    }
+    // SAFETY: `struct tm` is far smaller than 128 bytes on Apple platforms; `tm_gmtoff` is at byte 40.
+    unsafe {
+        let t = time(std::ptr::null_mut());
+        let mut buf = [0u8; 128];
+        if localtime_r(&t, &mut buf).is_null() {
+            return 0;
+        }
+        i64::from_ne_bytes(buf[40..48].try_into().unwrap_or([0; 8]))
     }
 }
 
 impl Server {
+    /// Takes the model in queue order; `interactive` requests go ahead of background ones.
+    fn acquire_model(&self, interactive: bool, what: &str) -> MutexGuard<'_, ChatModel> {
+        let t0 = std::time::Instant::now();
+        let ticket = self.gate.next_ticket.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut q = self.gate.queue.lock().unwrap_or_else(|p| p.into_inner());
+            if interactive { q.0.push_back(ticket) } else { q.1.push_back(ticket) }
+            loop {
+                let head = q.0.front().or(q.1.front()).copied();
+                if head == Some(ticket) {
+                    if interactive { q.0.pop_front(); } else { q.1.pop_front(); }
+                    break;
+                }
+                q = self.gate.cv.wait(q).unwrap_or_else(|p| p.into_inner());
+            }
+        }
+        let guard = self.model.lock().unwrap_or_else(|p| p.into_inner());
+        self.gate.cv.notify_all();
+        let waited = t0.elapsed().as_secs_f64();
+        if waited > 1.0 {
+            eprintln!("[{}] [model] {what} waited {waited:.1}s for the model", clock_hms());
+        }
+        guard
+    }
+
     fn active_workdir(&self) -> PathBuf {
         self.workdir.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
@@ -666,12 +717,8 @@ fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
     }
     let id = format!("chatcmpl-{}-{}", now(), srv.next_id.fetch_add(1, Ordering::Relaxed));
     let created = now();
-    let _quick = tools_json.is_empty().then(|| QuickTicket::new(&srv.quick_waiting));
-    let t_lock = std::time::Instant::now();
-    let mut model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
-    if t_lock.elapsed().as_secs_f64() > 1.0 {
-        eprintln!("[model] chat request waited {:.1}s for the model", t_lock.elapsed().as_secs_f64());
-    }
+    let interactive = req.header("x-kronos-tab").is_some();
+    let mut model = srv.acquire_model(interactive, if interactive { "chat (tab)" } else { "chat (api)" });
 
     if !streaming {
         match model.generate_with_tools(&messages, &tools_json, &params, |_| true) {
@@ -932,11 +979,12 @@ fn execute_allocated_turn(
         workdir,
         attachments,
         media_ms,
-        origin: _,
+        origin,
         raw_user_text: _,
         agent_label: _,
         parent_turn_id: _,
     } = spec;
+    let interactive_turn = !matches!(origin.as_str(), "external" | "subagent" | "multi_agent");
 
     let tracked_workdir = Mutex::new(workdir.clone());
 
@@ -1165,11 +1213,9 @@ fn execute_allocated_turn(
         }
     });
 
-    let quick = effective_route == TurnRoute::Chat;
-    let _quick_ticket = quick.then(|| QuickTicket::new(&srv.quick_waiting));
-    let run_res = run_agent_turn_prioritized(
-        &srv.model,
-        (!quick).then_some(&srv.quick_waiting),
+    let step_label = format!("{} step ({})", if interactive_turn { "tab" } else { origin.as_str() }, effective_route.as_str());
+    let run_res = run_agent_turn_with_lock(
+        || srv.acquire_model(interactive_turn, &step_label),
         &mut history,
         &tools_json,
         &cfg,
@@ -2230,6 +2276,7 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
     }
     if req.method == "GET" && (req.path == "/" || req.path == "/index.html") {
         let live_html = fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/src/web/chat.html")).ok();
+        srv.ui_stamp.store(fnv1a64(live_html.as_deref().unwrap_or(CHAT_PAGE.as_bytes())), Ordering::Relaxed);
         return respond_bytes(
             &mut stream,
             200,
@@ -2329,7 +2376,7 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
                 r#"{"turn_id":0,"agent_ord":0,"agent_label":"","parent_turn_id":0,"origin":"","active":false,"active_count":0,"started_at":0,"finished_at":0,"step":0,"max_steps":0,"status_detail":"","workdir":"","user_text":"","deliverables":[],"agents":[],"next_index":0,"events":[]}"#.to_string()
             };
             drop(turns);
-            respond(&mut stream, 200, "application/json", &body);
+            respond_bytes(&mut stream, 200, "application/json", &format!("x-kronos-ui: {:x}\r\n", srv.ui_stamp.load(Ordering::Relaxed)), body.as_bytes());
         }
         ("GET", "/v1/models") => respond(
             &mut stream,
@@ -2874,7 +2921,8 @@ fn main() {
         turn_seq: AtomicU64::new(now_millis()),
         agent_seq: AtomicU64::new(1),
         media_seq: AtomicU64::new(1),
-        quick_waiting: AtomicUsize::new(0),
+        gate: ModelGate::new(),
+        ui_stamp: AtomicU64::new(fnv1a64(CHAT_PAGE.as_bytes())),
     });
     eprintln!(
         "serving {} on http://{addr}/ (quick HUD http://{addr}/quick · weights {weights_gib:.2} GiB + {kv_tag} {kv_gib:.2} GiB @ ctx={ctx_sz} · workdir={})",

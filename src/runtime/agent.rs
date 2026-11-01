@@ -5000,14 +5000,13 @@ pub fn run_agent_turn_shared_with_spawner(
     spawner: Option<&SubAgentSpawner>,
     on_event: impl FnMut(AgentEvent<'_>) -> bool,
 ) -> Result<String, String> {
-    run_agent_turn_prioritized(model_lock, None, history, tools_json, cfg, spawner, on_event)
+    run_agent_turn_with_lock(|| model_lock.lock().unwrap_or_else(|p| p.into_inner()), history, tools_json, cfg, spawner, on_event)
 }
 
-/// Like [`run_agent_turn_shared_with_spawner`], but before each model step waits while
-/// `yield_while` is non-zero, so quick interactive turns are not starved by long tool loops.
-pub fn run_agent_turn_prioritized(
-    model_lock: &std::sync::Mutex<ChatModel>,
-    yield_while: Option<&std::sync::atomic::AtomicUsize>,
+/// Like [`run_agent_turn_shared_with_spawner`], but takes the model through `acquire`, so the
+/// server can queue steps fairly behind interactive requests.
+pub fn run_agent_turn_with_lock<'a>(
+    mut acquire: impl FnMut() -> std::sync::MutexGuard<'a, ChatModel>,
     history: &mut Vec<Message>,
     tools_json: &[String],
     cfg: &AgentTurnConfig,
@@ -5016,17 +5015,7 @@ pub fn run_agent_turn_prioritized(
 ) -> Result<String, String> {
     run_agent_turn_inner(
         |f| {
-            let t0 = std::time::Instant::now();
-            if let Some(flag) = yield_while {
-                while flag.load(std::sync::atomic::Ordering::Acquire) > 0 && t0.elapsed().as_secs() < 300 {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-            }
-            let mut guard = model_lock.lock().unwrap_or_else(|p| p.into_inner());
-            let waited = t0.elapsed().as_secs_f64();
-            if waited > 1.0 {
-                eprintln!("[model] step waited {waited:.1}s for the model");
-            }
+            let mut guard = acquire();
             f(&mut guard);
         },
         history,
