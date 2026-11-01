@@ -4,6 +4,7 @@ pub mod real_llm;
 pub mod sparse_moe;
 pub mod moe_800b;
 pub mod engine;
+pub mod kv_blob;
 pub mod demo_model;
 pub mod compiler;
 pub mod bpe_tokenizer;

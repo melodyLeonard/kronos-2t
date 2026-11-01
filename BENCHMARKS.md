@@ -146,6 +146,63 @@ Notes:
 - Pure 14B Metal prefill reaches 262.6 tok/s at 512 tokens (`simdgroup_matrix` FP32 accumulate
   with on-the-fly NF4 codebook dequantization in threadgroup memory).
 
+## Prompt lookup, per-session KV, and 4-bit KV
+
+Measured on the same M4 Pro through `kronos_server` (`--mode nf4g128`, int8 KV unless noted,
+greedy, median of 3 runs). "Code edit" sends a 157-line Python module (1,595 prompt tokens) and
+asks for one method rename with the complete file echoed back (1,207 reply tokens);
+"free-form" is a 300-token essay. "Before" is commit f1a605a (5-token lookup only when no draft
+is attached); "after" tries lookup first (up to 16 tokens), then the draft model.
+
+| Model | Workload | Before | After | Lookup accepted |
+|---|---|---:|---:|---:|
+| 0.5B, Metal, no draft | code edit | 249 tok/s | 290 tok/s | 1043 / 1273 |
+| 0.5B, Metal, no draft | free-form | 176 tok/s | 175 tok/s | 61 / 123 |
+| 14B + 0.5B draft, Metal* | code edit | 15.4 tok/s | 14.7 tok/s | draft 1064 / 1077 before; lookup+draft 1102 / 1293 after |
+| 14B + 0.5B draft, Metal* | free-form | 10.5 tok/s | 9.6 tok/s | 142 / 361 before; 141 / 369 after |
+| 14B, Metal, no draft | code edit, free-form | pending | pending | – |
+
+\* Measured (n=2) while another process ran an 8-core WikiText battery, so the CPU draft had no
+free P-cores; the 48 tok/s reference above was measured on an idle machine. Under that load the
+two binaries are within noise of each other on the 14B. Re-measure on an idle machine before
+drawing a 14B conclusion.
+
+Greedy output is identical in all modes (`test_tiered_speculation_matches_plain_greedy_05b`
+compares plain decoding, lookup, and lookup + draft token-for-token on the 0.5B).
+
+### Per-session KV cache (`--kv-sessions 3`)
+
+Two conversations of about 5,530 tokens each, alternating one new turn per request. Prefill
+time is the server's `prefill_secs` for that request, which here is the time to the first token.
+
+| Model | Switch between A and B | Resume after restart | Without `session_id` |
+|---|---:|---:|---:|
+| 0.5B, Metal, int8 KV | 47–84 ms (11 new tokens) | 66 ms (from `state-dir/kv`, 36 MiB) | 1.3–1.6 s (5,195 tokens) |
+| 0.5B, Metal, Q4 KV | 49–96 ms | 97 ms | – |
+| 0.5B, CPU, int8 KV | 0.46–0.64 s | 1.1 s | 52–54 s cold |
+| 14B + 0.5B draft, Metal | pending | pending | pending |
+
+Replies after a restore match the replies from a full reprocess byte for byte (same KV bytes).
+The CPU rows were measured while another process used all P-cores.
+
+### 4-bit KV (`--q4-kv`)
+
+SmolLM2-135M, `nf4g128`, WikiText-2 test as in the tables above (64 chunks of 256 tokens,
+GPTQ calibration on 32k WikiText train tokens), plus 16 chunks of 2,048 tokens for longer
+contexts. KV bytes are the measured allocation after filling 32,768 positions.
+
+| KV cache | PPL, 256 ctx | KL | Top-1 | PPL, 2048 ctx | KL | Top-1 | KV bytes/token | KV at 32k |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| FP32 reference weights, FP32 KV | 17.40 | – | – | 13.39 | – | – | 73,728 | 2,304 MiB |
+| int8 Hadamard (default) | 18.47 | 0.067 | 85.2% | 14.22 | 0.065 | 86.2% | 12,240 | 382.5 MiB |
+| 4-bit Hadamard (`--q4-kv`) | 19.09 | 0.099 | 82.4% | 14.67 | 0.098 | 83.2% | 6,120 | 191.2 MiB |
+
+For Qwen2.5-Coder-14B on Metal (48 layers, 8 KV heads of 128, group-32 scales) the same slot
+layout gives 110,592 B/token with int8 KV (3.38 GiB at 32k) and 55,296 B/token with Q4
+(1.69 GiB at 32k). Q4 KV costs about 0.03 nat of KL and 3 points of top-1 agreement on the 135M;
+on the 0.5B it changed one of the two 5,500-token test answers above, so it is a memory trade,
+not a free default.
+
 ## MoE streaming experiment
 
 `bench_800b` models an 812B-parameter mixture-of-experts layout (80 layers, 7168 hidden,

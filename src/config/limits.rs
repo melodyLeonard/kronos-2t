@@ -10,6 +10,10 @@ pub const SPEC_DRAFT_K_GREEDY: usize = 7;
 pub const SPEC_DRAFT_K_SAMPLE: usize = 7;
 pub const SPEC_DRAFT_K_INIT: usize = 4;
 
+/// Prompt-lookup speculation window (tokens copied from the cached context per verify batch).
+pub const SPEC_LOOKUP_K_MAX: usize = 16;
+pub const SPEC_LOOKUP_K_INIT: usize = 8;
+
 pub const JEV_CACHE_SLOTS: usize = 2;
 pub const JEV_PREFIX_CAP: usize = 80;
 

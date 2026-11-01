@@ -3,6 +3,7 @@
 use crate::kernels::hadamard::rademacher_sign_masks_64;
 use crate::model::memory_budget::MemoryBudgetProfile;
 use crate::model::real_llm::LlamaConfig;
+use crate::model::kv_blob::KvSlotPtrs;
 use crate::kernels::simd_lut::{
     bf16_to_f32, f32_to_bf16, NfSdotMatrix, PageAlignedBytes, NF4_DEFAULT_CODEBOOK_I8,
 };
@@ -502,6 +503,26 @@ impl GpuKvCache {
             pos
         } else {
             self.sink_tokens + ((pos - self.sink_tokens) % self.ring_len)
+        }
+    }
+
+    fn slot_ptrs(&self) -> KvSlotPtrs {
+        let data_bytes = if self.bits == 4 { self.head_dim / 2 } else { self.head_dim };
+        let scale_bytes = self.groups_per_head
+            * if self.bits == 4 {
+                std::mem::size_of::<u16>()
+            } else {
+                std::mem::size_of::<f32>()
+            };
+        KvSlotPtrs {
+            k_data: self.k_data.contents_ptr(),
+            v_data: self.v_data.contents_ptr(),
+            k_scale: self.k_scales.contents_ptr(),
+            v_scale: self.v_scales.contents_ptr(),
+            data_bytes,
+            scale_bytes,
+            cap: self.cap_seq_len,
+            heads: self.num_layers * self.num_kv_heads,
         }
     }
 
@@ -1439,6 +1460,36 @@ impl MetalLlamaEngine {
     #[inline]
     pub fn kv_cache_bytes(&self) -> usize {
         self.kv.physical_bytes()
+    }
+
+    /// `(bits, bytes_per_pos)` of the token-major KV blob layout; `None` with a ring buffer.
+    pub fn kv_blob_layout(&self) -> Option<(u8, usize)> {
+        (self.kv.ring_len == 0).then(|| (self.kv.bits, self.kv.slot_ptrs().bytes_per_pos()))
+    }
+
+    pub fn kv_export_positions(&self, lo: usize, hi: usize, out: &mut Vec<u8>) -> bool {
+        if self.kv.ring_len > 0 || hi > self.kv.cap_seq_len {
+            return false;
+        }
+        // SAFETY: shared buffers are idle after the last synchronous command buffer; `hi <= cap`.
+        unsafe { self.kv.slot_ptrs().export(lo, hi, out) };
+        true
+    }
+
+    pub fn kv_import_positions(&mut self, data: &[u8], n: usize) -> bool {
+        if self.kv.ring_len > 0
+            || n > self.kv.max_seq_len
+            || self.kv.ensure_seq_capacity(self.device.id(), n, 0).is_err()
+        {
+            return false;
+        }
+        let p = self.kv.slot_ptrs();
+        if data.len() < n * p.bytes_per_pos() {
+            return false;
+        }
+        // SAFETY: capacity covers `n` positions and `data` was length-checked.
+        unsafe { p.import(data, n) };
+        true
     }
 
     pub fn load_prefix_kv(&mut self, keys: &[f32], values: &[f32], rows: usize, n: usize) -> Result<(), String> {

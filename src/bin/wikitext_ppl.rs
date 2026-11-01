@@ -8,7 +8,9 @@
 //!   `--calib-tokens N`  tokens taken from `--calib-ids` (default 8192)
 //!   `--cache-dir DIR`   reuse/save compiled engines
 //!   `--sdot`            use the `SDOT` kernel and batched prefill
-//!   `--q8-kv`           use the INT8 Hadamard KV cache
+//!   `--q8-kv`           use the INT8 Hadamard KV cache (`--q4-kv` the 4-bit one; both give two candidates per mode)
+//!   `--kv-ctx N`        also fill N positions and report measured KV bytes
+//! `<token_ids_file>` may also be a `.txt` file, tokenized with the model's own tokenizer.
 //!   `--speed`           also measure decode tok/s
 //!   `--prefill`         also measure batched prompt processing (pp = ctx) tok/s
 //!
@@ -122,6 +124,11 @@ fn compile_or_load(
             return eng;
         }
     }
+    let chat_path = model_dir.join(format!("kronos-{mode_key}.k2tb"));
+    if let Ok(eng) = RealLlamaEngine::load_bipolar(model_dir, &chat_path, n_ctx) {
+        eprintln!("  loaded cached {}", chat_path.display());
+        return eng;
+    }
     let eng = fp32.compile_sequential_bipolar_gptq(mode, calib_sequences, 8);
     std::fs::create_dir_all(dir).expect("create cache dir");
     eng.save_bipolar(&path).expect("save bipolar cache");
@@ -136,8 +143,25 @@ fn main() {
     }
     let flag = |name: &str| args.iter().position(|a| a == name).map(|i| args[i + 1].clone());
     let model_dir = Path::new(&args[1]);
-    let ids = read_ids(&args[2]);
+    let tokenizer = BpeTokenizer::from_model_dir(model_dir).expect("failed to load BPE tokenizer");
+    let ids = if args[2].ends_with(".txt") {
+        tokenizer.encode(&std::fs::read_to_string(&args[2]).expect("failed to read text"))
+    } else {
+        read_ids(&args[2])
+    };
     let n_ctx: usize = flag("--ctx").map_or(256, |s| s.parse().unwrap());
+    let kv_ctx: usize = flag("--kv-ctx").map_or(0, |s| s.parse().unwrap());
+    let eng_ctx = n_ctx.max(kv_ctx);
+    let mut kv_variants: Vec<u8> = Vec::new();
+    if args.iter().any(|a| a == "--q8-kv") {
+        kv_variants.push(8);
+    }
+    if args.iter().any(|a| a == "--q4-kv") {
+        kv_variants.push(4);
+    }
+    if kv_variants.is_empty() {
+        kv_variants.push(32);
+    }
     let n_chunks = flag("--chunks").map_or(64, |s| s.parse().unwrap()).min(ids.len() / n_ctx);
     let modes = flag("--modes").unwrap_or_else(|| "q40,b4,mk,b5".to_string());
     let speed = args.iter().any(|a| a == "--speed");
@@ -161,7 +185,6 @@ fn main() {
         n_chunks * (n_ctx - 1 - first)
     );
 
-    let tokenizer = BpeTokenizer::from_model_dir(model_dir).expect("failed to load BPE tokenizer");
     let calib_sequences: Vec<Vec<usize>> = if let Some(path) = flag("--calib-ids") {
         let calib_tokens: usize = flag("--calib-tokens").map_or(8192, |s| s.parse().unwrap());
         let calib = read_ids(&path);
@@ -192,9 +215,9 @@ fn main() {
         calib_sequences.iter().map(|s| s.len()).sum::<usize>()
     );
 
-    let mut fp32 = RealLlamaEngine::load_fp32_reference(model_dir, n_ctx).expect("load fp32");
-    let mut candidates: Vec<(&str, RealLlamaEngine)> = Vec::new();
-    for m in modes.split(',') {
+    let mut fp32 = RealLlamaEngine::load_fp32_reference(model_dir, eng_ctx).expect("load fp32");
+    let mut candidates: Vec<(String, RealLlamaEngine)> = Vec::new();
+    for (m, kv_bits) in modes.split(',').flat_map(|m| kv_variants.iter().map(move |&b| (m, b))) {
         let t = Instant::now();
         let (label, eng) = match m {
             "q40" => (
@@ -319,7 +342,7 @@ fn main() {
                     "mk" => ("Kronos Bipolar Mixed-K + GPTQ", RealWeightMode::KronosBipolarGptqMixedK),
                     _ => ("Kronos Bipolar-5 + GPTQ", RealWeightMode::KronosBipolarGptq { num_planes: 5 }),
                 };
-                (label, compile_or_load(&fp32, model_dir, mode, m, &calib_tag, &calib_sequences, cache_dir.as_deref(), n_ctx))
+                (label, compile_or_load(&fp32, model_dir, mode, m, &calib_tag, &calib_sequences, cache_dir.as_deref(), eng_ctx))
             }
             // `nfpQOGDH` (`G=64`) / `nfgQOGDH` (`G=128`): NF bits `3..=5` per role.
             p if p.len() == 8 && (p.starts_with("nfp") || p.starts_with("nfg")) => {
@@ -336,7 +359,7 @@ fn main() {
                 let g_tag = if sgc == 2 { "G128" } else { "G64" };
                 let label: &'static str =
                     Box::leak(format!("Kronos NF {} {}", &p[3..], g_tag).into_boxed_str());
-                (label, compile_or_load(&fp32, model_dir, mode, m, &calib_tag, &calib_sequences, cache_dir.as_deref(), n_ctx))
+                (label, compile_or_load(&fp32, model_dir, mode, m, &calib_tag, &calib_sequences, cache_dir.as_deref(), eng_ctx))
             }
             // `pQOGDH`: planes for qkv, o, gate_up, down, lm_head (e.g. `p44455`).
             p if p.len() == 6 && p.starts_with('p') => {
@@ -349,11 +372,18 @@ fn main() {
                     head: d[4],
                 };
                 let label: &'static str = Box::leak(format!("Kronos Bipolar planes {}", &p[1..]).into_boxed_str());
-                (label, compile_or_load(&fp32, model_dir, mode, m, &calib_tag, &calib_sequences, cache_dir.as_deref(), n_ctx))
+                (label, compile_or_load(&fp32, model_dir, mode, m, &calib_tag, &calib_sequences, cache_dir.as_deref(), eng_ctx))
             }
             other => panic!("unknown mode {other}"),
         };
         eprintln!("  compiled {label} in {:.1}s", t.elapsed().as_secs_f64());
+        let mut eng = eng;
+        let label = if kv_bits == 32 {
+            label.to_string()
+        } else {
+            eng.set_kv_bits(kv_bits);
+            format!("{label} KV{kv_bits}")
+        };
         candidates.push((label, eng));
     }
     if args.iter().any(|a| a == "--sdot") {
@@ -361,11 +391,6 @@ fn main() {
             if eng.mode != RealWeightMode::GgufQ4_0 {
                 eng.repack_sdot();
             }
-        }
-    }
-    if args.iter().any(|a| a == "--q8-kv") {
-        for (_, eng) in candidates.iter_mut() {
-            eng.enable_q8_kv_cache(true);
         }
     }
     fp32.set_num_threads(p_cores);
@@ -446,6 +471,28 @@ fn main() {
         );
     }
 
+    if kv_ctx > 0 {
+        println!("\n  KV cache after {kv_ctx} positions (measured allocation)");
+        for (label, eng) in candidates.iter_mut() {
+            eng.set_num_threads(p_cores);
+            eng.reset_context();
+            let mut pos = 0usize;
+            while pos < kv_ctx {
+                let n = 512.min(kv_ctx - pos);
+                let chunk: Vec<usize> = (0..n).map(|i| ids[(pos + i) % ids.len()]).collect();
+                eng.forward_prompt(&chunk);
+                pos += n;
+            }
+            let bytes = eng.kv_cache_bytes();
+            let per_pos = eng.kv_blob_layout().map_or(0, |l| l.bytes_per_pos as usize);
+            println!(
+                "  {label:<32} | {:>8.1} MiB | {per_pos} B/token ({:.1} MiB/32k)",
+                bytes as f64 / (1024.0 * 1024.0),
+                (per_pos * 32768) as f64 / (1024.0 * 1024.0)
+            );
+        }
+    }
+
     if args.iter().any(|a| a == "--prefill") {
         println!("\n  Prefill (pp{n_ctx}, mean ± sd of 5 runs, tok/s; max |logit diff| vs token-by-token)");
         let prompt = &ids[..n_ctx];
@@ -482,7 +529,7 @@ fn main() {
     if speed {
         println!("\n  Decode speed (tg32, mean ± sd of 5 runs, tok/s)");
         for (label, eng) in std::iter::once(("Exact FP32 Reference", &mut fp32))
-            .chain(candidates.iter_mut().map(|(l, e)| (*l, e)))
+            .chain(candidates.iter_mut().map(|(l, e)| (l.as_str(), e)))
         {
             let mut line = format!("  {label:<32}");
             for threads in [1, 4, p_cores] {
