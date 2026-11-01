@@ -107,7 +107,9 @@ Sparse-MoE checkpoints compile their experts on the Metal GPU when one is presen
 to the CPU GPTQ path; `KRONOS_COMPILE_CPU=1` forces CPU, `KRONOS_COMPILE_BATCH=N` sets experts
 per dispatch). `kronos_server <dir> --mode M --calib FILE --compile-only` compiles without
 loading the model. Qwen3-Coder-30B-A3B (`nf3nf4g128`): 12.3 min on an M4 Pro versus 48 min on
-CPU (`nf4g128`).
+CPU (`nf4g128`). On the same machine the compiled 30B decodes at 52.6 tok/s with a short
+context and 37.6 tok/s at 6.6k tokens (prefill 126 to 134 tok/s); `KRONOS_DECODE_PROF=1`
+prints the GPU time per kernel class.
 
 The KV cache is stored as int8 after a Hadamard rotation, about 4x smaller than FP32;
 `--fp32-kv` turns this off. On macOS, `nf4` and `nf4g128` models run on the Metal GPU by default

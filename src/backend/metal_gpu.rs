@@ -255,6 +255,8 @@ struct Nf4MatParams {
     n_offset: u32,
     bits: u32,
     chunk_bytes: u32,
+    n_splits: u32,
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -288,7 +290,7 @@ struct MoeGemvParams {
     cb_off: u32,
     pair_off: u32,
     x_by_slot: u32,
-    _pad: u32,
+    n_splits: u32,
 }
 
 #[repr(C)]
@@ -336,6 +338,17 @@ struct GqaFlashParams {
 
 /// Max sequence splits for flash-decoding attention (one threadgroup per split).
 const ATTN_MAX_SPLITS: usize = 64;
+/// Max column splits for single-token gemv (partials merged by a reduce kernel).
+const GEMV_MAX_SPLITS: usize = 8;
+/// Threadgroups a decode gemv should reach before splitting columns.
+const GEMV_TARGET_TGS: usize = 1024;
+
+fn gemv_splits(threadgroups: usize, num_scale_groups: usize) -> usize {
+    if threadgroups >= GEMV_TARGET_TGS {
+        return 1;
+    }
+    (GEMV_TARGET_TGS / threadgroups.max(1)).clamp(1, GEMV_MAX_SPLITS.min(num_scale_groups.max(1)))
+}
 
 pub(crate) struct GpuNf4Matrix {
     pair_buf: MtlObj,
@@ -754,6 +767,8 @@ struct GpuScratch {
     moe_out: MtlObj,
     moe_logits: MtlObj,
     attn_part: MtlObj,
+    gemv_part: MtlObj,
+    moe_part: MtlObj,
 }
 
 impl GpuScratch {
@@ -780,6 +795,16 @@ impl GpuScratch {
             moe_ids: alloc_shared_buffer(device, (n * moe_k).max(1) * 4, "sc.moe_ids")?,
             moe_w: alloc_shared_buffer(device, (n * moe_k).max(1) * f32_b, "sc.moe_w")?,
             moe_logits: alloc_shared_buffer(device, n * 1024 * f32_b, "sc.moe_logits")?,
+            gemv_part: alloc_shared_buffer(
+                device,
+                qkv_rows.max(2 * cfg.intermediate_size).max(cfg.hidden_size) * GEMV_MAX_SPLITS * f32_b,
+                "sc.gemv_part",
+            )?,
+            moe_part: alloc_shared_buffer(
+                device,
+                moe_k.max(1) * GEMV_MAX_SPLITS * (2 * cfg.eff_moe_inter()).max(cfg.hidden_size) * f32_b,
+                "sc.moe_part",
+            )?,
             attn_part: alloc_shared_buffer(
                 device,
                 GEMV_MAX_TOKENS * cfg.num_attention_heads * ATTN_MAX_SPLITS * (cfg.head_dim() + 2) * f32_b,
@@ -845,6 +870,8 @@ pub struct MetalLlamaEngine {
     pso_moe_router: MtlObj,
     pso_moe_router_logits: MtlObj,
     pso_gqa_reduce: MtlObj,
+    pso_gemv_reduce: MtlObj,
+    pso_moe_reduce: MtlObj,
     pso_moe_gemv: MtlObj,
     pso_moe_combine: MtlObj,
     moe: Option<MoeGeometry>,
@@ -1133,6 +1160,8 @@ impl MetalLlamaEngine {
                 let pso_moe_router = build_pipeline(device.id(), library.id(), "moe_router_topk")?;
                 let pso_moe_router_logits = build_pipeline(device.id(), library.id(), "moe_router_logits")?;
                 let pso_gqa_reduce = build_pipeline(device.id(), library.id(), "gqa_decode_reduce")?;
+                let pso_gemv_reduce = build_pipeline(device.id(), library.id(), "gemv_splitk_reduce")?;
+                let pso_moe_reduce = build_pipeline(device.id(), library.id(), "moe_splitk_reduce")?;
                 let pso_moe_gemv = build_pipeline(device.id(), library.id(), "nf4_moe_gemv")?;
                 let pso_moe_combine = build_pipeline(device.id(), library.id(), "moe_combine")?;
 
@@ -1252,6 +1281,8 @@ impl MetalLlamaEngine {
                     pso_moe_router,
                     pso_moe_router_logits,
                     pso_gqa_reduce,
+                    pso_gemv_reduce,
+                    pso_moe_reduce,
                     pso_moe_gemv,
                     pso_moe_combine,
                     moe: moe_geom,
@@ -1897,11 +1928,15 @@ impl MetalLlamaEngine {
                 cb_off: cb_off as u32,
                 pair_off: pair_off as u32,
                 x_by_slot: u32::from(x_by_slot),
-                _pad: 0,
+                n_splits: 1,
             }
         };
-        let gu = gemv(2 * g.d_ff, h, g.gu_codebook_off, g.gu_pair_off, false);
-        let dn = gemv(h, g.d_ff, g.dn_codebook_off, g.dn_pair_off, true);
+        let mut gu = gemv(2 * g.d_ff, h, g.gu_codebook_off, g.gu_pair_off, false);
+        let mut dn = gemv(h, g.d_ff, g.dn_codebook_off, g.dn_pair_off, true);
+        if n_tok == 1 {
+            gu.n_splits = gemv_splits(gu.num_pairs as usize * k, gu.num_scale_groups as usize) as u32;
+            dn.n_splits = gemv_splits(dn.num_pairs as usize * k, dn.num_scale_groups as usize) as u32;
+        }
         let bias_id = moe.router_bias.as_ref().map_or_else(|| self.dummy_buf.id(), MtlObj::id);
         // SAFETY: valid encoder; all buffers are owned by `self` or borrowed for the engine's lifetime.
         unsafe {
@@ -1933,7 +1968,15 @@ impl MetalLlamaEngine {
             msg_sel!(*enc, st.set_buf, self.scratch.x_rot_f32.id() => Id, 0usize => usize, 2usize => usize; ());
             msg_sel!(*enc, st.set_buf, self.scratch.moe_gu.id() => Id, 0usize => usize, 3usize => usize; ());
             msg_sel!(*enc, st.set_bytes, (&gu as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 4usize => usize; ());
-            msg_sel!(*enc, st.dispatch_tg, MtlSize::new(gu.num_pairs as usize, k, n_tok) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.moe_part.id() => Id, 0usize => usize, 5usize => usize; ());
+            msg_sel!(*enc, st.dispatch_tg, MtlSize::new(gu.num_pairs as usize * gu.n_splits as usize, k, n_tok) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            if gu.n_splits > 1 {
+                msg_sel!(*enc, st.set_cps, self.pso_moe_reduce.id() => Id; ());
+                msg_sel!(*enc, st.set_buf, self.scratch.moe_part.id() => Id, 0usize => usize, 0usize => usize; ());
+                msg_sel!(*enc, st.set_buf, self.scratch.moe_gu.id() => Id, 0usize => usize, 1usize => usize; ());
+                msg_sel!(*enc, st.set_bytes, (&gu as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 2usize => usize; ());
+                msg_sel!(*enc, st.dispatch_tg, MtlSize::new((gu.rows as usize).div_ceil(256), k * n_tok, 1) => MtlSize, MtlSize::new(256, 1, 1) => MtlSize; ());
+            }
             if prof_on { self.prof_cut(cmd, enc, "moe_gate_up"); }
 
             // SwiGLU + FWHT over n_tok*k rows of width d_ff -> x_rot rows [(t*k+s)][d_ff].
@@ -1947,7 +1990,15 @@ impl MetalLlamaEngine {
             msg_sel!(*enc, st.set_buf, self.scratch.x_rot_f32.id() => Id, 0usize => usize, 2usize => usize; ());
             msg_sel!(*enc, st.set_buf, self.scratch.moe_out.id() => Id, 0usize => usize, 3usize => usize; ());
             msg_sel!(*enc, st.set_bytes, (&dn as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 4usize => usize; ());
-            msg_sel!(*enc, st.dispatch_tg, MtlSize::new(dn.num_pairs as usize, k, n_tok) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.moe_part.id() => Id, 0usize => usize, 5usize => usize; ());
+            msg_sel!(*enc, st.dispatch_tg, MtlSize::new(dn.num_pairs as usize * dn.n_splits as usize, k, n_tok) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            if dn.n_splits > 1 {
+                msg_sel!(*enc, st.set_cps, self.pso_moe_reduce.id() => Id; ());
+                msg_sel!(*enc, st.set_buf, self.scratch.moe_part.id() => Id, 0usize => usize, 0usize => usize; ());
+                msg_sel!(*enc, st.set_buf, self.scratch.moe_out.id() => Id, 0usize => usize, 1usize => usize; ());
+                msg_sel!(*enc, st.set_bytes, (&dn as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 2usize => usize; ());
+                msg_sel!(*enc, st.dispatch_tg, MtlSize::new((dn.rows as usize).div_ceil(256), k * n_tok, 1) => MtlSize, MtlSize::new(256, 1, 1) => MtlSize; ());
+            }
             if prof_on { self.prof_cut(cmd, enc, "moe_down"); }
 
             // hidden[t] += sum_s w[t][s] * moe_out[t][s].
@@ -2060,7 +2111,9 @@ impl MetalLlamaEngine {
         n_tok: usize,
     ) {
         let st = sels();
-        let params = Nf4MatParams {
+        let pair_blocks = (mat.num_stripes as usize).div_ceil(2);
+        let splits = if n_tok == 1 { gemv_splits(pair_blocks, mat.num_scale_groups as usize) } else { 1 };
+        let mut params = Nf4MatParams {
             cb0: mat.cb_packed[0],
             cb1: mat.cb_packed[1],
             cb2: mat.cb_packed[2],
@@ -2079,7 +2132,10 @@ impl MetalLlamaEngine {
             n_offset: 0,
             bits: mat.bits,
             chunk_bytes: mat.chunk_bytes,
+            n_splits: 1,
+            _pad: 0,
         };
+        params.n_splits = splits as u32;
         let bias_id = bias.unwrap_or_else(|| self.dummy_buf.id());
         let res_id = residual.unwrap_or_else(|| self.dummy_buf.id());
 
@@ -2101,14 +2157,36 @@ impl MetalLlamaEngine {
                     6usize => usize;
                     ()
                 );
-                let pair_blocks = (mat.num_stripes as usize).div_ceil(2);
+                msg_sel!(enc, st.set_buf, self.scratch.gemv_part.id() => Id, 0usize => usize, 7usize => usize; ());
                 msg_sel!(
                     enc,
                     st.dispatch_tg,
-                    MtlSize::new(pair_blocks, 1, 1) => MtlSize,
+                    MtlSize::new(pair_blocks, splits, 1) => MtlSize,
                     MtlSize::new(128, 1, 1) => MtlSize;
                     ()
                 );
+                if splits > 1 {
+                    msg_sel!(enc, st.set_cps, self.pso_gemv_reduce.id() => Id; ());
+                    msg_sel!(enc, st.set_buf, self.scratch.gemv_part.id() => Id, 0usize => usize, 0usize => usize; ());
+                    msg_sel!(enc, st.set_buf, bias_id => Id, 0usize => usize, 1usize => usize; ());
+                    msg_sel!(enc, st.set_buf, res_id => Id, 0usize => usize, 2usize => usize; ());
+                    msg_sel!(enc, st.set_buf, out_buf => Id, 0usize => usize, 3usize => usize; ());
+                    msg_sel!(
+                        enc,
+                        st.set_bytes,
+                        (&params as *const Nf4MatParams).cast::<c_void>() => *const c_void,
+                        std::mem::size_of::<Nf4MatParams>() => usize,
+                        4usize => usize;
+                        ()
+                    );
+                    msg_sel!(
+                        enc,
+                        st.dispatch_tg,
+                        MtlSize::new((mat.rows as usize).div_ceil(256), 1, 1) => MtlSize,
+                        MtlSize::new(256, 1, 1) => MtlSize;
+                        ()
+                    );
+                }
             } else if n_tok <= GEMV_MAX_TOKENS {
                 msg_sel!(enc, st.set_cps, self.pso_gemv_batch.id() => Id; ());
                 msg_sel!(enc, st.set_buf, mat.pair_buf.id() => Id, 0usize => usize, 0usize => usize; ());
@@ -2199,6 +2277,8 @@ struct Nf4MatParams {
     uint n_offset;
     uint bits;
     uint chunk_bytes;
+    uint n_splits;
+    uint _pad;
 };
 
 struct MoeRouterParams {
@@ -2228,7 +2308,7 @@ struct MoeGemvParams {
     uint cb_off;
     uint pair_off;
     uint x_by_slot;
-    uint _pad;
+    uint n_splits;
 };
 
 struct RopeKvParams {
@@ -2826,14 +2906,19 @@ kernel void nf4_moe_gemv(
     device const float* x_rot  [[buffer(2)]],
     device float*       out    [[buffer(3)]],
     constant MoeGemvParams& p  [[buffer(4)]],
+    device float*       part   [[buffer(5)]],
     uint3 tg      [[threadgroup_position_in_grid]],
     uint sg_id    [[simdgroup_index_in_threadgroup]],
     uint tid      [[thread_index_in_simdgroup]],
     uint tid_tg   [[thread_index_in_threadgroup]])
 {
-    const uint pair_idx = tg.x;
+    const uint pair_idx = tg.x % p.num_pairs;
+    const uint split = tg.x / p.num_pairs;
     const uint slot = tg.z * p.top_k + tg.y;
-    if (pair_idx >= p.num_pairs || tg.y >= p.top_k || tg.z >= p.n_tok) return;
+    if (split >= p.n_splits || tg.y >= p.top_k || tg.z >= p.n_tok) return;
+    const uint per_split = (p.num_scale_groups + p.n_splits - 1u) / p.n_splits;
+    const uint sg_lo = split * per_split;
+    const uint sg_hi = min(p.num_scale_groups, sg_lo + per_split);
     device const uchar* rec = shard + ulong(ids[slot]) * ulong(p.expert_bytes);
     device const uint* cbw = (device const uint*)(rec + p.cb_off);
 
@@ -2855,7 +2940,7 @@ kernel void nf4_moe_gemv(
     float acc_b = 0.0f;
     device const uchar* p_base = rec + p.pair_off + ulong(pair_idx) * ulong(p.pair_total_bytes);
     const uint sg_stride = 64u + p.scale_group_chunks * pair_chunk_b;
-    for (uint sg = sg_id; sg < p.num_scale_groups; sg += 4u) {
+    for (uint sg = sg_lo + sg_id; sg < sg_hi; sg += 4u) {
         device const uchar* sg_ptr = p_base + ulong(sg) * ulong(sg_stride);
         float wsa = bf16_bytes_to_f32(sg_ptr + lane * 2u);
         float wsb = bf16_bytes_to_f32(sg_ptr + 32u + lane * 2u);
@@ -2895,9 +2980,28 @@ kernel void nf4_moe_gemv(
         uint row = pair_idx * 32u + tid;
         if (row < p.rows) {
             float sum = tg_red[0][tid] + tg_red[1][tid] + tg_red[2][tid] + tg_red[3][tid];
-            out[ulong(slot) * ulong(p.rows) + row] = sum;
+            if (p.n_splits > 1u) {
+                part[(ulong(slot) * ulong(p.n_splits) + ulong(split)) * ulong(p.rows) + row] = sum;
+            } else {
+                out[ulong(slot) * ulong(p.rows) + row] = sum;
+            }
         }
     }
+}
+
+// Sums the column-split partials of `nf4_moe_gemv` per (slot, row).
+kernel void moe_splitk_reduce(
+    device const float* part [[buffer(0)]],
+    device float*       out  [[buffer(1)]],
+    constant MoeGemvParams& p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    const uint row = gid.x;
+    const uint slot = gid.y;
+    if (row >= p.rows || slot >= p.top_k * p.n_tok) return;
+    float sum = 0.0f;
+    for (uint s = 0u; s < p.n_splits; ++s) sum += part[(ulong(slot) * ulong(p.n_splits) + ulong(s)) * ulong(p.rows) + row];
+    out[ulong(slot) * ulong(p.rows) + row] = sum;
 }
 
 // hidden[t] += sum_s w[t][s] * expert_out[t][s].
@@ -2929,11 +3033,17 @@ kernel void nf4_gemv_decode1(
     device const float* residual    [[buffer(4)]],
     device float*       out         [[buffer(5)]],
     constant Nf4MatParams& p        [[buffer(6)]],
-    uint pair_idx [[threadgroup_position_in_grid]],
+    device float*       part        [[buffer(7)]],
+    uint2 tg_pos  [[threadgroup_position_in_grid]],
     uint sg_id    [[simdgroup_index_in_threadgroup]],
     uint tid      [[thread_index_in_simdgroup]],
     uint tid_tg   [[thread_index_in_threadgroup]])
 {
+    const uint pair_idx = tg_pos.x;
+    const uint split = tg_pos.y;
+    const uint per_split = (p.num_scale_groups + p.n_splits - 1u) / p.n_splits;
+    const uint sg_lo = split * per_split;
+    const uint sg_hi = min(p.num_scale_groups, sg_lo + per_split);
     const uint sa = pair_idx * 2u;
     if (sa >= p.num_stripes) return;
     const bool is_tail = (pair_idx >= p.num_pairs);
@@ -2957,7 +3067,7 @@ kernel void nf4_gemv_decode1(
     if (!is_tail) {
         device const uchar* p_base = pair_stream + ulong(pair_idx) * ulong(p.pair_total_bytes);
         const uint sg_stride = 64u + p.scale_group_chunks * pair_chunk_b;
-        for (uint sg = sg_id; sg < p.num_scale_groups; sg += 4u) {
+        for (uint sg = sg_lo + sg_id; sg < sg_hi; sg += 4u) {
             device const uchar* sg_ptr = p_base + ulong(sg) * ulong(sg_stride);
             float wsa = bf16_bytes_to_f32(sg_ptr + lane * 2u);
             float wsb = bf16_bytes_to_f32(sg_ptr + 32u + lane * 2u);
@@ -2988,7 +3098,7 @@ kernel void nf4_gemv_decode1(
         }
     } else {
         const uint sg_stride = 32u + p.scale_group_chunks * chunk_b;
-        for (uint sg = sg_id; sg < p.num_scale_groups; sg += 4u) {
+        for (uint sg = sg_lo + sg_id; sg < sg_hi; sg += 4u) {
             device const uchar* sg_ptr = tail_stream + ulong(sg) * ulong(sg_stride);
             float wsa = bf16_bytes_to_f32(sg_ptr + lane * 2u);
             uint c0 = sg * p.scale_group_chunks;
@@ -3025,11 +3135,32 @@ kernel void nf4_gemv_decode1(
         uint row = sa * 16u + tid;
         if (row < p.rows) {
             float sum = tg_red[0][tid] + tg_red[1][tid] + tg_red[2][tid] + tg_red[3][tid];
+            if (p.n_splits > 1u) {
+                part[split * p.rows + row] = sum;
+                return;
+            }
             if (p.has_bias != 0u) sum += bias[row];
             if (p.has_residual != 0u) sum += residual[row];
             out[row] = sum;
         }
     }
+}
+
+// Sums the column-split partials of `nf4_gemv_decode1`, then applies bias and residual.
+kernel void gemv_splitk_reduce(
+    device const float* part     [[buffer(0)]],
+    device const float* bias     [[buffer(1)]],
+    device const float* residual [[buffer(2)]],
+    device float*       out      [[buffer(3)]],
+    constant Nf4MatParams& p     [[buffer(4)]],
+    uint row [[thread_position_in_grid]])
+{
+    if (row >= p.rows) return;
+    float sum = 0.0f;
+    for (uint s = 0u; s < p.n_splits; ++s) sum += part[s * p.rows + row];
+    if (p.has_bias != 0u) sum += bias[row];
+    if (p.has_residual != 0u) sum += residual[row];
+    out[row] = sum;
 }
 
 kernel void nf4_gemv_batch(
