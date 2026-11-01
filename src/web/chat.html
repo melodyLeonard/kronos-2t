@@ -94,6 +94,25 @@
     border-radius:50%; animation:srvspin .9s linear infinite;
   }
   @keyframes srvspin { to { transform:rotate(360deg); } }
+  /* Tooltips: icon buttons carry data-tip; shown on hover and keyboard focus */
+  [data-tip] { position:relative; }
+  [data-tip]::after {
+    content:attr(data-tip); position:absolute; left:50%; top:calc(100% + 7px); transform:translateX(-50%) translateY(-3px);
+    background:#18181b; color:#fafafa; font:11.5px/1.3 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    font-weight:500; padding:5px 8px; border-radius:7px; white-space:nowrap; pointer-events:none;
+    opacity:0; transition:opacity .12s ease, transform .12s ease; z-index:50; box-shadow:0 4px 14px rgba(0,0,0,0.25);
+  }
+  [data-tip]:hover::after, [data-tip]:focus-visible::after { opacity:1; transform:translateX(-50%) translateY(0); transition-delay:.25s; }
+  [data-tip-pos="right"]::after { left:calc(100% + 8px); top:50%; transform:translateY(-50%) translateX(-3px); }
+  [data-tip-pos="right"]:hover::after, [data-tip-pos="right"]:focus-visible::after { transform:translateY(-50%) translateX(0); }
+  [data-tip-pos="top"]::after { top:auto; bottom:calc(100% + 7px); transform:translateX(-50%) translateY(3px); }
+  [data-tip-pos="top"]:hover::after, [data-tip-pos="top"]:focus-visible::after { transform:translateX(-50%) translateY(0); }
+  @media (prefers-color-scheme: dark) { [data-tip]::after { background:#f4f4f5; color:#0d0e11; } }
+  /* Voice button: the mic becomes a live level meter while recording */
+  #voice-wave { display:none; align-items:flex-end; gap:2px; height:16px; }
+  #voice-wave span { width:3px; height:4px; border-radius:2px; background:currentColor; transition:height .09s ease-out; }
+  #voice-btn.recording #voice-wave { display:inline-flex; }
+  #voice-btn.recording > svg { display:none; }
   /* Code view: syntax tokens and lint gutter */
   .tok-kw { color:#7c3aed; } .tok-str { color:#15803d; } .tok-num { color:#b45309; }
   .tok-cmt { color:#6b7280; font-style:italic; } .tok-fn { color:#1d4ed8; } .tok-type { color:#0f766e; }
@@ -581,9 +600,11 @@
   }
   .composer-row { display:flex; gap:8px; align-items:flex-end; }
   #attach-btn, #voice-btn {
-    height:42px; padding:0 12px; display:inline-flex; align-items:center; gap:6px;
-    font-size:13px; color:var(--muted); flex-shrink:0;
+    width:42px; height:42px; padding:0; display:inline-flex; align-items:center; justify-content:center;
+    color:var(--muted); flex-shrink:0; border-radius:12px;
   }
+  #attach-btn:hover, #voice-btn:hover { color:var(--text); }
+  #voice-btn-label { display:none; }
   #voice-btn.recording {
     background:var(--warn-bg); color:var(--warn-fg); border-color:var(--accent);
     animation:voicePulse 1.25s ease-in-out infinite;
@@ -621,13 +642,15 @@
     border-radius:10px; line-height:1.45;
   }
   #send, #stop {
-    background:var(--accent); color:var(--accent-ink); border:none;
-    height:42px; padding:0 18px; font-weight:600; flex-shrink:0;
+    background:var(--accent); color:var(--accent-ink); border:none; border-radius:12px;
+    width:42px; height:42px; padding:0; display:inline-flex; align-items:center; justify-content:center; flex-shrink:0;
   }
+  #send:hover:not(:disabled) { filter:brightness(1.08); }
   #stop {
     background:var(--panel); color:var(--text); border:1px solid var(--line);
-    height:42px; padding:0 14px; font-weight:600; flex-shrink:0;
+    width:42px; height:42px; padding:0; display:inline-flex; align-items:center; justify-content:center; flex-shrink:0;
   }
+  #stop[hidden] { display:none; }
   #stop.hidden { display:none; }
 
   /* Drag Resizer & Closeable Adaptive Workspace Pane */
@@ -878,19 +901,26 @@
         </div>
         <div class="composer-row">
           <input id="file-input" type="file" multiple hidden>
-          <button id="attach-btn" type="button" title="Attach or paste PDF, code, CSV, DOCX, ZIP, or images (Cmd+V)">+ Attach</button>
+          <button id="attach-btn" type="button" title="Attach files: PDF, code, CSV, DOCX, ZIP or images (Cmd+V)" aria-label="Attach files">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 12-8.5 8.5a5 5 0 0 1-7-7L14 5a3.3 3.3 0 0 1 4.7 4.7L10 18.4a1.7 1.7 0 0 1-2.4-2.4L16 7.6"/></svg>
+          </button>
           <textarea id="input" rows="1" placeholder="Ask anything, speak (⌘⇧V), build software, or paste files (⌘V)…" autofocus></textarea>
           <button id="voice-btn" type="button" title="Speak voice command (Cmd+Shift+V)" aria-label="Voice input">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <rect x="9" y="2" width="6" height="12" rx="3"/>
               <path d="M5 10a7 7 0 0 0 14 0"/>
               <path d="M12 17v4"/>
               <path d="M8 21h8"/>
             </svg>
+            <span id="voice-wave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></span>
             <span id="voice-btn-label">Voice</span>
           </button>
-          <button id="send" type="submit">Send</button>
-          <button id="stop" type="button" hidden title="Stop the running turn">Stop</button>
+          <button id="send" type="submit" title="Send (Enter)" aria-label="Send">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+          </button>
+          <button id="stop" type="button" hidden title="Stop the running turn" aria-label="Stop">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+          </button>
         </div>
       </form>
     </section>
@@ -2523,12 +2553,15 @@ chatCol.addEventListener("drop", async (e) => {
 
 /* Keyboard shortcuts: Cmd+B sidebar, Cmd+N new conversation, Cmd+Shift+V voice */
 function setVoiceEqLevel(level) {
-  const bars = $("voice-eq").querySelectorAll("span");
   const weights = [0.45, 0.8, 1.0, 0.75, 0.5];
   const lv = Math.max(0, Math.min(1, Number(level) || 0));
-  bars.forEach((b, i) => {
-    const h = Math.round(4 + lv * 13 * weights[i]);
-    b.style.height = `${h}px`;
+  $("voice-eq").querySelectorAll("span").forEach((b, i) => {
+    b.style.height = `${Math.round(4 + lv * 13 * weights[i])}px`;
+  });
+  // The button's own bars jitter a little so a steady level still reads as live audio.
+  $("voice-wave").querySelectorAll("span").forEach((b, i) => {
+    const j = 0.85 + Math.random() * 0.3;
+    b.style.height = `${Math.round(3 + lv * 13 * weights[i] * j)}px`;
   });
 }
 
@@ -3613,6 +3646,20 @@ window.addEventListener("hashchange", () => {
 /* Initial Boot */
 (async function boot() {
   renderEmptyState();
+  // Icon-only controls get a styled tooltip from their title.
+  document.querySelectorAll(".sb-ib, .hdr-ib, #sidebar-toggle, #ws-close, .sb-icon-btn, #attach-btn, #voice-btn, #send, #stop").forEach(el => {
+    const t = el.getAttribute("title");
+    if (!t) return;
+    el.setAttribute("data-tip", t);
+    el.removeAttribute("title");
+    if (el.classList.contains("sb-ib")) el.setAttribute("data-tip-pos", "right");
+    if (["attach-btn", "voice-btn", "send", "stop"].includes(el.id)) el.setAttribute("data-tip-pos", "top");
+  });
+  // The voice button's hidden state label drives its tooltip.
+  new MutationObserver(() => {
+    const t = $("voice-btn-label").textContent;
+    $("voice-btn").setAttribute("data-tip", t === "Done" ? "Stop listening and send" : (t === "Voice" ? "Voice input (Cmd+Shift+V)" : "Transcribing…"));
+  }).observe($("voice-btn-label"), { childList: true, characterData: true, subtree: true });
   fetch("/v1/models", { headers: headers() }).then(r => r.json())
     .then(j => $("model").textContent = j.data ? j.data[0].id : (j.error?.message || "unavailable"))
     .catch(() => $("model").textContent = "server unreachable");
