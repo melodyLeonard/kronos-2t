@@ -103,6 +103,12 @@ a mix of encyclopedic and web text works well) and caches it as
 `--calib`. `--mode` picks the precision (`b4`, `nf4g128`, `p55454` (default), `b5`, `b6`); see
 [BENCHMARKS.md](BENCHMARKS.md) for the size, quality and speed of each.
 
+Sparse-MoE checkpoints compile their experts on the Metal GPU when one is present (bit-identical
+to the CPU GPTQ path; `KRONOS_COMPILE_CPU=1` forces CPU, `KRONOS_COMPILE_BATCH=N` sets experts
+per dispatch). `kronos_server <dir> --mode M --calib FILE --compile-only` compiles without
+loading the model. Qwen3-Coder-30B-A3B (`nf3nf4g128`): 12.3 min on an M4 Pro versus 48 min on
+CPU (`nf4g128`).
+
 The KV cache is stored as int8 after a Hadamard rotation, about 4x smaller than FP32;
 `--fp32-kv` turns this off. On macOS, `nf4` and `nf4g128` models run on the Metal GPU by default
 (`--cpu` forces CPU execution). Pass `--draft models/<small-model>` to enable lossless speculative

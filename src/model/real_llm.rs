@@ -3763,6 +3763,27 @@ impl RealLlamaEngine {
             }
         };
 
+        #[cfg(target_os = "macos")]
+        let mut gpu_compiler = if std::env::var_os("KRONOS_COMPILE_CPU").is_none()
+            && expert_bits >= 3
+            && expert_sgc <= 2
+            && cfg.hidden_size.is_multiple_of(16)
+            && (2 * cfg.eff_moe_inter()).is_multiple_of(16)
+        {
+            match crate::backend::metal_compile::MetalGptqCompiler::new() {
+                Ok(g) => {
+                    eprintln!("compiling MoE experts on the Metal GPU (KRONOS_COMPILE_CPU=1 forces the CPU path)");
+                    Some(g)
+                }
+                Err(e) => {
+                    eprintln!("Metal compile unavailable ({e}); using the CPU path");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let mode_words = match mode {
             RealWeightMode::KronosBipolarGptq { num_planes } => [0, num_planes, 0, 0, 0, 0],
             RealWeightMode::KronosBipolarGptqMixedK => [1, 0, 0, 0, 0, 0],
@@ -4224,38 +4245,115 @@ impl RealLlamaEngine {
                     None
                 };
 
-                // Stream routed experts one-by-one into `.k2tm` (non-interleaved `gu`).
-                let mut gu_tmp = vec![0.0f32; 2 * moe_inter];
-                let mut sw_tmp = vec![0.0f32; moe_inter];
-                let mut dn_tmp = vec![0.0f32; h_dim];
-                let mut act_mid = Int8ChunkActivation::new_zeroed(moe_inter);
-                let fallback_step = (total_tokens / 32).max(1);
+                let experts_on_gpu = {
+                    #[cfg(target_os = "macos")]
+                    {
+                        match gpu_compiler.as_mut() {
+                            Some(gpu) => {
+                                compile_moe_experts_gpu(
+                                    gpu,
+                                    &store,
+                                    l,
+                                    &cfg,
+                                    &expert_buckets,
+                                    &act_in_all,
+                                    &hess_mlp,
+                                    &mut moe_out_all,
+                                    &mut k2tm_writer,
+                                    total_tokens,
+                                    expert_bits,
+                                    expert_sgc,
+                                )?;
+                                true
+                            }
+                            None => false,
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        false
+                    }
+                };
+                if !experts_on_gpu {
+                    // Stream routed experts one-by-one into `.k2tm` (non-interleaved `gu`).
+                    let mut gu_tmp = vec![0.0f32; 2 * moe_inter];
+                    let mut sw_tmp = vec![0.0f32; moe_inter];
+                    let mut dn_tmp = vec![0.0f32; h_dim];
+                    let mut act_mid = Int8ChunkActivation::new_zeroed(moe_inter);
+                    let fallback_step = (total_tokens / 32).max(1);
 
-                for (e, bucket) in expert_buckets.iter().enumerate() {
-                    let (gu_f32, dn_f32) = read_moe_expert_f32(
-                        &store,
-                        l,
-                        e,
-                        cfg.num_experts,
-                        h_dim,
-                        moe_inter,
-                        true,
-                    )?;
-                    let gu_mat = compile_hadamard_gptq_nf(
-                        &gu_f32,
-                        2 * moe_inter,
-                        h_dim,
-                        expert_bits,
-                        expert_sgc,
-                        Some(&hess_mlp),
-                        compile_threads,
-                    );
-                    drop(gu_f32);
+                    for (e, bucket) in expert_buckets.iter().enumerate() {
+                        let (gu_f32, dn_f32) = read_moe_expert_f32(
+                            &store,
+                            l,
+                            e,
+                            cfg.num_experts,
+                            h_dim,
+                            moe_inter,
+                            true,
+                        )?;
+                        let gu_mat = compile_hadamard_gptq_nf(
+                            &gu_f32,
+                            2 * moe_inter,
+                            h_dim,
+                            expert_bits,
+                            expert_sgc,
+                            Some(&hess_mlp),
+                            compile_threads,
+                        );
+                        drop(gu_f32);
 
-                    let mut hess_e_dn = FullRowGptqHessian::new(moe_inter);
-                    if bucket.len() >= 16 {
-                        for &(tok_idx, _) in bucket {
-                            // SAFETY: `gu_tmp` has `2 * moe_inter == gu_mat.rows` floats.
+                        let mut hess_e_dn = FullRowGptqHessian::new(moe_inter);
+                        if bucket.len() >= 16 {
+                            for &(tok_idx, _) in bucket {
+                                // SAFETY: `gu_tmp` has `2 * moe_inter == gu_mat.rows` floats.
+                                unsafe {
+                                    nf_sdot_stripe_range_int8(
+                                        &gu_mat,
+                                        &act_in_all[tok_idx],
+                                        0,
+                                        gu_mat.num_stripes,
+                                        gu_tmp.as_mut_ptr(),
+                                    );
+                                }
+                                let (g, u) = gu_tmp.split_at(moe_inter);
+                                swiglu_activate(g, u, &mut sw_tmp);
+                                fwht64_signed_inplace(&mut sw_tmp);
+                                hess_e_dn.observe_prerotated(&sw_tmp);
+                            }
+                        } else {
+                            for tok_idx in (0..total_tokens).step_by(fallback_step) {
+                                // SAFETY: `gu_tmp` has `2 * moe_inter == gu_mat.rows` floats.
+                                unsafe {
+                                    nf_sdot_stripe_range_int8(
+                                        &gu_mat,
+                                        &act_in_all[tok_idx],
+                                        0,
+                                        gu_mat.num_stripes,
+                                        gu_tmp.as_mut_ptr(),
+                                    );
+                                }
+                                let (g, u) = gu_tmp.split_at(moe_inter);
+                                swiglu_activate(g, u, &mut sw_tmp);
+                                fwht64_signed_inplace(&mut sw_tmp);
+                                hess_e_dn.observe_prerotated(&sw_tmp);
+                            }
+                        }
+                        hess_e_dn.finalize(BIPOLAR_GPTQ_DAMP);
+                        let dn_mat = compile_hadamard_gptq_nf(
+                            &dn_f32,
+                            h_dim,
+                            moe_inter,
+                            expert_bits,
+                            expert_sgc,
+                            Some(&hess_e_dn),
+                            compile_threads,
+                        );
+                        drop(dn_f32);
+                        drop(hess_e_dn);
+
+                        for &(tok_idx, weight) in bucket {
+                            // SAFETY: `gu_tmp` and `dn_tmp` match `gu_mat.rows` and `dn_mat.rows`.
                             unsafe {
                                 nf_sdot_stripe_range_int8(
                                     &gu_mat,
@@ -4268,71 +4366,25 @@ impl RealLlamaEngine {
                             let (g, u) = gu_tmp.split_at(moe_inter);
                             swiglu_activate(g, u, &mut sw_tmp);
                             fwht64_signed_inplace(&mut sw_tmp);
-                            hess_e_dn.observe_prerotated(&sw_tmp);
-                        }
-                    } else {
-                        for tok_idx in (0..total_tokens).step_by(fallback_step) {
-                            // SAFETY: `gu_tmp` has `2 * moe_inter == gu_mat.rows` floats.
+                            act_mid.populate(&sw_tmp);
+                            // SAFETY: `dn_tmp` has `h_dim == dn_mat.rows` floats.
                             unsafe {
                                 nf_sdot_stripe_range_int8(
-                                    &gu_mat,
-                                    &act_in_all[tok_idx],
+                                    &dn_mat,
+                                    &act_mid,
                                     0,
-                                    gu_mat.num_stripes,
-                                    gu_tmp.as_mut_ptr(),
+                                    dn_mat.num_stripes,
+                                    dn_tmp.as_mut_ptr(),
                                 );
                             }
-                            let (g, u) = gu_tmp.split_at(moe_inter);
-                            swiglu_activate(g, u, &mut sw_tmp);
-                            fwht64_signed_inplace(&mut sw_tmp);
-                            hess_e_dn.observe_prerotated(&sw_tmp);
+                            let dst = &mut moe_out_all[tok_idx * h_dim..(tok_idx + 1) * h_dim];
+                            for (d, &s) in dst.iter_mut().zip(dn_tmp.iter()) {
+                                *d += weight * s;
+                            }
                         }
-                    }
-                    hess_e_dn.finalize(BIPOLAR_GPTQ_DAMP);
-                    let dn_mat = compile_hadamard_gptq_nf(
-                        &dn_f32,
-                        h_dim,
-                        moe_inter,
-                        expert_bits,
-                        expert_sgc,
-                        Some(&hess_e_dn),
-                        compile_threads,
-                    );
-                    drop(dn_f32);
-                    drop(hess_e_dn);
 
-                    for &(tok_idx, weight) in bucket {
-                        // SAFETY: `gu_tmp` and `dn_tmp` match `gu_mat.rows` and `dn_mat.rows`.
-                        unsafe {
-                            nf_sdot_stripe_range_int8(
-                                &gu_mat,
-                                &act_in_all[tok_idx],
-                                0,
-                                gu_mat.num_stripes,
-                                gu_tmp.as_mut_ptr(),
-                            );
-                        }
-                        let (g, u) = gu_tmp.split_at(moe_inter);
-                        swiglu_activate(g, u, &mut sw_tmp);
-                        fwht64_signed_inplace(&mut sw_tmp);
-                        act_mid.populate(&sw_tmp);
-                        // SAFETY: `dn_tmp` has `h_dim == dn_mat.rows` floats.
-                        unsafe {
-                            nf_sdot_stripe_range_int8(
-                                &dn_mat,
-                                &act_mid,
-                                0,
-                                dn_mat.num_stripes,
-                                dn_tmp.as_mut_ptr(),
-                            );
-                        }
-                        let dst = &mut moe_out_all[tok_idx * h_dim..(tok_idx + 1) * h_dim];
-                        for (d, &s) in dst.iter_mut().zip(dn_tmp.iter()) {
-                            *d += weight * s;
-                        }
+                        k2tm_writer.write_expert(&gu_mat, &dn_mat)?;
                     }
-
-                    k2tm_writer.write_expert(&gu_mat, &dn_mat)?;
                 }
 
                 let mut tok_cursor = 0usize;
@@ -8866,6 +8918,103 @@ unsafe fn axpy_f32_neon(dst: &mut [f32], src: &[f32], alpha: f32) {
 }
 
 #[inline]
+/// GPU twin of the per-expert loop in `compile_streaming_moe_to_files`: experts are compiled in
+/// batches, the routed-token forwards run on the GPU, and the results stream into the `.k2tm` writer
+/// in expert order.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn compile_moe_experts_gpu(
+    gpu: &mut crate::backend::metal_compile::MetalGptqCompiler,
+    store: &SafeTensorsStore,
+    layer: usize,
+    cfg: &LlamaConfig,
+    buckets: &[Vec<(usize, f32)>],
+    act_in_all: &[Int8ChunkActivation],
+    hess_mlp: &FullRowGptqHessian,
+    moe_out_all: &mut [f32],
+    writer: &mut StreamingK2tmWriter,
+    total_tokens: usize,
+    bits: usize,
+    sgc: usize,
+) -> io::Result<()> {
+    use crate::backend::metal_compile::{HessianSet, Slot};
+    let h = cfg.hidden_size;
+    let inter = cfg.eff_moe_inter();
+    let num_experts = cfg.num_experts;
+    let batch = std::env::var("KRONOS_COMPILE_BATCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8)
+        .max(1);
+    let gpu_err = io::Error::other;
+    gpu.upload_layer_acts(act_in_all).map_err(gpu_err)?;
+    let fallback_step = (total_tokens / 32).max(1);
+    for e0 in (0..num_experts).step_by(batch) {
+        let e1 = (e0 + batch).min(num_experts);
+        let mut gus = Vec::with_capacity(e1 - e0);
+        let mut dns = Vec::with_capacity(e1 - e0);
+        for e in e0..e1 {
+            let (gu, dn) = read_moe_expert_f32(store, layer, e, num_experts, h, inter, true)?;
+            gus.push(gu);
+            dns.push(dn);
+        }
+        let gu_refs: Vec<&[f32]> = gus.iter().map(Vec::as_slice).collect();
+        let gu_mats = gpu
+            .compile_nf_batch(Slot::GateUp, &gu_refs, 2 * inter, h, bits, sgc, HessianSet::Shared(hess_mlp))
+            .map_err(gpu_err)?;
+        drop(gus);
+        // Hessian tokens first (routed tokens, or a strided sample for rarely routed experts),
+        // then the routed tokens whose outputs feed the residual stream.
+        let mut hess_dn = Vec::with_capacity(e1 - e0);
+        let mut tok_lists = Vec::with_capacity(e1 - e0);
+        for (m, e) in (e0..e1).enumerate() {
+            let bucket = &buckets[e];
+            let (hess_n, toks): (usize, Vec<u32>) = if bucket.len() >= 16 {
+                (bucket.len(), bucket.iter().map(|&(t, _)| t as u32).collect())
+            } else {
+                let mut v: Vec<u32> = (0..total_tokens).step_by(fallback_step).map(|t| t as u32).collect();
+                let n = v.len();
+                v.extend(bucket.iter().map(|&(t, _)| t as u32));
+                (n, v)
+            };
+            let sw = gpu.forward_gate_up_swiglu(m, &toks).map_err(gpu_err)?;
+            let mut hd = FullRowGptqHessian::new(inter);
+            for row in sw[..hess_n * inter].chunks_exact(inter) {
+                hd.observe_prerotated(row);
+            }
+            hess_dn.push(hd);
+            tok_lists.push((hess_n, toks));
+        }
+        std::thread::scope(|s| {
+            for hd in hess_dn.iter_mut() {
+                s.spawn(move || hd.finalize(BIPOLAR_GPTQ_DAMP));
+            }
+        });
+        let hrefs: Vec<&FullRowGptqHessian> = hess_dn.iter().collect();
+        let dn_refs: Vec<&[f32]> = dns.iter().map(Vec::as_slice).collect();
+        let dn_mats = gpu
+            .compile_nf_batch(Slot::Down, &dn_refs, h, inter, bits, sgc, HessianSet::PerMatrix(&hrefs))
+            .map_err(gpu_err)?;
+        drop(dns);
+        for (m, e) in (e0..e1).enumerate() {
+            let out = gpu.forward_down(m).map_err(gpu_err)?;
+            let bucket = &buckets[e];
+            let (hess_n, toks) = &tok_lists[m];
+            let skip = if bucket.len() >= 16 { 0 } else { *hess_n };
+            for (i, &(tok_idx, weight)) in bucket.iter().enumerate() {
+                debug_assert_eq!(toks[skip + i] as usize, tok_idx);
+                let src = &out[(skip + i) * h..(skip + i + 1) * h];
+                let dst = &mut moe_out_all[tok_idx * h..(tok_idx + 1) * h];
+                for (d, &v) in dst.iter_mut().zip(src) {
+                    *d += weight * v;
+                }
+            }
+            writer.write_expert(&gu_mats[m], &dn_mats[m])?;
+        }
+    }
+    Ok(())
+}
+
 fn swiglu_activate(gate: &[f32], up: &[f32], out: &mut [f32]) {
     debug_assert_eq!(gate.len(), up.len());
     debug_assert_eq!(gate.len(), out.len());

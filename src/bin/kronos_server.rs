@@ -10,9 +10,12 @@
 //!   `--fp32-kv`           use an `FP32` KV cache instead of the default INT8 one
 //!   `--cpu`               force CPU inference (disables default Metal GPU backend for NF4)
 //!   `--metal`             require Metal GPU inference
+//!   `--moe-hot CSV`       expert-routing histogram (from `KRONOS_EXPERT_HIST`) used with
+//!   `--moe-wire-gib N`    to wire only the most-routed experts that fit N GiB; the rest page on demand
 //!   `--draft DIR`         draft model for speculative decoding (`--draft-mode M`)
 //!   `--ane`               prefill on the Neural Engine (`ane` feature, models in `<model_dir>/ane`)
 //!   `--mode M`, `--calib FILE`, `--calib-tokens N`, `--ctx N`, `--threads N` as in `kronos_chat`
+//!   `--compile-only`          compile the Sparse-MoE `.k2tb`/`.k2tm` for `--mode` and exit
 //!
 //! Endpoints: `POST /v1/chat/completions`, `POST /v1/agent/chat`, `POST /v1/turn`,
 //! `POST /v1/compact`, `GET /v1/sessions`, `GET /v1/sessions/get?id=...`, `POST /v1/sessions/save`,
@@ -2672,6 +2675,12 @@ fn main() {
     let calib_opt = calib.as_deref().map(|c| (Path::new(c), num("--calib-tokens", 16384.0) as usize));
     let cache_dir_flag = flag("--cache-dir");
     let cache_dir_opt = cache_dir_flag.as_deref().map(Path::new);
+    if let Some(csv) = flag("--moe-hot") {
+        std::env::set_var("KRONOS_EXPERT_HOT", csv);
+    }
+    if let Some(gib) = flag("--moe-wire-gib") {
+        std::env::set_var("KRONOS_WIRE_GIB", gib);
+    }
     if let Some(mb_str) = flag("--memory-budget-mb") {
         let mb: usize = mb_str.parse().expect("numeric --memory-budget-mb");
         kronos_2t::model::memory_budget::MemoryBudgetProfile::set_global_budget_override_mb(mb);
@@ -2679,6 +2688,23 @@ fn main() {
     let requested_ctx = flag("--ctx")
         .or_else(|| flag("--max-seq-len"))
         .map_or(16384usize, |v| v.parse().expect("numeric --ctx"));
+    if args.iter().any(|a| a == "--compile-only") {
+        let (calib_path, n) = calib_opt.expect("--compile-only needs --calib FILE");
+        let text = std::fs::read_to_string(calib_path).expect("calibration text");
+        let core = model_dir.join(format!("kronos-moe-core-{mode}.k2tb"));
+        let experts = model_dir.join(format!("kronos-moe-experts-{mode}.k2tm"));
+        let weight_mode = kronos_2t::runtime::chat::parse_mode(&mode).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2);
+        });
+        let t = std::time::Instant::now();
+        kronos_2t::runtime::chat::compile_moe(model_dir, &core, &experts, weight_mode, &text, n).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
+        eprintln!("compiled {} + {} in {:.1} min", core.display(), experts.display(), t.elapsed().as_secs_f64() / 60.0);
+        return;
+    }
     let mut model = ChatModel::load_with_cache_dir(
         model_dir,
         cache_dir_opt,

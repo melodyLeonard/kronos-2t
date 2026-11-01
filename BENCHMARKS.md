@@ -180,7 +180,7 @@ Measured on the same Apple Silicon machine with `cargo run --release --bin bench
 - Metal GPU acceleration covers `nf4`, `nf4g128`, `nf3`, `nf5`, and `e8q2g128`; bipolar bit-plane tiers (`b4`, `p55454`, `b5`, `b6`) run on CPU (or `--ane` for prefill).
 - 4-bit quality depends on the calibration domain (see above).
 - Bipolar-6 single-core decode is ~7% slower than Q6_K at 135M/360M (43% faster at 1.7B).
-- GPTQ compile: 34 s (135M), 90 s (360M), ~12 min (1.7B) per tier.
+- GPTQ compile: 34 s (135M), 90 s (360M), ~12 min (1.7B) per tier on CPU; the 30B-A3B MoE experts compile on the Metal GPU in 12.3 min (48 min on CPU). Dense models still compile on CPU.
 - Apple Silicon only (`aarch64` NEON + `sdot`, `Metal.framework` on macOS, `libkronos_2t.a` C FFI on `aarch64-apple-ios`).
 
 ## Reproduce

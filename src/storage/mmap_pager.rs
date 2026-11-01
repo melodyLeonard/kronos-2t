@@ -77,8 +77,14 @@ pub(crate) mod sys {
 
         /// Wires the whole mapping so the OS cannot evict it under memory pressure.
         pub fn lock_resident(&self) -> io::Result<()> {
-            // SAFETY: `[self.ptr, self.len)` is a live mapping owned by `self`.
-            if unsafe { mlock(self.ptr, self.len) } == 0 {
+            self.lock_range(0, self.len)
+        }
+
+        /// Wires `[offset, offset + len)` (page-aligned) of the mapping.
+        pub fn lock_range(&self, offset: usize, len: usize) -> io::Result<()> {
+            assert!(offset + len <= self.len);
+            // SAFETY: the range lies inside the live mapping owned by `self`.
+            if unsafe { mlock(self.ptr.byte_add(offset), len) } == 0 {
                 Ok(())
             } else {
                 Err(io::Error::last_os_error())

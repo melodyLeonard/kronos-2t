@@ -9,16 +9,16 @@ use crate::kernels::simd_lut::{
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::OnceLock;
 
-type Id = *mut c_void;
-type Sel = *mut c_void;
+pub(crate) type Id = *mut c_void;
+pub(crate) type Sel = *mut c_void;
 
 #[link(name = "objc")]
 unsafe extern "C" {
-    fn objc_getClass(name: *const c_char) -> Id;
-    fn sel_registerName(name: *const c_char) -> Sel;
-    fn objc_msgSend();
-    fn objc_autoreleasePoolPush() -> *mut c_void;
-    fn objc_autoreleasePoolPop(pool: *mut c_void);
+    pub(crate) fn objc_getClass(name: *const c_char) -> Id;
+    pub(crate) fn sel_registerName(name: *const c_char) -> Sel;
+    pub(crate) fn objc_msgSend();
+    pub(crate) fn objc_autoreleasePoolPush() -> *mut c_void;
+    pub(crate) fn objc_autoreleasePoolPop(pool: *mut c_void);
 }
 
 #[link(name = "Foundation", kind = "framework")]
@@ -26,17 +26,17 @@ unsafe extern "C" {}
 
 #[link(name = "Metal", kind = "framework")]
 unsafe extern "C" {
-    fn MTLCreateSystemDefaultDevice() -> Id;
+    pub(crate) fn MTLCreateSystemDefaultDevice() -> Id;
 }
 
-const MTL_RESOURCE_STORAGE_MODE_SHARED: usize = 0;
-const MTL_CMD_STATUS_COMPLETED: usize = 4;
+pub(crate) const MTL_RESOURCE_STORAGE_MODE_SHARED: usize = 0;
+pub(crate) const MTL_CMD_STATUS_COMPLETED: usize = 4;
 const MAX_PROMPT_CHUNK_GPU: usize = 1536;
 const GEMV_MAX_TOKENS: usize = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-struct MtlSize {
+pub(crate) struct MtlSize {
     width: usize,
     height: usize,
     depth: usize,
@@ -44,7 +44,7 @@ struct MtlSize {
 
 impl MtlSize {
     #[inline]
-    const fn new(width: usize, height: usize, depth: usize) -> Self {
+    pub(crate) const fn new(width: usize, height: usize, depth: usize) -> Self {
         Self {
             width,
             height,
@@ -53,33 +53,33 @@ impl MtlSize {
     }
 }
 
-struct Selectors {
-    retain: Sel,
-    release: Sel,
-    str_utf8: Sel,
-    utf8_string: Sel,
-    loc_desc: Sel,
-    new_cmd_queue: Sel,
-    new_lib_src: Sel,
-    new_fn_name: Sel,
-    new_cps_fn: Sel,
-    new_buf_len: Sel,
-    new_buf_bytes: Sel,
-    new_buf_nocopy: Sel,
-    buf_contents: Sel,
-    buf_length: Sel,
-    cmd_buffer: Sel,
-    compute_enc: Sel,
-    set_cps: Sel,
-    set_buf: Sel,
-    set_bytes: Sel,
-    dispatch_tg: Sel,
-    end_enc: Sel,
-    commit: Sel,
-    wait_done: Sel,
-    cmd_status: Sel,
-    cmd_error: Sel,
-    rec_max_ws: Sel,
+pub(crate) struct Selectors {
+    pub(crate) retain: Sel,
+    pub(crate) release: Sel,
+    pub(crate) str_utf8: Sel,
+    pub(crate) utf8_string: Sel,
+    pub(crate) loc_desc: Sel,
+    pub(crate) new_cmd_queue: Sel,
+    pub(crate) new_lib_src: Sel,
+    pub(crate) new_fn_name: Sel,
+    pub(crate) new_cps_fn: Sel,
+    pub(crate) new_buf_len: Sel,
+    pub(crate) new_buf_bytes: Sel,
+    pub(crate) new_buf_nocopy: Sel,
+    pub(crate) buf_contents: Sel,
+    pub(crate) buf_length: Sel,
+    pub(crate) cmd_buffer: Sel,
+    pub(crate) compute_enc: Sel,
+    pub(crate) set_cps: Sel,
+    pub(crate) set_buf: Sel,
+    pub(crate) set_bytes: Sel,
+    pub(crate) dispatch_tg: Sel,
+    pub(crate) end_enc: Sel,
+    pub(crate) commit: Sel,
+    pub(crate) wait_done: Sel,
+    pub(crate) cmd_status: Sel,
+    pub(crate) cmd_error: Sel,
+    pub(crate) rec_max_ws: Sel,
 }
 
 // SAFETY: Objective-C `SEL` values are immutable process-wide interned pointers.
@@ -87,7 +87,7 @@ unsafe impl Send for Selectors {}
 // SAFETY: Objective-C `SEL` values are immutable process-wide interned pointers.
 unsafe impl Sync for Selectors {}
 
-fn sels() -> &'static Selectors {
+pub(crate) fn sels() -> &'static Selectors {
     static SELS: OnceLock<Selectors> = OnceLock::new();
     SELS.get_or_init(|| {
         let reg = |s: &CStr| -> Sel {
@@ -132,6 +132,7 @@ macro_rules! msg_sel {
         f($obj, $sel $(, $arg)*)
     }};
 }
+pub(crate) use msg_sel;
 
 fn nsstring_class() -> Id {
     static CLS: OnceLock<usize> = OnceLock::new();
@@ -144,7 +145,7 @@ fn nsstring_class() -> Id {
     raw as Id
 }
 
-unsafe fn nsstring(s: &str) -> Result<Id, String> {
+pub(crate) unsafe fn nsstring(s: &str) -> Result<Id, String> {
     let c = CString::new(s).map_err(|_| "NUL byte in string".to_string())?;
     let st = sels();
     // SAFETY: Valid `NSString` class and UTF-8 pointer inside active autorelease pool.
@@ -156,7 +157,7 @@ unsafe fn nsstring(s: &str) -> Result<Id, String> {
     }
 }
 
-unsafe fn ns_error_string(err: Id) -> String {
+pub(crate) unsafe fn ns_error_string(err: Id) -> String {
     if err.is_null() {
         return "unknown Metal error".to_string();
     }
@@ -176,7 +177,7 @@ unsafe fn ns_error_string(err: Id) -> String {
     }
 }
 
-struct MtlObj(Id);
+pub(crate) struct MtlObj(pub(crate) Id);
 
 // SAFETY: Metal handles are thread-safe refcounted objects; mutable execution uses `&mut self`.
 unsafe impl Send for MtlObj {}
@@ -184,7 +185,7 @@ unsafe impl Send for MtlObj {}
 unsafe impl Sync for MtlObj {}
 
 impl MtlObj {
-    fn from_retained(ptr: Id, what: &str) -> Result<Self, String> {
+    pub(crate) fn from_retained(ptr: Id, what: &str) -> Result<Self, String> {
         if ptr.is_null() {
             Err(format!("Metal allocation failed: {what}"))
         } else {
@@ -193,19 +194,19 @@ impl MtlObj {
     }
 
     #[inline]
-    fn id(&self) -> Id {
+    pub(crate) fn id(&self) -> Id {
         self.0
     }
 
     #[inline]
-    fn contents_ptr(&self) -> *mut u8 {
+    pub(crate) fn contents_ptr(&self) -> *mut u8 {
         let st = sels();
         // SAFETY: Valid `MTLBuffer` with `MTLResourceStorageModeShared`.
         unsafe { msg_sel!(self.0, st.buf_contents; *mut u8) }
     }
 
     #[inline]
-    fn byte_len(&self) -> usize {
+    pub(crate) fn byte_len(&self) -> usize {
         let st = sels();
         // SAFETY: Valid `MTLBuffer`.
         unsafe { msg_sel!(self.0, st.buf_length; usize) }
@@ -860,7 +861,7 @@ impl MoeHist {
     }
 }
 
-fn alloc_shared_buffer(device: Id, byte_len: usize, what: &str) -> Result<MtlObj, String> {
+pub(crate) fn alloc_shared_buffer(device: Id, byte_len: usize, what: &str) -> Result<MtlObj, String> {
     let len = byte_len.max(16);
     let st = sels();
     // SAFETY: Valid `MTLDevice` and byte length.
@@ -888,7 +889,7 @@ fn alloc_shared_buffer(device: Id, byte_len: usize, what: &str) -> Result<MtlObj
     Ok(obj)
 }
 
-fn upload_slice_buffer<T: Copy>(device: Id, slice: &[T], what: &str) -> Result<MtlObj, String> {
+pub(crate) fn upload_slice_buffer<T: Copy>(device: Id, slice: &[T], what: &str) -> Result<MtlObj, String> {
     let byte_len = std::mem::size_of_val(slice);
     if byte_len == 0 {
         return alloc_shared_buffer(device, 16, what);
@@ -988,7 +989,7 @@ fn wrap_nf4_matrix(device: Id, mat: &NfSdotMatrix, dummy: Id, label: &str) -> Re
     })
 }
 
-fn build_pipeline(device: Id, library: Id, fn_name: &str) -> Result<MtlObj, String> {
+pub(crate) fn build_pipeline(device: Id, library: Id, fn_name: &str) -> Result<MtlObj, String> {
     let st = sels();
     // SAFETY: Valid `MTLDevice` and `MTLLibrary` inside active autorelease pool.
     unsafe {

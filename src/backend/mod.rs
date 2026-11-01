@@ -4,3 +4,5 @@
 pub mod metal_gpu;
 #[cfg(all(feature = "ane", target_os = "macos"))]
 pub mod coreml;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub mod metal_compile;

@@ -739,7 +739,7 @@ impl SparseMoeRuntime {
 
         let backend = match policy {
             MoeExpertOpenPolicy::ForceZeroCopyMmap => {
-                let mmap = open_zero_copy_shard(&probe_file, file_len)?;
+                let mmap = open_zero_copy_shard(&probe_file, file_len, &header)?;
                 MoeExpertBackend::ZeroCopyMmap {
                     mmap,
                     header,
@@ -748,7 +748,7 @@ impl SparseMoeRuntime {
                 }
             }
             MoeExpertOpenPolicy::AutoBudget if file_len <= arena_budget => {
-                let mmap = open_zero_copy_shard(&probe_file, file_len)?;
+                let mmap = open_zero_copy_shard(&probe_file, file_len, &header)?;
                 MoeExpertBackend::ZeroCopyMmap {
                     mmap,
                     header,
@@ -1688,16 +1688,66 @@ unsafe fn dot_f32_moe_neon(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Maps the expert shard read-only and wires it in RAM (`KRONOS_NO_WIRE=1` skips the wiring).
-/// An unwired shard gets evicted under memory pressure and refaulted from SSD mid-token.
-fn open_zero_copy_shard(file: &std::fs::File, len: usize) -> io::Result<RawMmap> {
+/// With `KRONOS_EXPERT_HOT=<histogram csv>` and `KRONOS_WIRE_GIB=<n>` only the most-routed
+/// experts that fit the budget are wired; the rest stay pageable.
+/// An unwired expert gets evicted under memory pressure and refaulted from SSD mid-token.
+fn open_zero_copy_shard(file: &std::fs::File, len: usize, header: &K2tmShardHeader) -> io::Result<RawMmap> {
     let _ = nvme_io::clear_file_nocache(file);
     let mmap = RawMmap::map_read_only(file, len)?;
-    if std::env::var_os("KRONOS_NO_WIRE").is_none() {
-        if let Err(e) = mmap.lock_resident() {
-            eprintln!("warning: could not wire {:.1} GiB expert shard ({e}); expect stalls under memory pressure", len as f64 / (1u64 << 30) as f64);
-        }
+    if std::env::var_os("KRONOS_NO_WIRE").is_some() {
+        return Ok(mmap);
+    }
+    let hot = std::env::var("KRONOS_EXPERT_HOT").ok();
+    let budget = std::env::var("KRONOS_WIRE_GIB").ok().and_then(|v| v.parse::<f64>().ok());
+    if let (Some(csv), Some(gib)) = (hot, budget) {
+        wire_hot_experts(&mmap, header, &csv, (gib * (1u64 << 30) as f64) as usize);
+    } else if let Err(e) = mmap.lock_resident() {
+        eprintln!("warning: could not wire {:.1} GiB expert shard ({e}); expect stalls under memory pressure", len as f64 / (1u64 << 30) as f64);
     }
     Ok(mmap)
+}
+
+/// Wires the most-routed experts from a `layer,expert,count` histogram until `budget` bytes are wired.
+fn wire_hot_experts(mmap: &RawMmap, header: &K2tmShardHeader, csv: &str, budget: usize) {
+    let text = match std::fs::read_to_string(csv) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("warning: cannot read expert histogram {csv}: {e}; wiring nothing");
+            return;
+        }
+    };
+    let mut rows: Vec<(u64, usize, usize)> = text
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split(',');
+            let layer = it.next()?.trim().parse().ok()?;
+            let expert = it.next()?.trim().parse().ok()?;
+            let count = it.next()?.trim().parse().ok()?;
+            (layer < header.num_layers && expert < header.experts_per_layer).then_some((count, layer, expert))
+        })
+        .collect();
+    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let total: u64 = rows.iter().map(|r| r.0).sum();
+    let rec = header.aligned_expert_bytes;
+    let (mut wired, mut covered, mut n) = (0usize, 0u64, 0usize);
+    for (count, layer, expert) in rows {
+        if wired + rec > budget {
+            break;
+        }
+        let off = K2TM_PAGE_BYTES + (layer * header.experts_per_layer + expert) * rec;
+        if mmap.lock_range(off, rec).is_err() {
+            break;
+        }
+        wired += rec;
+        covered += count;
+        n += 1;
+    }
+    let all = header.num_layers * header.experts_per_layer;
+    eprintln!(
+        "wired {n}/{all} experts ({:.2} GiB) covering {:.1}% of routed tokens; the rest page on demand",
+        wired as f64 / (1u64 << 30) as f64,
+        if total > 0 { 100.0 * covered as f64 / total as f64 } else { 0.0 }
+    );
 }
 
 #[cfg(test)]
