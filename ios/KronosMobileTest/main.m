@@ -1369,7 +1369,9 @@ static const CGFloat kSidebarWidth = 296.0;
         KronosMobileSession *sess = kronos_session_create([modelDir UTF8String], "nf4g128", 2048, 0, 1850);
         if (sess != NULL) {
             kronos_session_configure_kv(sess, 8, 2048, 64);
+#if !TARGET_OS_SIMULATOR
             kronos_session_enable_metal(sess);
+#endif
             self.session = sess;
         }
         dispatch_async(dispatch_get_main_queue(), ^{

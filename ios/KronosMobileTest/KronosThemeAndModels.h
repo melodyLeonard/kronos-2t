@@ -109,7 +109,7 @@ static inline UIColor *kronosSidebarMuted(void)  { return [UIColor colorWithRed:
     self.tintColor = tint;
     [self bounce];
     __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         __strong typeof(weakSelf) me = weakSelf;
         if (me == nil) return;
         [UIView transitionWithView:me duration:0.2 options:UIViewAnimationOptionTransitionCrossDissolve animations:^{
@@ -181,7 +181,7 @@ static inline void kronosShowToast(UIView *host, NSString *text) {
     ]];
     pill.transform = CGAffineTransformMakeTranslation(0, 10);
     [UIView animateWithDuration:0.18 animations:^{ pill.alpha = 1.0; pill.transform = CGAffineTransformIdentity; }];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [UIView animateWithDuration:0.22 animations:^{ pill.alpha = 0.0; pill.transform = CGAffineTransformMakeTranslation(0, 8); }
                          completion:^(BOOL f) { [pill removeFromSuperview]; }];
     });

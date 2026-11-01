@@ -76,10 +76,11 @@
     border-radius:999px; background:var(--accent); color:var(--accent-ink);
   }
   .hdr-ib .cnt:empty, .hdr-ib .cnt.zero { display:none; }
-  .srv-row { display:flex; align-items:center; justify-content:space-between; gap:8px; margin:6px 0; font-size:12px; }
-  .srv-row select { width:160px; font-size:12px; padding:4px 7px; }
-  .srv-stat { font-size:11px; color:var(--muted); line-height:1.5; margin:4px 0 6px; }
-  .srv-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
+  .srv-row { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:9px 0; font-size:12.5px; }
+  .srv-row select { flex:1; min-width:0; max-width:190px; font-size:12px; padding:6px 9px; }
+  .srv-stat { font-size:11.5px; color:var(--muted); line-height:1.55; margin:0 0 10px; word-break:break-word; }
+  .srv-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .srv-actions .mini-btn { padding:6px 12px; border-radius:8px; }
   .btn-danger { border-color:#ef4444; color:#ef4444; }
   .btn-danger:hover:not(:disabled) { background:rgba(239,68,68,0.1); border-color:#ef4444; }
   .btn-accent { background:var(--accent); color:var(--accent-ink); border-color:var(--accent); }
@@ -222,32 +223,33 @@
 
   /* Settings popover */
   #settings-popover {
-    display:none; position:fixed; left:14px; bottom:52px; width:292px;
+    display:none; position:fixed; left:14px; bottom:56px; width:min(328px, calc(100vw - 28px));
+    max-height:calc(100dvh - 76px); overflow-y:auto; overscroll-behavior:contain;
     background:var(--panel); color:var(--text); border:1px solid var(--line);
-    border-radius:12px; padding:12px 14px; z-index:30;
+    border-radius:14px; padding:16px 18px 14px; z-index:30;
     box-shadow:0 14px 36px rgba(0,0,0,0.32);
   }
   #settings-popover.open { display:block; }
   .settings-hdr {
     display:flex; align-items:center; justify-content:space-between;
-    font-weight:600; font-size:13px; margin-bottom:8px;
+    font-weight:600; font-size:13.5px; margin-bottom:12px;
   }
   #settings-popover label {
-    display:flex; align-items:center; justify-content:space-between; gap:8px;
-    margin:7px 0; font-size:12px; color:var(--text);
+    display:flex; align-items:center; justify-content:space-between; gap:12px;
+    margin:10px 0; font-size:12.5px; color:var(--text);
   }
   #settings-popover input, #settings-popover select {
-    width:142px; font-size:12px; padding:4px 7px;
+    width:min(156px, 52%); min-width:0; font-size:12px; padding:6px 9px;
   }
   #settings-popover input[type="checkbox"] {
     width:auto; padding:0; accent-color:var(--accent); cursor:pointer;
   }
   .dev-ctx-box {
-    margin:6px 0 10px; padding:9px 10px; border:1px solid var(--line);
-    border-radius:10px; background:var(--subtle);
+    margin:8px 0 14px; padding:12px 14px; border:1px solid var(--line);
+    border-radius:12px; background:var(--subtle);
   }
   .dev-ctx-stats {
-    font-size:11px; color:var(--muted); margin:4px 0 7px; line-height:1.4;
+    font-size:11.5px; color:var(--muted); margin:6px 0 10px; line-height:1.5;
   }
   .dev-ctx-actions { display:flex; gap:6px; flex-wrap:wrap; }
   #device-hdr-btn.active { border-color:var(--accent); color:var(--accent); }
@@ -279,7 +281,7 @@
     white-space:pre-wrap; word-break:break-word; color:var(--text);
   }
   .settings-note {
-    margin-top:8px; padding-top:8px; border-top:1px solid var(--line);
+    margin-top:12px; padding-top:10px; border-top:1px solid var(--line);
     font-size:11.5px; color:var(--muted); line-height:1.45;
   }
 
