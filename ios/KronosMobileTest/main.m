@@ -646,7 +646,7 @@ static const CGFloat kSidebarWidth = 296.0;
 
     self.sidebarSettingsSubtitle = [[UILabel alloc] init];
     self.sidebarSettingsSubtitle.translatesAutoresizingMaskIntoConstraints = NO;
-    self.sidebarSettingsSubtitle.text = @"Device Context On · Phone Use On";
+    self.sidebarSettingsSubtitle.text = @"Context on · Phone on";
     self.sidebarSettingsSubtitle.textColor = kronosSidebarMuted();
     self.sidebarSettingsSubtitle.font = [UIFont systemFontOfSize:11.0 weight:UIFontWeightRegular];
     [settingsFooter addSubview:self.sidebarSettingsSubtitle];
@@ -756,8 +756,8 @@ static const CGFloat kSidebarWidth = 296.0;
 
 - (void)refreshSidebarSettingsFooter {
     KronosMobileSettings *s = [KronosMobileSettings sharedSettings];
-    NSString *ctxPart = s.developDeviceContext ? @"Device Context On" : @"Device Context Off";
-    NSString *phonePart = s.allowPhoneUse ? @"Phone Use On" : @"Phone Use Off";
+    NSString *ctxPart = s.developDeviceContext ? @"Context on" : @"Context off";
+    NSString *phonePart = s.allowPhoneUse ? @"Phone on" : @"Phone off";
     self.sidebarSettingsSubtitle.text = [NSString stringWithFormat:@"%@ · %@", ctxPart, phonePart];
 }
 
