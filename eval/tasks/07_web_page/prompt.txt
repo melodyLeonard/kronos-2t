@@ -1,0 +1,7 @@
+Create a single-file to-do web page index.html (inline CSS and plain JavaScript, no frameworks, no external files) with:
+- a text input with id="new-todo"
+- a button with id="add" that adds the input's trimmed text as a new <li> inside <ul id="todos"> (ignore empty input) and clears the input
+- clicking an <li> toggles the CSS class "done" on it (strike-through style)
+- a <span id="count"> that always shows the number of items NOT done, as a plain integer
+- pressing Enter in the input also adds the item
+Wire the event handlers in a <script> at the end of <body> (or inside a DOMContentLoaded listener). Keep it small and verify the file is valid HTML.

@@ -203,6 +203,48 @@ layout gives 110,592 B/token with int8 KV (3.38 GiB at 32k) and 55,296 B/token w
 on the 0.5B it changed one of the two 5,500-token test answers above, so it is a memory trade,
 not a free default.
 
+## Agent context growth (`eval/`, Qwen2.5-Coder-14B + 0.5B draft, Metal)
+
+`eval/run_eval.py` drives the 10 hidden-check tasks in `eval/tasks/` through the live
+`kronos_server` agent loop (`POST /v1/agent/chat`, `--ctx 32768`, temperature 0) and scores them
+with checks the model never sees. Two full runs so far, on the same M4 Pro 24 GB
+(`eval/results/baseline.json`, `eval/results/after.json`, side by side in
+`eval/results/before_after.md`). The baseline ran while another session held a 3 GB 30B process
+and a `cargo test` on the CPU; the after run had no competing model process.
+
+| metric | baseline `f1a605a` | after `fc146c3` |
+|---|---:|---:|
+| pass rate | 3/10 | 2/10 |
+| median step time | 16.66 s | 6.71 s |
+| median prompt tokens per step | 5,746 | 4,825 |
+| total agent steps / prompt tokens | 92 / 658,463 | 152 / 752,015 |
+| peak server RSS | 8,428 MiB | 6,698 MiB |
+| follow-up first token over 20 turns, median | 11.46 s | 5.18 s |
+| follow-up first token, p90 / max | 14.65 / 21.72 s | 49.90 / 51.06 s |
+| follow-up prompt tokens at turn 20 | 14,937 | 4,808 |
+| follow-up turns ending without a final reply | 0 | 13 |
+
+What changed in `fc146c3`: the per-turn workspace block is a file list plus files changed since the
+last turn (the baseline inlined up to 12 KB of file contents every turn); `run_command`,
+`search_files` and `list_dir` results are capped head+tail at 2 KB with the full text saved under
+`.kronos_tool_output/` for `read_file`; the loop ends as soon as a verification command passes
+after the last edit; `write_file` on an existing file with a small diff gets an `edit_file` nudge;
+history is compacted once the prompt passes a token budget (8,192 in this run).
+
+What the after run showed: per-step prompt size and step time fell, but two behaviors regressed and
+cost the follow-up task. The model copies `  6: ` line-number prefixes from the prefetched snapshot
+into `edit_file` `old_text`, and the new "prefer edit_file" wording made it retry that failing edit
+until `max_steps` instead of falling back to `write_file` (turns 7 to 20, 6 steps each). The 8k
+budget also let the intra-turn compaction fold the 24 KB `read_file` result of the step just taken
+(task 10), after which the model re-read and re-edited in a loop. The 51 s first-token outliers are
+re-prefills after each such compaction. Neither run reaches the 0.5 s follow-up first-token target:
+every turn pays the Jev pre-pass plus prefill of the new user block, 3.3 to 5.9 s here before any
+compaction.
+
+Commit `c67d265` fixes the two mechanisms (`edit_file` strips pasted line-number prefixes when the
+literal text is absent, the intra-turn compaction never folds the most recent step, budget 12,288)
+but has not been measured yet; the table above is the only measured before/after.
+
 ## MoE streaming experiment
 
 `bench_800b` models an 812B-parameter mixture-of-experts layout (80 layers, 7168 hidden,

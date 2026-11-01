@@ -12,7 +12,10 @@ pub use crate::config::prompts::{AGENT_SYSTEM_PROMPT, UNIFIED_SYSTEM_PROMPT};
 use crate::config::prompts::COMPACTED_MEMORY_HEADER;
 
 pub use crate::config::limits::{MAX_CMD_OUTPUT_BYTES, MAX_READ_BYTES};
-use crate::config::limits::MAX_SEARCH_MATCHES;
+use crate::config::limits::{
+    AGENT_COMPACT_BUDGET_TOKENS, MAX_SEARCH_MATCHES, TOOL_RESULT_MAX_BYTES, WRITE_FILE_SMALL_CHANGE_PERCENT,
+};
+use crate::config::paths::TOOL_OUTPUT_DIR;
 
 
 #[derive(Clone, Debug)]
@@ -541,6 +544,29 @@ fn truncate_utf8_head_tail(s: &str, max_bytes: usize) -> String {
     )
 }
 
+/// Caps a bulky tool result for the prompt and saves the full text under `.kronos_tool_output/`.
+pub fn cap_tool_result(workdir: &Path, step: usize, idx: usize, tool_name: &str, output: &str) -> String {
+    if output.len() <= TOOL_RESULT_MAX_BYTES
+        || matches!(tool_name, "read_file" | "write_file" | "edit_file")
+    {
+        return output.to_string();
+    }
+    let rel = format!("{TOOL_OUTPUT_DIR}/step{step}_{idx}_{tool_name}.txt");
+    let saved = fs::create_dir_all(workdir.join(TOOL_OUTPUT_DIR))
+        .and_then(|()| fs::write(workdir.join(&rel), output.as_bytes()))
+        .is_ok();
+    let capped = truncate_utf8_head_tail(output, TOOL_RESULT_MAX_BYTES);
+    if saved {
+        format!(
+            "{capped}\n[output capped at {TOOL_RESULT_MAX_BYTES} bytes; full {} bytes ({} lines) saved to `{rel}` — call read_file with start_line/end_line to see more]",
+            output.len(),
+            output.lines().count()
+        )
+    } else {
+        capped
+    }
+}
+
 pub fn mime_type_for_path(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
@@ -569,6 +595,7 @@ fn should_skip_entry(name: &str) -> bool {
         || name == "__pycache__"
         || name == ".DS_Store"
         || name == ".kronos_media"
+        || name == TOOL_OUTPUT_DIR
         || name == crate::config::paths::STATE_DIR
         || name.starts_with(".kronos_cmd_")
 }
@@ -2584,15 +2611,64 @@ fn exec_write_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
         Ok(()) => {
             let clean_rel = relative_display_in_workdir(workdir, &target, rel);
             let diff = build_file_diff(&clean_rel, prev_opt, &final_content);
-            let msg = format!(
+            let mut msg = format!(
                 "ok: wrote {} bytes ({} lines{sync_note}) to `{clean_rel}`",
                 final_content.len(),
                 final_content.lines().count()
             );
+            if let Some(nudge) = diff.as_ref().and_then(small_rewrite_nudge) {
+                msg.push_str(&nudge);
+            }
             attach_validation_status(workdir, &target, &clean_rel, msg, diff)
         }
         Err(e) => err_outcome(&format!("error writing `{rel}`: {e}")),
     }
+}
+
+/// Suggests `edit_file` when a `write_file` rewrote an existing file but changed only a few lines.
+fn small_rewrite_nudge(diff: &FileChangeDiff) -> Option<String> {
+    if !diff.existed_before {
+        return None;
+    }
+    let before_lines = diff.before_content.lines().count();
+    let changed = diff.added_lines.max(diff.removed_lines);
+    if before_lines < 12 || changed * 100 > before_lines * WRITE_FILE_SMALL_CHANGE_PERCENT {
+        return None;
+    }
+    Some(format!(
+        " (note: only {changed} of {before_lines} lines changed — use edit_file with a short unique old_text for small changes to existing files)"
+    ))
+}
+
+fn strip_line_number_prefix(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let rest = &t[digits..];
+    let rest = rest.strip_prefix(':').or_else(|| rest.strip_prefix(" |")).or_else(|| rest.strip_prefix('|'))?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
+/// Removes `N: ` / `N | ` line-number prefixes copied from tool output when every non-empty
+/// line of `old_text` carries one; `new_text` is stripped the same way.
+fn strip_line_number_prefixes(old_text: &str, new_text: &str) -> (String, String) {
+    let lines: Vec<&str> = old_text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() || !lines.iter().all(|l| strip_line_number_prefix(l).is_some()) {
+        return (old_text.to_string(), new_text.to_string());
+    }
+    let strip_all = |text: &str| -> String {
+        let mut out: Vec<String> = text
+            .lines()
+            .map(|l| strip_line_number_prefix(l).unwrap_or(l).to_string())
+            .collect();
+        if text.ends_with('\n') {
+            out.push(String::new());
+        }
+        out.join("\n")
+    };
+    (strip_all(old_text), strip_all(new_text))
 }
 
 /// Matches `norm_old` against `norm_existing` by comparing contiguous non-empty trimmed lines.
@@ -2786,6 +2862,15 @@ fn exec_edit_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
     let existing = match fs::read_to_string(&target) {
         Ok(s) => s,
         Err(e) => return err_outcome(&format!("error reading `{rel}`: {e}")),
+    };
+    // Models often paste `read_file` output verbatim; drop `  12: ` / `  12 | ` prefixes when
+    // the literal text is absent but the stripped text is present.
+    let (stripped_old, stripped_new) = strip_line_number_prefixes(old_text, new_text);
+    let use_stripped = !existing.contains(old_text) && existing.contains(stripped_old.as_str());
+    let (old_text, new_text): (&str, &str) = if use_stripped {
+        (stripped_old.as_str(), stripped_new.as_str())
+    } else {
+        (old_text, new_text)
     };
 
     let mut match_positions = Vec::new();
@@ -3727,16 +3812,97 @@ pub fn build_unified_system_prompt() -> String {
 
 const WORKSPACE_STATUS_OPEN: &str = "[Workspace Status]";
 const WORKSPACE_STATUS_CLOSE: &str = "[/Workspace Status]";
+const WORKSPACE_LISTING_MAX_FILES: usize = 60;
 
+type WorkspaceFingerprint = std::collections::HashMap<String, (u64, u128)>;
+
+fn workspace_seen_states() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, WorkspaceFingerprint>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, WorkspaceFingerprint>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn fingerprint_entries(workdir: &Path, entries: &[WorkspaceFileEntry]) -> WorkspaceFingerprint {
+    entries
+        .iter()
+        .map(|e| {
+            let mtime = fs::metadata(workdir.join(&e.path))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            (e.path.clone(), (e.bytes, mtime))
+        })
+        .collect()
+}
+
+/// Records the current on-disk state so the next turn can flag files changed outside the agent.
+pub fn remember_workspace_state(workdir: &Path) {
+    let entries = list_workspace_files(workdir);
+    let fp = fingerprint_entries(workdir, &entries);
+    let mut seen = workspace_seen_states().lock().unwrap_or_else(|p| p.into_inner());
+    seen.insert(workdir.to_path_buf(), fp);
+}
+
+/// Compact per-turn workspace status: directory, file listing, changes since the last turn, and
+/// validation problems. File contents are fetched on demand with `read_file`.
 pub fn build_workspace_context_block(workdir: &Path) -> String {
     let dir_line = format!("Workspace directory on disk: {}", workdir.display());
-    let snap = format_workspace_snapshot(workdir, 12 * 1024);
-    let body = if snap.is_empty() {
-        "Workspace status: currently empty (0 files on disk; use write_file to create new files).".to_string()
-    } else {
-        snap
-    };
-    format!("{WORKSPACE_STATUS_OPEN}\n{dir_line}\n\n{}\n{WORKSPACE_STATUS_CLOSE}", body.trim_end())
+    let entries: Vec<WorkspaceFileEntry> = list_workspace_files(workdir)
+        .into_iter()
+        .filter(|e| !e.path.starts_with(".kronos_media/"))
+        .collect();
+    if entries.is_empty() {
+        return format!(
+            "{WORKSPACE_STATUS_OPEN}\n{dir_line}\nWorkspace status: currently empty (0 files on disk; use write_file to create new files).\n{WORKSPACE_STATUS_CLOSE}"
+        );
+    }
+    let current = fingerprint_entries(workdir, &entries);
+    let previous = workspace_seen_states()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(workdir)
+        .cloned();
+    let mut changed: Vec<&str> = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
+    if let Some(prev) = previous.as_ref() {
+        for e in &entries {
+            if prev.get(&e.path) != current.get(&e.path) {
+                changed.push(&e.path);
+            }
+        }
+        removed = prev
+            .keys()
+            .filter(|p| !current.contains_key(*p))
+            .cloned()
+            .collect();
+        removed.sort();
+    }
+
+    let mut out = format!("{WORKSPACE_STATUS_OPEN}\n{dir_line}\nFiles ({}):\n", entries.len());
+    for e in entries.iter().take(WORKSPACE_LISTING_MAX_FILES) {
+        let mut tags: Vec<&str> = Vec::new();
+        if changed.contains(&e.path.as_str()) {
+            tags.push("changed since last turn");
+        }
+        if !e.validation_ok {
+            tags.push(&e.validation_msg);
+        }
+        if tags.is_empty() {
+            out.push_str(&format!("- {} ({} bytes)\n", e.path, e.bytes));
+        } else {
+            out.push_str(&format!("- {} ({} bytes, {})\n", e.path, e.bytes, tags.join("; ")));
+        }
+    }
+    if entries.len() > WORKSPACE_LISTING_MAX_FILES {
+        out.push_str(&format!("- ... {} more files\n", entries.len() - WORKSPACE_LISTING_MAX_FILES));
+    }
+    if !removed.is_empty() {
+        out.push_str(&format!("Removed since last turn: {}\n", removed.join(", ")));
+    }
+    out.push_str("Call read_file to view a file before editing it.\n");
+    out.push_str(WORKSPACE_STATUS_CLOSE);
+    out
 }
 
 fn build_initial_system_prompt() -> String {
@@ -3956,7 +4122,6 @@ pub fn compact_messages_with_budget(
                 base_mem.push_str(b);
                 base_mem.push('\n');
             }
-            let full_snap = format_workspace_snapshot(workdir, 14 * 1024);
             let brief_snap = format_workspace_snapshot(workdir, 0);
 
             let build_candidate = |snap_str: &str| -> Vec<Message> {
@@ -3976,18 +4141,10 @@ pub fn compact_messages_with_budget(
                 rebuilt
             };
 
-            let cand_full = build_candidate(&full_snap);
-            let tok_full = count_fn(&cand_full);
-            if tok_full < before_tokens {
+            let cand_brief = build_candidate(&brief_snap);
+            if count_fn(&cand_brief) < before_tokens {
                 compacted_messages += split_msg_idx.saturating_sub(sys_offset);
-                *history = cand_full;
-            } else {
-                let cand_brief = build_candidate(&brief_snap);
-                let tok_brief = count_fn(&cand_brief);
-                if tok_brief < before_tokens {
-                    compacted_messages += split_msg_idx.saturating_sub(sys_offset);
-                    *history = cand_brief;
-                }
+                *history = cand_brief;
             }
         }
     }
@@ -4007,7 +4164,7 @@ pub fn compact_messages_with_budget(
             .find(|(_, m)| m.role == "user" && !is_synthetic_harness_user(&m.content))
             .map(|(i, _)| i)
             .unwrap_or(sys_offset);
-        for protect_tail in [6usize, 2, 0] {
+        for protect_tail in [6usize, 4, 2] {
             let raw_stop = history.len().saturating_sub(protect_tail);
             if raw_stop <= active_user_idx + 1 {
                 continue;
@@ -4126,11 +4283,12 @@ pub fn compact_conversation_history(
 ) -> CompactionReport {
     let ctx = model.context_size();
     // Keep hot KV prefix intact while guaranteeing >= 3,200 tokens of generation headroom on 16k context.
-    let threshold = if ctx >= 8192 {
+    let ctx_threshold = if ctx >= 8192 {
         ((ctx * 80) / 100).min(ctx.saturating_sub(3200))
     } else {
         (ctx * 74) / 100
     };
+    let threshold = ctx_threshold.min(AGENT_COMPACT_BUDGET_TOKENS);
     compact_messages_with_budget(history, workdir, force, threshold, |msgs| {
         model.count_prompt_tokens(msgs, tools_json)
     })
@@ -4918,6 +5076,28 @@ fn is_verification_or_test_command(cmd: &str) -> bool {
     active_runners.iter().any(|r| lower.contains(r))
 }
 
+/// Final summary when a verification command passed after the last edit, so no extra model step is spent.
+fn early_finish_after_verified_edit(
+    edits_clean: bool,
+    last_mutation_seq: usize,
+    last_passing_test_seq: usize,
+    passing_cmd: &str,
+    modified_files: &[String],
+) -> Option<String> {
+    if !edits_clean || last_mutation_seq == 0 || last_passing_test_seq <= last_mutation_seq || passing_cmd.is_empty() {
+        return None;
+    }
+    let files = if modified_files.is_empty() {
+        "workspace files".to_string()
+    } else {
+        modified_files.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ")
+    };
+    Some(format!(
+        "Done: edited {files}; verification command `{}` passed after the last edit.",
+        summarize_single_line(passing_cmd, 120)
+    ))
+}
+
 fn exec_spawn_agent(
     cur_workdir: &Path,
     raw_args: &str,
@@ -5126,6 +5306,7 @@ fn run_agent_turn_inner(
     let mut action_seq = 0usize;
     let mut last_mutation_seq = 0usize;
     let mut last_passing_test_seq = 0usize;
+    let mut last_passing_test_cmd = String::new();
     let mut unresolved_edits: Vec<(String, String)> = Vec::new();
     let mut modified_files: Vec<String> = Vec::new();
     let mut tracked_files: Vec<String> = Vec::new();
@@ -5475,6 +5656,9 @@ fn run_agent_turn_inner(
             }
 
             let secs = t_start.elapsed().as_secs_f64();
+            if touched_files || used_any_tools || !active_tools.is_empty() {
+                remember_workspace_state(&active_workdir);
+            }
             let _ = on_event(AgentEvent::Done {
                 steps: step,
                 total_secs: secs,
@@ -5636,6 +5820,7 @@ fn run_agent_turn_inner(
                     if is_verification_or_test_command(&cmd_str) {
                         action_seq += 1;
                         last_passing_test_seq = action_seq;
+                        last_passing_test_cmd = cmd_str.clone();
                     }
                 } else {
                     if !outcome.output.starts_with("error: blocked duplicate `run_command`")
@@ -5657,7 +5842,28 @@ fn run_agent_turn_inner(
             }) {
                 return Err("cancelled".to_string());
             }
-            history.push(Message::tool_result(&tc.id, &outcome.output));
+            let capped = cap_tool_result(&active_workdir, step, idx, &tc.name, &outcome.output);
+            history.push(Message::tool_result(&tc.id, &capped));
+        }
+
+        if let Some(final_text) = early_finish_after_verified_edit(
+            touched_files && unresolved_edits.is_empty(),
+            last_mutation_seq,
+            last_passing_test_seq,
+            &last_passing_test_cmd,
+            &modified_files,
+        ) {
+            if let Ok(v_rep) = verify_workspace_work(&active_workdir, &modified_files, cfg.cmd_timeout_secs) {
+                let _ = on_event(AgentEvent::Verified { step, report: &v_rep });
+                history.push(Message::new("assistant", &final_text));
+                remember_workspace_state(&active_workdir);
+                let _ = on_event(AgentEvent::Done {
+                    steps: step,
+                    total_secs: t_start.elapsed().as_secs_f64(),
+                    final_text: &final_text,
+                });
+                return Ok(final_text);
+            }
         }
 
         if !unresolved_edits.is_empty() {
@@ -5668,8 +5874,13 @@ fn run_agent_turn_inner(
                     .map(|(p, err)| format!("`{p}`: {err}"))
                     .collect();
                 if !pending.is_empty() {
+                    let first_path = unresolved_edits
+                        .iter()
+                        .map(|(p, _)| p.as_str())
+                        .find(|p| !p.is_empty())
+                        .unwrap_or("the reported file");
                     last_tool.content.push_str(&format!(
-                        "\n[Pending validation errors still on disk — fix with `write_file` before finishing: {}]",
+                        "\n[Pending validation errors still on disk: {}. Your next tool call must fix `{first_path}` (read_file it, then edit_file the failing lines or write_file a complete rewrite); do not rewrite other files first.]",
                         pending.join("; ")
                     ));
                 }
@@ -5964,7 +6175,13 @@ mod tests {
         // 9. System prompt stays static; the workspace snapshot lives in the user turn.
         assert_eq!(build_initial_system_prompt(), AGENT_SYSTEM_PROMPT);
         let populated_block = build_workspace_context_block(&dir);
-        assert!(populated_block.contains("--- theme.css"));
+        assert!(populated_block.contains("- theme.css ("));
+        assert!(!populated_block.contains("changed since last turn"));
+        remember_workspace_state(&dir);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(dir.join("theme.css"), "body { color: #111; }\n").unwrap();
+        let after_edit = build_workspace_context_block(&dir);
+        assert!(after_edit.contains("theme.css (22 bytes, changed since last turn)"));
         let wrapped = format!("{populated_block}\n\nfix the button");
         assert_eq!(strip_injected_prompt_headers(&wrapped), "fix the button");
         let empty_dir = std::env::temp_dir().join(format!("kronos_empty_ws_{}", std::process::id()));
@@ -6142,7 +6359,8 @@ mod tests {
         assert_eq!(hist[0].content, sys_before);
         assert!(hist[1].content.starts_with(COMPACTED_MEMORY_HEADER));
         assert!(hist[1].content.contains(".kronos_media/image_1.png"));
-        assert!(hist[1].content.contains("--- theme.css"));
+        assert!(hist[1].content.contains("- theme.css ("));
+        assert!(!hist[1].content.contains("body { color: #111; }"));
         assert_eq!(hist.last().unwrap().content, "Now polish button padding");
 
         // 12. compute_unified_diff + verify_workspace_work catch DOM/CSS/V8 bugs and verify clean repair.
@@ -6490,6 +6708,88 @@ mod tests {
             "math ".repeat(700)
         );
         assert!(validate_markdown_script(Path::new("script.md"), &full_md).is_ok());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_context_growth_guards() {
+        let dir = std::env::temp_dir().join(format!("kronos_ctx_guard_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Bulky command output is capped head+tail and saved in full under the hidden tool-output dir.
+        let big: String = (0..400).map(|i| format!("line {i} of a long test log\n")).collect();
+        let capped = cap_tool_result(&dir, 3, 1, "run_command", &big);
+        assert!(capped.len() < TOOL_RESULT_MAX_BYTES + 400, "capped len {}", capped.len());
+        assert!(capped.starts_with("line 0 of"));
+        assert!(capped.contains("line 399 of"));
+        assert!(capped.contains("saved to `.kronos_tool_output/step3_1_run_command.txt`"));
+        assert_eq!(fs::read_to_string(dir.join(".kronos_tool_output/step3_1_run_command.txt")).unwrap(), big);
+        assert_eq!(cap_tool_result(&dir, 3, 2, "read_file", &big), big);
+        assert_eq!(cap_tool_result(&dir, 3, 3, "run_command", "exit_code=0"), "exit_code=0");
+        assert!(list_workspace_files(&dir).iter().all(|e| !e.path.starts_with(".kronos_tool_output")));
+
+        // Rewriting an existing file with a tiny change nudges toward edit_file; new files do not.
+        let src: String = (0..40).map(|i| format!("x{i} = {i}\n")).collect();
+        fs::write(dir.join("vals.py"), &src).unwrap();
+        let rewrite = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "w1".into(),
+                name: "write_file".into(),
+                arguments: format!(r#"{{"path":"vals.py","content":{}}}"#, quote(&src.replace("x7 = 7", "x7 = 70"))),
+            },
+            5,
+            1,
+        );
+        assert!(rewrite.ok && rewrite.output.contains("use edit_file"), "{}", rewrite.output);
+        let fresh = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "w2".into(),
+                name: "write_file".into(),
+                arguments: format!(r#"{{"path":"new.py","content":{}}}"#, quote(&src)),
+            },
+            5,
+            2,
+        );
+        assert!(fresh.ok && !fresh.output.contains("use edit_file"));
+
+        // edit_file tolerates line-number prefixes pasted from read_file output.
+        fs::write(dir.join("cfg.py"), "A = 1\nB = 2\nC = 3\n").unwrap();
+        let prefixed = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "e1".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"path":"cfg.py","old_text":"2: B = 2","new_text":"2: B = 20"}"#.into(),
+            },
+            5,
+            3,
+        );
+        assert!(prefixed.ok, "{}", prefixed.output);
+        assert_eq!(fs::read_to_string(dir.join("cfg.py")).unwrap(), "A = 1\nB = 20\nC = 3\n");
+        let piped = execute_tool(
+            &dir,
+            &ToolCall {
+                id: "e2".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"path":"cfg.py","old_text":"   1 | A = 1\n   2 | B = 20","new_text":"   1 | A = 10\n   2 | B = 20"}"#.into(),
+            },
+            5,
+            4,
+        );
+        assert!(piped.ok, "{}", piped.output);
+        assert_eq!(fs::read_to_string(dir.join("cfg.py")).unwrap(), "A = 10\nB = 20\nC = 3\n");
+        assert_eq!(strip_line_number_prefixes("x: 1", "x: 2"), ("x: 1".to_string(), "x: 2".to_string()));
+
+        // The loop may finish without another model step only once a test passed after the last edit.
+        assert!(early_finish_after_verified_edit(true, 0, 0, "", &[]).is_none());
+        assert!(early_finish_after_verified_edit(true, 2, 1, "python3 -m unittest", &[]).is_none());
+        assert!(early_finish_after_verified_edit(false, 1, 2, "python3 -m unittest", &[]).is_none());
+        let done = early_finish_after_verified_edit(true, 1, 2, "python3 -m unittest", &["vals.py".to_string()]).unwrap();
+        assert!(done.contains("`vals.py`") && done.contains("python3 -m unittest"));
 
         let _ = fs::remove_dir_all(&dir);
     }

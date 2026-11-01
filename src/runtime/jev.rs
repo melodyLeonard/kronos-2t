@@ -1187,10 +1187,10 @@ fn select_tools_kv_aware(
             kept.push(schema.clone());
             continue;
         };
+        // The tool set is fixed for the whole turn, so edit_file/read_file stay even when the
+        // workspace starts empty: files written in step 1 need targeted edits in later steps.
         let keep = match name.as_str() {
-            "write_file" => true,
-            // Always offered: files written earlier in the same turn need edits, not rewrites.
-            "edit_file" | "read_file" => true,
+            "write_file" | "edit_file" | "read_file" => true,
             "list_dir" => (workspace_has_files && wants_search) || wants_cmd,
             "search_files" => wants_search,
             "switch_workspace" => wants_switch,

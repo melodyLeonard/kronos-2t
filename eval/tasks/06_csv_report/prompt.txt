@@ -1,0 +1,16 @@
+Write report.py that reads a CSV given as its first argument (columns: date,region,product,units,unit_price) and prints a plain-text report in exactly this format:
+
+Sales report: <N> rows, <M> regions, <P> products
+Total revenue: <sum of units*unit_price, 2 decimals>
+
+By region:
+  <region> <revenue 2 decimals> (<units> units)
+  ...
+
+By month:
+  <YYYY-MM> <revenue 2 decimals>
+  ...
+
+Top product: <product> (<revenue 2 decimals>)
+
+Rules: revenue = units * unit_price per row, summed with floats and rounded to 2 decimals only when printing. "By region" is sorted by revenue descending, ties by name ascending. "By month" is sorted by month ascending. Top product is the product with the highest revenue (ties: alphabetically first). Exactly one blank line between sections, no trailing spaces, and the output ends with a single newline. Use only the standard library. Run it on sales.csv to verify it prints without errors.

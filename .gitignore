@@ -2,3 +2,4 @@
 /models
 *.k2t
 .DS_Store
+__pycache__/

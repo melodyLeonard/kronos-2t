@@ -1,0 +1,5 @@
+Bug reports against textutils.py:
+1. slugify("Hello, World!") returns "hello-world-" but should return "hello-world".
+2. truncate("abcdefghij", 6) returns "abcd..." (7 chars); the result must never exceed the limit, so it should be "abc...".
+3. word_freq("The the THE cat") counts "The", "the" and "THE" separately; it must be case-insensitive and return [("the", 3), ("cat", 1)].
+Fix these bugs in textutils.py with minimal edits. Do not change function names or signatures. Verify with a quick python3 -c check.

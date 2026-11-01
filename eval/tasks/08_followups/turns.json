@@ -1,0 +1,22 @@
+[
+ "In settings.py, change \"port\" from 8080 to 9090. Make only that edit.",
+ "Set \"workers\" to 4.",
+ "Add a new key \"host\" with value \"0.0.0.0\" right after \"port\".",
+ "Change \"log_level\" to \"DEBUG\".",
+ "Set \"debug\" to True.",
+ "Add a key \"max_batch\" with value 500 at the end of SETTINGS.",
+ "Bump \"version\" to \"1.1.0\".",
+ "Rename the key \"retries\" to \"max_retries\" (keep its value).",
+ "Set \"timeout_secs\" to 60.",
+ "Add a key \"features\" whose value is the list [\"csv\", \"json\"].",
+ "Add \"parquet\" to the end of the \"features\" list.",
+ "Add a key \"rate_limit_per_min\" with value 1200.",
+ "Set \"max_batch\" to 1000.",
+ "Add a key \"region\" with value \"eu-west-1\".",
+ "Change \"app_name\" to \"exporter-service\".",
+ "Add a key \"metrics_enabled\" with value True.",
+ "Remove the \"debug\" key entirely.",
+ "Set \"max_retries\" to 5.",
+ "Add a key \"shutdown_grace_secs\" with value 15.",
+ "Bump \"version\" to \"1.2.0\". That is the last change; do not touch anything else."
+]

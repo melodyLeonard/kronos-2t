@@ -1,0 +1,9 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Todo</title><style>.done{text-decoration:line-through}</style></head>
+<body><input id="new-todo"><button id="add">Add</button><ul id="todos"></ul><span id="count">0</span>
+<script>
+const i=document.getElementById('new-todo'),b=document.getElementById('add'),l=document.getElementById('todos'),c=document.getElementById('count');
+function upd(){c.textContent=String(l.querySelectorAll('li:not(.done)').length);}
+function add(){const t=i.value.trim();if(!t)return;const li=document.createElement('li');li.textContent=t;li.addEventListener('click',()=>{li.classList.toggle('done');upd();});l.appendChild(li);i.value='';upd();}
+b.addEventListener('click',add);i.addEventListener('keydown',e=>{if(e.key==='Enter')add();});upd();
+</script></body></html>

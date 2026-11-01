@@ -1,0 +1,1 @@
+The pyqueue package has 5 failing tests in test_queue.py. Run `python3 -m unittest -v test_queue` to see them, then fix the bugs in pyqueue/queue.py until the whole suite passes. Do not modify test_queue.py. Keep iterating: edit, re-run the tests, repeat until they all pass, then summarize what was wrong.

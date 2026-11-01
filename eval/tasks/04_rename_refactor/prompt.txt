@@ -1,0 +1,1 @@
+In the shop package, rename the function calc_total to compute_total everywhere it is defined, imported, or called (shop/pricing.py, shop/cart.py, shop/inventory.py, shop/main.py). The old name must not remain anywhere. Behavior must stay identical. Verify by running: python3 -m shop.main
