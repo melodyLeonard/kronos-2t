@@ -27,7 +27,7 @@
 use kronos_2t::runtime::agent::{
     build_unified_system_prompt, classify_turn_intent, compact_conversation_history,
     is_multi_agent_prompt, list_workspace_files, mime_type_for_path, resolve_jailed_path,
-    run_agent_turn_shared_with_spawner, serialize_messages_json, spawn_agent_tool_definition_json,
+    run_agent_turn_prioritized, serialize_messages_json, spawn_agent_tool_definition_json,
     tool_definitions_json, truncate_utf8, validate_file, AgentEvent, AgentTurnConfig,
     FileChangeDiff, SubAgentSpawner, TurnRoute, AGENT_SYSTEM_PROMPT, MAX_READ_BYTES,
     UNIFIED_SYSTEM_PROMPT,
@@ -42,7 +42,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -101,6 +101,24 @@ struct Server {
     turn_seq: AtomicU64,
     agent_seq: AtomicU64,
     media_seq: AtomicU64,
+    /// Quick chat turns waiting for the model; agent tool loops yield between steps while it is non-zero.
+    quick_waiting: AtomicUsize,
+}
+
+/// Marks a quick interactive turn as waiting until dropped.
+struct QuickTicket<'a>(&'a AtomicUsize);
+
+impl<'a> QuickTicket<'a> {
+    fn new(flag: &'a AtomicUsize) -> Self {
+        flag.fetch_add(1, Ordering::AcqRel);
+        Self(flag)
+    }
+}
+
+impl Drop for QuickTicket<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Server {
@@ -648,7 +666,12 @@ fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
     }
     let id = format!("chatcmpl-{}-{}", now(), srv.next_id.fetch_add(1, Ordering::Relaxed));
     let created = now();
+    let _quick = tools_json.is_empty().then(|| QuickTicket::new(&srv.quick_waiting));
+    let t_lock = std::time::Instant::now();
     let mut model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
+    if t_lock.elapsed().as_secs_f64() > 1.0 {
+        eprintln!("[model] chat request waited {:.1}s for the model", t_lock.elapsed().as_secs_f64());
+    }
 
     if !streaming {
         match model.generate_with_tools(&messages, &tools_json, &params, |_| true) {
@@ -1142,8 +1165,11 @@ fn execute_allocated_turn(
         }
     });
 
-    let run_res = run_agent_turn_shared_with_spawner(
+    let quick = effective_route == TurnRoute::Chat;
+    let _quick_ticket = quick.then(|| QuickTicket::new(&srv.quick_waiting));
+    let run_res = run_agent_turn_prioritized(
         &srv.model,
+        (!quick).then_some(&srv.quick_waiting),
         &mut history,
         &tools_json,
         &cfg,
@@ -2848,6 +2874,7 @@ fn main() {
         turn_seq: AtomicU64::new(now_millis()),
         agent_seq: AtomicU64::new(1),
         media_seq: AtomicU64::new(1),
+        quick_waiting: AtomicUsize::new(0),
     });
     eprintln!(
         "serving {} on http://{addr}/ (quick HUD http://{addr}/quick · weights {weights_gib:.2} GiB + {kv_tag} {kv_gib:.2} GiB @ ctx={ctx_sz} · workdir={})",
