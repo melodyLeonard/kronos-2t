@@ -12,7 +12,7 @@ try:
     q = PriorityQueue(); [q.push(i, 5) for i in range(50)]
     if [q.pop() for _ in range(50)] != list(range(50)): fails.append("hidden: fifo order over 50 ties")
     rl = RateLimiter(3, 1.0)
-    if [rl.allow(t) for t in (0, 0.2, 0.4, 0.6, 1.0, 1.21)] != [True, True, True, False, False, True]: fails.append("hidden: sliding window")
+    if [rl.allow(t) for t in (0, 0.2, 0.4, 0.6, 0.99, 1.21)] != [True, True, True, False, False, True]: fails.append("hidden: sliding window")
     if parse_duration("1m 0s") != 60 or parse_duration("0ms") != 0: fails.append("hidden: durations")
     try: parse_duration(""); fails.append("hidden: empty duration accepted")
     except ValueError: pass

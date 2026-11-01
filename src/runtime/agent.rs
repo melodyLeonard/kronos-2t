@@ -2423,9 +2423,16 @@ fn attach_validation_status(
     workdir: &Path,
     target: &Path,
     rel: &str,
-    base_msg: String,
+    mut base_msg: String,
     diff: Option<FileChangeDiff>,
 ) -> ToolExecOutcome {
+    if let Some(d) = diff.as_ref().filter(|d| d.existed_before) {
+        if let Ok(after) = fs::read_to_string(target) {
+            if let Some(note) = removed_reference_note(&d.before_content, &after) {
+                base_msg.push_str(&note);
+            }
+        }
+    }
     match validate_file(workdir, target, false) {
         Ok(note) => {
             let v_msg = if note.is_empty() { "ok".to_string() } else { note.clone() };
@@ -2628,6 +2635,84 @@ fn exec_write_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
         }
         Err(e) => err_outcome(&format!("error writing `{rel}`: {e}")),
     }
+}
+
+/// String literals (4+ chars) in a source line.
+fn string_literals(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let q = b[i];
+        if q == b'"' || q == b'\'' {
+            if let Some(len) = b[i + 1..].iter().position(|&c| c == q) {
+                let lit = &line[i + 1..i + 1 + len];
+                if lit.len() >= 4 && !out.iter().any(|o| o == lit) {
+                    out.push(lit.to_string());
+                }
+                i += len + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Name defined or assigned on a line (`def x`, `x =`, `self.x =`, `function x`, `let x`).
+fn defined_name(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    for kw in ["def ", "function ", "fn ", "let ", "const ", "var ", "class "] {
+        if let Some(rest) = t.strip_prefix(kw) {
+            let n: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            return (!n.is_empty()).then_some(n);
+        }
+    }
+    let (lhs, _) = t.split_once(" = ")?;
+    let n = lhs.trim().rsplit('.').next()?.to_string();
+    (!n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_')).then_some(n)
+}
+
+/// After an edit, names and string literals that left the file with a removed line but are still
+/// used elsewhere in it: the removed line was coupled to code the edit did not touch.
+fn removed_reference_note(before: &str, after: &str) -> Option<String> {
+    let after_lines: Vec<&str> = after.lines().collect();
+    let mut notes = Vec::new();
+    for (idx, line) in before.lines().enumerate() {
+        if line.trim().is_empty() || after_lines.contains(&line) {
+            continue;
+        }
+        let mut keys = string_literals(line);
+        if let Some(n) = defined_name(line) {
+            if n.len() >= 3 && !after_lines.iter().any(|l| defined_name(l).as_deref() == Some(n.as_str())) {
+                keys.push(n);
+            }
+        }
+        for key in keys {
+            let still: Vec<usize> = after_lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.contains(key.as_str()) && !before.lines().any(|b| b == **l && b == line))
+                .map(|(i, _)| i + 1)
+                .collect();
+            if !still.is_empty() && notes.len() < 3 {
+                notes.push(format!(
+                    "removed line {} `{}` shared `{key}` with line{} {}",
+                    idx + 1,
+                    truncate_utf8(line.trim(), 80),
+                    if still.len() > 1 { "s" } else { "" },
+                    still.iter().take(3).map(|n| n.to_string()).collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
+    }
+    if notes.is_empty() {
+        return None;
+    }
+    Some(format!(
+        " (note: {}; check that the code still using it behaves as its docstring says)",
+        notes.join("; ")
+    ))
 }
 
 /// Top-level definition names (`def`, `class`, `function`, `fn`, `struct`, `const/let/var x =`, …).
@@ -6207,6 +6292,19 @@ pub fn serialize_messages_json(messages: &[Message]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn removed_reference_note_flags_coupled_literals_and_names() {
+        let before = "class L:\n    def transfer(self):\n        self.withdraw(amount + fee)\n        self._add(when, src, -fee, \"transfer fee\")\n        self.deposit(dst)\n\n    def total_fees(self):\n        return -sum(e.amount for e in self._entries if e.memo == \"transfer fee\")\n";
+        let after = before.replace("        self._add(when, src, -fee, \"transfer fee\")\n", "");
+        let note = removed_reference_note(before, &after).unwrap();
+        assert!(note.contains("`transfer fee`") && note.contains("line 7"), "{note}");
+        let after2 = before.replace("self.withdraw(amount + fee)", "self.withdraw(amount)");
+        assert!(removed_reference_note(before, &after2).is_none());
+        let before3 = "def helper(x):\n    return x\n\ndef main():\n    return helper(1)\n";
+        let note3 = removed_reference_note(before3, "def main():\n    return helper(1)\n").unwrap();
+        assert!(note3.contains("`helper`"), "{note3}");
+    }
+
     #[test]
     fn rewrite_guard_and_announce_detection() {
         let before = "'use strict';\nfunction mean(xs) {}\nfunction median(xs) {}\nconst K = 1;\nmodule.exports = { mean, median };\n".repeat(3);
