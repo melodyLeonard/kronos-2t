@@ -2891,6 +2891,9 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1);
     });
+    if std::env::var("KRONOS_SPEC").is_ok_and(|v| v == "0") {
+        model.set_speculation(false);
+    }
     let force_cpu = args.iter().any(|a| a == "--cpu" || a == "--fp32-kv" || a == "--ane");
     let require_metal = args.iter().any(|a| a == "--metal");
     if args.iter().any(|a| a == "--fp32-kv") {

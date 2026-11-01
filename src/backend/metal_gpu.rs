@@ -75,6 +75,7 @@ pub(crate) struct Selectors {
     pub(crate) set_buf: Sel,
     pub(crate) set_bytes: Sel,
     pub(crate) dispatch_tg: Sel,
+    pub(crate) dispatch_tg_indirect: Sel,
     pub(crate) end_enc: Sel,
     pub(crate) commit: Sel,
     pub(crate) wait_done: Sel,
@@ -116,6 +117,7 @@ pub(crate) fn sels() -> &'static Selectors {
             set_buf: reg(c"setBuffer:offset:atIndex:"),
             set_bytes: reg(c"setBytes:length:atIndex:"),
             dispatch_tg: reg(c"dispatchThreadgroups:threadsPerThreadgroup:"),
+            dispatch_tg_indirect: reg(c"dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:"),
             end_enc: reg(c"endEncoding"),
             commit: reg(c"commit"),
             wait_done: reg(c"waitUntilCompleted"),
@@ -292,6 +294,17 @@ struct MoeGemvParams {
     pair_off: u32,
     x_by_slot: u32,
     n_splits: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MoeGroupParams {
+    n_tok: u32,
+    top_k: u32,
+    num_experts: u32,
+    gu_x: u32,
+    dn_x: u32,
+    tile: u32,
 }
 
 #[repr(C)]
@@ -790,6 +803,9 @@ struct GpuScratch {
     attn_part: MtlObj,
     gemv_part: MtlObj,
     moe_part: MtlObj,
+    moe_grp_slots: MtlObj,
+    moe_tiles: MtlObj,
+    moe_indirect: MtlObj,
 }
 
 impl GpuScratch {
@@ -815,6 +831,9 @@ impl GpuScratch {
             logits: alloc_shared_buffer(device, nl * cfg.vocab_size * f32_b, "sc.logits")?,
             moe_ids: alloc_shared_buffer(device, (n * moe_k).max(1) * 4, "sc.moe_ids")?,
             moe_w: alloc_shared_buffer(device, (n * moe_k).max(1) * f32_b, "sc.moe_w")?,
+            moe_grp_slots: alloc_shared_buffer(device, (n * moe_k).max(1) * 4, "sc.moe_grp_slots")?,
+            moe_tiles: alloc_shared_buffer(device, (n * moe_k).max(1) * 12, "sc.moe_tiles")?,
+            moe_indirect: alloc_shared_buffer(device, 32, "sc.moe_indirect")?,
             moe_logits: alloc_shared_buffer(device, n * 1024 * f32_b, "sc.moe_logits")?,
             gemv_part: alloc_shared_buffer(
                 device,
@@ -861,6 +880,8 @@ impl GpuScratch {
             self.gate_up = alloc_shared_buffer(device, n * 2 * cfg.intermediate_size * f32_b, "sc.gate_up")?;
             self.moe_ids = alloc_shared_buffer(device, (n * moe_k).max(1) * 4, "sc.moe_ids")?;
             self.moe_w = alloc_shared_buffer(device, (n * moe_k).max(1) * f32_b, "sc.moe_w")?;
+            self.moe_grp_slots = alloc_shared_buffer(device, (n * moe_k).max(1) * 4, "sc.moe_grp_slots")?;
+            self.moe_tiles = alloc_shared_buffer(device, (n * moe_k).max(1) * 12, "sc.moe_tiles")?;
             self.moe_logits = alloc_shared_buffer(device, n * 1024 * f32_b, "sc.moe_logits")?;
             self.moe_gu = alloc_shared_buffer(device, (n * moe_k * 2 * moe_ff).max(1) * f32_b, "sc.moe_gu")?;
             self.moe_out = alloc_shared_buffer(device, (n * moe_k * cfg.hidden_size).max(1) * f32_b, "sc.moe_out")?;
@@ -893,6 +914,8 @@ pub struct MetalLlamaEngine {
     pso_gqa_reduce: MtlObj,
     pso_gemv_reduce: MtlObj,
     pso_moe_reduce: MtlObj,
+    pso_moe_group: MtlObj,
+    pso_moe_gemv1: MtlObj,
     pso_moe_gemv: MtlObj,
     pso_moe_combine: MtlObj,
     moe: Option<MoeGeometry>,
@@ -916,37 +939,56 @@ pub struct MetalLlamaEngine {
 struct DecodeProf {
     sel_start: usize,
     sel_end: usize,
-    acc: std::sync::Mutex<Vec<(&'static str, usize, f64)>>,
+    /// `(label, batched, cuts, seconds)`; batched = multi-token verify/prefill-sized steps (`n_tok <= 8`).
+    acc: std::sync::Mutex<Vec<(&'static str, bool, usize, f64)>>,
     tokens: std::sync::atomic::AtomicUsize,
+    batch_calls: std::sync::atomic::AtomicUsize,
+    batch_tokens: std::sync::atomic::AtomicUsize,
+    batched: std::sync::atomic::AtomicBool,
+    /// Calls per `n_tok` (index = n_tok, capped at 64).
+    by_ntok: std::sync::Mutex<Vec<usize>>,
 }
 
 impl DecodeProf {
     fn add(&self, label: &'static str, secs: f64) {
+        let batched = self.batched.load(std::sync::atomic::Ordering::Relaxed);
         let mut acc = self.acc.lock().unwrap_or_else(|p| p.into_inner());
-        match acc.iter_mut().find(|e| e.0 == label) {
+        match acc.iter_mut().find(|e| e.0 == label && e.1 == batched) {
             Some(e) => {
-                e.1 += 1;
-                e.2 += secs;
+                e.2 += 1;
+                e.3 += secs;
             }
-            None => acc.push((label, 1, secs)),
+            None => acc.push((label, batched, 1, secs)),
         }
     }
 
     fn report(&self) {
-        let n = self.tokens.load(std::sync::atomic::Ordering::Relaxed).max(1) as f64;
-        let mut acc = self.acc.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        acc.sort_by(|a, b| b.2.total_cmp(&a.2));
-        let total: f64 = acc.iter().map(|e| e.2).sum();
-        let mut line = format!("[decode-prof] {n:.0} tokens, GPU {:.1} ms/tok:", total / n * 1e3);
-        for (label, count, secs) in &acc {
-            line.push_str(&format!(
-                " {label} {:.2}ms ({:.0}%, {:.0} dispatches)",
-                secs / n * 1e3,
-                secs / total * 100.0,
-                *count as f64 / n
-            ));
+        use std::sync::atomic::Ordering::Relaxed;
+        let acc = self.acc.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        for batched in [false, true] {
+            let mut rows: Vec<_> = acc.iter().filter(|e| e.1 == batched).cloned().collect();
+            if rows.is_empty() {
+                continue;
+            }
+            rows.sort_by(|a, b| b.3.total_cmp(&a.3));
+            let total: f64 = rows.iter().map(|e| e.3).sum();
+            let (unit, n) = if batched {
+                let calls = self.batch_calls.load(Relaxed).max(1) as f64;
+                let toks = self.batch_tokens.load(Relaxed) as f64;
+                (format!("{calls:.0} batch calls ({:.1} tok/call), GPU {:.1} ms/call", toks / calls, total / calls * 1e3), calls)
+            } else {
+                let n = self.tokens.load(Relaxed).max(1) as f64;
+                (format!("{n:.0} tokens, GPU {:.1} ms/tok", total / n * 1e3), n)
+            };
+            let mut line = format!("[decode-prof] {unit}:");
+            for (label, _, count, secs) in &rows {
+                line.push_str(&format!(" {label} {:.2}ms ({:.0}%, {:.0} dispatches)", secs / n * 1e3, secs / total * 100.0, *count as f64 / n));
+            }
+            eprintln!("{line}");
         }
-        eprintln!("{line}");
+        let hist = self.by_ntok.lock().unwrap_or_else(|p| p.into_inner());
+        let shown: Vec<String> = hist.iter().enumerate().filter(|(_, &c)| c > 0).map(|(n, c)| format!("{n}:{c}")).collect();
+        eprintln!("[decode-prof] run_chunk calls by n_tok (64 = larger): {}", shown.join(" "));
     }
 }
 
@@ -1185,6 +1227,8 @@ impl MetalLlamaEngine {
                 let pso_gqa_reduce = build_pipeline(device.id(), library.id(), "gqa_decode_reduce")?;
                 let pso_gemv_reduce = build_pipeline(device.id(), library.id(), "gemv_splitk_reduce")?;
                 let pso_moe_reduce = build_pipeline(device.id(), library.id(), "moe_splitk_reduce")?;
+                let pso_moe_group = build_pipeline(device.id(), library.id(), "moe_group_tokens")?;
+                let pso_moe_gemv1 = build_pipeline(device.id(), library.id(), "nf4_moe_gemv1")?;
                 let pso_moe_gemv = build_pipeline(device.id(), library.id(), "nf4_moe_gemv")?;
                 let pso_moe_combine = build_pipeline(device.id(), library.id(), "moe_combine")?;
 
@@ -1277,6 +1321,10 @@ impl MetalLlamaEngine {
                     sel_end: sel_registerName(c"GPUEndTime".as_ptr()) as usize,
                     acc: std::sync::Mutex::new(Vec::new()),
                     tokens: std::sync::atomic::AtomicUsize::new(0),
+                    batch_calls: std::sync::atomic::AtomicUsize::new(0),
+                    batch_tokens: std::sync::atomic::AtomicUsize::new(0),
+                    batched: std::sync::atomic::AtomicBool::new(false),
+                    by_ntok: std::sync::Mutex::new(vec![0; 65]),
                 });
                 let moe_hist = match (moe_geom, std::env::var_os("KRONOS_EXPERT_HIST")) {
                     (Some(g), Some(path)) => Some(MoeHist {
@@ -1306,6 +1354,8 @@ impl MetalLlamaEngine {
                     pso_gqa_reduce,
                     pso_gemv_reduce,
                     pso_moe_reduce,
+                    pso_moe_group,
+                    pso_moe_gemv1,
                     pso_moe_gemv,
                     pso_moe_combine,
                     moe: moe_geom,
@@ -1610,7 +1660,11 @@ impl MetalLlamaEngine {
                 if enc.is_null() {
                     return Err("MTLCommandBuffer computeCommandEncoder returned nil".to_string());
                 }
-                let prof_on = self.prof.is_some() && n_tok == 1;
+                let prof_on = self.prof.is_some() && n_tok <= GEMV_MAX_TOKENS;
+                if let Some(prof) = &self.prof {
+                    prof.batched.store(n_tok > 1, std::sync::atomic::Ordering::Relaxed);
+                    prof.by_ntok.lock().unwrap_or_else(|p| p.into_inner())[n_tok.min(64)] += 1;
+                }
 
                 let kv_cap = self.kv.cap_seq_len as u32;
 
@@ -1891,7 +1945,13 @@ impl MetalLlamaEngine {
                 if prof_on {
                     self.prof_cut(&mut cmd, &mut enc, "lm_head");
                     if let Some(prof) = &self.prof {
-                        let n = prof.tokens.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let n = if n_tok == 1 {
+                            prof.tokens.fetch_add(1, Relaxed) + 1
+                        } else {
+                            prof.batch_tokens.fetch_add(n_tok, Relaxed);
+                            prof.batch_calls.fetch_add(1, Relaxed) + 1
+                        };
                         if n % 32 == 0 {
                             prof.report();
                         }
@@ -2008,6 +2068,23 @@ impl MetalLlamaEngine {
             msg_sel!(*enc, st.set_buf, self.scratch.moe_w.id() => Id, 0usize => usize, 2usize => usize; ());
             msg_sel!(*enc, st.set_bytes, (&rp as *const MoeRouterParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeRouterParams>() => usize, 3usize => usize; ());
             msg_sel!(*enc, st.dispatch_tg, MtlSize::new(n_tok, 1, 1) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            let grp = MoeGroupParams {
+                n_tok: n_tok as u32,
+                top_k: k as u32,
+                num_experts: cfg.num_experts as u32,
+                gu_x: gu.num_pairs * gu.n_splits,
+                dn_x: dn.num_pairs * dn.n_splits,
+                tile: 16,
+            };
+            if n_tok > 1 {
+            msg_sel!(*enc, st.set_cps, self.pso_moe_group.id() => Id; ());
+            msg_sel!(*enc, st.set_buf, ids_buf => Id, ids_off => usize, 0usize => usize; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.moe_grp_slots.id() => Id, 0usize => usize, 1usize => usize; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.moe_tiles.id() => Id, 0usize => usize, 2usize => usize; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.moe_indirect.id() => Id, 0usize => usize, 3usize => usize; ());
+            msg_sel!(*enc, st.set_bytes, (&grp as *const MoeGroupParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGroupParams>() => usize, 4usize => usize; ());
+            msg_sel!(*enc, st.dispatch_tg, MtlSize::new(1, 1, 1) => MtlSize, MtlSize::new(256, 1, 1) => MtlSize; ());
+            }
             if prof_on { self.prof_cut(cmd, enc, "moe_router"); }
 
             // Post-attention RMSNorm + FWHT -> x_rot rows [n_tok][h].
@@ -2015,14 +2092,23 @@ impl MetalLlamaEngine {
             if prof_on { self.prof_cut(cmd, enc, "moe_norm_fwht"); }
 
             // gate_up for every (token, slot): moe_gu[(t*k+s)][2*d_ff].
-            msg_sel!(*enc, st.set_cps, self.pso_moe_gemv.id() => Id; ());
+            msg_sel!(*enc, st.set_cps, (if n_tok == 1 { &self.pso_moe_gemv1 } else { &self.pso_moe_gemv }).id() => Id; ());
             msg_sel!(*enc, st.set_buf, moe.shard.id() => Id, 0usize => usize, 0usize => usize; ());
-            msg_sel!(*enc, st.set_buf, ids_buf => Id, ids_off => usize, 1usize => usize; ());
+            if n_tok == 1 {
+                msg_sel!(*enc, st.set_buf, ids_buf => Id, ids_off => usize, 1usize => usize; ());
+            } else {
+                msg_sel!(*enc, st.set_buf, self.scratch.moe_grp_slots.id() => Id, 0usize => usize, 1usize => usize; ());
+            }
             msg_sel!(*enc, st.set_buf, self.scratch.x_rot_f32.id() => Id, 0usize => usize, 2usize => usize; ());
             msg_sel!(*enc, st.set_buf, self.scratch.moe_gu.id() => Id, 0usize => usize, 3usize => usize; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.moe_tiles.id() => Id, 0usize => usize, 6usize => usize; ());
             msg_sel!(*enc, st.set_bytes, (&gu as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 4usize => usize; ());
             msg_sel!(*enc, st.set_buf, self.scratch.moe_part.id() => Id, 0usize => usize, 5usize => usize; ());
-            msg_sel!(*enc, st.dispatch_tg, MtlSize::new(gu.num_pairs as usize * gu.n_splits as usize, k, n_tok) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            if n_tok == 1 {
+                msg_sel!(*enc, st.dispatch_tg, MtlSize::new(gu.num_pairs as usize * gu.n_splits as usize, k, 1) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            } else {
+                msg_sel!(*enc, st.dispatch_tg_indirect, self.scratch.moe_indirect.id() => Id, 0usize => usize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            }
             if gu.n_splits > 1 {
                 msg_sel!(*enc, st.set_cps, self.pso_moe_reduce.id() => Id; ());
                 msg_sel!(*enc, st.set_buf, self.scratch.moe_part.id() => Id, 0usize => usize, 0usize => usize; ());
@@ -2037,14 +2123,23 @@ impl MetalLlamaEngine {
             if prof_on { self.prof_cut(cmd, enc, "moe_swiglu_fwht"); }
 
             // down for every (token, slot): moe_out[(t*k+s)][h].
-            msg_sel!(*enc, st.set_cps, self.pso_moe_gemv.id() => Id; ());
+            msg_sel!(*enc, st.set_cps, (if n_tok == 1 { &self.pso_moe_gemv1 } else { &self.pso_moe_gemv }).id() => Id; ());
             msg_sel!(*enc, st.set_buf, moe.shard.id() => Id, 0usize => usize, 0usize => usize; ());
-            msg_sel!(*enc, st.set_buf, ids_buf => Id, ids_off => usize, 1usize => usize; ());
+            if n_tok == 1 {
+                msg_sel!(*enc, st.set_buf, ids_buf => Id, ids_off => usize, 1usize => usize; ());
+            } else {
+                msg_sel!(*enc, st.set_buf, self.scratch.moe_grp_slots.id() => Id, 0usize => usize, 1usize => usize; ());
+            }
             msg_sel!(*enc, st.set_buf, self.scratch.x_rot_f32.id() => Id, 0usize => usize, 2usize => usize; ());
             msg_sel!(*enc, st.set_buf, self.scratch.moe_out.id() => Id, 0usize => usize, 3usize => usize; ());
+            msg_sel!(*enc, st.set_buf, self.scratch.moe_tiles.id() => Id, 0usize => usize, 6usize => usize; ());
             msg_sel!(*enc, st.set_bytes, (&dn as *const MoeGemvParams).cast::<c_void>() => *const c_void, std::mem::size_of::<MoeGemvParams>() => usize, 4usize => usize; ());
             msg_sel!(*enc, st.set_buf, self.scratch.moe_part.id() => Id, 0usize => usize, 5usize => usize; ());
-            msg_sel!(*enc, st.dispatch_tg, MtlSize::new(dn.num_pairs as usize * dn.n_splits as usize, k, n_tok) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            if n_tok == 1 {
+                msg_sel!(*enc, st.dispatch_tg, MtlSize::new(dn.num_pairs as usize * dn.n_splits as usize, k, 1) => MtlSize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            } else {
+                msg_sel!(*enc, st.dispatch_tg_indirect, self.scratch.moe_indirect.id() => Id, 16usize => usize, MtlSize::new(128, 1, 1) => MtlSize; ());
+            }
             if dn.n_splits > 1 {
                 msg_sel!(*enc, st.set_cps, self.pso_moe_reduce.id() => Id; ());
                 msg_sel!(*enc, st.set_buf, self.scratch.moe_part.id() => Id, 0usize => usize, 0usize => usize; ());
@@ -2362,6 +2457,15 @@ struct MoeGemvParams {
     uint pair_off;
     uint x_by_slot;
     uint n_splits;
+};
+
+struct MoeGroupParams {
+    uint n_tok;
+    uint top_k;
+    uint num_experts;
+    uint gu_x;
+    uint dn_x;
+    uint tile;
 };
 
 struct RopeKvParams {
@@ -2716,6 +2820,11 @@ inline void init_nf_tables(
     if (p.bits == 4u) {
         l_pair[tid_tg] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg);
         l_pair[tid_tg + 128u] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg + 128u);
+    } else if (p.bits == 3u) {
+        if (tid_tg < 64u) {
+            l_pair[tid_tg] = half2(half(nf4_byte_lut(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg & 7u)),
+                                   half(nf4_byte_lut(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg >> 3u)));
+        }
     } else if (tid_tg < 16u) {
         float c = nf4_byte_lut(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg);
         if (p.bits == 5u) {
@@ -2808,8 +2917,11 @@ inline void unpack_nf_8cols(
             idx_lo = v2 & 7u;
             idx_hi = (v2 >> 3u) & 7u;
         }
-        w_lo = float4(cb32_s[idx_lo.x], cb32_s[idx_lo.y], cb32_s[idx_lo.z], cb32_s[idx_lo.w]);
-        w_hi = float4(cb32_s[idx_hi.x], cb32_s[idx_hi.y], cb32_s[idx_hi.z], cb32_s[idx_hi.w]);
+        // One gather per (lo, hi) pair from the 64-entry 3-bit pair table.
+        uint4 key = idx_lo | (idx_hi << 3u);
+        half2 p0 = l_pair[key.x], p1 = l_pair[key.y], p2 = l_pair[key.z], p3 = l_pair[key.w];
+        w_lo = float4(p0.x, p1.x, p2.x, p3.x);
+        w_hi = float4(p0.y, p1.y, p2.y, p3.y);
     } else {
         uint g = tid >> 3u;
         uint half16 = (tid >> 2u) & 1u;
@@ -2833,6 +2945,11 @@ inline void init_nf_tables_cb(
     if (bits == 4u) {
         l_pair[tid_tg] = make_nf4_pair(cb0, cb1, cb2, cb3, tid_tg);
         l_pair[tid_tg + 128u] = make_nf4_pair(cb0, cb1, cb2, cb3, tid_tg + 128u);
+    } else if (bits == 3u) {
+        if (tid_tg < 64u) {
+            l_pair[tid_tg] = half2(half(nf4_byte_lut(cb0, cb1, cb2, cb3, tid_tg & 7u)),
+                                   half(nf4_byte_lut(cb0, cb1, cb2, cb3, tid_tg >> 3u)));
+        }
     } else if (tid_tg < 16u) {
         float c = nf4_byte_lut(cb0, cb1, cb2, cb3, tid_tg);
         if (bits == 5u) {
@@ -2953,7 +3070,49 @@ kernel void moe_router_topk(
 }
 
 // Threadgroup (pair, slot, token): one 32-row pair of expert ids[t*k+slot] against one x_rot row.
-kernel void nf4_moe_gemv(
+// Buckets the routed (token, slot) pairs by expert and emits tiles of up to `tile` slots per expert,
+// plus the indirect dispatch sizes for the gate_up and down gemvs. One threadgroup of 256 threads.
+kernel void moe_group_tokens(
+    device const uint* ids        [[buffer(0)]],
+    device uint*       grp_slots  [[buffer(1)]],
+    device uint*       tiles      [[buffer(2)]],
+    device uint*       indirect   [[buffer(3)]],
+    constant MoeGroupParams& p    [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    threadgroup atomic_uint cnt[1024];
+    threadgroup atomic_uint cursor[1024];
+    const uint E = p.num_experts;
+    const uint n = p.n_tok * p.top_k;
+    for (uint e = tid; e < E; e += 256u) atomic_store_explicit(&cnt[e], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < n; i += 256u) atomic_fetch_add_explicit(&cnt[ids[i]], 1u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        uint s = 0u, t = 0u;
+        for (uint e = 0u; e < E; ++e) {
+            uint c = atomic_load_explicit(&cnt[e], memory_order_relaxed);
+            atomic_store_explicit(&cursor[e], s, memory_order_relaxed);
+            for (uint j = 0u; j < c; j += p.tile) {
+                tiles[t * 3u] = e;
+                tiles[t * 3u + 1u] = s + j;
+                tiles[t * 3u + 2u] = min(p.tile, c - j);
+                ++t;
+            }
+            s += c;
+        }
+        indirect[0] = p.gu_x; indirect[1] = t; indirect[2] = 1u;
+        indirect[4] = p.dn_x; indirect[5] = t; indirect[6] = 1u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < n; i += 256u) {
+        uint pos = atomic_fetch_add_explicit(&cursor[ids[i]], 1u, memory_order_relaxed);
+        grp_slots[pos] = i;
+    }
+}
+
+// Single-token expert gemv (one slot per threadgroup); batches use the grouped kernel below.
+kernel void nf4_moe_gemv1(
     device const uchar* shard  [[buffer(0)]],
     device const uint*  ids    [[buffer(1)]],
     device const float* x_rot  [[buffer(2)]],
@@ -3034,6 +3193,118 @@ kernel void nf4_moe_gemv(
                 out[ulong(slot) * ulong(p.rows) + row] = sum;
             }
         }
+    }
+}
+
+// Accumulates one stripe pair of one expert against up to `T` slots of a tile.
+template <uint T>
+inline void moe_tile_gemv(
+    device const uchar* rec, device const float* x_rot, device float* out, device float* part,
+    constant MoeGemvParams& p, uint pair_idx, uint split, uint cnt,
+    threadgroup const half2* l_pair, threadgroup const float* cb32_s,
+    threadgroup const uint* slot_s, threadgroup const uint* xrow_s,
+    threadgroup float (*tg_red)[16][32],
+    uint sg_id, uint tid)
+{
+    const uint per_split = (p.num_scale_groups + p.n_splits - 1u) / p.n_splits;
+    const uint sg_lo = split * per_split;
+    const uint sg_hi = min(p.num_scale_groups, sg_lo + per_split);
+    const uint r = tid & 15u;
+    const bool stripe_b = tid >= 16u;
+    const uint lane_lo = ((r >> 2u) << 3u) | (r & 3u);
+    const uint chunk_b = p.chunk_bytes;
+    const uint pair_chunk_b = 2u * chunk_b;
+    float acc[T];
+    float sgacc[T];
+    for (uint t = 0u; t < T; ++t) acc[t] = 0.0f;
+    device const uchar* p_base = rec + p.pair_off + ulong(pair_idx) * ulong(p.pair_total_bytes);
+    const uint sg_stride = 64u + p.scale_group_chunks * pair_chunk_b;
+    for (uint sg = sg_lo + sg_id; sg < sg_hi; sg += 4u) {
+        device const uchar* sg_ptr = p_base + ulong(sg) * ulong(sg_stride);
+        float ws = bf16_bytes_to_f32(sg_ptr + (stripe_b ? 32u : 0u) + r * 2u);
+        uint c0 = sg * p.scale_group_chunks;
+        uint c1 = min(c0 + p.scale_group_chunks, p.num_chunks);
+        for (uint t = 0u; t < T; ++t) sgacc[t] = 0.0f;
+        for (uint c = c0; c < c1; ++c) {
+            device const uchar* d = sg_ptr + 64u + (c - c0) * pair_chunk_b + (stripe_b ? chunk_b : 0u);
+            for (uint kk = 0u; kk < 4u; ++kk) {
+                float4 w0, w1, w2, w3;
+                unpack_nf_8cols(d, p.bits, kk, lane_lo, l_pair, cb32_s, w0, w1);
+                unpack_nf_8cols(d, p.bits, kk, lane_lo | 4u, l_pair, cb32_s, w2, w3);
+                const uint col = c * 64u + kk * 16u;
+                for (uint t = 0u; t < T; ++t) {
+                    if (T == 1u || t < cnt) {
+                        device const float4* xp = (device const float4*)(x_rot + ulong(xrow_s[t]) * ulong(p.cols) + col);
+                        sgacc[t] += dot(w0, xp[0]) + dot(w1, xp[1]) + dot(w2, xp[2]) + dot(w3, xp[3]);
+                    }
+                }
+            }
+        }
+        for (uint t = 0u; t < T; ++t) acc[t] += sgacc[t] * ws;
+    }
+    for (uint t = 0u; t < T; ++t) {
+        if (T == 1u || t < cnt) tg_red[sg_id][t][tid] = acc[t];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_id == 0u) {
+        uint row = pair_idx * 32u + tid;
+        if (row < p.rows) {
+            for (uint t = 0u; t < T; ++t) {
+                if (T != 1u && t >= cnt) break;
+                float sum = tg_red[0][t][tid] + tg_red[1][t][tid] + tg_red[2][t][tid] + tg_red[3][t][tid];
+                ulong slot = ulong(slot_s[t]);
+                if (p.n_splits > 1u) {
+                    part[(slot * ulong(p.n_splits) + ulong(split)) * ulong(p.rows) + row] = sum;
+                } else {
+                    out[slot * ulong(p.rows) + row] = sum;
+                }
+            }
+        }
+    }
+}
+
+// Expert gemv over one tile of up to 16 routed slots: weights are unpacked once per threadgroup
+// and applied to every token in the tile. Lane = row of the 32-row stripe pair.
+kernel void nf4_moe_gemv(
+    device const uchar* shard     [[buffer(0)]],
+    device const uint*  grp_slots [[buffer(1)]],
+    device const float* x_rot     [[buffer(2)]],
+    device float*       out       [[buffer(3)]],
+    constant MoeGemvParams& p     [[buffer(4)]],
+    device float*       part      [[buffer(5)]],
+    device const uint*  tiles     [[buffer(6)]],
+    uint2 tg      [[threadgroup_position_in_grid]],
+    uint sg_id    [[simdgroup_index_in_threadgroup]],
+    uint tid      [[thread_index_in_simdgroup]],
+    uint tid_tg   [[thread_index_in_threadgroup]])
+{
+    const uint pair_idx = tg.x % p.num_pairs;
+    const uint split = tg.x / p.num_pairs;
+    if (split >= p.n_splits) return;
+    const uint e = tiles[tg.y * 3u];
+    const uint off = tiles[tg.y * 3u + 1u];
+    const uint cnt = tiles[tg.y * 3u + 2u];
+    device const uchar* rec = shard + ulong(e) * ulong(p.expert_bytes);
+    device const uint* cbw = (device const uint*)(rec + p.cb_off);
+
+    threadgroup half2 l_pair[256];
+    threadgroup float cb32_s[32];
+    threadgroup uint slot_s[16];
+    threadgroup uint xrow_s[16];
+    threadgroup float tg_red[4][16][32];
+    init_nf_tables_cb(p.bits, cbw[0], cbw[1], cbw[2], cbw[3], tid_tg, l_pair, cb32_s);
+    if (tid_tg < 16u) {
+        uint slot = (tid_tg < cnt) ? grp_slots[off + tid_tg] : 0u;
+        slot_s[tid_tg] = slot;
+        xrow_s[tid_tg] = (p.x_by_slot != 0u) ? slot : (slot / p.top_k);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (cnt <= 1u) {
+        moe_tile_gemv<1>(rec, x_rot, out, part, p, pair_idx, split, cnt, l_pair, cb32_s, slot_s, xrow_s, tg_red, sg_id, tid);
+    } else if (cnt <= 4u) {
+        moe_tile_gemv<4>(rec, x_rot, out, part, p, pair_idx, split, cnt, l_pair, cb32_s, slot_s, xrow_s, tg_red, sg_id, tid);
+    } else {
+        moe_tile_gemv<16>(rec, x_rot, out, part, p, pair_idx, split, cnt, l_pair, cb32_s, slot_s, xrow_s, tg_red, sg_id, tid);
     }
 }
 
