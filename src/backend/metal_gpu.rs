@@ -1155,7 +1155,9 @@ impl MetalLlamaEngine {
                 let raw_q: Id = msg_sel!(device.id(), st.new_cmd_queue; Id);
                 let queue = MtlObj::from_retained(raw_q, "newCommandQueue")?;
 
-                let src_ns = nsstring(METAL_SHADER_SOURCE)?;
+                let exp = std::env::var("KRONOS_GEMV_EXP").unwrap_or_else(|_| "0".to_string());
+                let shader_src = format!("#define GEMV_EXP {exp}\n{METAL_SHADER_SOURCE}");
+                let src_ns = nsstring(&shader_src)?;
                 let mut err: Id = std::ptr::null_mut();
                 let raw_lib: Id = msg_sel!(
                     device.id(),
@@ -2978,54 +2980,49 @@ kernel void nf4_moe_gemv(
     init_nf_tables_cb(p.bits, cbw[0], cbw[1], cbw[2], cbw[3], tid_tg, l_pair, cb32_s);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint g = tid >> 3u;
-    const uint half16 = (tid >> 2u) & 1u;
-    const uint j = tid & 3u;
-    const uint lane = (g << 2u) | j;
+    // Lane = row of the 32-row stripe pair (0..15 stripe a, 16..31 stripe b); every lane walks
+    // both 8-column halves, so the unpack's branches are uniform across the SIMD group.
+    const uint r = tid & 15u;
+    const bool stripe_b = tid >= 16u;
+    const uint lane_lo = ((r >> 2u) << 3u) | (r & 3u);
     const uint chunk_b = p.chunk_bytes;
     const uint pair_chunk_b = 2u * chunk_b;
     const uint x_row = (p.x_by_slot != 0u) ? slot : tg.z;
     device const float* x = x_rot + ulong(x_row) * ulong(p.cols);
 
-    float acc_a = 0.0f;
-    float acc_b = 0.0f;
+    float acc = 0.0f;
     device const uchar* p_base = rec + p.pair_off + ulong(pair_idx) * ulong(p.pair_total_bytes);
     const uint sg_stride = 64u + p.scale_group_chunks * pair_chunk_b;
     for (uint sg = sg_lo + sg_id; sg < sg_hi; sg += 4u) {
         device const uchar* sg_ptr = p_base + ulong(sg) * ulong(sg_stride);
-        float wsa = bf16_bytes_to_f32(sg_ptr + lane * 2u);
-        float wsb = bf16_bytes_to_f32(sg_ptr + 32u + lane * 2u);
+        float ws = bf16_bytes_to_f32(sg_ptr + (stripe_b ? 32u : 0u) + r * 2u);
         uint c0 = sg * p.scale_group_chunks;
         uint c1 = min(c0 + p.scale_group_chunks, p.num_chunks);
-        float sga = 0.0f;
-        float sgb = 0.0f;
+        float sgacc = 0.0f;
         for (uint c = c0; c < c1; ++c) {
-            uint sub_c = c - c0;
-            device const uchar* da = sg_ptr + 64u + sub_c * pair_chunk_b;
-            device const uchar* db = da + chunk_b;
+            device const uchar* d = sg_ptr + 64u + (c - c0) * pair_chunk_b + (stripe_b ? chunk_b : 0u);
             for (uint kk = 0u; kk < 4u; ++kk) {
-                uint col = c * 64u + kk * 16u + half16 * 8u;
-                device const float4* xp = (device const float4*)(x + col);
-                float4 x0 = xp[0];
-                float4 x1 = xp[1];
-                float4 wa0, wa1, wb0, wb1;
-                unpack_nf_8cols(da, p.bits, kk, tid, l_pair, cb32_s, wa0, wa1);
-                sga += dot(wa0, x0) + dot(wa1, x1);
-                unpack_nf_8cols(db, p.bits, kk, tid, l_pair, cb32_s, wb0, wb1);
-                sgb += dot(wb0, x0) + dot(wb1, x1);
+                device const float4* xp = (device const float4*)(x + c * 64u + kk * 16u);
+                float4 w0, w1, w2, w3;
+#if GEMV_EXP == 1 || GEMV_EXP == 3
+                w0 = float4(float(d[kk * 8u + r]));
+                w1 = w0; w2 = w0; w3 = w0;
+#else
+                unpack_nf_8cols(d, p.bits, kk, lane_lo, l_pair, cb32_s, w0, w1);
+                unpack_nf_8cols(d, p.bits, kk, lane_lo | 4u, l_pair, cb32_s, w2, w3);
+#endif
+#if GEMV_EXP == 2 || GEMV_EXP == 3
+                sgacc += dot(w0, float4(1.0f)) + dot(w1, float4(1.0f)) + dot(w2, float4(1.0f)) + dot(w3, float4(1.0f));
+#else
+                sgacc += dot(w0, xp[0]) + dot(w1, xp[1]) + dot(w2, xp[2]) + dot(w3, xp[3]);
+#endif
             }
         }
-        acc_a += sga * wsa;
-        acc_b += sgb * wsb;
+        acc += sgacc * ws;
     }
 
-    acc_a += simd_shuffle_xor(acc_a, ushort(4));
-    acc_b += simd_shuffle_xor(acc_b, ushort(4));
     threadgroup float tg_red[4][32];
-    if (half16 == 0u) {
-        tg_red[sg_id][lane] = acc_a;
-        tg_red[sg_id][16u + lane] = acc_b;
-    }
+    tg_red[sg_id][tid] = acc;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg_id == 0u) {
         uint row = pair_idx * 32u + tid;
