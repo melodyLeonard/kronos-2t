@@ -1087,6 +1087,13 @@ static inline BOOL kronosParseFindFileIntent(NSString *query, NSString **outTerm
     }
     term = [term stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (term.length < 2 || [term componentsSeparatedByString:@" "].count > 6) return NO;
+    // Keep the user's spelling ("ND result") when the lowercase mapping preserved offsets.
+    NSString *orig = [query stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *origLow = [[orig stringByReplacingOccurrencesOfString:@"?" withString:@""] stringByReplacingOccurrencesOfString:@"." withString:@""];
+    NSRange r = [[origLow lowercaseString] rangeOfString:term];
+    if (r.location != NSNotFound && origLow.length == [origLow lowercaseString].length) {
+        term = [origLow substringWithRange:r];
+    }
     for (NSString *app in @[@"whatsapp", @"safari", @"github", @"linkedin", @"settings", @"camera", @"photos", @"mail", @"messages", @"maps", @"calendar", @"notes", @"music", @"spotify", @"youtube", @"instagram", @"chrome", @"app "]) {
         if ([term hasPrefix:app]) return NO;
     }

@@ -982,7 +982,7 @@ static const CGFloat kSidebarWidth = 296.0;
             UILabel *body = nil;
             UIStackView *extra = nil;
             [self appendKronosBubbleOutBody:&body outExtraStack:&extra];
-            body.attributedText = kronosFormatMessageText(content, NO);
+            body.attributedText = kronosFormatMessageText(kronosStripThinkBlocks(content), NO);
 
             if (previewImageFile.length > 0) {
                 NSString *imgPath = [kronosWorkspaceDirectory() stringByAppendingPathComponent:previewImageFile];
