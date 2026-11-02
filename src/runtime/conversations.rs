@@ -115,7 +115,9 @@ pub fn extract_conversation_query_terms(user_prompt: &str) -> Vec<String> {
         "check", "read", "summarize", "summary", "please", "can", "could", "would", "you",
         "did", "does", "do", "have", "has", "had", "today", "yesterday", "earlier", "previous",
         "past", "any", "all", "who", "when", "where", "how", "why", "that", "this", "these",
-        "those", "talk", "talked", "talking", "discuss", "discussed", "history",
+        "those", "talk", "talked", "talking", "discuss", "discussed", "history", "call", "called",
+        "calls", "calling", "after", "since", "before", "she", "he", "him", "they", "them", "back",
+        "yet", "still", "responded", "respond", "answered", "answer",
     ]
     .into_iter()
     .collect();
@@ -161,6 +163,9 @@ pub enum MessageDirectionIntent {
     /// User wants the latest message authored/sent by the user to the contact
     /// (e.g. "what was my last message to Oliver-ke", "what did I send to Dera").
     OutgoingFromUser,
+    /// User wants to know whether the contact wrote back after the user's latest message
+    /// (e.g. "has Sandra texted me after my last message to her").
+    RepliesSinceMyLast,
     /// User wants a bidirectional overview of recent messages in the thread
     /// (e.g. "show recent messages with Oliver-ke", "summarize my chat with Dera").
     ThreadOverview,
@@ -170,6 +175,40 @@ pub fn parse_message_direction_intent(user_prompt: &str) -> MessageDirectionInte
     let low = strip_injected_context_prefix(user_prompt)
         .to_ascii_lowercase()
         .replace(['\u{2018}', '\u{2019}'], "'");
+
+    let since_cues = [
+        "after my last",
+        "since my last",
+        "after my message",
+        "since my message",
+        "after i messaged",
+        "since i messaged",
+        "after i texted",
+        "since i texted",
+        "replied to my",
+        "reply to my",
+        "responded to my",
+        "respond to my",
+    ];
+    if since_cues.iter().any(|p| low.contains(p)) {
+        return MessageDirectionIntent::RepliesSinceMyLast;
+    }
+
+    // Anything that is not a literal "what did they send" lookup is a question about the thread.
+    // "WhatsApp" must not read as "whats".
+    let low = low.replace("whatsapp", " ").replace("whats app", " ");
+    let words: Vec<&str> = low.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+    let names_message = words.iter().any(|w| {
+        ["message", "messages", "text", "texts", "sent", "send", "say", "said", "wrote", "write", "reply", "replied"].contains(w)
+    });
+    let asks_for_it = ["what was", "what's", "whats", "what is", "what did", "show", "read", "tell me", "get "].iter().any(|c| low.contains(c));
+    let literal = ["last message", "latest message", "recent message", "last text", "latest text", "message from ", "messages from "]
+        .iter()
+        .any(|c| low.contains(c))
+        || (asks_for_it && names_message && !low.contains(" about "));
+    if !literal {
+        return MessageDirectionIntent::ThreadOverview;
+    }
 
     let outgoing_cues = [
         "my last message",
@@ -1100,8 +1139,41 @@ mod macos_sources {
                     truncate_chars(&out_row[3], 260)
                 )
             }),
+            MessageDirectionIntent::RepliesSinceMyLast => format_replies_since_lead(rows),
             MessageDirectionIntent::ThreadOverview => None,
         }
+    }
+
+    /// `rows` are newest first: [contact, time, from_me, text]. Calls are not in this table.
+    fn format_replies_since_lead(rows: &[Vec<String>]) -> Option<String> {
+        let rows: Vec<&Vec<String>> = rows.iter().filter(|r| r.len() >= 4).collect();
+        let top = rows.first()?;
+        let replies = rows.iter().take_while(|r| r[2] != "1").count();
+        let header = if replies == 0 {
+            format!("No, `{}` has not messaged you since your last message at {}. WhatsApp messages only, calls not checked", top[0], top[1])
+        } else if let Some(mine) = rows.get(replies) {
+            format!(
+                "Yes, `{}` sent {} message{} after your last message at {}. Latest at {}. WhatsApp messages only, calls not checked",
+                top[0],
+                replies,
+                if replies == 1 { "" } else { "s" },
+                mine[1],
+                top[1]
+            )
+        } else {
+            format!("Yes, `{}` sent at least {} messages after your last message. Latest at {}. WhatsApp messages only, calls not checked", top[0], replies, top[1])
+        };
+        Some(format!("  VERIFIED DIRECT ANSWER ({header}): \"{}\"", truncate_chars(&top[3], 260)))
+    }
+
+    #[test]
+    fn replies_since_lead_counts_only_newer_incoming() {
+        let row = |t: &str, me: &str, x: &str| vec!["Sam".to_string(), t.to_string(), me.to_string(), x.to_string()];
+        let yes = format_replies_since_lead(&[row("t3", "0", "b"), row("t2", "0", "a"), row("t1", "1", "mine"), row("t0", "0", "old")]).unwrap();
+        assert!(yes.contains("Yes, `Sam` sent 2 messages after your last message at t1. Latest at t3"), "{yes}");
+        assert!(yes.contains("\"b\""), "{yes}");
+        let no = format_replies_since_lead(&[row("t1", "1", "mine"), row("t0", "0", "old")]).unwrap();
+        assert!(no.contains("No, `Sam` has not messaged you since your last message at t1"), "{no}");
     }
 
     pub fn query_whatsapp_sqlite(
@@ -1153,6 +1225,15 @@ mod macos_sources {
                         }
                     })
                     .collect();
+                // Words like "rider" are not contacts: keep the first term that names a chat.
+                let partner_preds: Vec<String> = partner_preds
+                    .into_iter()
+                    .find(|p| {
+                        let sql = format!("SELECT 1 FROM ZWACHATSESSION cs WHERE {p} LIMIT 1;");
+                        !run_sqlite_query(&staged, &sql).is_empty()
+                    })
+                    .into_iter()
+                    .collect();
                 if !partner_preds.is_empty() {
                     let sql = format!(
                         "SELECT COALESCE(cs.ZPARTNERNAME, cs.ZCONTACTJID, 'Unknown'), \
@@ -1162,14 +1243,16 @@ mod macos_sources {
                          FROM ZWAMESSAGE m \
                          JOIN ZWACHATSESSION cs ON m.ZCHATSESSION = cs.Z_PK \
                          WHERE ({}) AND m.ZTEXT IS NOT NULL AND LENGTH(TRIM(m.ZTEXT)) > 0 \
-                         ORDER BY m.ZMESSAGEDATE DESC LIMIT 20;",
-                        partner_preds.join(" OR ")
+                         ORDER BY m.ZMESSAGEDATE DESC LIMIT {};",
+                        partner_preds.join(" OR "),
+                        // Thread questions may hinge on a message older than the last few.
+                        if intent == MessageDirectionIntent::ThreadOverview { 60 } else { 20 }
                     );
                     let rows = run_sqlite_query(&staged, &sql);
                     if !rows.is_empty() {
                         lines.push(format!(
                             "WhatsApp Direct Thread History with `{}` (newest first; `You ->` = sent by you, `From` = sent to you):",
-                            terms.join(", ")
+                            rows[0].first().map_or("contact", |n| n.as_str())
                         ));
                         if let Some(lead) = format_sqlite_directional_lead(&rows, intent) {
                             lines.push(lead);
@@ -2223,7 +2306,7 @@ mod macos_sources {
                             ));
                         }
                     }
-                    MessageDirectionIntent::ThreadOverview => {}
+                    MessageDirectionIntent::RepliesSinceMyLast | MessageDirectionIntent::ThreadOverview => {}
                 }
 
                 out.push(format!(
@@ -2764,5 +2847,26 @@ mod tests {
             ),
             "unexpected outgoing format:\n{out_fmt}"
         );
+    }
+
+    #[test]
+    fn replies_since_my_last_intent_and_terms() {
+        let q = "Has Sandra texted or called me after my last message to her on WhatsApp?";
+        assert_eq!(parse_message_direction_intent(q), MessageDirectionIntent::RepliesSinceMyLast);
+        assert_eq!(extract_conversation_query_terms(q), vec!["sandra".to_string()]);
+        assert_eq!(parse_message_direction_intent("what was my last message to Dera"), MessageDirectionIntent::OutgoingFromUser);
+    }
+
+    #[test]
+    fn thread_questions_are_not_literal_lookups() {
+        for q in [
+            "Sandra is sending a rider to me, has the rider arrived ? On WhatsApp",
+            "Has Sandra messaged me on WhatsApp",
+            "what did Sandra say about the rider",
+            "Has Sandra sent the rider yet? On WhatsApp",
+        ] {
+            assert_eq!(parse_message_direction_intent(q), MessageDirectionIntent::ThreadOverview, "{q}");
+        }
+        assert_eq!(parse_message_direction_intent("What did Dera send me"), MessageDirectionIntent::IncomingFromContact);
     }
 }

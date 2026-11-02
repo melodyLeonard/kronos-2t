@@ -283,7 +283,7 @@
         return @"Lets Kronos open apps, pre-fill WhatsApp message drafts, and prepare LinkedIn posts with your photos. Kronos always asks you to review before sending or publishing.";
     }
     if (section == 2) {
-        return @"Connects over local Wi-Fi to your Mac Kronos 14B server for desktop context and high-accuracy local reasoning, falling back automatically to the on-device Qwen2.5-1.5B-Instruct Metal engine when offline.";
+        return @"Connects over local Wi-Fi to your Mac Kronos server for desktop context and high-accuracy local reasoning, falling back automatically to the on-device Qwen2.5-1.5B-Instruct Metal engine when offline.";
     }
     return @"Controls spoken replies and whether a pause ends the recording. Nothing is sent until you press Send.";
 }
@@ -355,8 +355,8 @@
         cell.imageView.image = [UIImage systemImageNamed:@"laptopcomputer.and.iphone"];
         cell.accessoryView = [self makeSwitchWithTag:102 isOn:s.macSyncEnabled];
     } else if (indexPath.section == 2 && indexPath.row == 1) {
-        cell.textLabel.text = @"Use Mac 14B Engine on Wi-Fi";
-        cell.detailTextLabel.text = @"High-accuracy local 14B model when on LAN";
+        cell.textLabel.text = @"Use Mac Engine on Wi-Fi";
+        cell.detailTextLabel.text = @"Uses the model your Mac is serving when it is reachable";
         cell.imageView.image = [UIImage systemImageNamed:@"cpu"];
         cell.accessoryView = [self makeSwitchWithTag:105 isOn:s.preferMacEngineOnLan];
     } else if (indexPath.section == 2 && indexPath.row == 2) {
@@ -526,6 +526,36 @@ static inline BOOL kronosIsGenericMessagePlaceholder(NSString *span) {
     return [generics containsObject:low];
 }
 
+/// "her efforts" said to Kronos becomes "your efforts" in the message to her.
+static inline NSString *kronosIndirectSpeechToDirect(NSString *text) {
+    NSString *out = text ?: @"";
+    NSArray<NSArray<NSString *> *> *swaps = @[
+        // "you" was said to Kronos, so in the message it names Kronos. This runs before her -> you.
+        @[@"\\byou,?\\s+kronos\\b", @"Kronos"],
+        @[@"\\byou('re| are)\\b", @"Kronos is"], @[@"\\byou were\\b", @"Kronos was"], @[@"\\byou have\\b", @"Kronos has"],
+        @[@"\\byour\\b", @"Kronos's"], @[@"\\byou\\b", @"Kronos"],
+        @[@"\\b(the|that) (message|text) above\\b", @"my last message"], @[@"\\b(the|that) above (message|text)\\b", @"my last message"],
+        @[@"\\b(she|he) is\\b", @"you are"], @[@"\\b(she|he)'s\\b", @"you're"], @[@"\\b(she|he) was\\b", @"you were"],
+        @[@"\\b(she|he) has\\b", @"you have"], @[@"\\b(she|he)\\b", @"you"], @[@"\\bhim\\b", @"you"], @[@"\\bhis\\b", @"your"], @[@"\\bhers\\b", @"yours"],
+        @[@"\\bher(?=\\s*(?:$|[.,!?;:]|(?:and|but|or|for|to|that|if|because|so|when|about|with|at|in|on|very|too|again|soon|today|tomorrow|now)\\b))", @"you"],
+        @[@"\\bher\\b", @"your"],
+    ];
+    for (NSArray<NSString *> *sw in swaps) {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:sw[0] options:NSRegularExpressionCaseInsensitive error:nil];
+        out = [re stringByReplacingMatchesInString:out options:0 range:NSMakeRange(0, out.length) withTemplate:sw[1]];
+    }
+    return out;
+}
+
+/// "Tell Sandra that ..." with no app named: a person followed by what to say.
+static inline BOOL kronosIsTellPersonThat(NSString *low) {
+    NSArray<NSString *> *words = [low componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (words.count < 4) return NO;
+    if (![@[@"tell", @"text", @"message"] containsObject:words[0]]) return NO;
+    if (![@[@"that", @"saying"] containsObject:words[2]]) return NO;
+    return ![@[@"me", @"us", @"you", @"him", @"her", @"them", @"everyone", @"people", @"something", @"it", @"this", @"the", @"a", @"an", @"my", @"kronos"] containsObject:words[1]];
+}
+
 static inline BOOL kronosParseWhatsAppDraftIntent(NSString *userText,
                                                   NSString **outRecipient,
                                                   NSString **outExplicitMessage,
@@ -541,7 +571,7 @@ static inline BOOL kronosParseWhatsAppDraftIntent(NSString *userText,
     NSString *trimmed = [normOrig stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     NSString *low = [trimmed lowercaseString];
 
-    if (![low containsString:@"whatsapp"]) return NO;
+    if (![low containsString:@"whatsapp"] && !kronosIsTellPersonThat(low)) return NO;
 
     NSArray<NSString *> *imperativeStarts = @[
         @"open whatsapp", @"launch whatsapp", @"start whatsapp",
@@ -642,6 +672,10 @@ static inline BOOL kronosParseWhatsAppDraftIntent(NSString *userText,
                 } else if (words.count >= 2) {
                     recipient = kronosCleanExtractedSpan(words[0]);
                     NSString *rem = kronosCleanExtractedSpan([[words subarrayWithRange:NSMakeRange(1, words.count - 1)] componentsJoinedByString:@" "]);
+                    NSString *remLow = [rem lowercaseString];
+                    if ([remLow hasPrefix:@"that "] || [remLow hasPrefix:@"saying "]) {
+                        rem = kronosIndirectSpeechToDirect([rem substringFromIndex:[remLow hasPrefix:@"that "] ? 5 : 7]);
+                    }
                     if (rem.length > 0 && ![[rem lowercaseString] isEqualToString:@"on whatsapp"]) {
                         explicitMsg = rem;
                         isTopic = ([dv isEqualToString:@"ask "] || [[rem lowercaseString] hasPrefix:@"about "] || [[rem lowercaseString] hasPrefix:@"if "]);
@@ -756,6 +790,7 @@ static inline NSString *kronosTryGenerateChatViaLocalMac14B(NSArray<NSDictionary
         NSMutableURLRequest *probeReq = [NSMutableURLRequest requestWithURL:probeURL
                                                                 cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
                                                             timeoutInterval:0.65];
+    kronosApplyMacAuth(probeReq);
         dispatch_semaphore_t pSem = dispatch_semaphore_create(0);
         __block BOOL reachable = NO;
         [[[NSURLSession sharedSession] dataTaskWithRequest:probeReq completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
@@ -782,7 +817,8 @@ static inline NSString *kronosTryGenerateChatViaLocalMac14B(NSArray<NSDictionary
 
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
                                                        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                                   timeoutInterval:7.5];
+                                                   timeoutInterval:150.0];
+    kronosApplyMacAuth(req);
     req.HTTPMethod = @"POST";
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     req.HTTPBody = bodyData;
@@ -797,7 +833,7 @@ static inline NSString *kronosTryGenerateChatViaLocalMac14B(NSArray<NSDictionary
         }
         dispatch_semaphore_signal(sem);
     }] resume];
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7.8 * NSEC_PER_SEC)));
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(151.0 * NSEC_PER_SEC)));
 
     if (statusCode == 200 && respData.length > 0) {
         NSDictionary *json = [NSJSONSerialization JSONObjectWithData:respData options:0 error:nil];
@@ -1334,6 +1370,7 @@ static inline void kronosSyncContinualMemoryAndDistillVaultWithMac(void) {
                 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:memURL
                                                                    cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
                                                                timeoutInterval:2.0];
+    kronosApplyMacAuth(req);
                 req.HTTPMethod = @"POST";
                 [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
                 req.HTTPBody = body;
@@ -1357,6 +1394,7 @@ static inline void kronosSyncContinualMemoryAndDistillVaultWithMac(void) {
                 NSMutableURLRequest *vReq = [NSMutableURLRequest requestWithURL:vaultURL
                                                                     cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
                                                                 timeoutInterval:2.5];
+    kronosApplyMacAuth(vReq);
                 vReq.HTTPMethod = @"POST";
                 [vReq setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
                 vReq.HTTPBody = vBody;

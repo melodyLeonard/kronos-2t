@@ -254,7 +254,17 @@ static NSString *const kKronosMobileSystemPrompt =
      "His stack: Rust, TypeScript, JavaScript, Elixir, Solidity, C, Node.js, NestJS, Apache Kafka, GraphQL, gRPC, PostgreSQL, MongoDB, Neo4j, Redis, React.js, Next.js, React Native, AWS, Docker, Kubernetes. "
      "When describing an attached photograph of a physical object or scene, identify the physical objects and setting naturally and concisely without calling it a text detection or OCR task. "
      "Answer strictly from verified context and never fabricate placeholder numbers or messages. "
-     "When an iPhone Device Context block is present, trust its access lines and never claim to lack access it lists.";
+     "When an iPhone Device Context block is present, trust its access lines and never claim to lack access it lists. "
+     "You cannot see which apps are installed: never state that an app is or is not installed.";
+
+/// Bearer token for the Mac bridge, compiled in from ~/.kronos/device_token.
+static inline void kronosApplyMacAuth(NSMutableURLRequest *req) {
+#ifdef KRONOS_MAC_TOKEN
+    [req setValue:@"Bearer " KRONOS_MAC_TOKEN forHTTPHeaderField:@"Authorization"];
+#else
+    (void)req;
+#endif
+}
 
 static inline NSString *kronosDocumentsDirectory(void) {
     NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
@@ -722,6 +732,7 @@ static inline NSSet<NSString *> *kronosRelationshipAliasesForTarget(NSString *lo
                 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:statusURL
                                                                    cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
                                                                timeoutInterval:2.0];
+                kronosApplyMacAuth(req);
                 dispatch_semaphore_t sem = dispatch_semaphore_create(0);
                 __block NSData *respData = nil;
                 __block NSInteger statusCode = 0;
@@ -1349,6 +1360,150 @@ static inline BOOL kronosParseFindFileIntent(NSString *query, NSString **outTerm
     }
     if (outTerm != NULL) *outTerm = term;
     return YES;
+}
+
+typedef NS_ENUM(NSInteger, KronosAppAsk) { KronosAppAskHas, KronosAppAskCount, KronosAppAskOpen };
+
+/// Name matches from a word boundary, ignoring spaces and doubled letters ("Uloo" finds "Ulo").
+static inline BOOL kronosAppNameMatches(NSString *name, NSString *query) {
+    NSString *(^squash)(NSString *) = ^NSString *(NSString *t) {
+        NSMutableString *out = [NSMutableString string];
+        unichar prev = 0;
+        NSString *low = [t lowercaseString];
+        for (NSUInteger i = 0; i < low.length; i++) {
+            unichar c = [low characterAtIndex:i];
+            if (![[NSCharacterSet alphanumericCharacterSet] characterIsMember:c] || c == prev) continue;
+            [out appendFormat:@"%C", c];
+            prev = c;
+        }
+        return out;
+    };
+    NSString *want = squash(query);
+    if (want.length == 0) return NO;
+    NSArray<NSString *> *words = [name componentsSeparatedByCharactersInSet:[[NSCharacterSet alphanumericCharacterSet] invertedSet]];
+    for (NSUInteger i = 0; i < words.count; i++) {
+        NSString *tail = [[words subarrayWithRange:NSMakeRange(i, words.count - i)] componentsJoinedByString:@" "];
+        if ([squash(tail) hasPrefix:want]) return YES;
+    }
+    return NO;
+}
+
+/// App questions beyond "do I have": "how many Ulo apps", "open the Justa app", "how about the X app".
+static inline BOOL kronosParseAppAsk(NSString *query, BOOL afterAppTurn, NSString **outApp, KronosAppAsk *outAsk) {
+    NSString *q = [[kronosNormalizeApostrophes(query ?: @"") stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"?. "]];
+    NSString *low = [q lowercaseString];
+    NSString *rest = nil;
+    KronosAppAsk ask = KronosAppAskHas;
+    if ([low hasPrefix:@"how many "]) {
+        rest = [q substringFromIndex:9];
+        ask = KronosAppAskCount;
+    } else {
+        for (NSString *lead in @[@"how about ", @"what about ", @"and "]) {
+            if ([low hasPrefix:lead]) { rest = [q substringFromIndex:lead.length]; break; }
+        }
+        if (rest == nil) {
+            for (NSString *lead in @[@"open ", @"launch ", @"start "]) {
+                if ([low hasPrefix:lead]) { rest = [q substringFromIndex:lead.length]; ask = KronosAppAskOpen; break; }
+            }
+        }
+    }
+    if (rest == nil) return NO;
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"(\\s+(do|did|are|have|on)\\b.*)$" options:NSRegularExpressionCaseInsensitive error:nil];
+    rest = [re stringByReplacingMatchesInString:rest options:0 range:NSMakeRange(0, rest.length) withTemplate:@""];
+    BOOL sawApp = NO;
+    NSString *trimmedLow = [rest lowercaseString];
+    if ([trimmedLow isEqualToString:@"apps"] || [trimmedLow isEqualToString:@"app"]) { rest = @""; sawApp = YES; }
+    for (NSString *t in @[@" apps", @" app", @" applications", @" application"]) {
+        if ([[rest lowercaseString] hasSuffix:t]) { rest = [rest substringToIndex:rest.length - t.length]; sawApp = YES; break; }
+    }
+    if (!sawApp && !afterAppTurn) return NO;
+    for (NSString *pre in @[@"the ", @"my ", @"an ", @"a "]) {
+        if ([[rest lowercaseString] hasPrefix:pre]) { rest = [rest substringFromIndex:pre.length]; break; }
+    }
+    rest = [rest stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (rest.length == 0 && ask != KronosAppAskCount) return NO;
+    if ([rest componentsSeparatedByString:@" "].count > 4) return NO;
+    if (outApp != NULL) *outApp = rest;
+    if (outAsk != NULL) *outAsk = ask;
+    return YES;
+}
+
+/// "Do I have the Justa app on my phone?", "Is Spotify installed?", "Do I have WhatsApp?".
+static inline BOOL kronosParseHasAppIntent(NSString *query, NSString **outApp) {
+    NSString *q = [[kronosNormalizeApostrophes(query ?: @"") stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"?. "]];
+    NSString *low = [q lowercaseString];
+    NSString *rest = nil;
+    for (NSString *lead in @[@"do i have ", @"have i got ", @"have i installed ", @"did i install ", @"is ", @"is there "]) {
+        if ([low hasPrefix:lead]) { rest = [q substringFromIndex:lead.length]; }
+    }
+    if (rest == nil) return NO;
+    BOOL viaIs = [low hasPrefix:@"is "];
+    NSArray<NSString *> *tails = @[@" on my phone", @" on this phone", @" on my iphone", @" on this iphone", @" on my device", @" on here", @" on it", @" installed", @" downloaded"];
+    BOOL sawTail = NO, sawInstalled = NO;
+    for (BOOL changed = YES; changed;) {
+        changed = NO;
+        for (NSString *t in tails) {
+            if ([[rest lowercaseString] hasSuffix:t]) {
+                rest = [rest substringToIndex:rest.length - t.length];
+                sawTail = YES;
+                if ([t isEqualToString:@" installed"] || [t isEqualToString:@" downloaded"]) sawInstalled = YES;
+                changed = YES;
+            }
+        }
+    }
+    BOOL sawApp = NO;
+    for (NSString *t in @[@" app", @" application"]) {
+        if ([[rest lowercaseString] hasSuffix:t]) { rest = [rest substringToIndex:rest.length - t.length]; sawApp = YES; }
+    }
+    for (NSString *pre in @[@"the ", @"an ", @"a "]) {
+        if ([[rest lowercaseString] hasPrefix:pre]) { rest = [rest substringFromIndex:pre.length]; break; }
+    }
+    rest = [rest stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (rest.length < 2 || [rest componentsSeparatedByString:@" "].count > 4) return NO;
+    NSArray *known = @[@"whatsapp", @"instagram", @"telegram", @"slack", @"youtube", @"twitter", @"x", @"github", @"linkedin", @"gmail", @"spotify", @"tiktok", @"facebook", @"snapchat", @"chrome", @"netflix", @"uber", @"bolt", @"zoom"];
+    BOOL names = sawApp || sawInstalled || (!viaIs && sawTail && [known containsObject:[rest lowercaseString]]) || (!viaIs && [known containsObject:[rest lowercaseString]]);
+    if (!names) return NO;
+    if (outApp != NULL) *outApp = rest;
+    return YES;
+}
+
+/// "On my Mac, fix the failing tests" or "fix the failing tests on my Mac".
+static inline BOOL kronosParseMacTaskIntent(NSString *query, NSString **outTask) {
+    NSString *q = [query ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *low = [q lowercaseString];
+    NSString *task = nil;
+    for (NSString *lead in @[@"start on my mac", @"run on my mac", @"on my mac", @"on the mac", @"tell my mac to", @"ask my mac to", @"have my mac", @"get my mac to"]) {
+        if ([low hasPrefix:lead]) { task = [q substringFromIndex:lead.length]; break; }
+    }
+    if (task == nil) {
+        for (NSString *tail in @[@" on my mac", @" on the mac", @" on my macbook"]) {
+            NSString *cut = [low hasSuffix:@"."] ? [low substringToIndex:low.length - 1] : low;
+            if ([cut hasSuffix:tail]) { task = [q substringToIndex:cut.length - tail.length]; break; }
+        }
+        if (task != nil) {
+            NSString *first = [[[task lowercaseString] componentsSeparatedByString:@" "] firstObject];
+            NSArray *asks = @[@"what", @"what's", @"whats", @"where", @"who", @"when", @"why", @"how", @"is", @"are", @"do", @"does", @"did", @"was", @"has", @"have"];
+            if ([asks containsObject:first]) return NO;
+        }
+    }
+    if (task == nil) return NO;
+    NSMutableCharacterSet *trim = [NSMutableCharacterSet whitespaceAndNewlineCharacterSet];
+    [trim addCharactersInString:@",:;-"];
+    task = [task stringByTrimmingCharactersInSet:trim];
+    for (NSString *pre in @[@"can you ", @"could you ", @"please "]) {
+        if ([[task lowercaseString] hasPrefix:pre]) task = [task substringFromIndex:pre.length];
+    }
+    if (task.length < 3) return NO;
+    if (outTask != NULL) *outTask = task;
+    return YES;
+}
+
+static inline BOOL kronosIsMacTaskStatusQuery(NSString *query) {
+    NSString *low = [[query ?: @"" lowercaseString] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    for (NSString *c in @[@"what is my mac doing", @"what's my mac doing", @"whats my mac doing", @"is my mac done", @"is my mac finished", @"mac task status", @"my mac task", @"task on my mac"]) {
+        if ([low containsString:c]) return YES;
+    }
+    return NO;
 }
 
 /// "last screenshot I took", "when was my latest photo", "how many videos do I have".
@@ -2936,7 +3091,9 @@ static inline NSArray<NSString *> *kronosExtractExternalLookupTerms(NSString *qu
         @"write", @"wrote", @"written", @"thing", @"thread", @"conversation", @"conversations",
         @"me", @"my", @"our",
         @"did", @"does", @"do", @"have", @"has", @"had", @"today", @"yesterday", @"please",
-        @"tell", @"show", @"check", @"read", @"who", @"when", @"how", @"that", @"this"
+        @"tell", @"show", @"check", @"read", @"who", @"when", @"how", @"that", @"this",
+        @"call", @"called", @"calls", @"calling", @"after", @"since", @"before", @"her", @"his", @"she", @"he", @"him",
+        @"they", @"them", @"back", @"yet", @"still", @"responded", @"respond", @"answered", @"answer"
     ]];
     NSMutableCharacterSet *keepSet = [[NSCharacterSet alphanumericCharacterSet] mutableCopy];
     [keepSet addCharactersInString:@"-"];
@@ -3158,6 +3315,23 @@ typedef NS_ENUM(NSInteger, KronosMessageDirectionIntent) {
 static inline KronosMessageDirectionIntent kronosParseMessageDirectionIntent(NSString *query) {
     NSString *low = [[kronosNormalizeApostrophes(query ?: @"") lowercaseString]
                      stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    // Mirrors parse_message_direction_intent: non-literal asks are questions about the thread.
+    low = [[low stringByReplacingOccurrencesOfString:@"whatsapp" withString:@" "] stringByReplacingOccurrencesOfString:@"whats app" withString:@" "];
+    NSCharacterSet *nonWord = [[NSCharacterSet alphanumericCharacterSet] invertedSet];
+    NSSet<NSString *> *words = [NSSet setWithArray:[low componentsSeparatedByCharactersInSet:nonWord]];
+    BOOL namesMessage = [words intersectsSet:[NSSet setWithArray:@[@"message", @"messages", @"text", @"texts", @"sent", @"send", @"say", @"said", @"wrote", @"write", @"reply", @"replied"]]];
+    BOOL asksForIt = NO;
+    for (NSString *c in @[@"what was", @"what's", @"whats", @"what is", @"what did", @"show", @"read", @"tell me", @"get "]) {
+        if ([low containsString:c]) asksForIt = YES;
+    }
+    BOOL literal = asksForIt && namesMessage && ![low containsString:@" about "];
+    for (NSString *c in @[@"last message", @"latest message", @"recent message", @"last text", @"latest text", @"message from ", @"messages from "]) {
+        if ([low containsString:c]) literal = YES;
+    }
+    for (NSString *c in @[@"after my last", @"since my last", @"after my message", @"since my message", @"after i messaged", @"since i messaged", @"after i texted", @"since i texted", @"replied to my", @"reply to my", @"responded to my", @"respond to my"]) {
+        if ([low containsString:c]) return KronosMsgIntentOutgoingFromUser;
+    }
+    if (!literal) return KronosMsgIntentThreadOverview;
     NSArray<NSString *> *outgoingCues = @[
         @"my last message", @"my latest message", @"my recent message",
         @"my message to ", @"my messages to ", @"my reply to ",
@@ -3313,12 +3487,13 @@ static inline KronosMessageDirectionIntent kronosParseMessageDirectionIntent(NSS
         BOOL macTccBlocked = NO;
         if (settings.macSyncEnabled && settings.macServerURL.length > 0) {
             NSString *base = [settings.macServerURL stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/ "]];
-            NSString *encQ = [query stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]] ?: @"";
-            NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@/v1/device/conversations?q=%@", base, encQ]];
+            NSString *encQ = [query stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet alphanumericCharacterSet]] ?: @"";
+            NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@/v1/device/conversations?q=%@&tz=%@", base, encQ, [NSTimeZone localTimeZone].name]];
             if (url != nil) {
                 NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url
                                                                    cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
                                                                timeoutInterval:6.0];
+                kronosApplyMacAuth(req);
                 dispatch_semaphore_t sem = dispatch_semaphore_create(0);
                 __block NSData *respData = nil;
                 __block NSInteger statusCode = 0;
@@ -3361,7 +3536,8 @@ static inline KronosMessageDirectionIntent kronosParseMessageDirectionIntent(NSS
                                 }
                             }
                             // 2. Deterministic direct rendering when Mac perception produced a verified direction-matched answer.
-                            if ([macCtx containsString:@"VERIFIED DIRECT ANSWER ("] && dirIntent != KronosMsgIntentThreadOverview) {
+                            // Thread rows are rendered as chat bubbles by the caller.
+                            if ([macCtx containsString:@"VERIFIED DIRECT ANSWER ("] && dirIntent != KronosMsgIntentThreadOverview && ![macCtx containsString:@"\n  - ["]) {
                                 for (NSString *ln in [macCtx componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
                                     NSRange vr = [ln rangeOfString:@"VERIFIED DIRECT ANSWER ("];
                                     if (vr.location != NSNotFound) {
@@ -3403,15 +3579,13 @@ static inline KronosMessageDirectionIntent kronosParseMessageDirectionIntent(NSS
         }
         if (macReached) {
             if (macTccBlocked) {
-                [honest appendFormat:@"On your synced Mac, %@ is currently scrolled off-screen in WhatsApp Desktop, and macOS Full Disk Access has not yet been enabled for Kronos to read older SQLite chat history. You can either:\n", contactDisplay];
-                [honest appendFormat:@"1. Scroll or open %@'s chat in WhatsApp on your Mac (or enable Full Disk Access for Kronos in macOS System Settings -> Privacy & Security -> Full Disk Access), or\n", contactDisplay];
-                [honest appendFormat:@"2. In WhatsApp on iPhone, tap %@ -> Export Chat (or share a screenshot) into Kronos Mobile.", contactDisplay];
+                [honest setString:@"macOS is blocking Kronos from reading WhatsApp on your Mac. Open System Settings, Privacy & Security, Full Disk Access. Remove kronos_device_bridge, add it again from ~/.kronos/bin, and turn it on. Then restart the bridge."];
             } else {
                 [honest appendFormat:@"%@ was not found in the visible WhatsApp window on your synced Mac. You can open %@'s thread on your Mac or export/screenshot the chat into Kronos Mobile.", contactDisplay, contactDisplay];
             }
         } else {
-            [honest appendFormat:@"iOS sandboxes WhatsApp's private database from other apps on iPhone. To let Kronos read %@'s real messages:\n", contactDisplay];
-            [honest appendString:@"1. Ensure Local Mac Context Sync is connected in Kronos Settings on the same Wi-Fi as your Mac, or\n"];
+            [honest appendFormat:@"iOS blocks WhatsApp's data on iPhone, so Kronos reads it through your Mac, and it could not reach your Mac at %@. To let Kronos read %@'s real messages:\n", settings.macServerURL, contactDisplay];
+            [honest appendString:@"1. Start kronos_device_bridge on your Mac, on the same Wi-Fi, or\n"];
             [honest appendFormat:@"2. In WhatsApp on iPhone, open %@ -> Export Chat (Without Media) or paste a chat screenshot into Kronos Mobile.", contactDisplay];
         }
         dispatch_async(dispatch_get_main_queue(), ^{

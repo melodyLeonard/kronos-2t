@@ -73,6 +73,8 @@ static inline NSString *kronosCleanDraftOutput(NSString *raw) {
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary *> *docPillTargets;
 @property (nonatomic, copy) NSString *pendingFindTerm;
 @property (nonatomic, assign) BOOL pickingFolderForIndex;
+@property (nonatomic, assign) BOOL lastTurnWasAppAsk;
+@property (nonatomic, copy) NSString *lastAskedApp;
 /// Recording strip above the composer: discard, timer, live waveform, stop.
 @property (nonatomic, strong) UIView *voiceBar;
 @property (nonatomic, strong) NSLayoutConstraint *voiceBarHeight;
@@ -995,6 +997,7 @@ static const CGFloat kSidebarWidth = 296.0;
                     [self addPhotoPreviewCardWithImage:savedImg caption:@"Selected photo from Photo Library" toStack:extra];
                 }
             }
+            if ([m[@"waThread"] isKindOfClass:[NSArray class]]) [self addWhatsAppThread:m[@"waThread"] toStack:extra];
             if ([actionType isEqualToString:@"whatsapp"] && draftURLStr.length > 0) {
                 self.lastWhatsAppDraftURL = [NSURL URLWithString:draftURLStr];
                 [self addWhatsAppOpenDraftButtonToStack:extra];
@@ -1924,6 +1927,408 @@ static const CGFloat kSidebarWidth = 296.0;
     }];
 }
 
+/// Answers from the real messages without the model, which misquoted them in testing.
+/// Returns NO when the context holds no thread lines.
+- (BOOL)answerThreadQuestion:(NSString *)question fromContext:(NSString *)context replyBody:(UILabel *)replyBody replyExtra:(UIStackView *)replyExtra convMsgs:(NSMutableArray *)convMsgs {
+    NSMutableArray<NSDictionary *> *msgs = [NSMutableArray array];
+    NSDateFormatter *dayFmt = [[NSDateFormatter alloc] init];
+    dayFmt.dateFormat = @"yyyy-MM-dd";
+    NSString *today = [dayFmt stringFromDate:[NSDate date]];
+    for (NSString *ln in [context componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+        NSString *t = [ln stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (![t hasPrefix:@"- ["]) continue;
+        NSRange close = [t rangeOfString:@"] "];
+        if (close.location == NSNotFound || close.location < 8) continue;
+        NSString *stamp = [t substringWithRange:NSMakeRange(3, close.location - 3)];
+        if (stamp.length >= 16) stamp = [stamp hasPrefix:today] ? [stamp substringWithRange:NSMakeRange(11, 5)] : [stamp substringToIndex:16];
+        NSString *body = [t substringFromIndex:close.location + 2];
+        NSRange colon = [body rangeOfString:@": "];
+        if (colon.location == NSNotFound) continue;
+        BOOL mine = [body hasPrefix:@"You"];
+        NSString *who = mine ? @"You" : [[body substringToIndex:colon.location] stringByReplacingOccurrencesOfString:@"From " withString:@""];
+        [msgs addObject:@{@"t": stamp, @"who": who, @"text": [body substringFromIndex:colon.location + 2]}];
+    }
+    if (msgs.count == 0) return NO;
+
+    NSString *contact = @"";
+    for (NSDictionary *m in msgs) {
+        if (![m[@"who"] isEqualToString:@"You"]) { contact = [m[@"who"] lowercaseString]; break; }
+    }
+    NSMutableArray<NSString *> *keys = [NSMutableArray array];
+    for (NSString *term in kronosExtractExternalLookupTerms(question)) {
+        NSString *low = [term lowercaseString];
+        if (low.length >= 4 && ![contact containsString:low]) [keys addObject:[low substringToIndex:MIN((NSUInteger)5, low.length)]];
+    }
+    NSMutableIndexSet *hits = [NSMutableIndexSet indexSet];
+    for (NSUInteger i = 0; i < msgs.count && hits.count < 4; i++) { // newest first
+        NSString *low = [msgs[i][@"text"] lowercaseString];
+        for (NSString *k in keys) {
+            if ([low containsString:k]) { [hits addIndex:i]; break; }
+        }
+    }
+    NSDictionary *hit = hits.count > 0 ? msgs[hits.firstIndex] : nil;
+    NSString *(^describe)(NSDictionary *) = ^NSString *(NSDictionary *m) {
+        NSString *who = [m[@"who"] isEqualToString:@"You"] ? @"you" : m[@"who"];
+        return [NSString stringWithFormat:@"from %@ at %@: \"%@\"", who, m[@"t"], m[@"text"]];
+    };
+    NSDictionary *latestIn = nil, *latestOut = nil;
+    for (NSDictionary *m in msgs) {
+        if ([m[@"who"] isEqualToString:@"You"]) { if (latestOut == nil) latestOut = m; }
+        else if (latestIn == nil) latestIn = m;
+    }
+    NSString *contactName = latestIn[@"who"] ?: @"them";
+    KronosMessageDirectionIntent intent = kronosParseMessageDirectionIntent(question);
+    NSString *reply = nil;
+    NSRange lead = [context rangeOfString:@"VERIFIED DIRECT ANSWER ("];
+    if (lead.location != NSNotFound) {
+        NSString *tail = [context substringFromIndex:lead.location + lead.length];
+        NSRange end = [tail rangeOfString:@"): "];
+        if (end.location != NSNotFound && ([tail hasPrefix:@"Yes,"] || [tail hasPrefix:@"No,"])) {
+            reply = [[[tail substringToIndex:end.location] stringByReplacingOccurrencesOfString:@"`" withString:@""] stringByAppendingString:@"."];
+        }
+    }
+    if (reply != nil) {
+    } else if (intent == KronosMsgIntentIncomingFromContact && latestIn != nil) {
+        reply = [NSString stringWithFormat:@"%@'s last message to you was at %@: \"%@\"", contactName, latestIn[@"t"], latestIn[@"text"]];
+    } else if (intent == KronosMsgIntentOutgoingFromUser && latestOut != nil) {
+        reply = [NSString stringWithFormat:@"Your last message to %@ was at %@: \"%@\"", contactName, latestOut[@"t"], latestOut[@"text"]];
+    } else if (hit != nil) {
+        reply = [NSString stringWithFormat:@"The latest message about this is %@", describe(hit)];
+    } else if (keys.count > 0) {
+        reply = [NSString stringWithFormat:@"Nothing in your recent messages mentions this. The latest message is %@", describe(msgs.firstObject)];
+    } else {
+        reply = [NSString stringWithFormat:@"The latest message is %@", describe(msgs.firstObject)];
+    }
+    // Bubbles: the matching messages with one neighbour each, plus the newest from each side.
+    NSMutableIndexSet *shown = [NSMutableIndexSet indexSet];
+    [hits enumerateIndexesUsingBlock:^(NSUInteger i, BOOL *stop) {
+        (void)stop;
+        [shown addIndex:i];
+        if (i > 0) [shown addIndex:i - 1];
+        if (i + 1 < msgs.count) [shown addIndex:i + 1];
+    }];
+    [shown addIndex:0];
+    if (latestIn != nil) [shown addIndex:[msgs indexOfObject:latestIn]];
+    if (hits.count == 0) [shown addIndexesInRange:NSMakeRange(0, MIN((NSUInteger)6, msgs.count))];
+    NSMutableArray<NSDictionary *> *thread = [NSMutableArray array];
+    __block NSUInteger prev = NSNotFound;
+    [shown enumerateIndexesWithOptions:NSEnumerationReverse usingBlock:^(NSUInteger i, BOOL *stop) {
+        (void)stop;
+        if (prev != NSNotFound && prev != i + 1) [thread addObject:@{@"gap": @YES}];
+        NSMutableDictionary *m = [msgs[i] mutableCopy];
+        if ([hits containsIndex:i]) m[@"hit"] = @YES;
+        [thread addObject:m];
+        prev = i;
+    }];
+
+    void (^finish)(NSString *, NSString *) = ^(NSString *text, NSString *badge) {
+        [self recordImmediateKronosReply:text actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+        [self addWhatsAppThread:thread toStack:replyExtra];
+        NSMutableDictionary *saved = [convMsgs.lastObject mutableCopy];
+        saved[@"waThread"] = thread;
+        saved[@"actionBadge"] = badge;
+        convMsgs[convMsgs.count - 1] = saved;
+        [self addActionPillWithTitle:badge previewFile:nil toStack:replyExtra];
+        [KronosConversationStore saveConversations:self.conversations];
+        [self scrollToBottomAnimated:YES];
+    };
+    if (intent != KronosMsgIntentThreadOverview) {
+        finish(reply, @"Verified WhatsApp Message");
+        return YES;
+    }
+
+    // The Mac model can weigh the thread; the phone's model misquoted it, so it is not used here.
+    NSMutableArray<NSString *> *timeline = [NSMutableArray array];
+    for (NSUInteger i = MIN((NSUInteger)30, msgs.count); i > 0; i--) {
+        NSDictionary *m = msgs[i - 1];
+        [timeline addObject:[NSString stringWithFormat:@"[%@] %@: %@", m[@"t"], m[@"who"], m[@"text"]]];
+    }
+    NSString *prompt = [NSString stringWithFormat:@"WhatsApp messages between the user (\"You\") and %@, oldest first:\n%@\n\nQuestion from the user: %@\n\nAnswer directly in one or two sentences, speaking to the user, using only these messages. Pay most attention to what %@ wrote. Mention the message and time that settle it. If they do not settle it, say so.", contactName, [timeline componentsJoinedByString:@"\n"], question, contactName];
+    replyBody.text = @"Reading the chat…";
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *answer = kronosTryGenerateChatViaLocalMac14B(@[@{@"role": @"user", @"content": prompt}], 160, 0.0f);
+        answer = [[kronosStripThinkBlocks(answer ?: @"") stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] copy];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (answer.length > 0) finish(answer, @"Read from your WhatsApp");
+            else finish(reply, @"Verified WhatsApp Message");
+        });
+    });
+    return YES;
+}
+
+/// Chat bubbles as in WhatsApp: yours on the right in green, theirs on the left, time under the text.
+- (void)addWhatsAppThread:(NSArray<NSDictionary *> *)thread toStack:(UIStackView *)stack {
+    UILabel *title = [[UILabel alloc] init];
+    NSString *contact = @"";
+    for (NSDictionary *m in thread) {
+        if (![m[@"who"] isEqualToString:@"You"]) { contact = m[@"who"]; break; }
+    }
+    title.text = contact.length > 0 ? [NSString stringWithFormat:@"WhatsApp · %@", contact] : @"WhatsApp";
+    title.font = [UIFont systemFontOfSize:12.0 weight:UIFontWeightSemibold];
+    title.textColor = kronosMutedColor();
+    [stack addArrangedSubview:title];
+
+    UIColor *mineColor = kronosDynamicColor(0xD9FDD3, 1.0, 0x005C4B, 1.0);
+    UIColor *theirColor = kronosDynamicColor(0xF0F0EE, 1.0, 0x202C33, 1.0);
+    UIStackView *list = [[UIStackView alloc] init];
+    list.axis = UILayoutConstraintAxisVertical;
+    list.spacing = 5.0;
+    for (NSDictionary *m in thread) {
+        if ([m[@"gap"] boolValue]) {
+            UILabel *gap = [[UILabel alloc] init];
+            gap.text = @"···";
+            gap.textAlignment = NSTextAlignmentCenter;
+            gap.textColor = kronosMutedColor();
+            gap.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightBold];
+            [list addArrangedSubview:gap];
+            continue;
+        }
+        BOOL mine = [m[@"who"] isEqualToString:@"You"];
+        UIView *row = [[UIView alloc] init];
+        UIView *bubble = [[UIView alloc] init];
+        bubble.translatesAutoresizingMaskIntoConstraints = NO;
+        bubble.backgroundColor = mine ? mineColor : theirColor;
+        bubble.layer.cornerRadius = 10.0;
+        if ([m[@"hit"] boolValue]) {
+            bubble.layer.borderWidth = 1.5;
+            bubble.layer.borderColor = kronosAccentColor().CGColor;
+        }
+        [row addSubview:bubble];
+
+        UILabel *text = [[UILabel alloc] init];
+        text.translatesAutoresizingMaskIntoConstraints = NO;
+        text.numberOfLines = 0;
+        text.text = m[@"text"];
+        text.font = [UIFont systemFontOfSize:15.0];
+        text.textColor = kronosTextColor();
+        [bubble addSubview:text];
+
+        UILabel *time = [[UILabel alloc] init];
+        time.translatesAutoresizingMaskIntoConstraints = NO;
+        time.text = m[@"t"];
+        time.font = [UIFont systemFontOfSize:11.0];
+        time.textColor = [kronosTextColor() colorWithAlphaComponent:0.6];
+        [bubble addSubview:time];
+
+        [NSLayoutConstraint activateConstraints:@[
+            [bubble.topAnchor constraintEqualToAnchor:row.topAnchor],
+            [bubble.bottomAnchor constraintEqualToAnchor:row.bottomAnchor],
+            mine ? [bubble.trailingAnchor constraintEqualToAnchor:row.trailingAnchor]
+                 : [bubble.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
+            mine ? [bubble.leadingAnchor constraintGreaterThanOrEqualToAnchor:row.leadingAnchor constant:48.0]
+                 : [bubble.trailingAnchor constraintLessThanOrEqualToAnchor:row.trailingAnchor constant:-48.0],
+            [text.topAnchor constraintEqualToAnchor:bubble.topAnchor constant:7.0],
+            [text.leadingAnchor constraintEqualToAnchor:bubble.leadingAnchor constant:10.0],
+            [text.trailingAnchor constraintEqualToAnchor:bubble.trailingAnchor constant:-10.0],
+            [time.topAnchor constraintEqualToAnchor:text.bottomAnchor constant:2.0],
+            [time.leadingAnchor constraintGreaterThanOrEqualToAnchor:bubble.leadingAnchor constant:10.0],
+            [time.trailingAnchor constraintEqualToAnchor:bubble.trailingAnchor constant:-10.0],
+            [time.bottomAnchor constraintEqualToAnchor:bubble.bottomAnchor constant:-5.0],
+        ]];
+        [list addArrangedSubview:row];
+    }
+    [stack addArrangedSubview:list];
+}
+
+- (void)answerApp:(NSString *)app ask:(KronosAppAsk)ask fallbackFind:(BOOL)fallbackFind replyBody:(UILabel *)replyBody replyExtra:(UIStackView *)replyExtra convMsgs:(NSMutableArray *)convMsgs {
+    replyBody.text = @"Checking your apps…";
+    [self macRequest:@"GET" path:@"/v1/device/phone_apps" body:nil timeout:(fallbackFind ? 6.0 : 30.0) completion:^(NSInteger status, NSDictionary *json) {
+        NSArray *apps = [json[@"apps"] isKindOfClass:[NSArray class]] ? json[@"apps"] : nil;
+        if (status != 200 || apps.count == 0) {
+            if (fallbackFind) {
+                [self answerFindRequest:app replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+                return;
+            }
+            [self answerAppWithoutMac:app ask:ask error:json[@"error"] replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+            return;
+        }
+        NSMutableArray<NSDictionary *> *hits = [NSMutableArray array];
+        for (NSDictionary *a in apps) {
+            if ([a isKindOfClass:[NSDictionary class]] && kronosAppNameMatches(a[@"name"] ?: @"", app)) [hits addObject:a];
+        }
+        NSMutableArray<NSString *> *names = [NSMutableArray array];
+        for (NSDictionary *a in hits) [names addObject:a[@"name"]];
+        NSString *joined = [names componentsJoinedByString:@", "];
+        NSString *reply;
+        if (ask == KronosAppAskCount) {
+            if (app.length == 0) reply = [NSString stringWithFormat:@"You have %lu apps on your iPhone, including Apple's built-in ones.", (unsigned long)apps.count];
+            else if (hits.count == 0) reply = [NSString stringWithFormat:@"None. I checked the %lu apps on your iPhone and none is named \"%@\".", (unsigned long)apps.count, app];
+            else reply = [NSString stringWithFormat:@"%lu %@ \"%@\": %@.", (unsigned long)hits.count, hits.count == 1 ? @"app matches" : @"apps match", app, joined];
+        } else if (hits.count == 0) {
+            if (fallbackFind) {
+                [self answerFindRequest:app replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+                return;
+            }
+            reply = [NSString stringWithFormat:@"No, I checked the %lu apps on your iPhone and none is named \"%@\".", (unsigned long)apps.count, app];
+        } else if (ask == KronosAppAskOpen && hits.count == 1) {
+            [self openPhoneApp:hits.firstObject replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+            return;
+        } else if (hits.count == 1) {
+            reply = [NSString stringWithFormat:@"Yes, %@ is installed on your iPhone.", joined];
+        } else {
+            reply = [NSString stringWithFormat:@"Yes, these match \"%@\": %@.", app, joined];
+        }
+        [self recordImmediateKronosReply:reply actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+        for (NSDictionary *a in hits) {
+            if (hits.count > 8) break;
+            [self addActionPillWithTitle:[NSString stringWithFormat:@"Open %@", a[@"name"]] symbol:@"arrow.up.forward.app" action:@selector(openPhoneAppTapped:) toStack:replyExtra];
+            UIView *pill = replyExtra.arrangedSubviews.lastObject;
+            pill.accessibilityIdentifier = a[@"bundle"];
+            pill.accessibilityLabel = a[@"name"];
+        }
+    }];
+}
+
+- (void)openPhoneApp:(NSDictionary *)app replyBody:(UILabel *)replyBody replyExtra:(UIStackView *)replyExtra convMsgs:(NSMutableArray *)convMsgs {
+    replyBody.text = [NSString stringWithFormat:@"Opening %@…", app[@"name"]];
+    [self macRequest:@"POST" path:@"/v1/device/phone_apps/open" body:@{@"bundle": app[@"bundle"] ?: @""} timeout:30.0 completion:^(NSInteger status, NSDictionary *json) {
+        NSString *reply = status == 200 ? [NSString stringWithFormat:@"Opened %@.", app[@"name"]]
+            : [NSString stringWithFormat:@"I couldn't open %@. %@", app[@"name"], json[@"error"] ?: @"Your Mac did not respond."];
+        [self recordImmediateKronosReply:reply actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+    }];
+}
+
+- (void)openPhoneAppTapped:(UIButton *)sender {
+    NSString *name = sender.accessibilityLabel ?: @"the app";
+    [self macRequest:@"POST" path:@"/v1/device/phone_apps/open" body:@{@"bundle": sender.accessibilityIdentifier ?: @""} timeout:30.0 completion:^(NSInteger status, NSDictionary *json) {
+        (void)json;
+        if (status != 200) kronosShowToast(self.view, [NSString stringWithFormat:@"Could not open %@", name]);
+    }];
+}
+
+/// Without the Mac, iOS only answers for the URL schemes this app declares.
+- (void)answerAppWithoutMac:(NSString *)app ask:(KronosAppAsk)ask error:(id)error replyBody:(UILabel *)replyBody replyExtra:(UIStackView *)replyExtra convMsgs:(NSMutableArray *)convMsgs {
+    NSDictionary *schemes = @{@"whatsapp": @"whatsapp", @"telegram": @"tg", @"slack": @"slack", @"youtube": @"youtube", @"instagram": @"instagram", @"twitter": @"twitter", @"github": @"github", @"linkedin": @"linkedin", @"gmail": @"googlegmail"};
+    NSString *scheme = schemes[[app lowercaseString]];
+    NSURL *url = scheme != nil ? [NSURL URLWithString:[scheme stringByAppendingString:@"://"]] : nil;
+    NSString *reply;
+    if (url != nil && ask != KronosAppAskCount) {
+        BOOL has = [[UIApplication sharedApplication] canOpenURL:url];
+        if (has && ask == KronosAppAskOpen) {
+            [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+            reply = [NSString stringWithFormat:@"Opened %@.", app];
+        } else {
+            reply = has ? [NSString stringWithFormat:@"Yes, %@ is installed on your iPhone.", app] : [NSString stringWithFormat:@"No, %@ is not installed on your iPhone.", app];
+        }
+    } else {
+        NSString *why = [error isKindOfClass:[NSString class]] ? [NSString stringWithFormat:@" Your Mac reported: %@.", error] : @"";
+        reply = [NSString stringWithFormat:@"I can't check your apps right now. iOS hides the app list from Kronos, so it asks your Mac, and that didn't work.%@ Check the bridge is running and your iPhone is on the same Wi-Fi, or connect the cable.", why];
+    }
+    [self recordImmediateKronosReply:reply actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+}
+
+- (void)macRequest:(NSString *)method path:(NSString *)path body:(NSDictionary *)body completion:(void (^)(NSInteger status, NSDictionary *json))completion {
+    [self macRequest:method path:path body:body timeout:8.0 completion:completion];
+}
+
+- (void)macRequest:(NSString *)method path:(NSString *)path body:(NSDictionary *)body timeout:(NSTimeInterval)timeout completion:(void (^)(NSInteger status, NSDictionary *json))completion {
+    KronosMobileSettings *settings = [KronosMobileSettings sharedSettings];
+    NSString *base = [settings.macServerURL stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/ "]];
+    NSURL *url = settings.macSyncEnabled ? [NSURL URLWithString:[base stringByAppendingString:path]] : nil;
+    if (url == nil) { completion(0, nil); return; }
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:timeout];
+    req.HTTPMethod = method;
+    kronosApplyMacAuth(req);
+    if (body != nil) {
+        [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+        req.HTTPBody = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    }
+    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSInteger status = (error == nil && [response isKindOfClass:[NSHTTPURLResponse class]]) ? [(NSHTTPURLResponse *)response statusCode] : 0;
+        id json = data.length > 0 ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(status, [json isKindOfClass:[NSDictionary class]] ? json : nil);
+        });
+    }] resume];
+}
+
+- (void)startMacTask:(NSString *)task replyBody:(UILabel *)replyBody replyExtra:(UIStackView *)replyExtra convMsgs:(NSMutableArray *)convMsgs {
+    replyBody.text = @"Sending the task to your Mac…";
+    [self macRequest:@"POST" path:@"/v1/device/tasks" body:@{@"prompt": task} completion:^(NSInteger status, NSDictionary *json) {
+        if (status != 200 || json[@"id"] == nil) {
+            NSString *why = [json[@"error"] isKindOfClass:[NSString class]] ? json[@"error"]
+                : [NSString stringWithFormat:@"Could not reach your Mac at %@. Check it is awake and on the same Wi-Fi.", [KronosMobileSettings sharedSettings].macServerURL];
+            [self recordImmediateKronosReply:why actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+            return;
+        }
+        [self followMacTask:json[@"id"] replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+    }];
+}
+
+- (void)followMacTask:(NSNumber *)taskId replyBody:(UILabel *)replyBody replyExtra:(UIStackView *)replyExtra convMsgs:(NSMutableArray *)convMsgs {
+    [self addActionPillWithTitle:@"Cancel task" symbol:@"xmark.circle" action:@selector(cancelMacTaskTapped:) toStack:replyExtra];
+    UIView *cancelPill = replyExtra.arrangedSubviews.lastObject;
+    cancelPill.accessibilityIdentifier = taskId.stringValue;
+    [self pollMacTask:taskId attempt:0 cancelPill:cancelPill replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+}
+
+- (void)pollMacTask:(NSNumber *)taskId attempt:(NSUInteger)attempt cancelPill:(UIView *)cancelPill replyBody:(UILabel *)replyBody replyExtra:(UIStackView *)replyExtra convMsgs:(NSMutableArray *)convMsgs {
+    NSString *path = [NSString stringWithFormat:@"/v1/device/tasks?id=%@", taskId];
+    [self macRequest:@"GET" path:path body:nil completion:^(NSInteger status, NSDictionary *json) {
+        NSArray *tasks = [json[@"tasks"] isKindOfClass:[NSArray class]] ? json[@"tasks"] : @[];
+        NSDictionary *t = [tasks.firstObject isKindOfClass:[NSDictionary class]] ? tasks.firstObject : nil;
+        NSString *state = t[@"state"] ?: @"";
+        NSString *final = nil;
+        if ([state isEqualToString:@"done"]) {
+            NSString *text = t[@"text"] ?: @"";
+            NSRange note = [text rangeOfString:@"\n[No tool calls"];
+            if (note.location != NSNotFound) text = [text substringToIndex:note.location];
+            NSArray *files = t[@"deliverables"];
+            final = [NSString stringWithFormat:@"Finished on your Mac.\n\n%@", text];
+            if (files.count > 0) final = [final stringByAppendingFormat:@"\n\nFiles: %@", [files componentsJoinedByString:@", "]];
+        } else if ([state isEqualToString:@"denied"]) {
+            final = @"The task did not run. It was denied on your Mac, or nobody approved it in time.";
+        } else if ([state isEqualToString:@"cancelled"]) {
+            final = @"Task cancelled.";
+        } else if ([state isEqualToString:@"failed"]) {
+            NSString *d = t[@"detail"];
+            final = [NSString stringWithFormat:@"The task failed on your Mac. %@", d ?: @""];
+        } else if (t == nil && status == 200) {
+            final = @"Your Mac no longer has this task. The bridge may have restarted.";
+        } else if (attempt >= 1200) {
+            final = @"The task is still running on your Mac. Ask \"what is my Mac doing\" to check on it.";
+        }
+        if (final != nil) {
+            [cancelPill removeFromSuperview];
+            [self recordImmediateKronosReply:final actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+            return;
+        }
+        if (t == nil) replyBody.text = @"Waiting to reconnect to your Mac…";
+        else if ([state isEqualToString:@"awaiting_approval"]) replyBody.text = @"Waiting for you to approve the task on your Mac.";
+        else {
+            NSString *d = t[@"detail"];
+            replyBody.text = [NSString stringWithFormat:@"Running on your Mac. %@", d ?: @""];
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self pollMacTask:taskId attempt:attempt + 1 cancelPill:cancelPill replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+        });
+    }];
+}
+
+- (void)cancelMacTaskTapped:(UIButton *)sender {
+    NSInteger taskId = sender.accessibilityIdentifier.integerValue;
+    [self macRequest:@"POST" path:@"/v1/device/tasks/cancel" body:@{@"id": @(taskId)} completion:^(NSInteger status, NSDictionary *json) {
+        (void)json;
+        kronosShowToast(self.view, status == 200 ? @"Cancelling" : @"Could not reach your Mac");
+    }];
+}
+
+- (void)answerMacTaskStatusWithReplyBody:(UILabel *)replyBody replyExtra:(UIStackView *)replyExtra convMsgs:(NSMutableArray *)convMsgs {
+    [self macRequest:@"GET" path:@"/v1/device/tasks" body:nil completion:^(NSInteger status, NSDictionary *json) {
+        NSArray *tasks = [json[@"tasks"] isKindOfClass:[NSArray class]] ? json[@"tasks"] : nil;
+        if (status != 200 || tasks == nil) {
+            [self recordImmediateKronosReply:@"Could not reach your Mac." actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+            return;
+        }
+        NSDictionary *t = tasks.firstObject;
+        if (t == nil) {
+            [self recordImmediateKronosReply:@"Your Mac has no tasks from this iPhone." actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+            return;
+        }
+        [self followMacTask:t[@"id"] replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+    }];
+}
+
 - (void)openSavedMediaTapped:(UIButton *)sender {
     NSString *path = sender.accessibilityIdentifier;
     if (![[NSFileManager defaultManager] fileExistsAtPath:path ?: @""]) return;
@@ -2486,6 +2891,38 @@ static const CGFloat kSidebarWidth = 296.0;
     NSString *trimmedLower = [[kronosNormalizeApostrophes(userText) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
     NSString *effectiveLower = [[kronosNormalizeApostrophes(effectiveQuery) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
 
+    // 0h. App questions: iOS hides the app list, so the paired Mac answers. Never the model.
+    BOOL afterAppTurn = self.lastTurnWasAppAsk;
+    self.lastTurnWasAppAsk = NO;
+    NSString *askedApp = nil;
+    KronosAppAsk appAsk = KronosAppAskHas;
+    if (turnAttachments.count == 0 && !awaitingWhatsAppDraftAnswer) {
+        BOOL isAppAsk = kronosParseHasAppIntent(effectiveQuery, &askedApp) || kronosParseAppAsk(effectiveQuery, afterAppTurn, &askedApp, &appAsk);
+        if (!isAppAsk && afterAppTurn && self.lastAskedApp.length > 0 &&
+            ([trimmedLower isEqualToString:@"open it"] || [trimmedLower isEqualToString:@"open that"] || [trimmedLower isEqualToString:@"open that app"] || [trimmedLower isEqualToString:@"open it please"])) {
+            askedApp = self.lastAskedApp;
+            appAsk = KronosAppAskOpen;
+            isAppAsk = YES;
+        }
+        if (isAppAsk && !kronosParseWhatsAppDraftIntent(userText, NULL, NULL, NULL, NULL, NULL)) {
+            self.lastTurnWasAppAsk = YES;
+            self.lastAskedApp = askedApp;
+            [self answerApp:askedApp ask:appAsk fallbackFind:NO replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+            return;
+        }
+    }
+
+    // 0m. "On my Mac, ...": run an agent task on the Mac after approval there.
+    NSString *macTask = nil;
+    if (turnAttachments.count == 0 && !awaitingWhatsAppDraftAnswer && kronosIsMacTaskStatusQuery(effectiveQuery)) {
+        [self answerMacTaskStatusWithReplyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+        return;
+    }
+    if (turnAttachments.count == 0 && !awaitingWhatsAppDraftAnswer && kronosParseMacTaskIntent(effectiveQuery, &macTask)) {
+        [self startMacTask:macTask replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+        return;
+    }
+
     // 0a. "Last screenshot I took": read Photos directly. No model call.
     NSInteger mediaKind = 0;
     BOOL mediaCount = NO;
@@ -2499,6 +2936,11 @@ static const CGFloat kSidebarWidth = 296.0;
     NSString *findTerm = nil;
     if (turnAttachments.count == 0 && !awaitingWhatsAppDraftAnswer && kronosParseFindFileIntent(effectiveQuery, &findTerm)
         && !kronosParseWhatsAppDraftIntent(userText, NULL, NULL, NULL, NULL, NULL) && !kronosParseLinkedInPostIntent(userText, NULL, NULL)) {
+        if ([trimmedLower hasPrefix:@"open "] || [trimmedLower hasPrefix:@"launch "]) {
+            self.pendingFindTerm = findTerm;
+            [self answerApp:findTerm ask:KronosAppAskOpen fallbackFind:YES replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+            return;
+        }
         [self answerFindRequest:findTerm replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
         return;
     }
@@ -2672,6 +3114,26 @@ static const CGFloat kSidebarWidth = 296.0;
                                     convMsgs:convMsgs];
             return;
         }
+        // Mac model resolves the pronouns; rules are the fallback.
+        NSString *waLow = [[effectiveQuery stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
+        if (!waIsTopic && kronosIsTellPersonThat(waLow)) {
+            replyBody.text = @"Writing the message…";
+            NSString *prompt = [NSString stringWithFormat:@"The user is talking to their assistant, Kronos, and said: \"%@\"\n\nWrite the WhatsApp message the user would send to %@, in the user's voice. \"I\" means the user. \"you\" in the request means Kronos, so write \"Kronos\". \"she\", \"he\" or \"her\" for %@ become \"you\" or \"your\". \"the message above\" means the user's last message to %@. Keep the user's tone and every point. Output only the message.", effectiveQuery, waRecipient, waRecipient, waRecipient];
+            NSString *fallback = waExplicitMsg;
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                NSString *rewritten = kronosTryGenerateChatViaLocalMac14B(@[@{@"role": @"user", @"content": prompt}], 200, 0.0f);
+                rewritten = [kronosStripThinkBlocks(rewritten ?: @"") stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self completeWhatsAppDraftForRecipient:waRecipient
+                                                rawUserSpec:(rewritten.length > 0 ? rewritten : fallback)
+                                              isInstruction:NO
+                                                  replyBody:replyBody
+                                                 replyExtra:replyExtra
+                                                   convMsgs:convMsgs];
+                });
+            });
+            return;
+        }
         [self completeWhatsAppDraftForRecipient:waRecipient
                                     rawUserSpec:waExplicitMsg
                                   isInstruction:waIsTopic
@@ -2726,6 +3188,9 @@ static const CGFloat kSidebarWidth = 296.0;
                                                replyBody:replyBody
                                               replyExtra:replyExtra
                                                 convMsgs:convMsgs];
+                        return;
+                    }
+                    if ([self answerThreadQuestion:effectiveQuery fromContext:verifiedContextOrDirectReply replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs]) {
                         return;
                     }
                     NSString *grounded = [NSString stringWithFormat:
