@@ -253,7 +253,8 @@ static NSString *const kKronosMobileSystemPrompt =
      "His public links and contact: GitHub https://github.com/melodyLeonard, LinkedIn https://www.linkedin.com/in/melody-leonard-a362b6192, Email melodyleonard7@gmail.com, X @Melody_Leonard7. "
      "His stack: Rust, TypeScript, JavaScript, Elixir, Solidity, C, Node.js, NestJS, Apache Kafka, GraphQL, gRPC, PostgreSQL, MongoDB, Neo4j, Redis, React.js, Next.js, React Native, AWS, Docker, Kubernetes. "
      "When describing an attached photograph of a physical object or scene, identify the physical objects and setting naturally and concisely without calling it a text detection or OCR task. "
-     "Because Kronos runs locally on the user's own iPhone with full user ownership, answer strictly from verified context and never fabricate placeholder numbers or messages.";
+     "Answer strictly from verified context and never fabricate placeholder numbers or messages. "
+     "When an iPhone Device Context block is present, trust its access lines and never claim to lack access it lists.";
 
 static inline NSString *kronosDocumentsDirectory(void) {
     NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
@@ -399,12 +400,24 @@ static inline NSSet<NSString *> *kronosRelationshipAliasesForTarget(NSString *lo
 + (instancetype)sharedManager;
 - (void)refreshDeviceContextInteractive:(BOOL)promptPermissions completion:(void (^)(void))completion;
 - (NSString *)indexSummaryText;
+/// Documents found under the folders the user granted (iCloud Drive, On My iPhone), indexed by name.
+@property (nonatomic, strong) NSArray<NSDictionary *> *documentIndex;
+@property (nonatomic, assign) NSUInteger documentsCount;
+- (NSUInteger)indexedFolderCount;
+- (NSArray<NSString *> *)indexedFolderNames;
+- (BOOL)addIndexedFolderURL:(NSURL *)url;
+- (void)reindexDocuments;
+- (NSArray<NSDictionary *> *)searchDocuments:(NSString *)term limit:(NSUInteger)limit;
+/// Copies the document into `destDir` (downloading an iCloud placeholder first) and returns the local path.
+- (NSString *)materializeDocument:(NSDictionary *)doc intoDirectory:(NSString *)destDir;
 - (NSString *)macSyncStatusText;
 - (NSString *)buildDeviceContextPromptBlockIfRelevant:(NSString *)query;
 - (NSString *)resolveContactPhoneDigitsForName:(NSString *)targetName outMatchedName:(NSString **)outName;
 - (void)lookupContactsForTarget:(NSString *)rawTarget
                      completion:(void (^)(BOOL found, NSString *directReply, NSString *primaryCallDigits))completion;
 - (void)fetchLatestPhotoForPostWithCompletion:(void (^)(UIImage *image, NSDate *takenDate, BOOL takenToday, NSString *errorNote))completion;
+/// kind: 0 photo (no screenshots), 1 screenshot, 2 video. Runs off the main queue; completes on main.
+- (void)fetchLatestMediaOfKind:(NSInteger)kind completion:(void (^)(UIImage *image, NSDate *date, NSUInteger total, BOOL limited, NSString *errorNote))completion;
 @end
 
 @implementation KronosIosDeviceContextManager
@@ -427,8 +440,168 @@ static inline NSSet<NSString *> *kronosRelationshipAliasesForTarget(NSString *lo
         _calendarEventsCount = (NSUInteger)[ud integerForKey:@"kronos_idx_cal"];
         _workspaceFilesCount = (NSUInteger)[ud integerForKey:@"kronos_idx_ws"];
         _lastIndexedAt = [ud doubleForKey:@"kronos_idx_ts"];
+        _documentIndex = [ud arrayForKey:@"kronos_idx_docs"] ?: @[];
+        _documentsCount = _documentIndex.count;
     }
     return self;
+}
+
+- (NSArray<NSData *> *)folderBookmarks {
+    return [[NSUserDefaults standardUserDefaults] arrayForKey:@"kronos_idx_folders"] ?: @[];
+}
+
+- (NSUInteger)indexedFolderCount {
+    return [self folderBookmarks].count;
+}
+
+- (NSArray<NSString *> *)indexedFolderNames {
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (NSData *bm in [self folderBookmarks]) {
+        BOOL stale = NO;
+        NSURL *u = [NSURL URLByResolvingBookmarkData:bm options:NSURLBookmarkResolutionWithoutUI relativeToURL:nil bookmarkDataIsStale:&stale error:nil];
+        if (u != nil) [names addObject:u.lastPathComponent];
+    }
+    return names;
+}
+
+- (BOOL)addIndexedFolderURL:(NSURL *)url {
+    // The picker opens in the app's own folder; granting that finds nothing.
+    if ([url.path containsString:NSHomeDirectory().lastPathComponent]) return NO;
+    BOOL sec = [url startAccessingSecurityScopedResource];
+    NSError *err = nil;
+    NSData *bm = [url bookmarkDataWithOptions:0 includingResourceValuesForKeys:nil relativeToURL:nil error:&err];
+    if (sec) [url stopAccessingSecurityScopedResource];
+    if (bm == nil) return NO;
+    NSMutableArray<NSData *> *all = [[self folderBookmarks] mutableCopy];
+    for (NSData *existing in all) {
+        BOOL stale = NO;
+        NSURL *u = [NSURL URLByResolvingBookmarkData:existing options:NSURLBookmarkResolutionWithoutUI relativeToURL:nil bookmarkDataIsStale:&stale error:nil];
+        if (u != nil && [u.path isEqualToString:url.path]) return YES;
+    }
+    [all addObject:bm];
+    [[NSUserDefaults standardUserDefaults] setObject:all forKey:@"kronos_idx_folders"];
+    return YES;
+}
+
+/// Walks every granted folder (6 levels, 20k entries) and records files, including iCloud
+/// placeholders (`.name.ext.icloud`) that are not downloaded yet.
+- (void)reindexDocuments {
+    NSMutableArray<NSDictionary *> *docs = [NSMutableArray array];
+    NSArray<NSData *> *bms = [self folderBookmarks];
+    for (NSUInteger fi = 0; fi < bms.count; fi++) {
+        BOOL stale = NO;
+        NSURL *root = [NSURL URLByResolvingBookmarkData:bms[fi] options:NSURLBookmarkResolutionWithoutUI relativeToURL:nil bookmarkDataIsStale:&stale error:nil];
+        if (root == nil) continue;
+        BOOL sec = [root startAccessingSecurityScopedResource];
+        NSDirectoryEnumerator<NSURL *> *en = [[NSFileManager defaultManager]
+            enumeratorAtURL:root
+            includingPropertiesForKeys:@[NSURLIsDirectoryKey, NSURLIsPackageKey, NSURLContentModificationDateKey, NSURLFileSizeKey]
+            options:NSDirectoryEnumerationSkipsPackageDescendants
+            errorHandler:^BOOL(NSURL *u, NSError *e) { (void)u; (void)e; return YES; }];
+        NSUInteger rootDepth = root.pathComponents.count;
+        for (NSURL *u in en) {
+            if (docs.count >= 20000) break;
+            if (u.pathComponents.count - rootDepth > 6) { [en skipDescendants]; continue; }
+            NSString *name = u.lastPathComponent;
+            if ([name isEqualToString:@".Trash"] || [name hasPrefix:@".Trash"]) { [en skipDescendants]; continue; }
+            NSNumber *isDir = nil;
+            [u getResourceValue:&isDir forKey:NSURLIsDirectoryKey error:nil];
+            if (isDir.boolValue) continue;
+            BOOL placeholder = [name hasPrefix:@"."] && [name hasSuffix:@".icloud"];
+            NSString *shown = name;
+            if (placeholder) {
+                shown = [[name substringFromIndex:1] stringByDeletingPathExtension];
+            } else if ([name hasPrefix:@"."]) {
+                continue;
+            }
+            NSDate *mod = nil;
+            [u getResourceValue:&mod forKey:NSURLContentModificationDateKey error:nil];
+            NSNumber *size = nil;
+            [u getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
+            NSString *rel = [[u.pathComponents subarrayWithRange:NSMakeRange(rootDepth, u.pathComponents.count - rootDepth)] componentsJoinedByString:@"/"];
+            [docs addObject:@{
+                @"name": shown,
+                @"rel": rel,
+                @"folder": @(fi),
+                @"root": root.lastPathComponent ?: @"",
+                @"placeholder": @(placeholder),
+                @"size": size ?: @0,
+                @"modified": @(mod ? mod.timeIntervalSince1970 : 0),
+            }];
+        }
+        if (sec) [root stopAccessingSecurityScopedResource];
+    }
+    self.documentIndex = docs;
+    self.documentsCount = docs.count;
+    [[NSUserDefaults standardUserDefaults] setObject:docs forKey:@"kronos_idx_docs"];
+}
+
+/// Name search: every query word of 3+ letters as a substring, shorter words whole; ranked by
+/// how much of the name the query covers, newest first on ties.
+- (NSArray<NSDictionary *> *)searchDocuments:(NSString *)term limit:(NSUInteger)limit {
+    NSMutableArray<NSDictionary *> *hits = [NSMutableArray array];
+    NSCharacterSet *sep = [[NSCharacterSet alphanumericCharacterSet] invertedSet];
+    NSMutableArray<NSString *> *words = [NSMutableArray array];
+    for (NSString *w in [[term lowercaseString] componentsSeparatedByCharactersInSet:sep]) {
+        if (w.length > 0) [words addObject:w];
+    }
+    if (words.count == 0) return @[];
+    NSSet<NSString *> *weak = [NSSet setWithArray:@[@"result", @"results", @"file", @"files", @"document", @"documents", @"doc", @"copy", @"pdf", @"of", @"for", @"and", @"my", @"the"]];
+    for (NSDictionary *d in self.documentIndex) {
+        NSString *name = [d[@"name"] lowercaseString];
+        NSSet<NSString *> *nameWords = [NSSet setWithArray:[name componentsSeparatedByCharactersInSet:sep]];
+        NSUInteger strong = 0, matched = 0, required = 0;
+        for (NSString *w in words) {
+            BOOL isWeak = [weak containsObject:w];
+            BOOL ok = (w.length >= 3) ? ([name rangeOfString:w].location != NSNotFound) : [nameWords containsObject:w];
+            if (!isWeak) { required++; if (ok) strong++; }
+            if (ok) matched++;
+        }
+        BOOL pass = required > 0 ? (strong == required) : (matched == words.count);
+        if (!pass) continue;
+        NSMutableDictionary *h = [d mutableCopy];
+        h[@"score"] = @((double)matched / (double)MAX(1u, (unsigned)nameWords.count) + (double)matched);
+        [hits addObject:h];
+    }
+    [hits sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSComparisonResult r = [b[@"score"] compare:a[@"score"]];
+        if (r != NSOrderedSame) return r;
+        return [b[@"modified"] compare:a[@"modified"]];
+    }];
+    if (hits.count > limit) return [hits subarrayWithRange:NSMakeRange(0, limit)];
+    return hits;
+}
+
+- (NSString *)materializeDocument:(NSDictionary *)doc intoDirectory:(NSString *)destDir {
+    NSArray<NSData *> *bms = [self folderBookmarks];
+    NSUInteger fi = [doc[@"folder"] unsignedIntegerValue];
+    if (fi >= bms.count) return nil;
+    BOOL stale = NO;
+    NSURL *root = [NSURL URLByResolvingBookmarkData:bms[fi] options:NSURLBookmarkResolutionWithoutUI relativeToURL:nil bookmarkDataIsStale:&stale error:nil];
+    if (root == nil) return nil;
+    BOOL sec = [root startAccessingSecurityScopedResource];
+    NSString *rel = doc[@"rel"];
+    NSURL *src = [root URLByAppendingPathComponent:rel];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([doc[@"placeholder"] boolValue]) {
+        // `.name.ext.icloud` -> `name.ext`; ask iCloud for the bytes and wait up to 25 s.
+        NSURL *real = [[src URLByDeletingLastPathComponent] URLByAppendingPathComponent:doc[@"name"]];
+        [fm startDownloadingUbiquitousItemAtURL:real error:nil];
+        for (int i = 0; i < 50 && ![fm fileExistsAtPath:real.path]; i++) {
+            [NSThread sleepForTimeInterval:0.5];
+        }
+        src = real;
+    }
+    NSString *dest = nil;
+    if ([fm fileExistsAtPath:src.path]) {
+        [fm createDirectoryAtPath:destDir withIntermediateDirectories:YES attributes:nil error:nil];
+        dest = [destDir stringByAppendingPathComponent:doc[@"name"]];
+        [fm removeItemAtPath:dest error:nil];
+        NSError *err = nil;
+        if (![fm copyItemAtURL:src toURL:[NSURL fileURLWithPath:dest] error:&err]) dest = nil;
+    }
+    if (sec) [root stopAccessingSecurityScopedResource];
+    return dest;
 }
 
 - (void)persistCounts {
@@ -448,11 +621,11 @@ static inline NSSet<NSString *> *kronosRelationshipAliasesForTarget(NSString *lo
     if (self.isRefreshing) {
         return @"Indexing on-device context...";
     }
-    return [NSString stringWithFormat:@"%lu contacts · %lu photos (%lu today) · %lu files",
+    return [NSString stringWithFormat:@"%lu contacts · %lu photos (%lu today) · %lu documents",
             (unsigned long)self.contactsCount,
             (unsigned long)self.photosCount,
             (unsigned long)self.todayPhotosCount,
-            (unsigned long)self.workspaceFilesCount];
+            (unsigned long)(self.workspaceFilesCount + self.documentsCount)];
 }
 
 - (NSString *)macSyncStatusText {
@@ -476,6 +649,7 @@ static inline NSSet<NSString *> *kronosRelationshipAliasesForTarget(NSString *lo
         for (NSString *f in wsRaw) {
             if (![f hasPrefix:@"."]) wsCnt++;
         }
+        [self reindexDocuments];
 
         NSUInteger cCount = 0;
         CNAuthorizationStatus cnAuth = [CNContactStore authorizationStatusForEntityType:CNEntityTypeContacts];
@@ -588,11 +762,19 @@ static inline NSSet<NSString *> *kronosRelationshipAliasesForTarget(NSString *lo
 - (NSString *)buildDeviceContextPromptBlockIfRelevant:(NSString *)query {
     if (![KronosMobileSettings sharedSettings].developDeviceContext) return nil;
     NSString *low = [query ?: @"" lowercaseString];
+    NSArray<NSDictionary *> *docHits = [self searchDocuments:query limit:5];
     BOOL asksDevice = [low containsString:@"my phone"] || [low containsString:@"my iphone"] ||
                       [low containsString:@"my device"] || [low containsString:@"workspace"] ||
                       [low containsString:@"my photos"] || [low containsString:@"my contacts"] ||
-                      [low containsString:@"calendar"] || [low containsString:@"schedule today"];
+                      [low containsString:@"photo"] || [low containsString:@"picture"] || [low containsString:@"screenshot"] ||
+                      [low containsString:@"access"] || [low containsString:@"permission"] ||
+                      [low containsString:@"calendar"] || [low containsString:@"schedule today"] ||
+                      [low containsString:@"file"] || [low containsString:@"document"] || docHits.count > 0;
     if (!asksDevice) return nil;
+    NSMutableString *docLines = [NSMutableString string];
+    for (NSDictionary *d in docHits) {
+        [docLines appendFormat:@"\n- Document on this iPhone: %@ (in %@)", d[@"name"], d[@"root"]];
+    }
 
     UIDevice *dev = [UIDevice currentDevice];
     NSArray<NSString *> *wsFiles = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:kronosWorkspaceDirectory() error:nil] ?: @[];
@@ -600,17 +782,34 @@ static inline NSSet<NSString *> *kronosRelationshipAliasesForTarget(NSString *lo
     for (NSString *f in wsFiles) {
         if (![f hasPrefix:@"."]) [cleanFiles addObject:f];
     }
+    PHAuthorizationStatus phAuth = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite];
+    NSMutableString *photoLine = [NSMutableString string];
+    if (phAuth == PHAuthorizationStatusAuthorized || phAuth == PHAuthorizationStatusLimited) {
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.dateStyle = NSDateFormatterLongStyle;
+        df.timeStyle = NSDateFormatterShortStyle;
+        NSDate *shot = kronosFetchMedia(1).firstObject.creationDate;
+        NSDate *photo = kronosFetchMedia(0).firstObject.creationDate;
+        [photoLine appendFormat:@"- Photo Library access: %@. Kronos can read it.\n", phAuth == PHAuthorizationStatusLimited ? @"granted for selected photos" : @"granted"];
+        if (shot != nil) [photoLine appendFormat:@"- Latest screenshot taken: %@\n", [df stringFromDate:shot]];
+        if (photo != nil) [photoLine appendFormat:@"- Latest photo taken: %@\n", [df stringFromDate:photo]];
+    } else {
+        [photoLine appendString:@"- Photo Library access: not granted.\n"];
+    }
     return [NSString stringWithFormat:
-            @"[iPhone Device Context — Local User-Owned Device]\n"
+            @"[iPhone Device Context]\n"
              "- Device: %@ (%@ %@)\n"
-             "- Indexed on iPhone: %lu contacts, %lu photos (%lu taken today), %lu workspace files (%@)\n"
+             "%@"
+             "- Indexed on iPhone: %lu contacts, %lu photos (%lu taken today), %lu documents in granted folders, %lu workspace files (%@)%@\n"
              "- Mac Companion Sync: %@\n",
-            dev.name, dev.systemName, dev.systemVersion,
+            dev.name, dev.systemName, dev.systemVersion, photoLine,
             (unsigned long)self.contactsCount,
             (unsigned long)self.photosCount,
             (unsigned long)self.todayPhotosCount,
+            (unsigned long)self.documentsCount,
             (unsigned long)cleanFiles.count,
             cleanFiles.count > 0 ? [cleanFiles componentsJoinedByString:@", "] : @"none",
+            docLines,
             [self macSyncStatusText]];
 }
 
@@ -912,6 +1111,56 @@ static inline NSSet<NSString *> *kronosRelationshipAliasesForTarget(NSString *lo
     });
 }
 
+static inline PHFetchResult<PHAsset *> *kronosFetchMedia(NSInteger kind) {
+    PHFetchOptions *opts = [[PHFetchOptions alloc] init];
+    opts.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"creationDate" ascending:NO]];
+    if (kind == 2) return [PHAsset fetchAssetsWithMediaType:PHAssetMediaTypeVideo options:opts];
+    opts.predicate = [NSPredicate predicateWithFormat:(kind == 1 ? @"(mediaSubtypes & %lu) != 0" : @"(mediaSubtypes & %lu) == 0"),
+                      (unsigned long)PHAssetMediaSubtypePhotoScreenshot];
+    return [PHAsset fetchAssetsWithMediaType:PHAssetMediaTypeImage options:opts];
+}
+
+- (void)fetchLatestMediaOfKind:(NSInteger)kind completion:(void (^)(UIImage *image, NSDate *date, NSUInteger total, BOOL limited, NSString *errorNote))completion {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        PHAuthorizationStatus auth = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite];
+        if (auth == PHAuthorizationStatusNotDetermined) {
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelReadWrite handler:^(PHAuthorizationStatus status) {
+                (void)status;
+                dispatch_semaphore_signal(sem);
+            }];
+            dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC)));
+            auth = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite];
+        }
+        if (auth != PHAuthorizationStatusAuthorized && auth != PHAuthorizationStatusLimited) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(nil, nil, 0, NO, @"Photo Library access is off for Kronos. Turn it on in iPhone Settings, then ask again.");
+            });
+            return;
+        }
+        BOOL limited = (auth == PHAuthorizationStatusLimited);
+        PHFetchResult<PHAsset *> *assets = kronosFetchMedia(kind);
+        PHAsset *latest = assets.firstObject;
+        NSUInteger total = assets.count;
+        __block UIImage *image = nil;
+        if (latest != nil) {
+            PHImageRequestOptions *o = [[PHImageRequestOptions alloc] init];
+            o.synchronous = YES;
+            o.deliveryMode = PHImageRequestOptionsDeliveryModeHighQualityFormat;
+            o.resizeMode = PHImageRequestOptionsResizeModeFast;
+            o.networkAccessAllowed = YES;
+            [[PHImageManager defaultManager] requestImageForAsset:latest targetSize:CGSizeMake(1440.0, 1440.0)
+                                                      contentMode:PHImageContentModeAspectFit options:o
+                                                    resultHandler:^(UIImage *result, NSDictionary *info) {
+                (void)info;
+                if (result != nil) image = result;
+            }];
+        }
+        NSDate *date = latest.creationDate;
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(image, date, total, limited, nil); });
+    });
+}
+
 - (void)fetchLatestPhotoForPostWithCompletion:(void (^)(UIImage *image, NSDate *takenDate, BOOL takenToday, NSString *errorNote))completion {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         PHAuthorizationStatus auth = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite];
@@ -1087,6 +1336,7 @@ static inline BOOL kronosParseFindFileIntent(NSString *query, NSString **outTerm
     }
     term = [term stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (term.length < 2 || [term componentsSeparatedByString:@" "].count > 6) return NO;
+    if ([@[@"my", @"the", @"it", @"this", @"that"] containsObject:term]) return NO;
     // Keep the user's spelling ("ND result") when the lowercase mapping preserved offsets.
     NSString *orig = [query stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     NSString *origLow = [[orig stringByReplacingOccurrencesOfString:@"?" withString:@""] stringByReplacingOccurrencesOfString:@"." withString:@""];
@@ -1098,6 +1348,30 @@ static inline BOOL kronosParseFindFileIntent(NSString *query, NSString **outTerm
         if ([term hasPrefix:app]) return NO;
     }
     if (outTerm != NULL) *outTerm = term;
+    return YES;
+}
+
+/// "last screenshot I took", "when was my latest photo", "how many videos do I have".
+/// kind: 0 photo, 1 screenshot, 2 video.
+static inline BOOL kronosParseLatestMediaIntent(NSString *query, NSInteger *outKind, BOOL *outCount) {
+    NSString *low = [[query ?: @"" lowercaseString] stringByReplacingOccurrencesOfString:@"screen shot" withString:@"screenshot"];
+    NSCharacterSet *sep = [[NSCharacterSet alphanumericCharacterSet] invertedSet];
+    NSMutableArray<NSString *> *words = [[low componentsSeparatedByCharactersInSet:sep] mutableCopy];
+    [words removeObject:@""];
+    if (words.count == 0 || words.count > 16) return NO;
+    NSSet<NSString *> *set = [NSSet setWithArray:words];
+    NSInteger kind = -1;
+    if ([set containsObject:@"screenshot"] || [set containsObject:@"screenshots"]) kind = 1;
+    else if ([set containsObject:@"video"] || [set containsObject:@"videos"]) kind = 2;
+    else if ([set intersectsSet:[NSSet setWithArray:@[@"photo", @"photos", @"picture", @"pictures", @"pic", @"pics", @"image", @"images", @"selfie"]]]) kind = 0;
+    if (kind < 0) return NO;
+    BOOL personal = [set intersectsSet:[NSSet setWithArray:@[@"my", @"i", @"me"]]] || [words.firstObject isEqualToString:@"show"] || [words.firstObject isEqualToString:@"open"];
+    if (!personal) return NO;
+    BOOL count = [low containsString:@"how many"];
+    BOOL recent = [set intersectsSet:[NSSet setWithArray:@[@"last", @"latest", @"newest", @"recent"]]];
+    if (!count && !recent) return NO;
+    if (outKind != NULL) *outKind = kind;
+    if (outCount != NULL) *outCount = count;
     return YES;
 }
 

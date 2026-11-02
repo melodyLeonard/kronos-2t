@@ -34,7 +34,25 @@
     self.navigationItem.leftBarButtonItem = shareItem;
 
     BOOL isHtml = [[fname lowercaseString] hasSuffix:@".html"] || [[fname lowercaseString] hasSuffix:@".htm"];
+    NSSet *richExts = [NSSet setWithArray:@[@"pdf", @"png", @"jpg", @"jpeg", @"heic", @"gif", @"webp", @"tiff", @"bmp",
+                                            @"doc", @"docx", @"xls", @"xlsx", @"ppt", @"pptx", @"rtf", @"pages", @"numbers", @"key"]];
+    BOOL isRich = [richExts containsObject:[[fname pathExtension] lowercaseString]];
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
+
+    if (isRich) {
+        self.webView = [[WKWebView alloc] initWithFrame:CGRectZero];
+        self.webView.translatesAutoresizingMaskIntoConstraints = NO;
+        [self.view addSubview:self.webView];
+        NSURL *fileURL = [NSURL fileURLWithPath:self.filePath];
+        [self.webView loadFileURL:fileURL allowingReadAccessToURL:[fileURL URLByDeletingLastPathComponent]];
+        [NSLayoutConstraint activateConstraints:@[
+            [self.webView.topAnchor constraintEqualToAnchor:safe.topAnchor],
+            [self.webView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+            [self.webView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+            [self.webView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        ]];
+        return;
+    }
 
     if (isHtml) {
         self.modeControl = [[UISegmentedControl alloc] initWithItems:@[@"Preview", @"Source"]];
@@ -197,7 +215,7 @@
 - (void)settingsViewControllerDidUpdateSettings;
 @end
 
-@interface KronosSettingsViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
+@interface KronosSettingsViewController : UIViewController <UITableViewDataSource, UITableViewDelegate, UIDocumentPickerDelegate>
 @property (nonatomic, weak) id<KronosSettingsViewControllerDelegate> delegate;
 @property (nonatomic, strong) UITableView *tableView;
 @end
@@ -242,7 +260,7 @@
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     (void)tableView;
-    if (section == 0) return 2; // Develop Device Context + On-Device Index refresh
+    if (section == 0) return 3; // Develop Device Context + refresh + indexed folders
     if (section == 1) return 1; // Allow Phone Use
     if (section == 2) return 3; // Sync with Local Mac + Use Mac 14B Engine + Mac Server Address
     return 2;                   // Spoken Voice Replies + Auto-Send Voice After Pause
@@ -280,7 +298,7 @@
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    NSString *cellId = (indexPath.section == 0 && indexPath.row == 1) || (indexPath.section == 2 && indexPath.row == 2)
+    NSString *cellId = (indexPath.section == 0 && indexPath.row >= 1) || (indexPath.section == 2 && indexPath.row == 2)
         ? @"SettingsDetailCell"
         : @"SettingsSwitchCell";
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cellId];
@@ -302,9 +320,18 @@
 
     if (indexPath.section == 0 && indexPath.row == 0) {
         cell.textLabel.text = @"Develop Device Context";
-        cell.detailTextLabel.text = @"Local Contacts, Photos, Calendar, and Files";
+        cell.detailTextLabel.text = @"Contacts, Photos, Calendar, and granted folders";
         cell.imageView.image = [UIImage systemImageNamed:@"sparkles.rectangle.stack"];
         cell.accessoryView = [self makeSwitchWithTag:100 isOn:s.developDeviceContext];
+    } else if (indexPath.section == 0 && indexPath.row == 2) {
+        NSArray<NSString *> *names = [mgr indexedFolderNames];
+        cell.textLabel.text = @"Indexed Folders";
+        cell.detailTextLabel.text = names.count > 0
+            ? [NSString stringWithFormat:@"%@ · %lu documents", [names componentsJoinedByString:@", "], (unsigned long)mgr.documentsCount]
+            : @"Add iCloud Drive or a folder so Kronos can find and open your documents";
+        cell.imageView.image = [UIImage systemImageNamed:@"folder.badge.plus"];
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     } else if (indexPath.section == 0 && indexPath.row == 1) {
         cell.textLabel.text = @"Refresh Device Context";
         cell.detailTextLabel.text = [mgr indexSummaryText];
@@ -391,8 +418,29 @@
     [self.delegate settingsViewControllerDidUpdateSettings];
 }
 
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    (void)controller;
+    KronosIosDeviceContextManager *mgr = [KronosIosDeviceContextManager sharedManager];
+    BOOL added = NO;
+    for (NSURL *u in urls) added = [mgr addIndexedFolderURL:u] || added;
+    if (!added) kronosShowToast(self.view, @"Choose iCloud Drive, not Kronos's folder");
+    [self.tableView reloadData];
+    __weak typeof(self) weakSelf = self;
+    [mgr refreshDeviceContextInteractive:NO completion:^{
+        [weakSelf.tableView reloadData];
+        [weakSelf.delegate settingsViewControllerDidUpdateSettings];
+    }];
+}
+
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (indexPath.section == 0 && indexPath.row == 2) {
+        UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeFolder]];
+        picker.allowsMultipleSelection = YES;
+        picker.delegate = self;
+        [self presentViewController:picker animated:YES completion:nil];
+        return;
+    }
     if (indexPath.section == 0 && indexPath.row == 1) {
         if (![KronosMobileSettings sharedSettings].developDeviceContext) {
             [KronosMobileSettings sharedSettings].developDeviceContext = YES;

@@ -69,6 +69,10 @@ static inline NSString *kronosCleanDraftOutput(NSString *raw) {
 @property (nonatomic, strong) UIView *welcomeView;
 
 @property (nonatomic, strong) UIView *composerContainer;
+/// Document hits offered as pills, by pill identifier; the term to retry after a folder grant.
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary *> *docPillTargets;
+@property (nonatomic, copy) NSString *pendingFindTerm;
+@property (nonatomic, assign) BOOL pickingFolderForIndex;
 /// Recording strip above the composer: discard, timer, live waveform, stop.
 @property (nonatomic, strong) UIView *voiceBar;
 @property (nonatomic, strong) NSLayoutConstraint *voiceBarHeight;
@@ -1259,6 +1263,31 @@ static const CGFloat kSidebarWidth = 296.0;
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     (void)controller;
+    if (self.pickingFolderForIndex) {
+        self.pickingFolderForIndex = NO;
+        KronosIosDeviceContextManager *mgr = [KronosIosDeviceContextManager sharedManager];
+        BOOL added = NO;
+        for (NSURL *u in urls) added = [mgr addIndexedFolderURL:u] || added;
+        if (!added) kronosShowToast(self.view, @"Choose iCloud Drive, not Kronos's folder");
+        NSString *term = self.pendingFindTerm;
+        self.pendingFindTerm = nil;
+        self.headerSubtitleLabel.text = @"Indexing documents…";
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            [mgr reindexDocuments];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.headerSubtitleLabel.text = @"";
+                [[KronosIosDeviceContextManager sharedManager] refreshDeviceContextInteractive:NO completion:nil];
+                if (term.length > 0) {
+                    UILabel *replyBody = nil;
+                    UIStackView *replyExtra = nil;
+                    [self appendKronosBubbleOutBody:&replyBody outExtraStack:&replyExtra];
+                    [self answerFindRequest:term replyBody:replyBody replyExtra:replyExtra convMsgs:self.activeConversation[@"messages"]];
+                    [self scrollToBottomAnimated:YES];
+                }
+            });
+        });
+        return;
+    }
     for (NSURL *url in urls) {
         BOOL sec = [url startAccessingSecurityScopedResource];
         NSData *data = [NSData dataWithContentsOfURL:url];
@@ -1734,6 +1763,178 @@ static const CGFloat kSidebarWidth = 296.0;
         [pill addTarget:self action:@selector(previewPillTapped:) forControlEvents:UIControlEventTouchUpInside];
     }
     [stack addArrangedSubview:pill];
+}
+
+/// Searches the workspace, this conversation's attachments and the granted-folder document index;
+/// opens the single best hit, lists several, or offers a folder grant / the pickers.
+- (void)answerFindRequest:(NSString *)findTerm replyBody:(UILabel *)replyBody replyExtra:(UIStackView *)replyExtra convMsgs:(NSMutableArray *)convMsgs {
+    KronosIosDeviceContextManager *mgr = [KronosIosDeviceContextManager sharedManager];
+    NSArray<NSString *> *wsHits = [self searchReadableFilesForTerm:findTerm];
+    NSArray<NSDictionary *> *docHits = [mgr searchDocuments:findTerm limit:6];
+    NSUInteger total = wsHits.count + docHits.count;
+    if (total > 0) {
+        NSString *msg;
+        if (total == 1) {
+            NSString *name = wsHits.count > 0 ? wsHits.firstObject : docHits.firstObject[@"name"];
+            NSString *where = wsHits.count > 0 ? @"the Kronos workspace" : docHits.firstObject[@"root"];
+            msg = [NSString stringWithFormat:@"Found \"%@\" in %@. Opening it.", name, where];
+        } else {
+            msg = [NSString stringWithFormat:@"Found %lu documents matching \"%@\" on this iPhone. Tap one to open it.", (unsigned long)total, findTerm];
+        }
+        [self recordImmediateKronosReply:msg actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+        for (NSString *f in wsHits) [self addActionPillWithTitle:f previewFile:f toStack:replyExtra];
+        if (self.docPillTargets == nil) self.docPillTargets = [NSMutableDictionary dictionary];
+        for (NSDictionary *d in docHits) {
+            NSString *key = [NSString stringWithFormat:@"doc:%@/%@", d[@"folder"], d[@"rel"]];
+            self.docPillTargets[key] = d;
+            NSString *title = [NSString stringWithFormat:@"%@ · %@%@", d[@"name"], d[@"root"], [d[@"placeholder"] boolValue] ? @" (iCloud)" : @""];
+            UIButton *pill = [KronosTapButton tapButton];
+            pill.translatesAutoresizingMaskIntoConstraints = NO;
+            [pill setImage:[UIImage systemImageNamed:@"doc.richtext"] forState:UIControlStateNormal];
+            [pill setTitle:[NSString stringWithFormat:@"  %@", title] forState:UIControlStateNormal];
+            pill.tintColor = kronosAccentColor();
+            [pill setTitleColor:kronosAccentColor() forState:UIControlStateNormal];
+            pill.titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightSemibold];
+            pill.titleLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+            pill.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
+            pill.backgroundColor = [kronosAccentColor() colorWithAlphaComponent:0.12];
+            pill.layer.cornerRadius = 10.0;
+            [pill.heightAnchor constraintEqualToConstant:36.0].active = YES;
+            pill.accessibilityIdentifier = key;
+            [pill addTarget:self action:@selector(openIndexedDocumentTapped:) forControlEvents:UIControlEventTouchUpInside];
+            [replyExtra addArrangedSubview:pill];
+        }
+        if (total == 1) {
+            if (wsHits.count > 0) [self openFilePreviewForFilename:wsHits.firstObject];
+            else [self openIndexedDocument:docHits.firstObject];
+        }
+        return;
+    }
+    NSUInteger folders = [mgr indexedFolderCount];
+    if (folders == 0) {
+        self.pendingFindTerm = findTerm;
+        NSString *msg = [NSString stringWithFormat:@"Kronos has not been given a folder to search yet, so it cannot see \"%@\". Tap Grant below, then Browse, iCloud Drive, Open. Kronos then indexes every document there and opens it on request. You only do this once.", findTerm];
+        [self recordImmediateKronosReply:msg actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+        [self addActionPillWithTitle:@"Grant a folder to search (iCloud Drive)" symbol:@"folder.badge.plus" action:@selector(grantFolderTapped) toStack:replyExtra];
+        [self addActionPillWithTitle:@"Choose the file directly" symbol:@"doc" action:@selector(pickDocumentTapped) toStack:replyExtra];
+        return;
+    }
+    NSString *msg = [NSString stringWithFormat:@"No document matching \"%@\" in the %lu folder%@ Kronos indexes (%lu documents) or the workspace. Grant another folder, or pick the file directly.",
+                     findTerm, (unsigned long)folders, folders == 1 ? @"" : @"s", (unsigned long)mgr.documentsCount];
+    [self recordImmediateKronosReply:msg actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+    self.pendingFindTerm = findTerm;
+    [self addActionPillWithTitle:@"Grant another folder" symbol:@"folder.badge.plus" action:@selector(grantFolderTapped) toStack:replyExtra];
+    [self addActionPillWithTitle:@"Choose from Files" symbol:@"folder" action:@selector(pickDocumentTapped) toStack:replyExtra];
+    [self addActionPillWithTitle:@"Choose from Photos" symbol:@"photo.on.rectangle" action:@selector(pickPhotoTapped) toStack:replyExtra];
+}
+
+- (void)grantFolderTapped {
+    self.pickingFolderForIndex = YES;
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeFolder]];
+    picker.allowsMultipleSelection = YES;
+    picker.delegate = self;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)openIndexedDocumentTapped:(UIButton *)sender {
+    NSDictionary *doc = self.docPillTargets[sender.accessibilityIdentifier ?: @""];
+    if (doc != nil) [self openIndexedDocument:doc];
+}
+
+/// Copies the document into the workspace cache (downloading from iCloud if needed) and previews it.
+- (void)openIndexedDocument:(NSDictionary *)doc {
+    self.headerSubtitleLabel.text = [doc[@"placeholder"] boolValue] ? @"Downloading from iCloud…" : @"Opening…";
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *cacheDir = [kronosWorkspaceDirectory() stringByAppendingPathComponent:@".opened"];
+        NSString *local = [[KronosIosDeviceContextManager sharedManager] materializeDocument:doc intoDirectory:cacheDir];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.headerSubtitleLabel.text = @"";
+            if (local == nil) {
+                UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Could not open" message:[NSString stringWithFormat:@"%@ is not available right now (it may still be downloading from iCloud).", doc[@"name"]] preferredStyle:UIAlertControllerStyleAlert];
+                [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [self presentViewController:a animated:YES completion:nil];
+                return;
+            }
+            KronosFilePreviewViewController *pvc = [[KronosFilePreviewViewController alloc] init];
+            pvc.filePath = local;
+            UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:pvc];
+            [self presentViewController:nav animated:YES completion:nil];
+        });
+    });
+}
+
+- (void)answerLatestMediaKind:(NSInteger)kind countOnly:(BOOL)countOnly replyBody:(UILabel *)replyBody replyExtra:(UIStackView *)replyExtra convMsgs:(NSMutableArray *)convMsgs {
+    if (![KronosMobileSettings sharedSettings].developDeviceContext) {
+        [self recordImmediateKronosReply:@"Develop Device Context is off, so Kronos is not reading your Photo Library. Turn it on in Settings and ask again." actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+        return;
+    }
+    NSString *noun = kind == 1 ? @"screenshot" : (kind == 2 ? @"video" : @"photo");
+    self.headerSubtitleLabel.text = @"Reading Photos…";
+    [[KronosIosDeviceContextManager sharedManager] fetchLatestMediaOfKind:kind completion:^(UIImage *image, NSDate *date, NSUInteger total, BOOL limited, NSString *errorNote) {
+        if (errorNote != nil || date == nil) {
+            self.headerSubtitleLabel.text = @"";
+            NSString *msg = errorNote ?: [NSString stringWithFormat:@"No %@s in your Photo Library%@.", noun, limited ? @" among the photos Kronos can see" : @""];
+            [self recordImmediateKronosReply:msg actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+            if (errorNote != nil) [self addActionPillWithTitle:@"Open iPhone Settings" symbol:@"gear" action:@selector(openAppSettingsTapped) toStack:replyExtra];
+            return;
+        }
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            NSString *seen = nil;
+            if (kind != 2 && !countOnly && image != nil) {
+                NSDictionary *rep = kronosAnalyzeUprightImageWithVision(kronosRenderUprightImage(image, 1280.0));
+                NSArray<NSString *> *lines = rep[@"ocrLines"];
+                NSArray<NSString *> *objects = rep[@"objects"];
+                if ([rep[@"ocrChars"] unsignedIntegerValue] >= 35) {
+                    NSString *text = [[lines subarrayWithRange:NSMakeRange(0, MIN((NSUInteger)6, lines.count))] componentsJoinedByString:@" "];
+                    if (text.length > 220) text = [[text substringToIndex:220] stringByAppendingString:@"…"];
+                    seen = [NSString stringWithFormat:@"Text in it: \"%@\"", text];
+                } else if (objects.count > 0) {
+                    seen = [NSString stringWithFormat:@"It appears to show: %@.", [[objects subarrayWithRange:NSMakeRange(0, MIN((NSUInteger)3, objects.count))] componentsJoinedByString:@", "]];
+                }
+            }
+            NSDateFormatter *stamp = [[NSDateFormatter alloc] init];
+            stamp.dateFormat = @"yyyyMMdd-HHmmss";
+            NSString *dir = [kronosWorkspaceDirectory() stringByAppendingPathComponent:@".opened"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@-%@.jpg", noun, [stamp stringFromDate:date]]];
+            NSData *jpeg = (kind != 2 && image != nil) ? UIImageJPEGRepresentation(image, 0.9) : nil;
+            BOOL saved = jpeg != nil && [jpeg writeToFile:path atomically:YES];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.headerSubtitleLabel.text = @"";
+                NSDateFormatter *df = [[NSDateFormatter alloc] init];
+                df.dateStyle = NSDateFormatterLongStyle;
+                df.timeStyle = NSDateFormatterShortStyle;
+                NSString *when = [df stringFromDate:date];
+                NSMutableString *msg = [NSMutableString string];
+                if (countOnly) [msg appendFormat:@"You have %lu %@%@ on this iPhone. The latest is from %@.", (unsigned long)total, noun, total == 1 ? @"" : @"s", when];
+                else [msg appendFormat:@"Your last %@ was %@ on %@.", noun, kind == 2 ? @"recorded" : @"taken", when];
+                if (seen != nil) [msg appendFormat:@" %@", seen];
+                if (limited) [msg appendString:@" Kronos only has access to the photos you selected, so a newer one may exist."];
+                [self recordImmediateKronosReply:msg actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+                if (image != nil) {
+                    [self addPhotoPreviewCardWithImage:image caption:when toStack:replyExtra];
+                    if (saved) {
+                        [self addActionPillWithTitle:[NSString stringWithFormat:@"Open %@", noun] symbol:@"arrow.up.left.and.arrow.down.right" action:@selector(openSavedMediaTapped:) toStack:replyExtra];
+                        replyExtra.arrangedSubviews.lastObject.accessibilityIdentifier = path;
+                    }
+                }
+                [self scrollToBottomAnimated:YES];
+            });
+        });
+    }];
+}
+
+- (void)openSavedMediaTapped:(UIButton *)sender {
+    NSString *path = sender.accessibilityIdentifier;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path ?: @""]) return;
+    KronosFilePreviewViewController *pvc = [[KronosFilePreviewViewController alloc] init];
+    pvc.filePath = path;
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:pvc];
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)openAppSettingsTapped {
+    [[UIApplication sharedApplication] openURL:[NSURL URLWithString:UIApplicationOpenSettingsURLString] options:@{} completionHandler:nil];
 }
 
 /// A pill that runs `action` on self (pickers, retries).
@@ -2285,26 +2486,20 @@ static const CGFloat kSidebarWidth = 296.0;
     NSString *trimmedLower = [[kronosNormalizeApostrophes(userText) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
     NSString *effectiveLower = [[kronosNormalizeApostrophes(effectiveQuery) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
 
+    // 0a. "Last screenshot I took": read Photos directly. No model call.
+    NSInteger mediaKind = 0;
+    BOOL mediaCount = NO;
+    if (turnAttachments.count == 0 && !awaitingWhatsAppDraftAnswer && kronosParseLatestMediaIntent(effectiveQuery, &mediaKind, &mediaCount)
+        && !kronosParseWhatsAppDraftIntent(userText, NULL, NULL, NULL, NULL, NULL) && !kronosParseLinkedInPostIntent(userText, NULL, NULL)) {
+        [self answerLatestMediaKind:mediaKind countOnly:mediaCount replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+        return;
+    }
+
     // 0. "Find / open my X": search what Kronos can read, or offer the pickers. No model call.
     NSString *findTerm = nil;
     if (turnAttachments.count == 0 && !awaitingWhatsAppDraftAnswer && kronosParseFindFileIntent(effectiveQuery, &findTerm)
         && !kronosParseWhatsAppDraftIntent(userText, NULL, NULL, NULL, NULL, NULL) && !kronosParseLinkedInPostIntent(userText, NULL, NULL)) {
-        NSArray<NSString *> *hits = [self searchReadableFilesForTerm:findTerm];
-        if (hits.count > 0) {
-            NSString *msg = [NSString stringWithFormat:@"Found %lu file%@ matching \"%@\" in the Kronos workspace on this iPhone. Tap one to open it.",
-                             (unsigned long)hits.count, hits.count == 1 ? @"" : @"s", findTerm];
-            [self recordImmediateKronosReply:msg actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
-            for (NSString *f in [hits subarrayWithRange:NSMakeRange(0, MIN(hits.count, 6u))]) {
-                [self addActionPillWithTitle:f previewFile:f toStack:replyExtra];
-            }
-        } else {
-            NSUInteger wsCount = [self searchReadableFilesForTerm:@""].count;
-            NSString *msg = [NSString stringWithFormat:@"No file matching \"%@\" among what Kronos can read on this iPhone (%lu workspace file%@ and this conversation's attachments). Kronos cannot browse Files or Photos by itself: pick it below and it will be read and opened.",
-                             findTerm, (unsigned long)wsCount, wsCount == 1 ? @"" : @"s"];
-            [self recordImmediateKronosReply:msg actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
-            [self addActionPillWithTitle:@"Choose from Files" symbol:@"folder" action:@selector(pickDocumentTapped) toStack:replyExtra];
-            [self addActionPillWithTitle:@"Choose from Photos" symbol:@"photo.on.rectangle" action:@selector(pickPhotoTapped) toStack:replyExtra];
-        }
+        [self answerFindRequest:findTerm replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
         return;
     }
 
