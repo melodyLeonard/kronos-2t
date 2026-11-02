@@ -23,6 +23,9 @@ pub struct KronosMobileSession {
     raw_bytes: Vec<u8>,
     emitted_bytes: usize,
     last_error: CString,
+    /// Let the model emit a `<think>` block (Qwen3 thinking mode). Off by default: replies start
+    /// with an empty think block so the model answers directly.
+    thinking: bool,
 }
 
 impl KronosMobileSession {
@@ -102,6 +105,7 @@ pub unsafe extern "C" fn kronos_session_create(
             raw_bytes: Vec::new(),
             emitted_bytes: 0,
             last_error: CString::new("").unwrap(),
+            thinking: false,
         })
     }));
 
@@ -578,7 +582,8 @@ pub unsafe extern "C" fn kronos_session_generate(
             ..GenParams::default()
         };
         sess.pending_token = None;
-        let gen = sess.model.generate(&msgs, &params, |piece| {
+        let prefix = if sess.thinking { "" } else { "<think>\n\n</think>\n\n" };
+        let gen = sess.model.generate_with_tools_prefixed(&msgs, &[], prefix, &params, |piece| {
             let Some(cb) = on_piece_cb else {
                 return true;
             };
@@ -691,7 +696,8 @@ pub unsafe extern "C" fn kronos_session_generate_chat_json(
             ..GenParams::default()
         };
         sess.pending_token = None;
-        let gen = sess.model.generate(&msgs, &params, |piece| {
+        let prefix = if sess.thinking { "" } else { "<think>\n\n</think>\n\n" };
+        let gen = sess.model.generate_with_tools_prefixed(&msgs, &[], prefix, &params, |piece| {
             let Some(cb) = on_piece_cb else {
                 return true;
             };
@@ -731,6 +737,20 @@ pub unsafe extern "C" fn kronos_session_generate_chat_json(
         }
     }));
     res.unwrap_or(-1)
+}
+
+/// Enables (`enabled != 0`) or disables the model's `<think>` block for chat generation.
+///
+/// # Safety
+/// `session` must be null or a valid `KronosMobileSession` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn kronos_session_set_thinking(session: *mut KronosMobileSession, enabled: i32) {
+    if session.is_null() {
+        return;
+    }
+    // SAFETY: Validated non-null exclusive session pointer.
+    let sess = unsafe { &mut *session };
+    sess.thinking = enabled != 0;
 }
 
 /// Clears the target and draft KV caches on `session`.

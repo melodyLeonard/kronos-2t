@@ -1031,6 +1031,89 @@ static inline NSAttributedString *kronosFormatMessageText(NSString *raw, BOOL is
     return out;
 }
 
+/// True while a reply has an unterminated `<think>` block (the model is still reasoning).
+static inline BOOL kronosHasOpenThinkBlock(NSString *text) {
+    NSRange open = [text rangeOfString:@"<think>" options:NSBackwardsSearch];
+    if (open.location == NSNotFound) return NO;
+    NSRange close = [text rangeOfString:@"</think>" options:NSBackwardsSearch];
+    return close.location == NSNotFound || close.location < open.location;
+}
+
+/// Removes every `<think>…</think>` block (and a trailing unterminated one) from a reply.
+static inline NSString *kronosStripThinkBlocks(NSString *text) {
+    if (text.length == 0 || [text rangeOfString:@"<think>"].location == NSNotFound) return text ?: @"";
+    NSMutableString *out = [NSMutableString string];
+    NSUInteger pos = 0;
+    while (pos < text.length) {
+        NSRange open = [text rangeOfString:@"<think>" options:0 range:NSMakeRange(pos, text.length - pos)];
+        if (open.location == NSNotFound) {
+            [out appendString:[text substringFromIndex:pos]];
+            break;
+        }
+        [out appendString:[text substringWithRange:NSMakeRange(pos, open.location - pos)]];
+        NSUInteger after = open.location + open.length;
+        NSRange close = [text rangeOfString:@"</think>" options:0 range:NSMakeRange(after, text.length - after)];
+        if (close.location == NSNotFound) break;
+        pos = close.location + close.length;
+    }
+    return [out stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+/// "find / open / where is / show me / do I have … my X (on this phone)" -> X; nil for app, chat or
+/// messaging requests.
+static inline BOOL kronosParseFindFileIntent(NSString *query, NSString **outTerm) {
+    NSString *low = [[query ?: @"" stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
+    low = [low stringByReplacingOccurrencesOfString:@"?" withString:@""];
+    low = [low stringByReplacingOccurrencesOfString:@"." withString:@""];
+    NSArray<NSString *> *lead = @[@"do i have access to ", @"do i have ", @"can you find ", @"please find ", @"find ", @"open ", @"where is ", @"where's ", @"show me ", @"locate ", @"look for ", @"search for ", @"get me "];
+    NSString *term = nil;
+    for (NSString *l in lead) {
+        if ([low hasPrefix:l]) { term = [low substringFromIndex:l.length]; break; }
+    }
+    if (term == nil) return NO;
+    NSArray<NSString *> *tails = @[@" on this phone", @" on my phone", @" on this iphone", @" on my iphone", @" on this device", @" on my device", @" in this phone", @" in my phone", @" in this iphone", @" in my iphone", @" here", @" for me", @" please"];
+    BOOL changed = YES;
+    while (changed) {
+        changed = NO;
+        for (NSString *t in tails) {
+            if ([term hasSuffix:t]) { term = [term substringToIndex:term.length - t.length]; changed = YES; }
+        }
+        term = [term stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    }
+    NSRange findIt = [term rangeOfString:@" find it"];
+    if (findIt.location != NSNotFound) term = [term substringToIndex:findIt.location];
+    for (NSString *pre in @[@"my ", @"the ", @"a ", @"an "]) {
+        if ([term hasPrefix:pre]) { term = [term substringFromIndex:pre.length]; break; }
+    }
+    term = [term stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (term.length < 2 || [term componentsSeparatedByString:@" "].count > 6) return NO;
+    for (NSString *app in @[@"whatsapp", @"safari", @"github", @"linkedin", @"settings", @"camera", @"photos", @"mail", @"messages", @"maps", @"calendar", @"notes", @"music", @"spotify", @"youtube", @"instagram", @"chrome", @"app "]) {
+        if ([term hasPrefix:app]) return NO;
+    }
+    if (outTerm != NULL) *outTerm = term;
+    return YES;
+}
+
+/// Files whose name matches every word of `term`: words of 3+ letters as substrings, shorter ones
+/// as whole words, so "nd result" does not match "index.html".
+static inline BOOL kronosFileNameMatchesTerm(NSString *filename, NSString *term) {
+    NSString *name = [filename lowercaseString];
+    NSCharacterSet *sep = [[NSCharacterSet alphanumericCharacterSet] invertedSet];
+    NSSet<NSString *> *nameWords = [NSSet setWithArray:[name componentsSeparatedByCharactersInSet:sep]];
+    NSSet<NSString *> *stop = [NSSet setWithArray:@[@"result", @"results", @"file", @"files", @"document", @"documents", @"doc", @"copy", @"pdf", @"image", @"photo", @"picture", @"screenshot", @"of", @"for", @"and", @"my"]];
+    NSUInteger checked = 0;
+    for (NSString *w in [[term lowercaseString] componentsSeparatedByCharactersInSet:sep]) {
+        if (w.length == 0 || [stop containsObject:w]) continue;
+        checked++;
+        if (w.length >= 3) {
+            if ([name rangeOfString:w].location == NSNotFound) return NO;
+        } else if (![nameWords containsObject:w]) {
+            return NO;
+        }
+    }
+    return checked > 0;
+}
+
 static inline NSString *kronosSanitizeFirstPersonReply(NSString *reply) {
     if (reply.length == 0) return reply;
     NSString *fixed = [reply stringByReplacingOccurrencesOfString:@"Melody Leonard built you"

@@ -91,6 +91,9 @@ int32_t kronos_session_generate_chat_json(
 
 void kronos_session_reset(KronosMobileSession *session);
 
+/* Thinking (`<think>` block) for chat generation; off by default. */
+void kronos_session_set_thinking(KronosMobileSession *session, int32_t enabled);
+
 int32_t kronos_ingest_attachment_bytes(
     const char *filename_utf8,
     const char *mime_utf8,

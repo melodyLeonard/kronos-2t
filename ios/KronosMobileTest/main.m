@@ -1490,6 +1490,7 @@ static const CGFloat kSidebarWidth = 296.0;
         KronosMobileSession *sess = kronos_session_create([modelDir UTF8String], "nf4g128", 2048, 0, 1850);
         if (sess != NULL) {
             kronos_session_configure_kv(sess, 8, 2048, 64);
+            kronos_session_set_thinking(sess, 0);
 #if !TARGET_OS_SIMULATOR
             kronos_session_enable_metal(sess);
 #endif
@@ -1733,6 +1734,59 @@ static const CGFloat kSidebarWidth = 296.0;
         [pill addTarget:self action:@selector(previewPillTapped:) forControlEvents:UIControlEventTouchUpInside];
     }
     [stack addArrangedSubview:pill];
+}
+
+/// A pill that runs `action` on self (pickers, retries).
+- (void)addActionPillWithTitle:(NSString *)title symbol:(NSString *)symbol action:(SEL)action toStack:(UIStackView *)stack {
+    if (title.length == 0 || stack == nil) return;
+    UIButton *pill = [KronosTapButton tapButton];
+    pill.translatesAutoresizingMaskIntoConstraints = NO;
+    [pill setImage:[UIImage systemImageNamed:symbol ?: @"arrow.right.circle"] forState:UIControlStateNormal];
+    [pill setTitle:[NSString stringWithFormat:@"  %@", title] forState:UIControlStateNormal];
+    pill.tintColor = kronosAccentColor();
+    [pill setTitleColor:kronosAccentColor() forState:UIControlStateNormal];
+    pill.titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightSemibold];
+    pill.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
+    pill.backgroundColor = [kronosAccentColor() colorWithAlphaComponent:0.12];
+    pill.layer.cornerRadius = 10.0;
+    [pill.heightAnchor constraintEqualToConstant:36.0].active = YES;
+    [pill addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    [stack addArrangedSubview:pill];
+}
+
+/// Workspace files and this conversation's attachment names matching `term` (all of them for "").
+- (NSArray<NSString *> *)searchReadableFilesForTerm:(NSString *)term {
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (NSString *f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:kronosWorkspaceDirectory() error:nil] ?: @[]) {
+        if (![f hasPrefix:@"."]) [names addObject:f];
+    }
+    for (NSDictionary *m in self.activeConversation[@"messages"] ?: @[]) {
+        for (NSString *a in m[@"attachments"] ?: @[]) {
+            if (![names containsObject:a]) [names addObject:a];
+        }
+    }
+    if (term.length == 0) return names;
+    NSMutableArray<NSString *> *hits = [NSMutableArray array];
+    for (NSString *n in names) {
+        if (kronosFileNameMatchesTerm(n, term)) [hits addObject:n];
+    }
+    return hits;
+}
+
+- (void)pickDocumentTapped {
+    UIDocumentPickerViewController *doc = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeItem] asCopy:YES];
+    doc.allowsMultipleSelection = YES;
+    doc.delegate = self;
+    [self presentViewController:doc animated:YES completion:nil];
+}
+
+- (void)pickPhotoTapped {
+    PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
+    cfg.selectionLimit = 4;
+    cfg.filter = [PHPickerFilter imagesFilter];
+    PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:cfg];
+    picker.delegate = self;
+    [self presentViewController:picker animated:YES completion:nil];
 }
 
 - (void)addPhotoPreviewCardWithImage:(UIImage *)image caption:(NSString *)caption toStack:(UIStackView *)stack {
@@ -2231,6 +2285,29 @@ static const CGFloat kSidebarWidth = 296.0;
     NSString *trimmedLower = [[kronosNormalizeApostrophes(userText) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
     NSString *effectiveLower = [[kronosNormalizeApostrophes(effectiveQuery) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] lowercaseString];
 
+    // 0. "Find / open my X": search what Kronos can read, or offer the pickers. No model call.
+    NSString *findTerm = nil;
+    if (turnAttachments.count == 0 && !awaitingWhatsAppDraftAnswer && kronosParseFindFileIntent(effectiveQuery, &findTerm)
+        && !kronosParseWhatsAppDraftIntent(userText, NULL, NULL, NULL, NULL, NULL) && !kronosParseLinkedInPostIntent(userText, NULL, NULL)) {
+        NSArray<NSString *> *hits = [self searchReadableFilesForTerm:findTerm];
+        if (hits.count > 0) {
+            NSString *msg = [NSString stringWithFormat:@"Found %lu file%@ matching \"%@\" in the Kronos workspace on this iPhone. Tap one to open it.",
+                             (unsigned long)hits.count, hits.count == 1 ? @"" : @"s", findTerm];
+            [self recordImmediateKronosReply:msg actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+            for (NSString *f in [hits subarrayWithRange:NSMakeRange(0, MIN(hits.count, 6u))]) {
+                [self addActionPillWithTitle:f previewFile:f toStack:replyExtra];
+            }
+        } else {
+            NSUInteger wsCount = [self searchReadableFilesForTerm:@""].count;
+            NSString *msg = [NSString stringWithFormat:@"No file matching \"%@\" among what Kronos can read on this iPhone (%lu workspace file%@ and this conversation's attachments). Kronos cannot browse Files or Photos by itself: pick it below and it will be read and opened.",
+                             findTerm, (unsigned long)wsCount, wsCount == 1 ? @"" : @"s"];
+            [self recordImmediateKronosReply:msg actionBadge:nil replyBody:replyBody replyExtra:replyExtra convMsgs:convMsgs];
+            [self addActionPillWithTitle:@"Choose from Files" symbol:@"folder" action:@selector(pickDocumentTapped) toStack:replyExtra];
+            [self addActionPillWithTitle:@"Choose from Photos" symbol:@"photo.on.rectangle" action:@selector(pickPhotoTapped) toStack:replyExtra];
+        }
+        return;
+    }
+
     // 1. Handle follow-up clarification turn for a pending WhatsApp draft.
     if (turnAttachments.count == 0 && (self.pendingWhatsAppRecipient.length > 0 || self.pendingWhatsAppAwaitingRecipient)) {
         BOOL isCancel = [trimmedLower isEqualToString:@"cancel"] || [trimmedLower isEqualToString:@"never mind"] ||
@@ -2583,9 +2660,11 @@ static const CGFloat kSidebarWidth = 296.0;
 
         NSMutableString *acc = [NSMutableString string];
         void (^flushBlock)(NSString *) = ^(NSString *snap) {
-            NSString *cleanSnap = kronosSanitizeFirstPersonReply(snap);
+            BOOL thinking = kronosHasOpenThinkBlock(snap);
+            NSString *cleanSnap = thinking ? @"Thinking…" : kronosSanitizeFirstPersonReply(kronosStripThinkBlocks(snap));
             dispatch_async(dispatch_get_main_queue(), ^{
                 replyBody.attributedText = kronosFormatMessageText(cleanSnap, NO);
+                replyBody.textColor = thinking ? kronosMutedColor() : kronosTextColor();
                 [self scrollToBottomAnimated:NO];
             });
         };
@@ -2656,7 +2735,7 @@ static const CGFloat kSidebarWidth = 296.0;
             }
         }
 
-        finalText = kronosVerifyAndRepairIdentityReply(finalText, userText);
+        finalText = kronosVerifyAndRepairIdentityReply(kronosStripThinkBlocks(finalText), userText);
         BOOL blockedDigits = kronosContainsUngroundedPlaceholderDigits(finalText, finalUserPrompt, userText);
         if (blockedDigits) {
             finalText = @"I checked your local context and do not have that verified number stored on your device yet, so I will not guess a placeholder value.";
