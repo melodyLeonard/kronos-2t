@@ -80,6 +80,24 @@ pub unsafe extern "C" fn kronos_session_create(
     threads: usize,
     memory_budget_mb: usize,
 ) -> *mut KronosMobileSession {
+    // SAFETY: Forwarded under this function's contract.
+    match unsafe { create_session(model_dir_utf8, mode_utf8, ctx_tokens, threads, memory_budget_mb) } {
+        Ok(sess) => Box::into_raw(Box::new(sess)),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// [`kronos_session_create`] with the load error kept.
+///
+/// # Safety
+/// Same pointer rules as [`kronos_session_create`].
+pub unsafe fn create_session(
+    model_dir_utf8: *const c_char,
+    mode_utf8: *const c_char,
+    ctx_tokens: usize,
+    threads: usize,
+    memory_budget_mb: usize,
+) -> Result<KronosMobileSession, String> {
     let res = catch_unwind(AssertUnwindSafe(|| -> Result<KronosMobileSession, String> {
         // SAFETY: Validated non-null NUL-terminated pointers per FFI contract.
         let model_dir = unsafe { cstr_to_str(model_dir_utf8)? };
@@ -108,11 +126,7 @@ pub unsafe extern "C" fn kronos_session_create(
             thinking: false,
         })
     }));
-
-    match res {
-        Ok(Ok(sess)) => Box::into_raw(Box::new(sess)),
-        _ => std::ptr::null_mut(),
-    }
+    res.unwrap_or_else(|_| Err("panic while loading the model".to_string()))
 }
 
 /// Releases a `KronosMobileSession` created by [`kronos_session_create`].

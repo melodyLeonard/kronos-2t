@@ -1,9 +1,10 @@
 //! Bridge between Kronos Mobile and this Mac, behind a bearer token. Serves device status,
 //! conversation lookup, the paired iPhone's app list, chat through the local model server,
-//! and agent tasks that need approval on the Mac. Every other server route stays private.
+//! agent tasks that need approval on the Mac, and the phone model files for the Android app.
+//! Every other server route stays private.
 //!
 //!   kronos_device_bridge [--host 127.0.0.1] [--port 18080] [--upstream 127.0.0.1:18085]
-//!                        [--approval-seconds 120] [--no-confirm]
+//!                        [--model-dir DIR] [--approval-seconds 120] [--no-confirm]
 //!
 //! Pass `--host 0.0.0.0` so the phone can reach it over Wi-Fi.
 //! `--no-confirm` runs tasks without the Mac prompt: anyone with the token can then run commands.
@@ -28,6 +29,15 @@ const MAX_BODY: usize = 8 << 20;
 const MAX_TASK_CHARS: usize = 1000;
 const MAX_PENDING_APPROVALS: usize = 3;
 const MAX_TASKS_KEPT: usize = 20;
+const PHONE_MODEL_FILES: [&str; 7] = [
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+    "kronos-nf4g128.k2tb",
+];
 
 #[derive(Clone, Default)]
 struct Task {
@@ -43,6 +53,7 @@ struct Task {
 struct Bridge {
     token: String,
     upstream: String,
+    model_dir: PathBuf,
     confirm: bool,
     approval_seconds: u64,
     tasks: Mutex<Vec<Task>>,
@@ -334,6 +345,38 @@ fn forward_chat(b: &Bridge, stream: &mut TcpStream, body: &[u8]) {
     }
 }
 
+fn model_manifest(b: &Bridge, stream: &mut TcpStream) {
+    let files: Option<Vec<String>> = PHONE_MODEL_FILES
+        .iter()
+        .map(|n| {
+            let bytes = std::fs::metadata(b.model_dir.join(n)).ok()?.len();
+            Some(format!(r#"{{"name":{},"bytes":{bytes}}}"#, quote(n)))
+        })
+        .collect();
+    match files {
+        Some(f) => reply(stream, 200, "OK", &format!(r#"{{"mode":"nf4g128","files":[{}]}}"#, f.join(","))),
+        None => reply(stream, 404, "Not Found", r#"{"error":"phone model is not on this Mac"}"#),
+    }
+}
+
+fn model_file(b: &Bridge, stream: &mut TcpStream, name: &str) {
+    if !PHONE_MODEL_FILES.contains(&name) {
+        return reply(stream, 404, "Not Found", r#"{"error":"not a model file"}"#);
+    }
+    let Ok(mut file) = std::fs::File::open(b.model_dir.join(name)) else {
+        return reply(stream, 404, "Not Found", r#"{"error":"phone model is not on this Mac"}"#);
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(head.as_bytes()).is_ok() {
+        let _ = std::io::copy(&mut file, stream);
+    }
+}
+
+fn default_model_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Documents/project/kronos-2t/models/Qwen3-0.6B")
+}
+
 fn load_token() -> std::io::Result<String> {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     let path = home.join(".kronos/device_token");
@@ -432,6 +475,8 @@ fn handle(mut stream: TcpStream, b: &Arc<Bridge>) {
     let body = &buf[split..split + want];
     match (method, path) {
         ("POST", "/v1/chat/completions") => forward_chat(b, &mut stream, body),
+        ("GET", "/v1/device/model") => model_manifest(b, &mut stream),
+        ("GET", p) if p.starts_with("/v1/device/model/") => model_file(b, &mut stream, &p["/v1/device/model/".len()..]),
         ("GET", "/v1/device/phone_apps") => phone_apps(&mut stream),
         ("POST", "/v1/device/phone_apps/open") => phone_app_open(&mut stream, body),
         ("POST", "/v1/device/tasks") => task_create(b, &mut stream, body),
@@ -478,6 +523,7 @@ fn main() {
     let bridge = Arc::new(Bridge {
         token,
         upstream: flag("--upstream").unwrap_or_else(|| "127.0.0.1:18085".into()),
+        model_dir: flag("--model-dir").map(PathBuf::from).unwrap_or_else(default_model_dir),
         confirm: !args.iter().any(|a| a == "--no-confirm"),
         approval_seconds: flag("--approval-seconds").and_then(|v| v.parse().ok()).unwrap_or(120),
         tasks: Mutex::new(Vec::new()),

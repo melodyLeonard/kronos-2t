@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="KronosTheme" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:colorAccent">#0D9488</item>
+        <item name="android:windowBackground">#F7F7F8</item>
+    </style>
+</resources>
