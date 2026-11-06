@@ -610,6 +610,227 @@ kernel void q35_gemv_multi_reduce(
     out[idx] = sum;
 }
 
+// NF4 single-token GEMV over full stripe pairs. Lane `T` loads 16 contiguous bytes of each 512-byte
+// chunk: k = T >> 3, row group g = (T & 7) >> 1, column half T & 1, so one 16-byte load holds 4 rows
+// x 8 columns and the 8 activations are reused for 4 rows of both stripes. Same layout as
+// `nf4_gemv_decode1`; partials for split columns go to `gemv_splitk_reduce`.
+kernel void q35_nf4_gemv1(
+    device const uchar* pair_stream [[buffer(0)]],
+    device const float* x_rot       [[buffer(2)]],
+    device const float* residual    [[buffer(4)]],
+    device float*       out         [[buffer(5)]],
+    constant Nf4MatParams& p        [[buffer(6)]],
+    device float*       part        [[buffer(7)]],
+    uint2 tg_pos  [[threadgroup_position_in_grid]],
+    uint sg_id    [[simdgroup_index_in_threadgroup]],
+    uint T        [[thread_index_in_simdgroup]],
+    uint tid_tg   [[thread_index_in_threadgroup]])
+{
+    const uint pair_idx = tg_pos.x;
+    const uint split = tg_pos.y;
+    const uint per_split = (p.num_scale_groups + p.n_splits - 1u) / p.n_splits;
+    const uint sg_lo = split * per_split;
+    const uint sg_hi = min(p.num_scale_groups, sg_lo + per_split);
+    if (pair_idx >= p.num_pairs) return;
+
+    threadgroup half2 l_pair[256];
+    l_pair[tid_tg] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg);
+    l_pair[tid_tg + 128u] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg + 128u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint k = T >> 3u;
+    const uint g = (T & 7u) >> 1u;
+    const uint hf = T & 1u;
+    float acc_a[4] = {0, 0, 0, 0};
+    float acc_b[4] = {0, 0, 0, 0};
+    device const uchar* p_base = pair_stream + ulong(pair_idx) * ulong(p.pair_total_bytes);
+    const uint sg_stride = 64u + p.scale_group_chunks * 1024u;
+    for (uint sg = sg_lo + sg_id; sg < sg_hi; sg += 4u) {
+        device const uchar* sg_ptr = p_base + ulong(sg) * ulong(sg_stride);
+        uint2 sra = *(device const uint2*)(sg_ptr + g * 8u);
+        uint2 srb = *(device const uint2*)(sg_ptr + 32u + g * 8u);
+        float4 sca = float4(as_type<float>(sra.x << 16), as_type<float>(sra.x & 0xFFFF0000u),
+                            as_type<float>(sra.y << 16), as_type<float>(sra.y & 0xFFFF0000u));
+        float4 scb = float4(as_type<float>(srb.x << 16), as_type<float>(srb.x & 0xFFFF0000u),
+                            as_type<float>(srb.y << 16), as_type<float>(srb.y & 0xFFFF0000u));
+        uint c0 = sg * p.scale_group_chunks;
+        uint c1 = min(c0 + p.scale_group_chunks, p.num_chunks);
+        float4 pa = float4(0.0f), pb = float4(0.0f);
+        for (uint c = c0; c < c1; ++c) {
+            device const uchar* da = sg_ptr + 64u + (c - c0) * 1024u;
+            uint4 wa = *(device const uint4*)(da + T * 16u);
+            uint4 wb = *(device const uint4*)(da + 512u + T * 16u);
+            device const float4* xp = (device const float4*)(x_rot + c * 64u + k * 16u + hf * 8u);
+            float4 x0 = xp[0], x1 = xp[1];
+            #pragma unroll
+            for (uint j = 0u; j < 4u; ++j) {
+                uint u = wa[j];
+                half2 q0 = l_pair[u & 0xFFu], q1 = l_pair[(u >> 8) & 0xFFu], q2 = l_pair[(u >> 16) & 0xFFu], q3 = l_pair[u >> 24];
+                pa[j] += dot(float4(q0.x, q1.x, q2.x, q3.x), x0) + dot(float4(q0.y, q1.y, q2.y, q3.y), x1);
+                uint v = wb[j];
+                half2 r0 = l_pair[v & 0xFFu], r1 = l_pair[(v >> 8) & 0xFFu], r2 = l_pair[(v >> 16) & 0xFFu], r3 = l_pair[v >> 24];
+                pb[j] += dot(float4(r0.x, r1.x, r2.x, r3.x), x0) + dot(float4(r0.y, r1.y, r2.y, r3.y), x1);
+            }
+        }
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) { acc_a[j] += pa[j] * sca[j]; acc_b[j] += pb[j] * scb[j]; }
+    }
+    // Lanes that share row group g differ in bits 0, 3 and 4 of T.
+    #pragma unroll
+    for (uint j = 0u; j < 4u; ++j) {
+        float a = acc_a[j], b = acc_b[j];
+        a += simd_shuffle_xor(a, ushort(1)); b += simd_shuffle_xor(b, ushort(1));
+        a += simd_shuffle_xor(a, ushort(8)); b += simd_shuffle_xor(b, ushort(8));
+        a += simd_shuffle_xor(a, ushort(16)); b += simd_shuffle_xor(b, ushort(16));
+        acc_a[j] = a; acc_b[j] = b;
+    }
+    threadgroup float tg_red[4][32];
+    if (T < 8u && hf == 0u) {
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            tg_red[sg_id][g * 4u + j] = acc_a[j];
+            tg_red[sg_id][16u + g * 4u + j] = acc_b[j];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_id != 0u) return;
+    uint row = pair_idx * 32u + T;
+    if (row >= p.rows) return;
+    float sum = tg_red[0][T] + tg_red[1][T] + tg_red[2][T] + tg_red[3][T];
+    if (p.n_splits > 1u) {
+        part[split * p.rows + row] = sum;
+        return;
+    }
+    if (p.has_residual != 0u) sum += residual[row];
+    out[row] = sum;
+}
+
+// `q35_nf4_gemv1` for up to MAXT tokens: each 16-byte load is unpacked and scaled once, then
+// applied to every token. Partials go to `q35_gemv_multi_reduce` when columns are split.
+template <uint MAXT>
+inline void q35_nf4_gemv_multi(
+    device const uchar* pair_stream, device const half* x_h, device const float* x_scale, device const float* residual,
+    device float* out, constant Nf4MatParams& p, device float* part, uint2 tg_pos, uint sg_id, uint T,
+    uint tid_tg, threadgroup half2* l_pair, threadgroup float* tg_red)
+{
+    const uint pair_idx = tg_pos.x;
+    const uint split = tg_pos.y;
+    const uint per_split = (p.num_scale_groups + p.n_splits - 1u) / p.n_splits;
+    const uint sg_lo = split * per_split;
+    const uint sg_hi = min(p.num_scale_groups, sg_lo + per_split);
+    if (pair_idx >= p.num_pairs) return;
+    const uint nt = min(p.n_tok, MAXT);
+
+    l_pair[tid_tg] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg);
+    l_pair[tid_tg + 128u] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg + 128u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint k = T >> 3u;
+    const uint g = (T & 7u) >> 1u;
+    const uint hf = T & 1u;
+    float acc[MAXT][8];
+    for (uint m = 0u; m < MAXT; ++m) for (uint r = 0u; r < 8u; ++r) acc[m][r] = 0.0f;
+    device const uchar* p_base = pair_stream + ulong(pair_idx) * ulong(p.pair_total_bytes);
+    const uint sg_stride = 64u + p.scale_group_chunks * 1024u;
+    const ulong xs = p.cols;
+    for (uint sg = sg_lo + sg_id; sg < sg_hi; sg += 4u) {
+        device const uchar* sg_ptr = p_base + ulong(sg) * ulong(sg_stride);
+        uint2 sra = *(device const uint2*)(sg_ptr + g * 8u);
+        uint2 srb = *(device const uint2*)(sg_ptr + 32u + g * 8u);
+        float sc[8] = {as_type<float>(sra.x << 16), as_type<float>(sra.x & 0xFFFF0000u),
+                       as_type<float>(sra.y << 16), as_type<float>(sra.y & 0xFFFF0000u),
+                       as_type<float>(srb.x << 16), as_type<float>(srb.x & 0xFFFF0000u),
+                       as_type<float>(srb.y << 16), as_type<float>(srb.y & 0xFFFF0000u)};
+        uint c0 = sg * p.scale_group_chunks;
+        uint c1 = min(c0 + p.scale_group_chunks, p.num_chunks);
+        for (uint c = c0; c < c1; ++c) {
+            device const uchar* da = sg_ptr + 64u + (c - c0) * 1024u;
+            uint4 wa = *(device const uint4*)(da + T * 16u);
+            uint4 wb = *(device const uint4*)(da + 512u + T * 16u);
+            const uint col = c * 64u + k * 16u + hf * 8u;
+            half4 xl[MAXT], xh[MAXT];
+            #pragma unroll
+            for (uint m = 0u; m < MAXT; ++m) {
+                if (m < nt) {
+                    device const half4* xp = (device const half4*)(x_h + ulong(m) * xs + col);
+                    xl[m] = xp[0];
+                    xh[m] = xp[1];
+                }
+            }
+            #pragma unroll
+            for (uint r = 0u; r < 8u; ++r) {
+                uint u = (r < 4u) ? wa[r] : wb[r - 4u];
+                half2 q0 = l_pair[u & 0xFFu], q1 = l_pair[(u >> 8) & 0xFFu], q2 = l_pair[(u >> 16) & 0xFFu], q3 = l_pair[u >> 24];
+                half s = half(sc[r]);
+                half4 lo = half4(q0.x, q1.x, q2.x, q3.x) * s;
+                half4 hi = half4(q0.y, q1.y, q2.y, q3.y) * s;
+                #pragma unroll
+                for (uint m = 0u; m < MAXT; ++m) {
+                    if (m < nt) acc[m][r] += float(dot(lo, xl[m]) + dot(hi, xh[m]));
+                }
+            }
+        }
+    }
+    for (uint m = 0u; m < MAXT; ++m) {
+        float ts = (m < nt) ? x_scale[m] : 0.0f;
+        for (uint r = 0u; r < 8u; ++r) acc[m][r] *= ts;
+    }
+    #pragma unroll
+    for (uint m = 0u; m < MAXT; ++m) {
+        #pragma unroll
+        for (uint r = 0u; r < 8u; ++r) {
+            float a = acc[m][r];
+            a += simd_shuffle_xor(a, ushort(1));
+            a += simd_shuffle_xor(a, ushort(8));
+            a += simd_shuffle_xor(a, ushort(16));
+            if (T < 8u && hf == 0u) tg_red[(sg_id * MAXT + m) * 32u + (r >> 2u) * 16u + g * 4u + (r & 3u)] = a;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint row = pair_idx * 32u + T;
+    if (row >= p.rows) return;
+    for (uint m = sg_id; m < nt; m += 4u) {
+        float sum = 0.0f;
+        for (uint s = 0u; s < 4u; ++s) sum += tg_red[(s * MAXT + m) * 32u + T];
+        if (p.n_splits > 1u) {
+            part[(ulong(split) * nt + m) * p.rows + row] = sum;
+        } else {
+            ulong idx = ulong(m) * p.rows + row;
+            if (p.has_residual != 0u) sum += residual[idx];
+            out[idx] = sum;
+        }
+    }
+}
+// Per-token scaled half copy of the rotated activations for the multi-token GEMV: `x / x_tok_scale`
+// keeps |x| <= 16, so NF4 codebook products stay far inside half range.
+kernel void q35_x_to_half(
+    device const float* x     [[buffer(0)]],
+    device const float* scale [[buffer(1)]],
+    device half*        x_h   [[buffer(2)]],
+    constant uint2&     dims  [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= dims.x || gid.y >= dims.y) return;
+    ulong i = ulong(gid.y) * dims.x + gid.x;
+    x_h[i] = half(x[i] / scale[gid.y]);
+}
+
+#define Q35_MULTI_KERNEL(NAME, MAXT) \
+kernel void NAME( \
+    device const uchar* pair_stream [[buffer(0)]], device const half* x_h [[buffer(2)]], \
+    device const float* x_scale [[buffer(3)]], \
+    device const float* residual [[buffer(4)]], device float* out [[buffer(5)]], \
+    constant Nf4MatParams& p [[buffer(6)]], device float* part [[buffer(7)]], \
+    uint2 tg_pos [[threadgroup_position_in_grid]], uint sg_id [[simdgroup_index_in_threadgroup]], \
+    uint T [[thread_index_in_simdgroup]], uint tid_tg [[thread_index_in_threadgroup]]) \
+{ \
+    threadgroup half2 l_pair[256]; \
+    threadgroup float tg_red[4 * MAXT * 32]; \
+    q35_nf4_gemv_multi<MAXT>(pair_stream, x_h, x_scale, residual, out, p, part, tg_pos, sg_id, T, tid_tg, l_pair, tg_red); \
+}
+Q35_MULTI_KERNEL(q35_nf4_gemv_multi4, 4u)
+Q35_MULTI_KERNEL(q35_nf4_gemv_multi8, 8u)
+
 struct MtpPrepParams { uint h; uint n_tok; float eps; uint _pad; };
 
 inline float q35_block_sum(float v, threadgroup float* red, uint sg, uint lane) {
@@ -718,11 +939,17 @@ struct Pipes {
     attn_reduce: MtlObj,
     mtp_prep: MtlObj,
     gemv_batch_split: MtlObj,
+    nf4_gemv1: MtlObj,
+    nf4_multi4: MtlObj,
+    nf4_multi8: MtlObj,
+    x_to_half: MtlObj,
     gemv_multi_reduce: MtlObj,
 }
 
 struct Scratch {
     hidden: MtlObj,
+    /// `[GEMV_MAX_TOKENS, max_rot]` scaled half activations for the multi-token GEMV.
+    x_h: MtlObj,
     x_rot_f32: MtlObj,
     x_rot_f16: MtlObj,
     x_tok_scale: MtlObj,
@@ -772,6 +999,9 @@ pub struct MetalQwen35 {
     /// Row-prefix view of `lm_head` scored by MTP drafts (low BPE ids are the frequent tokens).
     draft_head: Option<GpuNf4Matrix>,
     draft_vocab: usize,
+    /// Use `q35_nf4_gemv1` for single-token NF4 projections (`Q35_GEMV=old` restores the shared kernel).
+    wide_gemv: bool,
+    gemv_tg_target: usize,
     // Shapes.
     h: usize,
     inter: usize,
@@ -876,6 +1106,10 @@ impl MetalQwen35 {
                     attn_reduce: bp("q35_attn_reduce")?,
                     mtp_prep: bp("q35_mtp_prep")?,
                     gemv_batch_split: bp("q35_gemv_batch_split")?,
+                    nf4_gemv1: bp("q35_nf4_gemv1")?,
+                    nf4_multi4: bp("q35_nf4_gemv_multi4")?,
+                    nf4_multi8: bp("q35_nf4_gemv_multi8")?,
+                    x_to_half: bp("q35_x_to_half")?,
                     gemv_multi_reduce: bp("q35_gemv_multi_reduce")?,
                 };
                 let dummy = alloc_shared_buffer(device.id(), 64, "dummy")?;
@@ -930,6 +1164,7 @@ impl MetalQwen35 {
                 let n = MAX_CHUNK;
                 let n_f16 = n.div_ceil(128) * 128;
                 let sc = Scratch {
+                    x_h: alloc_shared_buffer(device.id(), GEMV_MAX_TOKENS * max_rot * 2, "x_h")?,
                     hidden: alloc_shared_buffer(device.id(), n * cfg.hidden_size * f32b, "hidden")?,
                     x_rot_f32: alloc_shared_buffer(device.id(), n * max_rot * f32b, "x_rot_f32")?,
                     x_rot_f16: alloc_shared_buffer(device.id(), n_f16 * max_rot * 2, "x_rot_f16")?,
@@ -1018,6 +1253,8 @@ impl MetalQwen35 {
                     pending: None,
                     draft_head: None,
                     draft_vocab: 0,
+                    wide_gemv: std::env::var("Q35_GEMV").map_or(true, |v| v != "old"),
+                    gemv_tg_target: std::env::var("Q35_TG_TARGET").ok().and_then(|v| v.parse().ok()).unwrap_or(2048),
                     mtp,
                     h: cfg.hidden_size,
                     inter: cfg.intermediate_size,
@@ -1451,7 +1688,16 @@ impl MetalQwen35 {
     /// NF projection of the rotated activations into `out` (optionally `+= residual`).
     unsafe fn proj(&self, enc: Id, mat: &GpuNf4Matrix, residual: Option<Id>, out: Id, n: usize) {
         let pair_blocks = (mat.num_stripes as usize).div_ceil(2);
-        let splits = if n <= GEMV_MAX_TOKENS { gemv_splits(pair_blocks, mat.num_scale_groups as usize) } else { 1 };
+        let wide = self.wide_gemv && mat.bits == 4 && mat.num_stripes == 2 * mat.num_pairs;
+        let splits = if n <= GEMV_MAX_TOKENS && wide {
+            // Enough threadgroups to keep every core streaming, without splitting scale groups thin.
+            let target = self.gemv_tg_target;
+            if pair_blocks >= target { 1 } else { (target / pair_blocks).clamp(1, GEMV_MAX_SPLITS.min(mat.num_scale_groups as usize / 4).max(1)) }
+        } else if n <= GEMV_MAX_TOKENS {
+            gemv_splits(pair_blocks, mat.num_scale_groups as usize)
+        } else {
+            1
+        };
         let params = Nf4MatParams {
             cb0: mat.cb_packed[0],
             cb1: mat.cb_packed[1],
@@ -1477,7 +1723,50 @@ impl MetalQwen35 {
         let res = residual.unwrap_or_else(|| self.dummy.id());
         let dummy = self.dummy.id();
         unsafe {
-            if n == 1 {
+            if (2..=4).contains(&n) && wide {
+                let dims = [mat.cols, n as u32];
+                set_cps(enc, &self.pipes.x_to_half);
+                set_buf(enc, self.sc.x_rot_f32.id(), 0, 0);
+                set_buf(enc, self.sc.x_tok_scale.id(), 0, 1);
+                set_buf(enc, self.sc.x_h.id(), 0, 2);
+                set_bytes(enc, &dims, 3);
+                dispatch_only(enc, MtlSize::new((mat.cols as usize).div_ceil(256), n, 1), MtlSize::new(256, 1, 1));
+                set_cps(enc, if n <= 4 { &self.pipes.nf4_multi4 } else { &self.pipes.nf4_multi8 });
+                set_buf(enc, mat.pair_buf.id(), 0, 0);
+                set_buf(enc, self.sc.x_h.id(), 0, 2);
+                set_buf(enc, self.sc.x_tok_scale.id(), 0, 3);
+                set_buf(enc, res, 0, 4);
+                set_buf(enc, out, 0, 5);
+                set_bytes(enc, &params, 6);
+                set_buf(enc, self.sc.gemv_part.id(), 0, 7);
+                dispatch_only(enc, MtlSize::new(mat.num_pairs as usize, splits, 1), MtlSize::new(128, 1, 1));
+                if splits > 1 {
+                    set_cps(enc, &self.pipes.gemv_multi_reduce);
+                    set_buf(enc, self.sc.gemv_part.id(), 0, 0);
+                    set_buf(enc, res, 0, 2);
+                    set_buf(enc, out, 0, 3);
+                    set_bytes(enc, &params, 4);
+                    dispatch_only(enc, MtlSize::new((mat.rows as usize).div_ceil(256), n, 1), MtlSize::new(256, 1, 1));
+                }
+            } else if n == 1 && wide {
+                set_cps(enc, &self.pipes.nf4_gemv1);
+                set_buf(enc, mat.pair_buf.id(), 0, 0);
+                set_buf(enc, self.sc.x_rot_f32.id(), 0, 2);
+                set_buf(enc, res, 0, 4);
+                set_buf(enc, out, 0, 5);
+                set_bytes(enc, &params, 6);
+                set_buf(enc, self.sc.gemv_part.id(), 0, 7);
+                dispatch_only(enc, MtlSize::new(mat.num_pairs as usize, splits, 1), MtlSize::new(128, 1, 1));
+                if splits > 1 {
+                    set_cps(enc, &self.pipes.gemv_reduce);
+                    set_buf(enc, self.sc.gemv_part.id(), 0, 0);
+                    set_buf(enc, dummy, 0, 1);
+                    set_buf(enc, res, 0, 2);
+                    set_buf(enc, out, 0, 3);
+                    set_bytes(enc, &params, 4);
+                    dispatch_only(enc, MtlSize::new((mat.rows as usize).div_ceil(256), 1, 1), MtlSize::new(256, 1, 1));
+                }
+            } else             if n == 1 {
                 set_cps(enc, &self.pipes.gemv1);
                 set_buf(enc, mat.pair_buf.id(), 0, 0);
                 set_buf(enc, mat.tail_buf.id(), 0, 1);
