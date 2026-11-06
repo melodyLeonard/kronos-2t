@@ -507,6 +507,17 @@ impl ConvSnapshots {
         self.entries[i].2 = self.clock;
     }
 
+    /// Marks every snapshot that is a prefix of `prompt` as used, so the shared system-prompt point
+    /// outlives the conversation snapshots built on it.
+    fn touch_prefixes(&mut self, prompt: &[usize]) {
+        self.clock += 1;
+        for e in &mut self.entries {
+            if prompt.starts_with(&e.0) {
+                e.2 = self.clock;
+            }
+        }
+    }
+
     fn insert(&mut self, toks: Vec<usize>, snap: PrefixSnap) {
         if snap.byte_len() == 0 || snap.byte_len() > self.budget_bytes {
             return;
@@ -521,7 +532,7 @@ impl ConvSnapshots {
             self.entries.retain(|(t, _, _)| !(t.len() <= toks.len() && toks[..t.len()] == t[..]));
         }
         while self.entries.iter().map(|e| e.1.byte_len()).sum::<usize>() + snap.byte_len() > self.budget_bytes {
-            let Some(oldest) = self.entries.iter().enumerate().min_by_key(|(_, e)| e.2).map(|(i, _)| i) else { break };
+            let Some(oldest) = self.entries.iter().enumerate().min_by_key(|(_, e)| (e.2, std::cmp::Reverse(e.0.len()))).map(|(i, _)| i) else { break };
             self.entries.remove(oldest);
         }
         self.clock += 1;
@@ -1445,6 +1456,12 @@ impl ChatModel {
         buf.push_str(assistant_prefix);
         ids.extend(self.tok.encode(&buf));
         if std::env::var_os("KRONOS_KV_DEBUG").is_some() {
+            if let Some(p) = std::env::var_os("KRONOS_PROMPT_DUMP") {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                    let _ = writeln!(f, "===== {} tokens\n{}", ids.len(), self.tok.decode(&ids));
+                }
+            }
             let n_asst = messages.iter().filter(|m| m.role == "assistant").count();
             eprintln!("[kv] render {} tokens, {hits}/{n_asst} assistant messages from generated ids", ids.len());
         }
@@ -1519,8 +1536,13 @@ impl ChatModel {
         let start = self.engine.position();
         let mut done = 0;
         if self.engine.is_qwen35() && !self.session_kv_enabled() {
+            // Also checkpoint right after the system turn (the second `<|im_start|>`): compaction keeps it.
+            let sys_end = self.cached.iter().chain(tail).enumerate().filter(|(_, &t)| t == self.im_start).nth(1).map(|(i, _)| i);
             loop {
-                let mark = ((start + done) / Q35_CKPT_TOKENS + 1) * Q35_CKPT_TOKENS - start;
+                let mut mark = ((start + done) / Q35_CKPT_TOKENS + 1) * Q35_CKPT_TOKENS - start;
+                if let Some(s) = sys_end.filter(|&s| s > start + done && s - start < mark && s >= ConvSnapshots::MIN_TOKENS) {
+                    mark = s - start;
+                }
                 if mark >= tail.len() {
                     break;
                 }
@@ -1564,6 +1586,7 @@ impl ChatModel {
                 common = n;
             }
         }
+        self.conv_snaps.touch_prefixes(prompt);
         self.engine.truncate_context(common);
         self.cached.truncate(common);
         common

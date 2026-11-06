@@ -296,6 +296,7 @@ fn main() {
                 gptq: !a.has("rtn"),
                 mlp_bits: a.num("mlp-bits", bits),
                 mlp_err_max: a.get("mlp-err-max").map_or(f32::INFINITY, |v| v.parse().expect("--mlp-err-max")),
+                in_bits: a.num("in-bits", bits),
             };
             let calib = a.path("calib", "../calib.txt");
             let seqs = token_seqs(&tok, &calib, a.num("seq-len", 512), a.num("calib-seqs", 8));
@@ -512,6 +513,32 @@ fn main() {
                 let approx: Vec<f32> = pairs.iter().enumerate().flat_map(|(i, p)| { let c = cent[nearest(&cent, p)]; let s = scales[i * 2 / g]; [c[0] * s, c[1] * s] }).collect();
                 line.push_str(&format!(" pairVQ64 {:.5}", rel(&approx)));
                 println!("{line}");
+            }
+        }
+        "step-bench" => {
+            // Decode step time on a fixed token stream (output ignored), best of `rounds`.
+            let model = load(&a);
+            let mut eng = MetalQwen35::new(&model, 4096).expect("Metal");
+            let steps = a.num("steps", 256);
+            let mut best = f64::MAX;
+            for _ in 0..a.num("rounds", 5) {
+                eng.reset();
+                eng.forward(&model, &[1, 2, 3, 4], &[3], &mut |_, _| {}).expect("prefill");
+                let t = Instant::now();
+                for i in 0..steps {
+                    eng.forward(&model, &[100 + i % 50], &[0], &mut |_, _| {}).expect("decode");
+                }
+                best = best.min(t.elapsed().as_secs_f64() / steps as f64);
+            }
+            println!("decode step {:.3} ms ({:.2} tok/s)", best * 1e3, 1.0 / best);
+            for nb in [2usize, 4, 8, 9, 16, 47, 64, 128, 512] {
+                eng.reset();
+                eng.forward(&model, &[1, 2, 3, 4], &[3], &mut |_, _| {}).expect("prefill");
+                let toks: Vec<usize> = (0..nb).map(|i| 100 + i % 50).collect();
+                eng.forward(&model, &toks, &[nb - 1], &mut |_, _| {}).expect("warm");
+                let t = Instant::now();
+                eng.forward(&model, &toks, &[nb - 1], &mut |_, _| {}).expect("batch");
+                println!("batch {nb:4}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
             }
         }
         "gemv-bench" => {

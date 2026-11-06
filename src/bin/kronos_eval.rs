@@ -159,6 +159,11 @@ impl Server {
             .arg(workroot)
             .arg("--state-dir")
             .arg(workroot.join(".state"));
+        // Fresh HOME: the server recalls saved conversations from `~/.kronos`, which would leak earlier runs into this one.
+        let home = workroot.join(".home");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("eval HOME");
+        cmd.env("HOME", &home);
         if let Some(d) = a.get("draft") {
             cmd.args(["--draft", d]);
         }

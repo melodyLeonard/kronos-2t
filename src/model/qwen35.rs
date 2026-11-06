@@ -563,6 +563,8 @@ pub struct QuantSpec {
     /// output error on calibration rows exceeds `mlp_err_max`.
     pub mlp_bits: usize,
     pub mlp_err_max: f32,
+    /// Bits for the attention and DeltaNet input projections (the most error-sensitive matrices).
+    pub in_bits: usize,
 }
 
 fn quantize(w: &[f32], rows: usize, cols: usize, bits: usize, sgc: usize, hess: Option<&FullRowGptqHessian>, threads: usize) -> NfSdotMatrix {
@@ -821,7 +823,7 @@ fn compile_layer(
     };
     let in_w = load_rows(store, &in_names)?;
     let in_rows = in_w.len() / h;
-    let in_q = quantize(&in_w, in_rows, h, bits, sgc, hess(&xn, h).as_ref(), threads);
+    let in_q = quantize(&in_w, in_rows, h, spec.in_bits, sgc, hess(&xn, h).as_ref(), threads);
     drop(in_w);
     let proj = dequant_rotated(&in_q).apply(&xn, t);
     let (core, lin_p, full_p) = if full {

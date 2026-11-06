@@ -130,7 +130,7 @@ pub(crate) fn load_qwen35(
                     return Err("calibration text is shorter than 512 tokens".to_string());
                 }
                 eprintln!("compiling Qwen3.5 {} ({mode_key}), one time only; this takes about 30 minutes...", model_dir.display());
-                let spec = QuantSpec { bits, head_bits: 4, scale_group_chunks: 2, gptq: true, mlp_bits: bits, mlp_err_max: f32::INFINITY };
+                let spec = QuantSpec { bits, head_bits: 4, scale_group_chunks: 2, gptq: true, mlp_bits: bits, mlp_err_max: f32::INFINITY, in_bits: bits };
                 let threads = std::thread::available_parallelism().map_or(8, |p| p.get());
                 let m = crate::model::qwen35::compile(model_dir, spec, &seqs, threads, &mut |s| eprintln!("{s}"))
                     .map_err(|e| format!("compile: {e}"))?;

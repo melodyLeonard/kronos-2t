@@ -45,6 +45,8 @@ struct DeltaParams {
     vdim: u32,
     eps: f32,
     ckpt_stride: u32,
+    /// 1: write the FWHT-64-rotated output to `x_rot_f32` (fuses the out_proj rotate).
+    rot_out: u32,
 }
 
 #[repr(C)]
@@ -83,14 +85,15 @@ struct AttnParams {
     n_splits: u32,
     split_len: u32,
     scale: f32,
-    _pad: u32,
+    /// 1: reduce writes FWHT-64-rotated output to `x_rot_f32`.
+    rot_out: u32,
 }
 
 const QWEN35_SHADER_SOURCE: &str = r#"
 struct ConvParams { uint conv_dim; uint in_stride; uint n_tok; uint ckpt_stride; };
 struct DeltaParams {
     uint n_tok; uint nk; uint nv; uint conv_dim; uint in_stride; uint ktot;
-    uint z_off; uint b_off; uint a_off; uint vdim; float eps; uint ckpt_stride;
+    uint z_off; uint b_off; uint a_off; uint vdim; float eps; uint ckpt_stride; uint rot_out;
 };
 struct AttnPrepParams {
     uint nh; uint nkv; uint hd; uint rot; uint in_stride; uint pos0; uint n_tok; uint kv_cap;
@@ -98,7 +101,7 @@ struct AttnPrepParams {
 };
 struct AttnParams {
     uint nh; uint nkv; uint hd; uint pos0; uint n_tok; uint kv_cap; uint n_splits; uint split_len;
-    float scale; uint _pad;
+    float scale; uint rot_out;
 };
 
 inline float q35_silu(float x) { return x / (1.0f + exp(-x)); }
@@ -143,6 +146,8 @@ kernel void q35_deltanet(
     device float*       out    [[buffer(6)]],
     constant DeltaParams& p    [[buffer(7)]],
     device float*       ckpt   [[buffer(8)]],
+    device const uint*  rademacher [[buffer(9)]],
+    device float*       x_rot  [[buffer(10)]],
     uint h    [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]],
     uint sg   [[simdgroup_index_in_threadgroup]],
@@ -152,6 +157,7 @@ kernel void q35_deltanet(
     threadgroup float tk[128];
     threadgroup float tq[128];
     threadgroup float red[8];
+    threadgroup float tout[128];
     const uint col = tid >> 1u;
     const uint part = tid & 1u;
     const uint r0 = part * 64u;
@@ -208,7 +214,19 @@ kernel void q35_deltanet(
         float ss = red[0] + red[1] + red[2] + red[3] + red[4] + red[5] + red[6] + red[7];
         if (part == 0u) {
             float z = prow[p.z_off + h * DV + col];
-            out[ulong(t) * p.vdim + h * DV + col] = o * rsqrt(ss / float(DV) + p.eps) * nw * q35_silu(z);
+            float y = o * rsqrt(ss / float(DV) + p.eps) * nw * q35_silu(z);
+            if (p.rot_out != 0u) tout[col] = y;
+            else out[ulong(t) * p.vdim + h * DV + col] = y;
+        }
+        if (p.rot_out != 0u) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg < 2u) {
+                uint i0 = h * DV + sg * 64u + lane;
+                float a = tout[sg * 64u + lane], c = tout[sg * 64u + 32u + lane];
+                fwht64_simd(a, c, rademacher[i0], rademacher[i0 + 32u], lane);
+                x_rot[ulong(t) * p.vdim + i0] = a;
+                x_rot[ulong(t) * p.vdim + i0 + 32u] = c;
+            }
         }
         if (p.ckpt_stride != 0u) {
             device float* ck = ckpt + ulong(t) * p.ckpt_stride + ulong(h) * DK * DV;
@@ -431,11 +449,14 @@ kernel void q35_attn_reduce(
     device const float* gate [[buffer(1)]],
     device float*       out  [[buffer(2)]],
     constant AttnParams& p   [[buffer(3)]],
+    device const uint*  rademacher [[buffer(4)]],
+    device float*       x_rot [[buffer(5)]],
     uint2 tg [[threadgroup_position_in_grid]],
     uint d   [[thread_index_in_threadgroup]])
 {
     const uint h = tg.x, t = tg.y;
     const uint hd = 256u;
+    threadgroup float tout[256];
     device const float* base = part + (ulong(t) * p.nh + h) * p.n_splits * (hd + 2u);
     float mx = -INFINITY;
     for (uint s = 0u; s < p.n_splits; s++) mx = max(mx, base[s * (hd + 2u)]);
@@ -448,7 +469,22 @@ kernel void q35_attn_reduce(
     }
     ulong idx = (ulong(t) * p.nh + h) * hd + d;
     float gv = gate[idx];
-    out[idx] = (acc / lt) * (1.0f / (1.0f + exp(-gv)));
+    float y = (acc / lt) * (1.0f / (1.0f + exp(-gv)));
+    if (p.rot_out == 0u) {
+        out[idx] = y;
+        return;
+    }
+    tout[d] = y;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint sg = d >> 5u, lane = d & 31u;
+    if (sg < 4u) {
+        uint i0 = h * hd + sg * 64u + lane;
+        float a = tout[sg * 64u + lane], c = tout[sg * 64u + 32u + lane];
+        fwht64_simd(a, c, rademacher[i0], rademacher[i0 + 32u], lane);
+        ulong o = ulong(t) * p.nh * hd + i0;
+        x_rot[o] = a;
+        x_rot[o + 32u] = c;
+    }
 }
 
 // `nf4_gemv_batch` (8-token simdgroup-matrix tile) with column splits so small-row matrices still
@@ -1135,6 +1171,8 @@ pub struct MetalQwen35 {
     draft_vocab: usize,
     /// Use `q35_nf4_gemv1` for single-token NF4 projections (`Q35_GEMV=old` restores the shared kernel).
     wide_gemv: bool,
+    /// Fused decode epilogues (`Q35_FUSE=0` disables).
+    fuse: bool,
     gemv_tg_target: usize,
     // Shapes.
     h: usize,
@@ -1394,6 +1432,7 @@ impl MetalQwen35 {
                     draft_head: None,
                     draft_vocab: 0,
                     wide_gemv: std::env::var("Q35_GEMV").map_or(true, |v| v != "old"),
+                    fuse: std::env::var("Q35_FUSE").map_or(true, |v| v != "0"),
                     gemv_tg_target: std::env::var("Q35_TG_TARGET").ok().and_then(|v| v.parse().ok()).unwrap_or(2048),
                     mtp,
                     h: cfg.hidden_size,
@@ -1755,7 +1794,9 @@ impl MetalQwen35 {
                 self.norm_fwht(enc, m.x.id(), layer.input_norm.id(), h, n, 0, mm);
                 self.proj(enc, &full.in_proj, None, self.sc.proj.id(), n);
                 self.encode_attention(enc, full, n, pos0);
-                self.norm_fwht(enc, self.sc.core.id(), self.dummy.id(), self.nh * self.hd, n, 1, mm);
+                if !self.fuse_rot(n) {
+                    self.norm_fwht(enc, self.sc.core.id(), self.dummy.id(), self.nh * self.hd, n, 1, mm);
+                }
                 self.proj(enc, &full.out_proj, Some(m.x.id()), m.x.id(), n);
                 self.norm_fwht(enc, m.x.id(), layer.post_norm.id(), h, n, 0, mm);
                 self.proj(enc, &layer.gate_up, None, self.sc.gate_up.id(), n);
@@ -1855,7 +1896,9 @@ impl MetalQwen35 {
                             self.encode_conv(enc, lin, n, ckpt.map(|c| &c.0));
                             self.encode_delta(enc, lin, n, ckpt.map(|c| &c.1));
                             if prof_on { self.cut(&mut cmd, &mut enc, "deltanet"); }
-                            self.norm_fwht(enc, self.sc.core.id(), self.dummy.id(), self.vdim, n, 1, mm);
+                            if !self.fuse_rot(n) {
+                                self.norm_fwht(enc, self.sc.core.id(), self.dummy.id(), self.vdim, n, 1, mm);
+                            }
                             self.proj(enc, &lin.out_proj, Some(self.sc.hidden.id()), self.sc.hidden.id(), n);
                             if prof_on { self.cut(&mut cmd, &mut enc, "lin_out_proj"); }
                         }
@@ -1864,7 +1907,9 @@ impl MetalQwen35 {
                             if prof_on { self.cut(&mut cmd, &mut enc, "attn_in_proj"); }
                             self.encode_attention(enc, full, n, pos0);
                             if prof_on { self.cut(&mut cmd, &mut enc, "attention"); }
-                            self.norm_fwht(enc, self.sc.core.id(), self.dummy.id(), self.nh * self.hd, n, 1, mm);
+                            if !self.fuse_rot(n) {
+                                self.norm_fwht(enc, self.sc.core.id(), self.dummy.id(), self.nh * self.hd, n, 1, mm);
+                            }
                             self.proj(enc, &full.out_proj, Some(self.sc.hidden.id()), self.sc.hidden.id(), n);
                             if prof_on { self.cut(&mut cmd, &mut enc, "attn_out_proj"); }
                         }
@@ -1967,6 +2012,11 @@ impl MetalQwen35 {
                 dispatch_only(enc, MtlSize::new(n_stride / 32, dim / 32, 1), MtlSize::new(256, 1, 1));
             }
         }
+    }
+
+    /// Whether mixers write rotated output straight into `x_rot_f32` (decode only).
+    fn fuse_rot(&self, n: usize) -> bool {
+        n == 1 && self.fuse
     }
 
     /// NF projection of the rotated activations into `out` (optionally `+= residual`).
@@ -2147,10 +2197,13 @@ impl MetalQwen35 {
             vdim: self.vdim as u32,
             eps: self.eps,
             ckpt_stride: if ckpt.is_some() { (self.n_lin * per) as u32 } else { 0 },
+            rot_out: u32::from(self.fuse_rot(n)),
         };
         let state_off = lin.slot * per * 4;
         unsafe {
             set_buf(enc, self.sc.conv.id(), 0, 0);
+            set_buf(enc, self.rademacher.id(), 0, 9);
+            set_buf(enc, self.sc.x_rot_f32.id(), 0, 10);
             set_buf(enc, self.sc.proj.id(), 0, 1);
             set_buf(enc, lin.dt_bias.id(), 0, 2);
             set_buf(enc, lin.a_neg.id(), 0, 3);
@@ -2191,7 +2244,7 @@ impl MetalQwen35 {
             n_splits: n_splits as u32,
             split_len: split_len as u32,
             scale: 1.0 / (self.hd as f32).sqrt(),
-            _pad: 0,
+            rot_out: u32::from(self.fuse_rot(n)),
         };
         unsafe {
             set_buf(enc, self.sc.proj.id(), 0, 0);
@@ -2223,6 +2276,8 @@ impl MetalQwen35 {
             set_buf(enc, self.sc.gate.id(), 0, 1);
             set_buf(enc, self.sc.core.id(), 0, 2);
             set_bytes(enc, &ap, 3);
+            set_buf(enc, self.rademacher.id(), 0, 4);
+            set_buf(enc, self.sc.x_rot_f32.id(), 0, 5);
             dispatch(enc, &self.pipes.attn_reduce, MtlSize::new(self.nh, n, 1), MtlSize::new(256, 1, 1));
         }
     }
@@ -2310,6 +2365,33 @@ mod tests {
         }
         let e = max_rel(&dec, &cpu);
         eprintln!("NF3 decode max rel err {e:.4}");
+        assert!(e < 0.05);
+    }
+
+    /// NF5 matrices match the CPU in decode, batch (verify) and prefill paths.
+    #[test]
+    fn gpu_matches_cpu_nf5() {
+        let model = Qwen35Model::synthetic_bits(small_cfg(), 23, false, 5);
+        let seq: Vec<usize> = (0..24).map(|i| (i * 37 + 3) % 512).collect();
+        let cpu = model.logits_cpu(&seq);
+        let v = model.cfg.vocab_size;
+        let mut eng = MetalQwen35::new(&model, 64).unwrap();
+        let want: Vec<usize> = (0..seq.len()).collect();
+        let mut pre = vec![0.0f32; seq.len() * v];
+        eng.forward(&model, &seq, &want, &mut |i, l| pre[i * v..(i + 1) * v].copy_from_slice(l)).unwrap();
+        eng.reset();
+        let mut dec = vec![0.0f32; seq.len() * v];
+        eng.forward(&model, &seq[..19], &want[..19], &mut |i, l| dec[i * v..(i + 1) * v].copy_from_slice(l)).unwrap();
+        eng.forward(&model, &seq[19..], &want[..5], &mut |i, l| dec[(19 + i) * v..(20 + i) * v].copy_from_slice(l)).unwrap();
+        let (ep, ed) = (max_rel(&pre, &cpu), max_rel(&dec, &cpu));
+        eprintln!("NF5 prefill {ep:.4} batch {ed:.4}");
+        assert!(ep < 0.05 && ed < 0.05);
+        eng.reset();
+        for (i, &t) in seq.iter().enumerate() {
+            eng.forward(&model, &[t], &[0], &mut |_, l| dec[i * v..(i + 1) * v].copy_from_slice(l)).unwrap();
+        }
+        let e = max_rel(&dec, &cpu);
+        eprintln!("NF5 decode {e:.4}");
         assert!(e < 0.05);
     }
 

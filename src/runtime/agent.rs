@@ -5645,7 +5645,8 @@ fn run_agent_turn_inner(
         with_model(&mut |model| {
             comp_res = Some(model.generate_with_tools_prefixed(
                 history,
-                if finalize_only { &[] } else { render_tools },
+                // Tools stay in the prompt when finalizing so the cached prefix still matches; calls are dropped below.
+                render_tools,
                 force_tool_prefix,
                 &step_params,
                 |piece| {
@@ -5909,8 +5910,7 @@ fn run_agent_turn_inner(
 
             history.push(Message::new("assistant", &comp.text));
             {
-                let tools_now: &[String] = if finalize_only { &[] } else { render_tools };
-                with_model(&mut |m| m.remember_generated(history, tools_now));
+                with_model(&mut |m| m.remember_generated(history, render_tools));
             }
 
             let mut final_rolled_back = false;
@@ -5949,8 +5949,7 @@ fn run_agent_turn_inner(
         let assistant_msg_idx = history.len();
         history.push(Message::assistant_tool_calls("", comp.tool_calls.clone()));
         {
-            let tools_now: &[String] = if finalize_only { &[] } else { render_tools };
-            with_model(&mut |m| m.remember_generated(history, tools_now));
+            with_model(&mut |m| m.remember_generated(history, render_tools));
         }
 
         let mut batch_blocker: Option<String> = None;
