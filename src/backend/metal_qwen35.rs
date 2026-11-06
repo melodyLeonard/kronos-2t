@@ -1088,7 +1088,9 @@ struct Prof {
 pub struct StateSnapshot {
     pub pos: usize,
     conv: Vec<u8>,
-    delta: Vec<u8>,
+    /// DeltaNet state: FP32 (exact) by default, FP16 with `KRONOS_SNAP_F16=1` (-20% bytes, max logit diff ~0.05).
+    delta: Vec<u16>,
+    delta_f32: Vec<u8>,
     /// Per (KV slot, kv head): K rows, V rows, K scales, V scales for positions `0..pos`.
     kv: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>,
     mtp_last: Option<Vec<u8>>,
@@ -1097,7 +1099,7 @@ pub struct StateSnapshot {
 impl StateSnapshot {
     /// Bytes held by this snapshot.
     pub fn bytes(&self) -> usize {
-        self.conv.len() + self.delta.len() + self.kv.iter().map(|k| k.0.len() + k.1.len() + k.2.len() + k.3.len()).sum::<usize>()
+        self.conv.len() + self.delta.len() * 2 + self.delta_f32.len() + self.kv.iter().map(|k| k.0.len() + k.1.len() + k.2.len() + k.3.len()).sum::<usize>()
     }
 }
 
@@ -1439,10 +1441,20 @@ impl MetalQwen35 {
                 copy(&self.v_scale, row0 * 4, self.pos * 4),
             ));
         }
+        let (mut delta, mut delta_f32) = (Vec::new(), Vec::new());
+        if std::env::var_os("KRONOS_SNAP_F16").is_none() {
+            delta_f32 = copy(&self.delta_state, 0, self.delta_state.byte_len());
+        } else {
+            // SAFETY: as above; the buffer holds `byte_len / 4` floats.
+            let src = unsafe { std::slice::from_raw_parts(self.delta_state.contents_ptr() as *const f32, self.delta_state.byte_len() / 4) };
+            delta = vec![0u16; src.len()];
+            crate::kernels::half::f32_to_f16(src, &mut delta);
+        }
         StateSnapshot {
             pos: self.pos,
             conv: copy(&self.conv_state, 0, self.conv_state.byte_len()),
-            delta: copy(&self.delta_state, 0, self.delta_state.byte_len()),
+            delta,
+            delta_f32,
             kv,
             mtp_last: self.mtp.as_ref().map(|m| copy(&m.last, 0, m.last.byte_len())),
         }
@@ -1455,7 +1467,13 @@ impl MetalQwen35 {
             unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), b.contents_ptr().add(off), src.len()) };
         };
         put(&self.conv_state, 0, &s.conv);
-        put(&self.delta_state, 0, &s.delta);
+        if s.delta.is_empty() {
+            put(&self.delta_state, 0, &s.delta_f32);
+        } else {
+            // SAFETY: same buffer and length as in `snapshot`.
+            let dst = unsafe { std::slice::from_raw_parts_mut(self.delta_state.contents_ptr() as *mut f32, s.delta.len()) };
+            crate::kernels::half::f16_to_f32(&s.delta, dst);
+        }
         for (slot_g, (k, v, ks, vs)) in s.kv.iter().enumerate() {
             let row0 = slot_g * self.kv_cap;
             put(&self.k_cache, row0 * self.hd, k);

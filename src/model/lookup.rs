@@ -45,6 +45,10 @@ impl SessionLookup {
         }
     }
 
+    pub fn num_docs(&self) -> usize {
+        self.docs.len()
+    }
+
     pub fn doc(&self, doc: usize) -> &[usize] {
         &self.docs[doc]
     }
@@ -52,7 +56,15 @@ impl SessionLookup {
     /// Up to `k` tokens that followed the best earlier match of the end of document `ctx`, or an
     /// empty draft. The best match is the one with the longest exact backward overlap.
     pub fn draft(&self, ctx: usize, k: usize) -> Vec<usize> {
-        let c = &self.docs[ctx];
+        self.draft_with(ctx, &[], k)
+    }
+
+    /// [`Self::draft`] as if `tail` were appended to document `ctx` (without indexing it).
+    pub fn draft_with(&self, ctx: usize, tail: &[usize], k: usize) -> Vec<usize> {
+        let d0 = &self.docs[ctx];
+        let keep = MAX_MATCH.min(d0.len());
+        let c: Vec<usize> = d0[d0.len() - keep..].iter().chain(tail).copied().collect();
+        let c_full_len = d0.len() + tail.len();
         if c.len() < KEY || k == 0 {
             return Vec::new();
         }
@@ -61,7 +73,7 @@ impl SessionLookup {
         let mut best: Option<(usize, usize, usize)> = None;
         for &(doc, end) in hits.iter().rev().take(MAX_CANDIDATES) {
             let (doc, end) = (doc as usize, end as usize);
-            if doc == ctx && end + 1 >= c.len() {
+            if doc == ctx && end + 1 >= c_full_len {
                 continue;
             }
             let d = &self.docs[doc];
@@ -94,6 +106,13 @@ mod tests {
         let ctx = s.add_doc(&[0, 5, 6, 7, 8]);
         s.push(ctx, 9);
         assert_eq!(s.draft(ctx, 3), vec![200, 201, 202]);
+    }
+
+    #[test]
+    fn virtual_tail_matches_like_pushed_tokens() {
+        let mut s = SessionLookup::new();
+        let ctx = s.add_doc(&[1, 2, 3, 4, 5, 9, 1, 2]);
+        assert_eq!(s.draft_with(ctx, &[3], 3), vec![4, 5, 9]);
     }
 
     #[test]

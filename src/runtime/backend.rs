@@ -63,6 +63,14 @@ impl Qwen35Backend {
         &self.logits
     }
 
+    /// Feeds `tokens` without reading logits.
+    pub(crate) fn feed(&mut self, tokens: &[usize]) {
+        self.settle();
+        if let Err(e) = self.gpu.forward(&self.model, tokens, &[], &mut |_, _| {}) {
+            panic!("Qwen3.5 forward: {e}");
+        }
+    }
+
     pub(crate) fn reset(&mut self) {
         self.pending = None;
         self.gpu.reset();

@@ -416,8 +416,12 @@ fn main() {
             eng.forward(&model, &full[..8], &[7], &mut |_, _| {}).expect("warm-up");
             eng.reset();
             let t = Instant::now();
-            let mut cold_tok = 0;
-            eng.forward(&model, &full, &[full.len() - 1], &mut |_, l| cold_tok = argmax(l)).expect("cold");
+            let (mut cold_tok, mut cold_l) = (0, Vec::new());
+            eng.forward(&model, &full, &[full.len() - 1], &mut |_, l| {
+                cold_tok = argmax(l);
+                cold_l = l.to_vec();
+            })
+            .expect("cold");
             let cold = t.elapsed().as_secs_f64();
             eng.reset();
             eng.forward(&model, &sys_ids, &[], &mut |_, _| {}).expect("system");
@@ -428,11 +432,15 @@ fn main() {
             let t = Instant::now();
             eng.restore(&snap);
             let t_restore = t.elapsed().as_secs_f64();
-            let mut warm_tok = 0;
-            eng.forward(&model, &turn, &[turn.len() - 1], &mut |_, l| warm_tok = argmax(l)).expect("warm");
+            let (mut warm_tok, mut dmax) = (0, 0f32);
+            eng.forward(&model, &turn, &[turn.len() - 1], &mut |_, l| {
+                warm_tok = argmax(l);
+                dmax = l.iter().zip(&cold_l).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            })
+            .expect("warm");
             let warm = t.elapsed().as_secs_f64();
             println!("system prompt {} tokens, turn {} tokens, snapshot {:.1} MB", sys_ids.len(), turn.len(), snap.bytes() as f64 / 1e6);
-            println!("first token cold {:.0} ms | from snapshot {:.0} ms (restore {:.1} ms, snapshot {:.1} ms) | same token {}", cold * 1e3, warm * 1e3, t_restore * 1e3, t_snap * 1e3, cold_tok == warm_tok);
+            println!("first token cold {:.0} ms | from snapshot {:.0} ms (restore {:.1} ms, snapshot {:.1} ms) | same token {} | max logit diff {dmax:.4}", cold * 1e3, warm * 1e3, t_restore * 1e3, t_snap * 1e3, cold_tok == warm_tok);
         }
         "requant-head" => {
             let mut model = load(&a);

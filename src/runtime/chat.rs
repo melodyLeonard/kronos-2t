@@ -531,8 +531,15 @@ impl ConvSnapshots {
 
 pub struct ChatModel {
     engine: Backend,
+    /// Prompt-lookup index over the live context (doc `look_ctx`) and recent conversations; drafts
+    /// Qwen3.5 speculation.
+    look: crate::model::lookup::SessionLookup,
+    look_ctx: usize,
     /// Qwen3.5-style template: the open assistant turn starts with an empty `<think>` block.
     think_block: bool,
+    /// `KRONOS_THINK=1`: open a real `<think>` block instead of the empty one; reasoning is
+    /// stripped before tool-call parsing.
+    thinking: bool,
     draft: Option<DraftEngine>,
     tok: BpeTokenizer,
     im_start: usize,
@@ -541,6 +548,8 @@ pub struct ChatModel {
     cached: Vec<usize>,
     /// Small 2-slot LRU KV prefix cache (`<= 80` tokens/slot) accelerating repeated `Kronos-Jev` calls.
     jev_caches: Vec<(Vec<usize>, crate::model::real_llm::KvPrefixSnapshot)>,
+    /// Qwen3.5 Jev states after the scorer system prompt, most recent first.
+    jev_q35: Vec<(Vec<usize>, crate::backend::metal_qwen35::StateSnapshot)>,
     /// KV snapshots of recent conversations, so switching back restores instead of re-prefilling.
     conv_snaps: ConvSnapshots,
     /// Generated token ids per assistant message, keyed by the hash of the canonical ChatML text up to
@@ -621,12 +630,16 @@ impl ChatModel {
         Ok(Self {
             engine,
             think_block,
+            thinking: think_block && std::env::var("KRONOS_THINK").is_ok_and(|v| v == "1"),
+            look: crate::model::lookup::SessionLookup::new(),
+            look_ctx: 0,
             draft: None,
             tok,
             im_start,
             im_end,
             cached: Vec::new(),
             jev_caches: Vec::with_capacity(2),
+            jev_q35: Vec::new(),
             conv_snaps: ConvSnapshots::new(),
             gen_memo: Vec::new(),
             last_gen: None,
@@ -1225,6 +1238,7 @@ impl ChatModel {
 
         // Metal included: the scorer overwrites only the first `tokens.len()` KV positions, which are
         // snapshotted and restored, so the conversation KV (and `self.cached`) stay intact.
+        let sys_ids = self.tok.encode(&format!("<|im_start|>system\n{system_hint}<|im_end|>\n"));
         let saved_total = self.cached.len();
         match &mut self.engine {
             Backend::Llama(e) => eval_with_jev_prefix(e, saved_total, &raw_tokens, &mut self.jev_caches, score_logits),
@@ -1232,8 +1246,25 @@ impl ChatModel {
                 // The recurrent state cannot be partly overwritten, so score from a clean context and put the
                 // whole conversation state back afterwards.
                 let saved = q.snapshot();
-                q.reset();
-                let res = score_logits(q.forward_last(&raw_tokens));
+                let hit = self.jev_q35.iter().position(|(t, _)| t.len() < raw_tokens.len() && raw_tokens.starts_with(t));
+                let start = if let Some(i) = hit {
+                    let e = self.jev_q35.remove(i);
+                    q.restore(&e.1);
+                    let n = e.0.len();
+                    self.jev_q35.insert(0, e);
+                    n
+                } else {
+                    q.reset();
+                    if sys_ids.len() >= 8 && sys_ids.len() < raw_tokens.len() && raw_tokens.starts_with(&sys_ids) {
+                        q.feed(&sys_ids);
+                        self.jev_q35.truncate(JEV_CACHE_SLOTS - 1);
+                        self.jev_q35.insert(0, (sys_ids.clone(), q.snapshot()));
+                        sys_ids.len()
+                    } else {
+                        0
+                    }
+                };
+                let res = score_logits(q.forward_last(&raw_tokens[start..]));
                 q.restore(&saved);
                 Some(res)
             }
@@ -1406,7 +1437,9 @@ impl ChatModel {
                 }
             }
         });
-        if self.think_block {
+        if self.thinking {
+            buf.push_str("<think>\n");
+        } else if self.think_block {
             buf.push_str(THINK_EMPTY);
         }
         buf.push_str(assistant_prefix);
@@ -1424,6 +1457,9 @@ impl ChatModel {
     pub fn remember_generated(&mut self, messages: &[Message], tools_json: &[String]) {
         use std::hash::{Hash, Hasher};
         let Some(gen) = self.last_gen.take() else { return };
+        if self.thinking {
+            return;
+        }
         if messages.last().is_none_or(|m| m.role != "assistant") || gen.is_empty() || !self.cached.ends_with(&gen) {
             return;
         }
@@ -1442,6 +1478,37 @@ impl ChatModel {
             self.gen_memo.remove(0);
         }
         self.gen_memo.push((key, gen));
+    }
+
+    /// Rebuilds the lookup index from the live context plus stored conversations.
+    fn rebuild_lookup(&mut self) {
+        let mut look = crate::model::lookup::SessionLookup::new();
+        let mut budget = 200_000usize;
+        for (toks, _, _) in &self.conv_snaps.entries {
+            if toks.len() > budget {
+                break;
+            }
+            budget -= toks.len();
+            look.add_doc(toks);
+        }
+        self.look_ctx = look.add_doc(&self.cached);
+        self.look = look;
+    }
+
+    /// Appends newly cached tokens to the lookup index (rebuilding if the context was cut).
+    fn sync_lookup(&mut self) {
+        if self.look_ctx >= self.look.num_docs() {
+            self.rebuild_lookup();
+            return;
+        }
+        let have = self.look.doc(self.look_ctx).len();
+        if have > self.cached.len() || (have > 0 && self.look.doc(self.look_ctx)[have - 1] != self.cached[have - 1]) {
+            self.rebuild_lookup();
+            return;
+        }
+        for i in have..self.cached.len() {
+            self.look.push(self.look_ctx, self.cached[i]);
+        }
     }
 
     /// Feeds `tail` after `self.cached` (which must match the engine) and copies the last logits into
@@ -1852,7 +1919,14 @@ impl ChatModel {
             if lookup_cooldown > 0 {
                 lookup_cooldown -= 1;
             } else if spec_ok && greedy && max_lookup >= 3 {
-                drafted = find_suffix_continuation(&self.cached, next, max_lookup, &mut draft_tokens);
+                drafted = if self.engine.is_qwen35() {
+                    self.sync_lookup();
+                    let d = self.look.draft_with(self.look_ctx, &[next], max_lookup);
+                    draft_tokens[..d.len()].copy_from_slice(&d);
+                    d.len()
+                } else {
+                    find_suffix_continuation(&self.cached, next, max_lookup, &mut draft_tokens)
+                };
                 if drafted >= 2 {
                     source = SpecSource::Lookup;
                 } else {
@@ -2120,6 +2194,10 @@ impl ChatModel {
             crate::kernels::thread_pool::SpinThreadPool::park_idle_workers();
         }
         let raw_text = String::from_utf8_lossy(&raw_bytes).into_owned();
+        let raw_text = match raw_text.find("</think>") {
+            Some(i) if self.thinking => raw_text[i + "</think>".len()..].trim_start().to_string(),
+            _ => raw_text,
+        };
         let (text, tool_calls) = if !tools_json.is_empty()
             || raw_text.contains(crate::config::markup::TOOL_CALL_OPEN)
             || raw_text.contains(crate::config::markup::TOOLS_OPEN)

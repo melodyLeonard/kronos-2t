@@ -5684,6 +5684,14 @@ fn run_agent_turn_inner(
             ));
         });
         let mut comp = comp_res.ok_or_else(|| "model unavailable".to_string())??;
+        // After repeated identical calls the step runs without tools; a model that still writes a
+        // call (the parser accepts `<tool_call>` text) must not get it executed again.
+        if finalize_only && !comp.tool_calls.is_empty() {
+            comp.tool_calls.clear();
+            if comp.text.trim().is_empty() {
+                comp.text = "I stopped repeating the same tool call; the last result above is where the work stands.".to_string();
+            }
+        }
         if alive && !aborted_fence_prose {
             let _ = filter.finish(|prose| on_event(AgentEvent::TextDelta(prose)));
         }
