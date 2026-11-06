@@ -469,6 +469,9 @@ impl ChatScratch {
     }
 }
 
+/// Prefill checkpoint spacing for Qwen3.5 (see `ChatModel::prefill_tail`).
+const Q35_CKPT_TOKENS: usize = 1024;
+
 /// Byte-budgeted LRU of KV snapshots keyed by their token prefix.
 struct ConvSnapshots {
     entries: Vec<(Vec<usize>, PrefixSnap, u64)>,
@@ -489,12 +492,12 @@ impl ConvSnapshots {
         a.iter().zip(b).take_while(|(x, y)| x == y).count()
     }
 
-    /// Index and usable length of the snapshot sharing the longest prefix with `prompt`.
+    /// Index and usable length of the snapshot that covers the longest prefix of `prompt`.
     fn best(&self, prompt: &[usize]) -> Option<(usize, usize)> {
         self.entries
             .iter()
             .enumerate()
-            .map(|(i, (toks, _, _))| (i, Self::common_prefix(toks, prompt)))
+            .map(|(i, (toks, snap, _))| (i, Backend::usable_prefix(snap, Self::common_prefix(toks, prompt))))
             .max_by_key(|&(_, n)| n)
             .filter(|&(_, n)| n > 0)
     }
@@ -509,10 +512,14 @@ impl ConvSnapshots {
             return;
         }
         // A snapshot that is a prefix of a stored one adds nothing; one that extends a stored one replaces it.
-        if self.entries.iter().any(|(t, _, _)| t.len() >= toks.len() && t[..toks.len()] == toks[..]) {
+        // Qwen3.5 snapshots resume only at their own length, so each prefix point is kept on its own.
+        let exact_only = matches!(snap, PrefixSnap::Qwen35(_));
+        if self.entries.iter().any(|(t, _, _)| if exact_only { *t == toks } else { t.len() >= toks.len() && t[..toks.len()] == toks[..] }) {
             return;
         }
-        self.entries.retain(|(t, _, _)| !(t.len() <= toks.len() && toks[..t.len()] == t[..]));
+        if !exact_only {
+            self.entries.retain(|(t, _, _)| !(t.len() <= toks.len() && toks[..t.len()] == t[..]));
+        }
         while self.entries.iter().map(|e| e.1.byte_len()).sum::<usize>() + snap.byte_len() > self.budget_bytes {
             let Some(oldest) = self.entries.iter().enumerate().min_by_key(|(_, e)| e.2).map(|(i, _)| i) else { break };
             self.entries.remove(oldest);
@@ -1280,8 +1287,7 @@ impl ChatModel {
                 let _ = dj.join();
             });
         } else {
-            let l = self.engine.forward_prompt(tail);
-            self.scratch.cur_logits.copy_from_slice(l);
+            self.prefill_tail(tail);
             if let Some(d) = self.draft.as_mut() {
                 let dv = d.draft_vocab;
                 let mut d_common = d
@@ -1438,6 +1444,33 @@ impl ChatModel {
         self.gen_memo.push((key, gen));
     }
 
+    /// Feeds `tail` after `self.cached` (which must match the engine) and copies the last logits into
+    /// `scratch.cur_logits`. On Qwen3.5, whose recurrent state only resumes from exact snapshots, it
+    /// also snapshots every `Q35_CKPT_TOKENS` positions so a later prompt that shares only part of
+    /// this one resumes from the nearest checkpoint instead of from scratch.
+    fn prefill_tail(&mut self, tail: &[usize]) {
+        let start = self.engine.position();
+        let mut done = 0;
+        if self.engine.is_qwen35() && !self.session_kv_enabled() {
+            loop {
+                let mark = ((start + done) / Q35_CKPT_TOKENS + 1) * Q35_CKPT_TOKENS - start;
+                if mark >= tail.len() {
+                    break;
+                }
+                self.engine.forward_prompt(&tail[done..mark]);
+                done = mark;
+                if let Some(snap) = self.engine.save_kv_prefix(start + done) {
+                    let mut toks = self.cached.clone();
+                    toks.extend_from_slice(&tail[..done]);
+                    self.conv_snaps.insert(toks, snap);
+                }
+            }
+        }
+        let vocab = self.engine.vocab_size();
+        let logits = self.engine.forward_prompt(&tail[done..]);
+        self.scratch.cur_logits[..vocab].copy_from_slice(&logits[..vocab]);
+    }
+
     /// Aligns the target KV cache with `prompt`: keeps the common prefix, snapshots a long context
     /// being left behind, and restores a stored snapshot when it covers more of `prompt`.
     /// Returns the number of cached tokens to reuse (at most `prompt.len() - 1`).
@@ -1485,8 +1518,7 @@ impl ChatModel {
         let common = self.align_kv(&prompt);
         let tail = &prompt[common..];
         let vocab = self.engine.vocab_size();
-        let logits = self.engine.forward_prompt(tail);
-        self.scratch.cur_logits[..vocab].copy_from_slice(&logits[..vocab]);
+        self.prefill_tail(tail);
         self.cached.extend_from_slice(tail);
         if self.im_start < self.scratch.cur_logits.len() {
             self.scratch.cur_logits[self.im_start] = f32::NEG_INFINITY;
@@ -1649,8 +1681,7 @@ impl ChatModel {
                     });
                     draft_synced_in_parallel = true;
                 } else {
-                    let l = self.engine.forward_prompt(&prompt[common..]);
-                    self.scratch.cur_logits.copy_from_slice(l);
+                    self.prefill_tail(&prompt[common..]);
                 }
             }
         }
