@@ -705,6 +705,96 @@ kernel void q35_nf4_gemv1(
     out[row] = sum;
 }
 
+// NF3 single-token GEMV over full stripe pairs with 2 chunks per scale group. Lane T owns one
+// (chunk, stripe, 32-column half, 4-row group) unit of each scale group: cc = T >> 4, s = (T >> 3) & 1,
+// h = (T >> 2) & 1, g = T & 3, and loads its 48 contiguous bytes (4 rows x 32 columns) at once.
+kernel void q35_nf3_gemv1(
+    device const uchar* pair_stream [[buffer(0)]],
+    device const float* x_rot       [[buffer(2)]],
+    device const float* residual    [[buffer(4)]],
+    device float*       out         [[buffer(5)]],
+    constant Nf4MatParams& p        [[buffer(6)]],
+    device float*       part        [[buffer(7)]],
+    uint2 tg_pos  [[threadgroup_position_in_grid]],
+    uint sg_id    [[simdgroup_index_in_threadgroup]],
+    uint T        [[thread_index_in_simdgroup]],
+    uint tid_tg   [[thread_index_in_threadgroup]])
+{
+    const uint pair_idx = tg_pos.x;
+    const uint split = tg_pos.y;
+    const uint per_split = (p.num_scale_groups + p.n_splits - 1u) / p.n_splits;
+    const uint sg_lo = split * per_split;
+    const uint sg_hi = min(p.num_scale_groups, sg_lo + per_split);
+    if (pair_idx >= p.num_pairs) return;
+
+    threadgroup half2 l_pair[64];
+    if (tid_tg < 64u) {
+        l_pair[tid_tg] = half2(half(nf4_byte_lut(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg & 7u)),
+                               half(nf4_byte_lut(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg >> 3u)));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint cc = T >> 4u, s = (T >> 3u) & 1u, h = (T >> 2u) & 1u, g = T & 3u;
+    float acc[4] = {0, 0, 0, 0};
+    device const uchar* p_base = pair_stream + ulong(pair_idx) * ulong(p.pair_total_bytes);
+    const uint sg_stride = 64u + 2u * 768u;
+    for (uint sg = sg_lo + sg_id; sg < sg_hi; sg += 4u) {
+        device const uchar* sg_ptr = p_base + ulong(sg) * ulong(sg_stride);
+        const uint c = sg * 2u + cc;
+        if (c >= p.num_chunks) continue;
+        uint2 sr = *(device const uint2*)(sg_ptr + s * 32u + g * 8u);
+        float4 sc = float4(as_type<float>(sr.x << 16), as_type<float>(sr.x & 0xFFFF0000u),
+                           as_type<float>(sr.y << 16), as_type<float>(sr.y & 0xFFFF0000u));
+        device const uint4* d = (device const uint4*)(sg_ptr + 64u + cc * 768u + s * 384u + h * 192u + g * 48u);
+        uint4 w0 = d[0], w1 = d[1], w2 = d[2];
+        device const float4* xp = (device const float4*)(x_rot + c * 64u + h * 32u);
+        float4 x[8];
+        #pragma unroll
+        for (uint i = 0u; i < 8u; ++i) x[i] = xp[i];
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            uint4 v0 = uint4(as_type<uchar4>(w0[j]));
+            uint4 v1 = uint4(as_type<uchar4>(w1[j]));
+            uint4 v2 = uint4(as_type<uchar4>(w2[j]));
+            uint4 key[4];
+            key[0] = (v0 & 7u) | (((v0 >> 3u) & 7u) << 3u);
+            key[1] = (((v0 >> 6u) & 3u) | (((v2 >> 6u) & 1u) << 2u)) | ((v1 & 7u) << 3u);
+            key[2] = ((v1 >> 3u) & 7u) | ((((v1 >> 6u) & 3u) | (((v2 >> 7u) & 1u) << 2u)) << 3u);
+            key[3] = (v2 & 7u) | (((v2 >> 3u) & 7u) << 3u);
+            float sum = 0.0f;
+            #pragma unroll
+            for (uint sp = 0u; sp < 4u; ++sp) {
+                half2 q0 = l_pair[key[sp].x], q1 = l_pair[key[sp].y], q2 = l_pair[key[sp].z], q3 = l_pair[key[sp].w];
+                sum += dot(float4(q0.x, q1.x, q2.x, q3.x), x[sp * 2u]) + dot(float4(q0.y, q1.y, q2.y, q3.y), x[sp * 2u + 1u]);
+            }
+            acc[j] += sum * sc[j];
+        }
+    }
+    #pragma unroll
+    for (uint j = 0u; j < 4u; ++j) {
+        float a = acc[j];
+        a += simd_shuffle_xor(a, ushort(4));
+        a += simd_shuffle_xor(a, ushort(16));
+        acc[j] = a;
+    }
+    threadgroup float tg_red[4][32];
+    if (cc == 0u && h == 0u) {
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) tg_red[sg_id][s * 16u + g * 4u + j] = acc[j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_id != 0u) return;
+    uint row = pair_idx * 32u + T;
+    if (row >= p.rows) return;
+    float sum = tg_red[0][T] + tg_red[1][T] + tg_red[2][T] + tg_red[3][T];
+    if (p.n_splits > 1u) {
+        part[split * p.rows + row] = sum;
+        return;
+    }
+    if (p.has_residual != 0u) sum += residual[row];
+    out[row] = sum;
+}
+
 // `q35_nf4_gemv1` for up to MAXT tokens: each 16-byte load is unpacked and scaled once, then
 // applied to every token. Partials go to `q35_gemv_multi_reduce` when columns are split.
 template <uint MAXT>
@@ -940,6 +1030,7 @@ struct Pipes {
     mtp_prep: MtlObj,
     gemv_batch_split: MtlObj,
     nf4_gemv1: MtlObj,
+    nf3_gemv1: MtlObj,
     nf4_multi4: MtlObj,
     nf4_multi8: MtlObj,
     x_to_half: MtlObj,
@@ -1107,6 +1198,7 @@ impl MetalQwen35 {
                     mtp_prep: bp("q35_mtp_prep")?,
                     gemv_batch_split: bp("q35_gemv_batch_split")?,
                     nf4_gemv1: bp("q35_nf4_gemv1")?,
+                    nf3_gemv1: bp("q35_nf3_gemv1")?,
                     nf4_multi4: bp("q35_nf4_gemv_multi4")?,
                     nf4_multi8: bp("q35_nf4_gemv_multi8")?,
                     x_to_half: bp("q35_x_to_half")?,
@@ -1560,7 +1652,7 @@ impl MetalQwen35 {
                 if cmd.is_null() || enc.is_null() {
                     return Err("Metal command buffer allocation failed".into());
                 }
-                let prof_on = self.prof.is_some() && n == 1;
+                let prof_on = self.prof.is_some() && n == std::env::var("Q35_PROF_N").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
                 let mm = n >= 2;
                 for layer in &self.layers {
                     self.norm_fwht(enc, self.sc.hidden.id(), layer.input_norm.id(), h, n, 0, mm);
@@ -1689,7 +1781,8 @@ impl MetalQwen35 {
     unsafe fn proj(&self, enc: Id, mat: &GpuNf4Matrix, residual: Option<Id>, out: Id, n: usize) {
         let pair_blocks = (mat.num_stripes as usize).div_ceil(2);
         let wide = self.wide_gemv && mat.bits == 4 && mat.num_stripes == 2 * mat.num_pairs;
-        let splits = if n <= GEMV_MAX_TOKENS && wide {
+        let wide3 = self.wide_gemv && mat.bits == 3 && mat.scale_group_chunks == 2 && mat.num_stripes == 2 * mat.num_pairs;
+        let splits = if n <= GEMV_MAX_TOKENS && (wide || (wide3 && n == 1)) {
             // Enough threadgroups to keep every core streaming, without splitting scale groups thin.
             let target = self.gemv_tg_target;
             if pair_blocks >= target { 1 } else { (target / pair_blocks).clamp(1, GEMV_MAX_SPLITS.min(mat.num_scale_groups as usize / 4).max(1)) }
@@ -1748,8 +1841,8 @@ impl MetalQwen35 {
                     set_bytes(enc, &params, 4);
                     dispatch_only(enc, MtlSize::new((mat.rows as usize).div_ceil(256), n, 1), MtlSize::new(256, 1, 1));
                 }
-            } else if n == 1 && wide {
-                set_cps(enc, &self.pipes.nf4_gemv1);
+            } else if n == 1 && (wide || wide3) {
+                set_cps(enc, if wide3 { &self.pipes.nf3_gemv1 } else { &self.pipes.nf4_gemv1 });
                 set_buf(enc, mat.pair_buf.id(), 0, 0);
                 set_buf(enc, self.sc.x_rot_f32.id(), 0, 2);
                 set_buf(enc, res, 0, 4);
@@ -2004,6 +2097,23 @@ mod tests {
             .count();
         eprintln!("prefill max rel err {e_prefill:.4}, decode {e_decode:.4}, argmax agree {agree}/{}", seq.len());
         assert!(e_prefill < 0.05 && e_decode < 0.05, "GPU/CPU mismatch: {e_prefill} {e_decode}");
+    }
+
+    /// NF3 MLP matrices through `q35_nf3_gemv1` match the CPU.
+    #[test]
+    fn gpu_matches_cpu_nf3_mlp() {
+        let model = Qwen35Model::synthetic_bits(small_cfg(), 17, false, 3);
+        let seq: Vec<usize> = (0..24).map(|i| (i * 41 + 7) % 512).collect();
+        let cpu = model.logits_cpu(&seq);
+        let v = model.cfg.vocab_size;
+        let mut eng = MetalQwen35::new(&model, 64).unwrap();
+        let mut dec = vec![0.0f32; seq.len() * v];
+        for (i, &t) in seq.iter().enumerate() {
+            eng.forward(&model, &[t], &[0], &mut |_, l| dec[i * v..(i + 1) * v].copy_from_slice(l)).unwrap();
+        }
+        let e = max_rel(&dec, &cpu);
+        eprintln!("NF3 decode max rel err {e:.4}");
+        assert!(e < 0.05);
     }
 
     /// GPU MTP drafts match the CPU MTP head row by row, whether filled singly or in a batch.

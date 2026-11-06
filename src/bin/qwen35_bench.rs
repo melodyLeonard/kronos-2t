@@ -191,6 +191,96 @@ fn decode_mtp(model: &Qwen35Model, eng: &mut MetalQwen35, first: usize, prompt_l
     (out, steps)
 }
 
+/// Prompt-lookup draft: the tokens that followed the most recent earlier occurrence of the longest
+/// (3..1-token) suffix of `ctx`, up to `k`.
+fn lookup_draft(ctx: &[usize], k: usize, min_n: usize) -> Vec<usize> {
+    for n in (min_n..=3usize).rev() {
+        if ctx.len() <= n {
+            continue;
+        }
+        let suffix = &ctx[ctx.len() - n..];
+        for start in (0..ctx.len() - n).rev() {
+            if &ctx[start..start + n] == suffix {
+                let from = start + n;
+                let end = (from + k).min(ctx.len());
+                if end > from {
+                    return ctx[from..end].to_vec();
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Greedy speculative decoding: prompt-lookup drafts of up to `k_lookup` tokens when the context
+/// repeats, else MTP drafts of `k_mtp` (0 disables either). Returns tokens and verify steps.
+/// With `auto`, lookup needs a 3-token match and 3+ drafts, and MTP runs only while its recent
+/// tokens per step beat the verify cost (probing every 8th step); other steps decode one token.
+#[allow(clippy::too_many_arguments)]
+fn decode_spec(model: &Qwen35Model, eng: &mut MetalQwen35, prompt: &[usize], first: usize, gen: usize, k_mtp: usize, k_lookup: usize, auto: bool) -> (Vec<usize>, usize) {
+    // A verify of ~4 tokens costs about this many single-token steps.
+    const VERIFY_COST: f64 = 2.4;
+    let mut mtp_rate = VERIFY_COST;
+    let use_mtp = k_mtp > 0 && eng.has_mtp();
+    let mut ctx = prompt.to_vec();
+    let mut x = first;
+    let mut pos = prompt.len();
+    let mut d = if use_mtp {
+        eng.mtp_fill(model, &[x], (pos - 1) % MAX_CHUNK, pos - 1, true).expect("MTP")
+    } else {
+        None
+    };
+    let mut out = Vec::with_capacity(gen + 8);
+    let mut steps = 0;
+    while out.len() < gen {
+        ctx.push(x);
+        let mut drafts = if k_lookup > 0 { lookup_draft(&ctx, k_lookup, if auto { 3 } else { 1 }) } else { Vec::new() };
+        if auto && drafts.len() < 3 {
+            drafts.clear();
+        }
+        let try_mtp = !auto || mtp_rate >= VERIFY_COST || steps % 8 == 0;
+        let from_mtp = drafts.len() < 2 && use_mtp && try_mtp;
+        if from_mtp {
+            drafts = vec![d.expect("draft")];
+            for j in 1..k_mtp {
+                drafts.push(eng.mtp_chain(model, drafts[j - 1], pos - 1 + j).expect("MTP chain"));
+            }
+        }
+        let mut feed = vec![x];
+        feed.extend(&drafts);
+        let mut am = vec![0usize; feed.len()];
+        if feed.len() == 1 {
+            eng.forward(model, &feed, &[0], &mut |_, l| am[0] = argmax(l)).expect("decode");
+        } else {
+            eng.verify(model, &feed, &mut |i, l| am[i] = argmax(l)).expect("verify");
+        }
+        let mut m = 0;
+        while m < drafts.len() && am[m] == drafts[m] {
+            m += 1;
+        }
+        if from_mtp {
+            mtp_rate = 0.7 * mtp_rate + 0.3 * (m + 1) as f64;
+        }
+        if feed.len() > 1 {
+            eng.accept(m + 1);
+        }
+        out.push(x);
+        out.extend(&drafts[..m]);
+        ctx.extend(&drafts[..m]);
+        let y = am[m];
+        if use_mtp {
+            let mut next_toks = drafts[..m].to_vec();
+            next_toks.push(y);
+            d = eng.mtp_fill(model, &next_toks, 0, pos, true).expect("MTP");
+        }
+        pos += m + 1;
+        x = y;
+        steps += 1;
+    }
+    out.truncate(gen);
+    (out, steps)
+}
+
 fn main() {
     let a = Args::parse();
     let tok = BpeTokenizer::from_model_dir(&a.model_dir).expect("tokenizer");
@@ -204,7 +294,14 @@ fn main() {
         }
         "compile" => {
             let bits = a.num("bits", 4);
-            let spec = QuantSpec { bits, head_bits: a.num("head-bits", bits), scale_group_chunks: 2, gptq: !a.has("rtn") };
+            let spec = QuantSpec {
+                bits,
+                head_bits: a.num("head-bits", bits),
+                scale_group_chunks: 2,
+                gptq: !a.has("rtn"),
+                mlp_bits: a.num("mlp-bits", bits),
+                mlp_err_max: a.get("mlp-err-max").map_or(f32::INFINITY, |v| v.parse().expect("--mlp-err-max")),
+            };
             let calib = a.path("calib", "../calib.txt");
             let seqs = token_seqs(&tok, &calib, a.num("seq-len", 512), a.num("calib-seqs", 8));
             let out = a.path("out", "kronos-qwen35-nf4g128.k2tb");
@@ -310,6 +407,43 @@ fn main() {
                 ids.len(),
                 out.len() as f64 / t1.elapsed().as_secs_f64()
             );
+        }
+        "edit-bench" => {
+            let model = load(&a);
+            let file = a.get("file").unwrap_or("src/kernels/accel.rs");
+            let code = std::fs::read_to_string(file).expect("--file");
+            let code: String = code.lines().take(a.num("lines", 120)).collect::<Vec<_>>().join("\n");
+            let user = match a.get("prompt") {
+                Some(p) => p.to_string(),
+                None => format!("Add a one-line doc comment above every function that lacks one, and return the whole file unchanged otherwise.\n\n```rust\n{code}\n```"),
+            };
+            let prompt = tok.encode(&format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+            let gen = a.num("gen", 400);
+            let mut eng = MetalQwen35::new(&model, prompt.len() + gen + 64).expect("Metal");
+            eng.set_draft_vocab(a.num("draft-vocab", 32768));
+            let run = |eng: &mut MetalQwen35, k_mtp: usize, k_lookup: usize, auto: bool| {
+                eng.reset();
+                let first = prefill(&model, eng, &prompt, k_mtp > 0);
+                let t = Instant::now();
+                let (o, steps) = if k_mtp == 0 && k_lookup == 0 {
+                    let o = decode_plain(&model, eng, first, gen);
+                    (o, gen)
+                } else {
+                    decode_spec(&model, eng, &prompt, first, gen, k_mtp, k_lookup, auto)
+                };
+                (o, steps, t.elapsed().as_secs_f64())
+            };
+            let (plain, _, tp) = run(&mut eng, 0, 0, false);
+            println!("prompt {} tokens, {gen} generated", prompt.len());
+            println!("plain               {:6.2} tok/s", gen as f64 / tp);
+            for (name, km, kl, auto) in [("MTP x3", 3usize, 0usize, false), ("lookup x7", 0, 7, false), ("auto: lookup + MTP", 3, 7, true)] {
+                let (o, steps, t) = run(&mut eng, km, kl, auto);
+                let same = o.iter().zip(&plain).take_while(|(x, y)| x == y).count();
+                println!("{name:<20}{:6.2} tok/s, {:.2} tokens/step, matches plain for {same}/{gen}", gen as f64 / t, gen as f64 / steps as f64);
+            }
+            if a.has("show") {
+                println!("{}", tok.decode(&plain));
+            }
         }
         _ => usage(),
     }

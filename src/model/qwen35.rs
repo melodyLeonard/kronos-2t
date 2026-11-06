@@ -559,6 +559,10 @@ pub struct QuantSpec {
     pub head_bits: usize,
     pub scale_group_chunks: usize,
     pub gptq: bool,
+    /// MLP (`gate_up`, `down`) bits; below `bits`, each matrix falls back to `bits` when its relative
+    /// output error on calibration rows exceeds `mlp_err_max`.
+    pub mlp_bits: usize,
+    pub mlp_err_max: f32,
 }
 
 fn quantize(w: &[f32], rows: usize, cols: usize, bits: usize, sgc: usize, hess: Option<&FullRowGptqHessian>, threads: usize) -> NfSdotMatrix {
@@ -745,6 +749,43 @@ pub fn reference_ppl(model_dir: &Path, seqs: &[Vec<usize>], log: &mut dyn FnMut(
     Ok((nll / n.max(1) as f64).exp())
 }
 
+/// Calibration rows used to score a quantized matrix.
+const ERR_ROWS: usize = 512;
+
+/// Relative output error `|X (W - Wq)^T|^2 / |X W^T|^2` on the first calibration rows.
+fn rel_output_error(w: &[f32], q: &NfSdotMatrix, x: &[f32]) -> f32 {
+    let cols = q.cols;
+    let t = (x.len() / cols).min(ERR_ROWS);
+    let xs = &x[..t * cols];
+    let exact = Lin { rows: q.rows, cols, w: w.to_vec(), rotated: false }.apply(xs, t);
+    let approx = dequant_rotated(q).apply(xs, t);
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for (a, b) in exact.iter().zip(&approx) {
+        num += ((a - b) as f64).powi(2);
+        den += (*a as f64).powi(2);
+    }
+    (num / den.max(1e-30)) as f32
+}
+
+/// Quantizes an MLP matrix at `spec.mlp_bits`, falling back to `spec.bits` when its output error
+/// is above `spec.mlp_err_max`.
+#[allow(clippy::too_many_arguments)]
+fn quantize_mlp(w: &[f32], rows: usize, cols: usize, x: &[f32], spec: QuantSpec, hess: Option<&FullRowGptqHessian>, threads: usize, lp: &str, what: &str) -> NfSdotMatrix {
+    let sgc = spec.scale_group_chunks;
+    if spec.mlp_bits >= spec.bits {
+        return quantize(w, rows, cols, spec.bits, sgc, hess, threads);
+    }
+    let q = quantize(w, rows, cols, spec.mlp_bits, sgc, hess, threads);
+    let e = rel_output_error(w, &q, x);
+    if e <= spec.mlp_err_max {
+        eprintln!("  {lp}{what}: {}-bit, rel err {e:.5}", spec.mlp_bits);
+        return q;
+    }
+    let q4 = quantize(w, rows, cols, spec.bits, sgc, hess, threads);
+    eprintln!("  {lp}{what}: {}-bit rel err {e:.5} over {:.5}, kept {}-bit (rel err {:.5})", spec.mlp_bits, spec.mlp_err_max, spec.bits, rel_output_error(w, &q4, x));
+    q4
+}
+
 /// Compiles one decoder layer at tensor prefix `lp` and advances the residual stream `x`
 /// (`[sum(lens), hidden]`) through the quantized weights.
 #[allow(clippy::too_many_arguments)]
@@ -813,11 +854,11 @@ fn compile_layer(
 
     let xn = rms_norm_rows(x, &post_norm, cfg.rms_norm_eps);
     let gu_w = load_rows(store, &[format!("{lp}mlp.gate_proj.weight"), format!("{lp}mlp.up_proj.weight")])?;
-    let gu_q = quantize(&gu_w, 2 * inter, h, bits, sgc, hess(&xn, h).as_ref(), threads);
+    let gu_q = quantize_mlp(&gu_w, 2 * inter, h, &xn, spec, hess(&xn, h).as_ref(), threads, lp, "gate_up");
     drop(gu_w);
     let act = swiglu_rows(&dequant_rotated(&gu_q).apply(&xn, t), inter);
     let dn_w = load_f32(store, &format!("{lp}mlp.down_proj.weight"))?;
-    let dn_q = quantize(&dn_w, h, inter, bits, sgc, hess(&act, inter).as_ref(), threads);
+    let dn_q = quantize_mlp(&dn_w, h, inter, &act, spec, hess(&act, inter).as_ref(), threads, lp, "down");
     drop(dn_w);
     add_into(x, &dequant_rotated(&dn_q).apply(&act, t));
 
@@ -1003,6 +1044,11 @@ impl Qwen35Model {
 
     /// Random model with the given shapes, for kernel parity tests.
     pub fn synthetic(cfg: Qwen35Config, seed: u64, with_mtp: bool) -> Self {
+        Self::synthetic_bits(cfg, seed, with_mtp, 4)
+    }
+
+    /// [`Self::synthetic`] with MLP matrices at `mlp_bits`.
+    pub fn synthetic_bits(cfg: Qwen35Config, seed: u64, with_mtp: bool, mlp_bits: usize) -> Self {
         let mut s = seed;
         let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
             (0..n)
@@ -1015,6 +1061,7 @@ impl Qwen35Model {
         let h = cfg.hidden_size;
         let threads = std::thread::available_parallelism().map_or(4, |p| p.get());
         let q = |w: Vec<f32>, rows: usize, cols: usize| compile_hadamard_gptq_nf(&w, rows, cols, 4, 2, None, threads);
+        let qb = |w: Vec<f32>, rows: usize, cols: usize| compile_hadamard_gptq_nf(&w, rows, cols, mlp_bits, 2, None, threads);
         let ws = 1.0 / (h as f32).sqrt();
         let mut layers = Vec::new();
         for l in 0..cfg.num_layers {
@@ -1043,8 +1090,8 @@ impl Qwen35Model {
                 input_norm: rnd(h, 0.4).into_iter().map(|v| 1.0 + v).collect(),
                 post_norm: rnd(h, 0.4).into_iter().map(|v| 1.0 + v).collect(),
                 mixer,
-                gate_up: q(rnd(2 * cfg.intermediate_size * h, 2.0 * ws), 2 * cfg.intermediate_size, h),
-                down: q(rnd(h * cfg.intermediate_size, 2.0 / (cfg.intermediate_size as f32).sqrt()), h, cfg.intermediate_size),
+                gate_up: qb(rnd(2 * cfg.intermediate_size * h, 2.0 * ws), 2 * cfg.intermediate_size, h),
+                down: qb(rnd(h * cfg.intermediate_size, 2.0 / (cfg.intermediate_size as f32).sqrt()), h, cfg.intermediate_size),
             });
         }
         let emb: Vec<u16> = rnd(cfg.vocab_size * h, 2.0)
