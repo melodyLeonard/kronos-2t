@@ -220,16 +220,18 @@ kernel void q35_deltanet(
 }
 
 // One threadgroup per (token, head); threads = head_dim (256). Q heads write normed, rotated q and
-// the raw gate; KV heads write normed, rotated k and v into the FP16 cache at their position.
+// the raw gate; KV heads write normed, rotated k and v into the Q8 cache (one absmax scale per row).
 kernel void q35_attn_prep(
     device const float* proj   [[buffer(0)]],
     device const float* q_norm [[buffer(1)]],
     device const float* k_norm [[buffer(2)]],
     device float*       q_out  [[buffer(3)]],
     device float*       g_out  [[buffer(4)]],
-    device half*        k_cache[[buffer(5)]],
-    device half*        v_cache[[buffer(6)]],
+    device char*        k_cache[[buffer(5)]],
+    device char*        v_cache[[buffer(6)]],
     constant AttnPrepParams& p [[buffer(7)]],
+    device float*       k_scale[[buffer(8)]],
+    device float*       v_scale[[buffer(9)]],
     uint2 tg   [[threadgroup_position_in_grid]],
     uint d     [[thread_index_in_threadgroup]],
     uint sg    [[simdgroup_index_in_threadgroup]],
@@ -239,6 +241,7 @@ kernel void q35_attn_prep(
     const uint hd = p.hd;
     threadgroup float buf[256];
     threadgroup float red[8];
+    threadgroup float rk[8], rv[8];
     device const float* row = proj + ulong(t) * p.in_stride;
     const bool is_q = hidx < p.nh;
     const uint qdim = p.nh * hd, kvd = p.nkv * hd;
@@ -266,9 +269,17 @@ kernel void q35_attn_prep(
         g_out[ulong(t) * qdim + hidx * hd + d] = row[hidx * 2u * hd + hd + d];
     } else {
         uint g = hidx - p.nh;
-        ulong slot = (ulong(g) * p.kv_cap + pos) * hd + d;
-        k_cache[slot] = half(x);
-        v_cache[slot] = half(row[2u * qdim + kvd + g * hd + d]);
+        float v = row[2u * qdim + kvd + g * hd + d];
+        float mk = simd_max(fabs(x)), mv = simd_max(fabs(v));
+        if (lane == 0u) { rk[sg] = mk; rv[sg] = mv; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mk = 0.0f; mv = 0.0f;
+        for (uint i = 0u; i < hd / 32u; i++) { mk = max(mk, rk[i]); mv = max(mv, rv[i]); }
+        float sk = max(mk, 1e-12f) / 127.0f, sv = max(mv, 1e-12f) / 127.0f;
+        ulong srow = ulong(g) * p.kv_cap + pos;
+        k_cache[srow * hd + d] = char(rint(x / sk));
+        v_cache[srow * hd + d] = char(rint(v / sv));
+        if (d == 0u) { k_scale[srow] = sk; v_scale[srow] = sv; }
     }
 }
 
@@ -276,10 +287,12 @@ kernel void q35_attn_prep(
 // lane holds 8 of the 256 dims. Writes (m, l, o[256]) per (token, head, split).
 kernel void q35_attn(
     device const float* q      [[buffer(0)]],
-    device const half*  k_cache[[buffer(1)]],
-    device const half*  v_cache[[buffer(2)]],
+    device const char*  k_cache[[buffer(1)]],
+    device const char*  v_cache[[buffer(2)]],
     device float*       part   [[buffer(3)]],
     constant AttnParams& p     [[buffer(4)]],
+    device const float* k_scale[[buffer(5)]],
+    device const float* v_scale[[buffer(6)]],
     uint3 tg   [[threadgroup_position_in_grid]],
     uint sg    [[simdgroup_index_in_threadgroup]],
     uint lane  [[thread_index_in_simdgroup]])
@@ -299,16 +312,18 @@ kernel void q35_attn(
     float m = -INFINITY, l = 0.0f;
     float o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     for (uint j = k0 + sg; j < k1; j += 8u) {
-        device const half* kr = k_cache + (ulong(g) * p.kv_cap + j) * hd + lane * 8u;
+        ulong srow = ulong(g) * p.kv_cap + j;
+        device const char* kr = k_cache + srow * hd + lane * 8u;
         float sc = 0.0f;
         for (uint i = 0u; i < 8u; i++) sc += qv[i] * float(kr[i]);
-        sc = simd_sum(sc);
+        sc = simd_sum(sc) * k_scale[srow];
         float mn = max(m, sc);
         float corr = exp(m - mn);
         float pj = exp(sc - mn);
         l = l * corr + pj;
-        device const half* vr = v_cache + (ulong(g) * p.kv_cap + j) * hd + lane * 8u;
-        for (uint i = 0u; i < 8u; i++) o[i] = o[i] * corr + pj * float(vr[i]);
+        device const char* vr = v_cache + srow * hd + lane * 8u;
+        float pv = pj * v_scale[srow];
+        for (uint i = 0u; i < 8u; i++) o[i] = o[i] * corr + pv * float(vr[i]);
         m = mn;
     }
     if (lane == 0u) { tm[sg] = m; tl[sg] = l; }
@@ -335,10 +350,12 @@ kernel void q35_attn(
 // `s` serves head `s & 3` on keys `(s >> 2) * 4 ..` of the tile. Same partial layout as `q35_attn`.
 kernel void q35_attn_gqa(
     device const float* q      [[buffer(0)]],
-    device const half*  k_cache[[buffer(1)]],
-    device const half*  v_cache[[buffer(2)]],
+    device const char*  k_cache[[buffer(1)]],
+    device const char*  v_cache[[buffer(2)]],
     device float*       part   [[buffer(3)]],
     constant AttnParams& p     [[buffer(4)]],
+    device const float* k_scale[[buffer(5)]],
+    device const float* v_scale[[buffer(6)]],
     uint3 tg   [[threadgroup_position_in_grid]],
     uint tid   [[thread_index_in_threadgroup]],
     uint sg    [[simdgroup_index_in_threadgroup]],
@@ -361,17 +378,21 @@ kernel void q35_attn_gqa(
     for (uint i = 0u; i < 8u; i++) qv[i] = qrow[i] * p.scale;
     float m = -INFINITY, l = 0.0f;
     float o[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    device const half* kb = k_cache + ulong(g) * p.kv_cap * hd;
-    device const half* vb = v_cache + ulong(g) * p.kv_cap * hd;
+    device const char* kb = k_cache + ulong(g) * p.kv_cap * hd;
+    device const char* vb = v_cache + ulong(g) * p.kv_cap * hd;
+    device const float* ksb = k_scale + ulong(g) * p.kv_cap;
+    device const float* vsb = v_scale + ulong(g) * p.kv_cap;
     for (uint j0 = k0; j0 < k1; j0 += 8u) {
         uint nk = min(8u, k1 - j0);
         // 256 threads load 8 keys x 256 dims of K and V, 8 halves each per tensor.
         uint r = tid >> 5u, c = (tid & 31u) * 8u;
         if (r < nk) {
-            *(threadgroup half4*)&kt[r][c] = *(device const half4*)(kb + ulong(j0 + r) * hd + c);
-            *(threadgroup half4*)&kt[r][c + 4u] = *(device const half4*)(kb + ulong(j0 + r) * hd + c + 4u);
-            *(threadgroup half4*)&vt[r][c] = *(device const half4*)(vb + ulong(j0 + r) * hd + c);
-            *(threadgroup half4*)&vt[r][c + 4u] = *(device const half4*)(vb + ulong(j0 + r) * hd + c + 4u);
+            ulong jr = ulong(j0 + r);
+            half ks = half(ksb[jr]), vs = half(vsb[jr]);
+            *(threadgroup half4*)&kt[r][c] = half4(*(device const char4*)(kb + jr * hd + c)) * ks;
+            *(threadgroup half4*)&kt[r][c + 4u] = half4(*(device const char4*)(kb + jr * hd + c + 4u)) * ks;
+            *(threadgroup half4*)&vt[r][c] = half4(*(device const char4*)(vb + jr * hd + c)) * vs;
+            *(threadgroup half4*)&vt[r][c + 4u] = half4(*(device const char4*)(vb + jr * hd + c + 4u)) * vs;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint jj = sub * 4u; jj < min(sub * 4u + 4u, nk); jj++) {
@@ -1075,8 +1096,11 @@ pub struct MetalQwen35 {
     lm_head: GpuNf4Matrix,
     conv_state: MtlObj,
     delta_state: MtlObj,
+    /// Q8 attention KV `[slot][kv_head][pos][head_dim]` with one f32 scale per row.
     k_cache: MtlObj,
     v_cache: MtlObj,
+    k_scale: MtlObj,
+    v_scale: MtlObj,
     sc: Scratch,
     kv_cap: usize,
     pos: usize,
@@ -1314,7 +1338,10 @@ impl MetalQwen35 {
                     None => None,
                 };
                 let kv_slots = n_full + usize::from(mtp.is_some());
-                let kv_bytes = kv_slots.max(1) * cfg.num_kv_heads * max_ctx * cfg.head_dim * 2;
+                let kv_rows = kv_slots.max(1) * cfg.num_kv_heads * max_ctx;
+                let kv_bytes = kv_rows * cfg.head_dim;
+                let k_scale = alloc_shared_buffer(device.id(), kv_rows * 4, "k_scale")?;
+                let v_scale = alloc_shared_buffer(device.id(), kv_rows * 4, "v_scale")?;
                 let k_cache = alloc_shared_buffer(device.id(), kv_bytes, "k_cache")?;
                 let v_cache = alloc_shared_buffer(device.id(), kv_bytes, "v_cache")?;
                 let prof = std::env::var_os("KRONOS_DECODE_PROF").map(|_| std::cell::RefCell::new(Prof {
@@ -1337,6 +1364,8 @@ impl MetalQwen35 {
                     delta_state,
                     k_cache,
                     v_cache,
+                    k_scale,
+                    v_scale,
                     sc,
                     kv_cap: max_ctx,
                     pos: 0,
@@ -1984,7 +2013,8 @@ impl MetalQwen35 {
             eps: self.eps,
             theta: self.theta,
         };
-        let kv_off = full.slot * self.nkv * self.kv_cap * self.hd * 2;
+        let kv_off = full.slot * self.nkv * self.kv_cap * self.hd;
+        let sc_off = full.slot * self.nkv * self.kv_cap * 4;
         let total = pos0 + n;
         let n_splits = if n <= GEMV_MAX_TOKENS { total.div_ceil(ATTN_SPLIT_KEYS).clamp(1, ATTN_MAX_SPLITS) } else { 1 };
         let split_len = total.div_ceil(n_splits);
@@ -2009,6 +2039,8 @@ impl MetalQwen35 {
             set_buf(enc, self.k_cache.id(), kv_off, 5);
             set_buf(enc, self.v_cache.id(), kv_off, 6);
             set_bytes(enc, &pp, 7);
+            set_buf(enc, self.k_scale.id(), sc_off, 8);
+            set_buf(enc, self.v_scale.id(), sc_off, 9);
             dispatch(enc, &self.pipes.attn_prep, MtlSize::new(n, self.nh + self.nkv, 1), MtlSize::new(self.hd, 1, 1));
 
             set_buf(enc, self.sc.q.id(), 0, 0);
@@ -2016,6 +2048,8 @@ impl MetalQwen35 {
             set_buf(enc, self.v_cache.id(), kv_off, 2);
             set_buf(enc, self.sc.attn_part.id(), 0, 3);
             set_bytes(enc, &ap, 4);
+            set_buf(enc, self.k_scale.id(), sc_off, 5);
+            set_buf(enc, self.v_scale.id(), sc_off, 6);
             if self.nh == 4 * self.nkv {
                 dispatch(enc, &self.pipes.attn_gqa, MtlSize::new(n_splits, self.nkv, n), MtlSize::new(256, 1, 1));
             } else {
