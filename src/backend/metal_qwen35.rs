@@ -7,7 +7,7 @@
 use crate::backend::metal_gpu::{
     alloc_shared_buffer, build_pipeline, gemv_splits, msg_sel, ns_error_string, nsstring, objc_autoreleasePoolPop,
     objc_autoreleasePoolPush, objc_msgSend, sels, upload_slice_buffer, wrap_nf4_matrix, GpuNf4Matrix, Id, MtlObj, MtlSize,
-    Nf4MatParams, NormFwhtParams, Sel, GEMV_MAX_SPLITS, GEMV_MAX_TOKENS, METAL_SHADER_SOURCE, MTLCreateSystemDefaultDevice,
+    Nf4MatParams, NormFwhtParams, Sel, GEMM_SPLIT_MAX_TOKENS, GEMV_MAX_SPLITS, GEMV_MAX_TOKENS, METAL_SHADER_SOURCE, MTLCreateSystemDefaultDevice,
     MTL_CMD_STATUS_COMPLETED,
 };
 use crate::kernels::hadamard::rademacher_sign_masks_64;
@@ -550,8 +550,8 @@ kernel void q35_gemv_batch_split(
                 for (uint k = 0u; k < 4u; ++k) {
                     uint col = c * 64u + k * 16u;
                     simdgroup_half8x8 x_f0, x_f1;
-                    simdgroup_load(x_f0, x_rot_f16 + ulong(col) * 128ul, 128);
-                    simdgroup_load(x_f1, x_rot_f16 + ulong(col + 8u) * 128ul, 128);
+                    simdgroup_load(x_f0, x_rot_f16 + ulong(col) * 128ul + p.n_offset, 128);
+                    simdgroup_load(x_f1, x_rot_f16 + ulong(col + 8u) * 128ul + p.n_offset, 128);
 
                     float4 wa0, wa1;
                     unpack_nf_8cols(da, p.bits, k, tid, l_pair, cb32_s, wa0, wa1);
@@ -600,8 +600,8 @@ kernel void q35_gemv_batch_split(
                 for (uint k = 0u; k < 4u; ++k) {
                     uint col = c * 64u + k * 16u;
                     simdgroup_half8x8 x_f0, x_f1;
-                    simdgroup_load(x_f0, x_rot_f16 + ulong(col) * 128ul, 128);
-                    simdgroup_load(x_f1, x_rot_f16 + ulong(col + 8u) * 128ul, 128);
+                    simdgroup_load(x_f0, x_rot_f16 + ulong(col) * 128ul + p.n_offset, 128);
+                    simdgroup_load(x_f1, x_rot_f16 + ulong(col + 8u) * 128ul + p.n_offset, 128);
 
                     float4 wa0, wa1;
                     unpack_nf_8cols(da, p.bits, k, tid, l_pair, cb32_s, wa0, wa1);
@@ -637,13 +637,13 @@ kernel void q35_gemv_batch_split(
             float b_val = (p.has_bias != 0u) ? bias[row] : 0.0f;
             for (uint m = sg_id; m < nt; m += 4u) {
                 uint off = tid * 8u + m;
-                float sum = (tg_buf[0][off] + tg_buf[1][off] + tg_buf[2][off] + tg_buf[3][off]) * x_tok_scale[m];
+                float sum = (tg_buf[0][off] + tg_buf[1][off] + tg_buf[2][off] + tg_buf[3][off]) * x_tok_scale[p.n_offset + m];
                 if (p.n_splits > 1u) {
                     part[(ulong(split) * p.n_tok + m) * p.rows + row] = sum;
                     continue;
                 }
                 sum += b_val;
-                ulong dst_idx = ulong(m) * ulong(p.rows) + ulong(row);
+                ulong dst_idx = ulong(p.n_offset + m) * ulong(p.rows) + ulong(row);
                 if (p.has_residual != 0u) sum += residual[dst_idx];
                 out[dst_idx] = sum;
             }
@@ -662,7 +662,7 @@ kernel void q35_gemv_multi_reduce(
     if (row >= p.rows || m >= p.n_tok) return;
     float sum = 0.0f;
     for (uint s = 0u; s < p.n_splits; ++s) sum += part[(ulong(s) * p.n_tok + m) * p.rows + row];
-    ulong idx = ulong(m) * p.rows + row;
+    ulong idx = ulong(p.n_offset + m) * p.rows + row;
     if (p.has_residual != 0u) sum += residual[idx];
     out[idx] = sum;
 }
@@ -1139,6 +1139,9 @@ impl StateSnapshot {
     }
 }
 
+/// Batches up to this size run the 8-token kernel in token chunks instead of the MMA GEMM.
+const GEMV_CHUNK_MAX_TOKENS: usize = 24;
+
 pub struct MetalQwen35 {
     _device: MtlObj,
     queue: MtlObj,
@@ -1342,7 +1345,7 @@ impl MetalQwen35 {
                     x_rot_f32: alloc_shared_buffer(device.id(), n * max_rot * f32b, "x_rot_f32")?,
                     x_rot_f16: alloc_shared_buffer(device.id(), n_f16 * max_rot * 2, "x_rot_f16")?,
                     x_tok_scale: alloc_shared_buffer(device.id(), n * f32b, "x_tok_scale")?,
-                    gemv_part: alloc_shared_buffer(device.id(), max_rows.max(cfg.hidden_size) * GEMV_MAX_SPLITS * GEMV_MAX_TOKENS * f32b, "gemv_part")?,
+                    gemv_part: alloc_shared_buffer(device.id(), max_rows.max(cfg.hidden_size) * GEMV_MAX_SPLITS * GEMV_MAX_TOKENS.max(GEMM_SPLIT_MAX_TOKENS) * f32b, "gemv_part")?,
                     proj: alloc_shared_buffer(device.id(), n * cfg.lin_in_rows().max(cfg.attn_in_rows()) * f32b, "proj")?,
                     conv: alloc_shared_buffer(device.id(), n * cfg.conv_dim() * f32b, "conv")?,
                     core: alloc_shared_buffer(device.id(), n * cfg.lin_v_dim().max(cfg.q_dim()) * f32b, "core")?,
@@ -2030,6 +2033,8 @@ impl MetalQwen35 {
             if pair_blocks >= target { 1 } else { (target / pair_blocks).clamp(1, GEMV_MAX_SPLITS.min(mat.num_scale_groups as usize / 4).max(1)) }
         } else if n <= GEMV_MAX_TOKENS {
             gemv_splits(pair_blocks, mat.num_scale_groups as usize)
+        } else if n <= GEMM_SPLIT_MAX_TOKENS {
+            gemv_splits((mat.rows as usize).div_ceil(32), mat.num_scale_groups as usize)
         } else {
             1
         };
@@ -2058,6 +2063,35 @@ impl MetalQwen35 {
         let res = residual.unwrap_or_else(|| self.dummy.id());
         let dummy = self.dummy.id();
         unsafe {
+            if n > GEMV_MAX_TOKENS && n <= GEMV_CHUNK_MAX_TOKENS {
+                let csplits = gemv_splits(pair_blocks, mat.num_scale_groups as usize);
+                for off in (0..n).step_by(GEMV_MAX_TOKENS) {
+                    let mut cp = params;
+                    cp.n_tok = (n - off).min(GEMV_MAX_TOKENS) as u32;
+                    cp.n_offset = off as u32;
+                    cp.n_splits = csplits as u32;
+                    set_cps(enc, &self.pipes.gemv_batch_split);
+                    set_buf(enc, mat.pair_buf.id(), 0, 0);
+                    set_buf(enc, mat.tail_buf.id(), 0, 1);
+                    set_buf(enc, self.sc.x_rot_f16.id(), 0, 2);
+                    set_buf(enc, self.sc.x_tok_scale.id(), 0, 3);
+                    set_buf(enc, dummy, 0, 4);
+                    set_buf(enc, res, 0, 5);
+                    set_buf(enc, out, 0, 6);
+                    set_bytes(enc, &cp, 7);
+                    set_buf(enc, self.sc.gemv_part.id(), 0, 8);
+                    dispatch_only(enc, MtlSize::new(pair_blocks, csplits, 1), MtlSize::new(128, 1, 1));
+                    if csplits > 1 {
+                        set_cps(enc, &self.pipes.gemv_multi_reduce);
+                        set_buf(enc, self.sc.gemv_part.id(), 0, 0);
+                        set_buf(enc, res, 0, 2);
+                        set_buf(enc, out, 0, 3);
+                        set_bytes(enc, &cp, 4);
+                        dispatch_only(enc, MtlSize::new((mat.rows as usize).div_ceil(256), cp.n_tok as usize, 1), MtlSize::new(256, 1, 1));
+                    }
+                }
+                return;
+            }
             if (2..=4).contains(&n) && wide {
                 let dims = [mat.cols, n as u32];
                 set_cps(enc, &self.pipes.x_to_half);
@@ -2152,12 +2186,21 @@ impl MetalQwen35 {
                 set_buf(enc, res, 0, 5);
                 set_buf(enc, out, 0, 6);
                 set_bytes(enc, &params, 7);
+                set_buf(enc, self.sc.gemv_part.id(), 0, 8);
                 let grid = if mma {
-                    MtlSize::new(n.div_ceil(128), (mat.rows as usize).div_ceil(32), 1)
+                    MtlSize::new(n.div_ceil(128), (mat.rows as usize).div_ceil(32), splits)
                 } else {
                     MtlSize::new(pair_blocks, 1, 1)
                 };
                 dispatch_only(enc, grid, MtlSize::new(128, 1, 1));
+                if mma && splits > 1 {
+                    set_cps(enc, &self.pipes.gemv_multi_reduce);
+                    set_buf(enc, self.sc.gemv_part.id(), 0, 0);
+                    set_buf(enc, res, 0, 2);
+                    set_buf(enc, out, 0, 3);
+                    set_bytes(enc, &params, 4);
+                    dispatch_only(enc, MtlSize::new((mat.rows as usize).div_ceil(256), n, 1), MtlSize::new(256, 1, 1));
+                }
             }
         }
     }

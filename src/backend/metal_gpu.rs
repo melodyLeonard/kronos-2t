@@ -34,6 +34,8 @@ pub(crate) const MTL_RESOURCE_STORAGE_MODE_SHARED: usize = 0;
 pub(crate) const MTL_CMD_STATUS_COMPLETED: usize = 4;
 const MAX_PROMPT_CHUNK_GPU: usize = 1536;
 pub(crate) const GEMV_MAX_TOKENS: usize = 8;
+/// Largest batch that still splits small matrices across threadgroups in the MMA GEMM.
+pub(crate) const GEMM_SPLIT_MAX_TOKENS: usize = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -2440,6 +2442,7 @@ impl MetalLlamaEngine {
                 msg_sel!(enc, st.set_buf, bias_id => Id, 0usize => usize, 4usize => usize; ());
                 msg_sel!(enc, st.set_buf, res_id => Id, 0usize => usize, 5usize => usize; ());
                 msg_sel!(enc, st.set_buf, out_buf => Id, 0usize => usize, 6usize => usize; ());
+                msg_sel!(enc, st.set_buf, self.dummy_buf.id() => Id, 0usize => usize, 8usize => usize; ());
                 msg_sel!(
                     enc,
                     st.set_bytes,
@@ -3763,6 +3766,58 @@ kernel void nf4_gemv_batch(
     }
 }
 
+// One 64-column chunk of the MMA GEMM: 4 row tiles of `Ws` against up to 4 token tiles of `x_base`.
+inline void mma_chunk(
+    thread simdgroup_float8x8 (&acc)[4][4],
+    threadgroup half (&Ws)[32][68],
+    device const half* x_base,
+    uint n_stride,
+    uint n_ni)
+{
+    if (n_ni == 4u) {
+        for (uint ks = 0u; ks < 64u; ks += 8u) {
+            simdgroup_half8x8 a_frag[4];
+            simdgroup_half8x8 b_frag[4];
+            #pragma clang loop unroll(full)
+            for (uint mi = 0u; mi < 4u; ++mi) {
+                simdgroup_load(a_frag[mi], &Ws[mi * 8u][ks], 68);
+            }
+            device const half* x_ks = x_base + ulong(ks) * ulong(n_stride);
+            #pragma clang loop unroll(full)
+            for (uint ni = 0u; ni < 4u; ++ni) {
+                simdgroup_load(b_frag[ni], x_ks + ni * 32u, n_stride);
+            }
+            #pragma clang loop unroll(full)
+            for (uint mi = 0u; mi < 4u; ++mi) {
+                #pragma clang loop unroll(full)
+                for (uint ni = 0u; ni < 4u; ++ni) {
+                    simdgroup_multiply_accumulate(acc[mi][ni], a_frag[mi], b_frag[ni], acc[mi][ni]);
+                }
+            }
+        }
+    } else {
+        for (uint ks = 0u; ks < 64u; ks += 8u) {
+            simdgroup_half8x8 a_frag[4];
+            #pragma clang loop unroll(full)
+            for (uint mi = 0u; mi < 4u; ++mi) {
+                simdgroup_load(a_frag[mi], &Ws[mi * 8u][ks], 68);
+            }
+            device const half* x_ks = x_base + ulong(ks) * ulong(n_stride);
+            #pragma clang loop unroll(full)
+            for (uint ni = 0u; ni < 4u; ++ni) {
+                if (ni < n_ni) {
+                    simdgroup_half8x8 b_frag;
+                    simdgroup_load(b_frag, x_ks + ni * 32u, n_stride);
+                    #pragma clang loop unroll(full)
+                    for (uint mi = 0u; mi < 4u; ++mi) {
+                        simdgroup_multiply_accumulate(acc[mi][ni], a_frag[mi], b_frag, acc[mi][ni]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 kernel void nf4_gemm_mma(
     device const uchar* pair_stream [[buffer(0)]],
     device const uchar* tail_stream [[buffer(1)]],
@@ -3772,11 +3827,20 @@ kernel void nf4_gemm_mma(
     device const float* residual    [[buffer(5)]],
     device float*       out         [[buffer(6)]],
     constant Nf4MatParams& p        [[buffer(7)]],
-    uint2 tg_pos [[threadgroup_position_in_grid]],
+    device float*       part        [[buffer(8)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tgs    [[threadgroups_per_grid]],
     uint sg_id   [[simdgroup_index_in_threadgroup]],
     uint tid     [[thread_index_in_simdgroup]],
     uint tid_tg  [[thread_index_in_threadgroup]])
 {
+    // Grid z > 1 splits the scale groups across threadgroups (small matrices, few tokens); each
+    // split writes token-scaled partials to `part` for `q35_gemv_multi_reduce`.
+    const uint n_splits = tgs.z, split = tg_pos.z;
+    const uint per_split = (p.num_scale_groups + n_splits - 1u) / n_splits;
+    const uint sg_lo = split * per_split;
+    const uint sg_hi = min(p.num_scale_groups, sg_lo + per_split);
+    if (sg_lo >= sg_hi) return;
     const uint n_base = tg_pos.x * 128u;
     const uint pair_idx = tg_pos.y;
     const uint row_base = pair_idx * 32u;
@@ -3818,12 +3882,61 @@ kernel void nf4_gemm_mma(
     const uint tail_sg_stride = 32u + p.scale_group_chunks * chunk_b;
     const device uchar* pair_base = pair_stream + ulong(pair_idx) * ulong(p.pair_total_bytes);
 
-    uint sg = 0u;
+    const uint c_lo = sg_lo * p.scale_group_chunks;
+    const uint c_hi = min(p.num_chunks, sg_hi * p.scale_group_chunks);
+
+    if (p.bits == 4u) {
+        // 4-bit fast path: the next chunk's 8 weight bytes and scale are loaded before this chunk's
+        // unpack + MMA, so the global-memory latency overlaps the barriers instead of serializing.
+        uchar4 nb0 = uchar4(0), nb1 = uchar4(0);
+        ushort ns = 0;
+        #define MMA_FETCH(cc)                                                                       \
+            if (st_valid && (cc) < c_hi) {                                                          \
+                uint sgi = (cc) / p.scale_group_chunks;                                             \
+                uint sub = (cc) - sgi * p.scale_group_chunks;                                       \
+                device const uchar* sp; device const uchar* dp;                                     \
+                if (!st_tail) {                                                                     \
+                    sp = pair_base + ulong(sgi) * ulong(pair_sg_stride);                            \
+                    dp = sp + 64u + sub * pair_chunk_b + side * chunk_b;                            \
+                    ns = *(device const ushort*)(sp + side * 32u + lane * 2u);                      \
+                } else {                                                                            \
+                    sp = tail_stream + ulong(sgi) * ulong(tail_sg_stride);                          \
+                    dp = sp + 32u + sub * chunk_b;                                                  \
+                    ns = *(device const ushort*)(sp + lane * 2u);                                   \
+                }                                                                                   \
+                nb0 = ((device const uchar4*)dp)[k_sub * 32u + tid];                                \
+                nb1 = ((device const uchar4*)dp)[(2u + k_sub) * 32u + tid];                         \
+            }
+        MMA_FETCH(c_lo);
+        for (uint c = c_lo; c < c_hi; ++c) {
+            uchar4 b0 = nb0, b1 = nb1;
+            float ws = as_type<float>(uint(ns) << 16u);
+            MMA_FETCH(c + 1u);
+            if (st_valid) {
+                half2 p0 = l_pair[b0.x], p1 = l_pair[b0.y], p2 = l_pair[b0.z], p3 = l_pair[b0.w];
+                *(threadgroup half4*)(&Ws[m_row][w_col]) = half4(float4(p0.x, p1.x, p2.x, p3.x) * ws);
+                *(threadgroup half4*)(&Ws[m_row][w_col + 4u]) = half4(float4(p0.y, p1.y, p2.y, p3.y) * ws);
+                p0 = l_pair[b1.x]; p1 = l_pair[b1.y]; p2 = l_pair[b1.z]; p3 = l_pair[b1.w];
+                *(threadgroup half4*)(&Ws[m_row][32u + w_col]) = half4(float4(p0.x, p1.x, p2.x, p3.x) * ws);
+                *(threadgroup half4*)(&Ws[m_row][32u + w_col + 4u]) = half4(float4(p0.y, p1.y, p2.y, p3.y) * ws);
+            } else {
+                *(threadgroup half4*)(&Ws[m_row][w_col]) = half4(0.0h);
+                *(threadgroup half4*)(&Ws[m_row][w_col + 4u]) = half4(0.0h);
+                *(threadgroup half4*)(&Ws[m_row][32u + w_col]) = half4(0.0h);
+                *(threadgroup half4*)(&Ws[m_row][32u + w_col + 4u]) = half4(0.0h);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            mma_chunk(acc, Ws, x_rot_f16 + ulong(c * 64u) * ulong(n_stride) + ulong(n_base + sg_n), n_stride, n_ni);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        #undef MMA_FETCH
+    } else {
+    uint sg = sg_lo;
     uint sub_c = 0u;
     float w_scale = 0.0f;
     device const uchar* sg_ptr = nullptr;
 
-    for (uint c = 0u; c < p.num_chunks; ++c) {
+    for (uint c = c_lo; c < c_hi; ++c) {
         if (sub_c == 0u && st_valid) {
             if (!st_tail) {
                 sg_ptr = pair_base + ulong(sg) * ulong(pair_sg_stride);
@@ -3853,51 +3966,7 @@ kernel void nf4_gemm_mma(
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        device const half* x_base = x_rot_f16 + ulong(c * 64u) * ulong(n_stride) + ulong(n_base + sg_n);
-        if (n_ni == 4u) {
-            for (uint ks = 0u; ks < 64u; ks += 8u) {
-                simdgroup_half8x8 a_frag[4];
-                simdgroup_half8x8 b_frag[4];
-                #pragma clang loop unroll(full)
-                for (uint mi = 0u; mi < 4u; ++mi) {
-                    simdgroup_load(a_frag[mi], &Ws[mi * 8u][ks], 68);
-                }
-                device const half* x_ks = x_base + ulong(ks) * ulong(n_stride);
-                #pragma clang loop unroll(full)
-                for (uint ni = 0u; ni < 4u; ++ni) {
-                    simdgroup_load(b_frag[ni], x_ks + ni * 32u, n_stride);
-                }
-                #pragma clang loop unroll(full)
-                for (uint mi = 0u; mi < 4u; ++mi) {
-                    #pragma clang loop unroll(full)
-                    for (uint ni = 0u; ni < 4u; ++ni) {
-                        simdgroup_multiply_accumulate(acc[mi][ni], a_frag[mi], b_frag[ni], acc[mi][ni]);
-                    }
-                }
-            }
-        } else {
-            for (uint ks = 0u; ks < 64u; ks += 8u) {
-                simdgroup_half8x8 a_frag[4];
-                #pragma clang loop unroll(full)
-                for (uint mi = 0u; mi < 4u; ++mi) {
-                    simdgroup_load(a_frag[mi], &Ws[mi * 8u][ks], 68);
-                }
-                device const half* x_ks = x_base + ulong(ks) * ulong(n_stride);
-                #pragma clang loop unroll(full)
-                for (uint ni = 0u; ni < 4u; ++ni) {
-                    if (ni < n_ni) {
-                        simdgroup_half8x8 b_frag;
-                        simdgroup_load(b_frag, x_ks + ni * 32u, n_stride);
-                        #pragma clang loop unroll(full)
-                        for (uint mi = 0u; mi < 4u; ++mi) {
-                            simdgroup_multiply_accumulate(acc[mi][ni], a_frag[mi], b_frag, acc[mi][ni]);
-                        }
-                    }
-                }
-            }
-        }
-
+        mma_chunk(acc, Ws, x_rot_f16 + ulong(c * 64u) * ulong(n_stride) + ulong(n_base + sg_n), n_stride, n_ni);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         ++sub_c;
@@ -3905,6 +3974,7 @@ kernel void nf4_gemm_mma(
             sub_c = 0u;
             ++sg;
         }
+    }
     }
 
     threadgroup float* cs_sg = ((threadgroup float*)&Ws[0][0]) + sg_id * 64u;
@@ -3923,10 +3993,15 @@ kernel void nf4_gemm_mma(
                     for (uint sub = 0u; sub < 2u; ++sub) {
                         uint tok = n_base + ni * 32u + sg_n + c_in + sub;
                         if (tok < p.n_tok) {
-                            float val = cs_sg[r_in * 8u + c_in + sub] * x_tok_scale[tok] + b_val;
+                            float val = cs_sg[r_in * 8u + c_in + sub] * x_tok_scale[tok];
                             ulong dst_idx = ulong(tok) * ulong(p.rows) + ulong(out_row);
-                            if (p.has_residual != 0u) val += residual[dst_idx];
-                            out[dst_idx] = val;
+                            if (n_splits > 1u) {
+                                part[(ulong(split) * p.n_tok + tok) * p.rows + out_row] = val;
+                            } else {
+                                val += b_val;
+                                if (p.has_residual != 0u) val += residual[dst_idx];
+                                out[dst_idx] = val;
+                            }
                         }
                     }
                 }

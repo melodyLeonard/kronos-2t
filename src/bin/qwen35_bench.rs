@@ -531,11 +531,14 @@ fn main() {
                 best = best.min(t.elapsed().as_secs_f64() / steps as f64);
             }
             println!("decode step {:.3} ms ({:.2} tok/s)", best * 1e3, 1.0 / best);
-            for nb in [2usize, 4, 8, 9, 16, 47, 64, 128, 512] {
+            for nb in [2usize, 4, 8, 9, 16, 24, 32, 47, 64, 128, 512] {
                 eng.reset();
                 eng.forward(&model, &[1, 2, 3, 4], &[3], &mut |_, _| {}).expect("prefill");
                 let toks: Vec<usize> = (0..nb).map(|i| 100 + i % 50).collect();
                 eng.forward(&model, &toks, &[nb - 1], &mut |_, _| {}).expect("warm");
+                for _ in 0..a.num("batch-reps", 0) {
+                    eng.forward(&model, &toks, &[nb - 1], &mut |_, _| {}).expect("rep");
+                }
                 let t = Instant::now();
                 eng.forward(&model, &toks, &[nb - 1], &mut |_, _| {}).expect("batch");
                 println!("batch {nb:4}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
