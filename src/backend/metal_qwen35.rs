@@ -26,7 +26,8 @@ struct ConvParams {
     conv_dim: u32,
     in_stride: u32,
     n_tok: u32,
-    _pad: u32,
+    /// Floats between per-token state checkpoints; 0 = no checkpoints.
+    ckpt_stride: u32,
 }
 
 #[repr(C)]
@@ -43,7 +44,7 @@ struct DeltaParams {
     a_off: u32,
     vdim: u32,
     eps: f32,
-    _pad: u32,
+    ckpt_stride: u32,
 }
 
 #[repr(C)]
@@ -77,10 +78,10 @@ struct AttnParams {
 }
 
 const QWEN35_SHADER_SOURCE: &str = r#"
-struct ConvParams { uint conv_dim; uint in_stride; uint n_tok; uint _pad; };
+struct ConvParams { uint conv_dim; uint in_stride; uint n_tok; uint ckpt_stride; };
 struct DeltaParams {
     uint n_tok; uint nk; uint nv; uint conv_dim; uint in_stride; uint ktot;
-    uint z_off; uint b_off; uint a_off; uint vdim; float eps; uint _pad;
+    uint z_off; uint b_off; uint a_off; uint vdim; float eps; uint ckpt_stride;
 };
 struct AttnPrepParams {
     uint nh; uint nkv; uint hd; uint rot; uint in_stride; uint pos0; uint n_tok; uint kv_cap;
@@ -100,6 +101,7 @@ kernel void q35_conv_silu(
     device float*       state [[buffer(2)]],
     device float*       out   [[buffer(3)]],
     constant ConvParams& p    [[buffer(4)]],
+    device float*       ckpt  [[buffer(5)]],
     uint c [[thread_position_in_grid]])
 {
     if (c >= p.conv_dim) return;
@@ -110,6 +112,10 @@ kernel void q35_conv_silu(
         float acc = wc.x * h0 + wc.y * h1 + wc.z * h2 + wc.w * x;
         out[ulong(t) * p.conv_dim + c] = q35_silu(acc);
         h0 = h1; h1 = h2; h2 = x;
+        if (p.ckpt_stride != 0u) {
+            device float* ck = ckpt + ulong(t) * p.ckpt_stride + c * 3u;
+            ck[0] = h0; ck[1] = h1; ck[2] = h2;
+        }
     }
     state[c * 3u] = h0; state[c * 3u + 1u] = h1; state[c * 3u + 2u] = h2;
 }
@@ -127,6 +133,7 @@ kernel void q35_deltanet(
     device float*       state  [[buffer(5)]],
     device float*       out    [[buffer(6)]],
     constant DeltaParams& p    [[buffer(7)]],
+    device float*       ckpt   [[buffer(8)]],
     uint h    [[threadgroup_position_in_grid]],
     uint tid  [[thread_index_in_threadgroup]],
     uint sg   [[simdgroup_index_in_threadgroup]],
@@ -193,6 +200,10 @@ kernel void q35_deltanet(
         if (part == 0u) {
             float z = prow[p.z_off + h * DV + col];
             out[ulong(t) * p.vdim + h * DV + col] = o * rsqrt(ss / float(DV) + p.eps) * nw * q35_silu(z);
+        }
+        if (p.ckpt_stride != 0u) {
+            device float* ck = ckpt + ulong(t) * p.ckpt_stride + ulong(h) * DK * DV;
+            for (uint i = 0u; i < 64u; i++) ck[(r0 + i) * DV + col] = s[i];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -427,6 +438,10 @@ pub struct MetalQwen35 {
     pos: usize,
     /// Token rows the `logits` scratch holds.
     logits_cap: usize,
+    /// Per-token `(conv, delta)` state checkpoints for speculative verification.
+    ckpt: Option<(MtlObj, MtlObj)>,
+    /// `(pos0, n)` of the last `verify` call, until `accept` settles it.
+    pending: Option<(usize, usize)>,
     // Shapes.
     h: usize,
     inter: usize,
@@ -630,6 +645,8 @@ impl MetalQwen35 {
                     kv_cap: max_ctx,
                     pos: 0,
                     logits_cap: 1,
+                    ckpt: None,
+                    pending: None,
                     h: cfg.hidden_size,
                     inter: cfg.intermediate_size,
                     vocab: cfg.vocab_size,
@@ -697,10 +714,48 @@ impl MetalQwen35 {
         while start < tokens.len() {
             let end = (start + MAX_CHUNK).min(tokens.len());
             let chunk_want: Vec<usize> = want.iter().filter(|&&w| w >= start && w < end).map(|&w| w - start).collect();
-            self.run_chunk(model, &tokens[start..end], &chunk_want, &mut |i, l| on_logits(start + i, l))?;
+            self.run_chunk(model, &tokens[start..end], &chunk_want, &mut |i, l| on_logits(start + i, l), false)?;
             start = end;
         }
         Ok(())
+    }
+
+    /// Speculative verification: feeds up to `GEMV_MAX_TOKENS` tokens in one batched pass, reports
+    /// logits for each, and keeps per-token recurrent checkpoints until [`Self::accept`].
+    pub fn verify(
+        &mut self,
+        model: &Qwen35Model,
+        tokens: &[usize],
+        on_logits: &mut dyn FnMut(usize, &[f32]),
+    ) -> Result<(), String> {
+        let n = tokens.len();
+        if n == 0 || n > GEMV_MAX_TOKENS {
+            return Err(format!("verify takes 1..={GEMV_MAX_TOKENS} tokens (got {n})"));
+        }
+        if self.pos + n > self.kv_cap {
+            return Err(format!("context {} exceeds capacity {}", self.pos + n, self.kv_cap));
+        }
+        let pos0 = self.pos;
+        let want: Vec<usize> = (0..n).collect();
+        self.run_chunk(model, tokens, &want, on_logits, true)?;
+        self.pending = Some((pos0, n));
+        Ok(())
+    }
+
+    /// Keeps the first `keep` tokens of the last [`Self::verify`] and rolls the rest back.
+    pub fn accept(&mut self, keep: usize) {
+        let Some((pos0, n)) = self.pending.take() else { return };
+        let keep = keep.clamp(1, n);
+        if keep == n {
+            return;
+        }
+        let (conv_ck, delta_ck) = self.ckpt.as_ref().expect("verify allocates checkpoints");
+        for (live, ck) in [(&self.conv_state, conv_ck), (&self.delta_state, delta_ck)] {
+            let slot = live.byte_len();
+            // SAFETY: checkpoint slot `keep - 1` holds one full copy of the live state; GPU idle.
+            unsafe { std::ptr::copy_nonoverlapping(ck.contents_ptr().add((keep - 1) * slot), live.contents_ptr(), slot) };
+        }
+        self.pos = pos0 + keep;
     }
 
     fn run_chunk(
@@ -709,6 +764,28 @@ impl MetalQwen35 {
         tokens: &[usize],
         want: &[usize],
         on_logits: &mut dyn FnMut(usize, &[f32]),
+        ckpt: bool,
+    ) -> Result<(), String> {
+        if ckpt && self.ckpt.is_none() {
+            let conv = alloc_shared_buffer(self._device.id(), GEMV_MAX_TOKENS * self.n_lin * self.conv_dim * 3 * 4, "conv_ckpt")?;
+            let delta = alloc_shared_buffer(self._device.id(), GEMV_MAX_TOKENS * self.n_lin * self.nv * 128 * 128 * 4, "delta_ckpt")?;
+            self.ckpt = Some((conv, delta));
+        }
+        let ckpt_bufs = if ckpt { self.ckpt.take() } else { None };
+        let res = self.run_chunk_inner(model, tokens, want, on_logits, ckpt_bufs.as_ref());
+        if ckpt {
+            self.ckpt = ckpt_bufs;
+        }
+        res
+    }
+
+    fn run_chunk_inner(
+        &mut self,
+        model: &Qwen35Model,
+        tokens: &[usize],
+        want: &[usize],
+        on_logits: &mut dyn FnMut(usize, &[f32]),
+        ckpt: Option<&(MtlObj, MtlObj)>,
     ) -> Result<(), String> {
         let n = tokens.len();
         let h = self.h;
@@ -745,8 +822,8 @@ impl MetalQwen35 {
                         GpuMixer::Linear(lin) => {
                             self.proj(enc, &lin.in_proj, None, self.sc.proj.id(), n);
                             if prof_on { self.cut(&mut cmd, &mut enc, "lin_in_proj"); }
-                            self.encode_conv(enc, lin, n);
-                            self.encode_delta(enc, lin, n);
+                            self.encode_conv(enc, lin, n, ckpt.map(|c| &c.0));
+                            self.encode_delta(enc, lin, n, ckpt.map(|c| &c.1));
                             if prof_on { self.cut(&mut cmd, &mut enc, "deltanet"); }
                             self.norm_fwht(enc, self.sc.core.id(), self.dummy.id(), self.vdim, n, 1, mm);
                             self.proj(enc, &lin.out_proj, Some(self.sc.hidden.id()), self.sc.hidden.id(), n);
@@ -932,20 +1009,28 @@ impl MetalQwen35 {
         }
     }
 
-    unsafe fn encode_conv(&self, enc: Id, lin: &GpuLinear, n: usize) {
-        let p = ConvParams { conv_dim: self.conv_dim as u32, in_stride: self.lin_rows as u32, n_tok: n as u32, _pad: 0 };
-        let state_off = lin.slot * self.conv_dim * 3 * 4;
+    unsafe fn encode_conv(&self, enc: Id, lin: &GpuLinear, n: usize, ckpt: Option<&MtlObj>) {
+        let per = self.conv_dim * 3;
+        let p = ConvParams {
+            conv_dim: self.conv_dim as u32,
+            in_stride: self.lin_rows as u32,
+            n_tok: n as u32,
+            ckpt_stride: if ckpt.is_some() { (self.n_lin * per) as u32 } else { 0 },
+        };
+        let state_off = lin.slot * per * 4;
         unsafe {
             set_buf(enc, self.sc.proj.id(), 0, 0);
             set_buf(enc, lin.conv_w.id(), 0, 1);
             set_buf(enc, self.conv_state.id(), state_off, 2);
             set_buf(enc, self.sc.conv.id(), 0, 3);
             set_bytes(enc, &p, 4);
+            set_buf(enc, ckpt.map_or(self.dummy.id(), |c| c.id()), if ckpt.is_some() { state_off } else { 0 }, 5);
             dispatch(enc, &self.pipes.conv, MtlSize::new(self.conv_dim.div_ceil(256), 1, 1), MtlSize::new(256, 1, 1));
         }
     }
 
-    unsafe fn encode_delta(&self, enc: Id, lin: &GpuLinear, n: usize) {
+    unsafe fn encode_delta(&self, enc: Id, lin: &GpuLinear, n: usize, ckpt: Option<&MtlObj>) {
+        let per = self.nv * 128 * 128;
         let p = DeltaParams {
             n_tok: n as u32,
             nk: self.nk as u32,
@@ -958,9 +1043,9 @@ impl MetalQwen35 {
             a_off: (self.conv_dim + self.vdim + self.nv) as u32,
             vdim: self.vdim as u32,
             eps: self.eps,
-            _pad: 0,
+            ckpt_stride: if ckpt.is_some() { (self.n_lin * per) as u32 } else { 0 },
         };
-        let state_off = lin.slot * self.nv * 128 * 128 * 4;
+        let state_off = lin.slot * per * 4;
         unsafe {
             set_buf(enc, self.sc.conv.id(), 0, 0);
             set_buf(enc, self.sc.proj.id(), 0, 1);
@@ -970,6 +1055,7 @@ impl MetalQwen35 {
             set_buf(enc, self.delta_state.id(), state_off, 5);
             set_buf(enc, self.sc.core.id(), 0, 6);
             set_bytes(enc, &p, 7);
+            set_buf(enc, ckpt.map_or(self.dummy.id(), |c| c.id()), if ckpt.is_some() { state_off } else { 0 }, 8);
             dispatch(enc, &self.pipes.delta, MtlSize::new(self.nv, 1, 1), MtlSize::new(256, 1, 1));
         }
     }
@@ -1096,5 +1182,32 @@ mod tests {
             .count();
         eprintln!("prefill max rel err {e_prefill:.4}, decode {e_decode:.4}, argmax agree {agree}/{}", seq.len());
         assert!(e_prefill < 0.05 && e_decode < 0.05, "GPU/CPU mismatch: {e_prefill} {e_decode}");
+    }
+
+    /// Rejected draft tokens leave no trace: verify junk, keep a prefix, then continue normally.
+    #[test]
+    fn verify_rollback_matches_plain_decode() {
+        let model = Qwen35Model::synthetic(small_cfg(), 11);
+        let seq: Vec<usize> = (0..24).map(|i| (i * 53 + 5) % 512).collect();
+        let cpu = model.logits_cpu(&seq);
+        let v = model.cfg.vocab_size;
+        let mut eng = MetalQwen35::new(&model, 128).unwrap();
+        eng.forward(&model, &seq[..10], &[], &mut |_, _| {}).unwrap();
+        let mut got = vec![0.0f32; v];
+        eng.verify(&model, &[seq[10], seq[11], 300, 301, 302], &mut |i, l| {
+            if i == 1 {
+                got.copy_from_slice(l);
+            }
+        })
+        .unwrap();
+        let e_verify = max_rel(&got, &cpu[11 * v..12 * v]);
+        eng.accept(2);
+        assert_eq!(eng.pos(), 12);
+        let mut rest = vec![0.0f32; (seq.len() - 12) * v];
+        let want: Vec<usize> = (0..seq.len() - 12).collect();
+        eng.forward(&model, &seq[12..], &want, &mut |i, l| rest[i * v..(i + 1) * v].copy_from_slice(l)).unwrap();
+        let e_after = max_rel(&rest, &cpu[12 * v..]);
+        eprintln!("verify err {e_verify:.4}, after rollback {e_after:.4}");
+        assert!(e_verify < 0.05 && e_after < 0.05);
     }
 }
