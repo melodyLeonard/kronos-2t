@@ -133,6 +133,56 @@ fn par_rows(rows: &mut [f64], c: usize, first: usize, f: impl Fn(usize, &mut [f6
 
 const CHOL_BLOCK: usize = 64;
 
+#[cfg(target_os = "macos")]
+#[link(name = "Accelerate", kind = "framework")]
+unsafe extern "C" {
+    fn cblas_sgemm(
+        order: i32,
+        trans_a: i32,
+        trans_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    );
+}
+
+/// `y = x w^T` for row-major `x` (`t x k`), `w` (`n x k`), `y` (`t x n`).
+pub fn sgemm_xwt(x: &[f32], w: &[f32], t: usize, k: usize, n: usize, y: &mut [f32]) {
+    assert_eq!(x.len(), t * k);
+    assert_eq!(w.len(), n * k);
+    assert_eq!(y.len(), t * n);
+    if t == 0 || n == 0 {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        const ROW_MAJOR: i32 = 101;
+        const NO_TRANS: i32 = 111;
+        const TRANS: i32 = 112;
+        // SAFETY: slice lengths match the `t x k`, `n x k`, `t x n` shapes passed to BLAS.
+        unsafe {
+            cblas_sgemm(
+                ROW_MAJOR, NO_TRANS, TRANS, t as i32, n as i32, k as i32, 1.0,
+                x.as_ptr(), k as i32, w.as_ptr(), k as i32, 0.0, y.as_mut_ptr(), n as i32,
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    for (xr, yr) in x.chunks_exact(k).zip(y.chunks_exact_mut(n)) {
+        for (wr, o) in w.chunks_exact(k).zip(yr.iter_mut()) {
+            *o = xr.iter().zip(wr).map(|(a, b)| a * b).sum();
+        }
+    }
+}
+
 /// In-place lower Cholesky `A = L L^T` (reads the lower triangle); `false` if not positive definite.
 pub fn cholesky_lower(a: &mut [f64], c: usize) -> bool {
     assert_eq!(a.len(), c * c);

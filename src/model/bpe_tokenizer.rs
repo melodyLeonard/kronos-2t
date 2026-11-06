@@ -636,8 +636,10 @@ fn parse_pre_tokenizer_is_qwen2(cur: &mut JsonCursor<'_>) -> Result<bool, String
                         cur.expect_byte(b':')?;
                         if k == "Regex" && cur.peek() == Some(b'"') {
                             let pat = cur.parse_string()?;
+                            // Qwen3.5 widens letters to `[\p{L}\p{M}]+`; the splitter is the same for unmarked text.
                             if pat.contains("[^\\r\\n\\p{L}\\p{N}]?\\p{L}+")
                                 || pat.contains("[^\r\n\\p{L}\\p{N}]?\\p{L}+")
+                                || pat.contains("[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+")
                             {
                                 *is_qwen2 = true;
                             }

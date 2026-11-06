@@ -33,7 +33,7 @@ unsafe extern "C" {
 pub(crate) const MTL_RESOURCE_STORAGE_MODE_SHARED: usize = 0;
 pub(crate) const MTL_CMD_STATUS_COMPLETED: usize = 4;
 const MAX_PROMPT_CHUNK_GPU: usize = 1536;
-const GEMV_MAX_TOKENS: usize = 8;
+pub(crate) const GEMV_MAX_TOKENS: usize = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -228,38 +228,38 @@ impl Drop for MtlObj {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct NormFwhtParams {
-    dim: u32,
-    n_tok: u32,
-    eps: f32,
-    mode: u32,
-    interleaved: u32,
-    write_f16: u32,
+pub(crate) struct NormFwhtParams {
+    pub(crate) dim: u32,
+    pub(crate) n_tok: u32,
+    pub(crate) eps: f32,
+    pub(crate) mode: u32,
+    pub(crate) interleaved: u32,
+    pub(crate) write_f16: u32,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Nf4MatParams {
-    cb0: u32,
-    cb1: u32,
-    cb2: u32,
-    cb3: u32,
-    rows: u32,
-    cols: u32,
-    num_stripes: u32,
-    num_pairs: u32,
-    num_chunks: u32,
-    scale_group_chunks: u32,
-    num_scale_groups: u32,
-    pair_total_bytes: u32,
-    n_tok: u32,
-    has_bias: u32,
-    has_residual: u32,
-    n_offset: u32,
-    bits: u32,
-    chunk_bytes: u32,
-    n_splits: u32,
-    _pad: u32,
+pub(crate) struct Nf4MatParams {
+    pub(crate) cb0: u32,
+    pub(crate) cb1: u32,
+    pub(crate) cb2: u32,
+    pub(crate) cb3: u32,
+    pub(crate) rows: u32,
+    pub(crate) cols: u32,
+    pub(crate) num_stripes: u32,
+    pub(crate) num_pairs: u32,
+    pub(crate) num_chunks: u32,
+    pub(crate) scale_group_chunks: u32,
+    pub(crate) num_scale_groups: u32,
+    pub(crate) pair_total_bytes: u32,
+    pub(crate) n_tok: u32,
+    pub(crate) has_bias: u32,
+    pub(crate) has_residual: u32,
+    pub(crate) n_offset: u32,
+    pub(crate) bits: u32,
+    pub(crate) chunk_bytes: u32,
+    pub(crate) n_splits: u32,
+    pub(crate) _pad: u32,
 }
 
 #[repr(C)]
@@ -361,11 +361,11 @@ struct GqaFlashParams {
 /// Max sequence splits for flash-decoding attention (one threadgroup per split).
 const ATTN_MAX_SPLITS: usize = 64;
 /// Max column splits for single-token gemv (partials merged by a reduce kernel).
-const GEMV_MAX_SPLITS: usize = 8;
+pub(crate) const GEMV_MAX_SPLITS: usize = 8;
 /// Threadgroups a decode gemv should reach before splitting columns.
 const GEMV_TARGET_TGS: usize = 1024;
 
-fn gemv_splits(threadgroups: usize, num_scale_groups: usize) -> usize {
+pub(crate) fn gemv_splits(threadgroups: usize, num_scale_groups: usize) -> usize {
     if threadgroups >= GEMV_TARGET_TGS {
         return 1;
     }
@@ -373,19 +373,19 @@ fn gemv_splits(threadgroups: usize, num_scale_groups: usize) -> usize {
 }
 
 pub(crate) struct GpuNf4Matrix {
-    pair_buf: MtlObj,
-    tail_buf: MtlObj,
-    cb_packed: [u32; 4],
-    rows: u32,
-    cols: u32,
-    num_stripes: u32,
-    num_pairs: u32,
-    num_chunks: u32,
-    scale_group_chunks: u32,
-    num_scale_groups: u32,
-    pair_total_bytes: u32,
-    bits: u32,
-    chunk_bytes: u32,
+    pub(crate) pair_buf: MtlObj,
+    pub(crate) tail_buf: MtlObj,
+    pub(crate) cb_packed: [u32; 4],
+    pub(crate) rows: u32,
+    pub(crate) cols: u32,
+    pub(crate) num_stripes: u32,
+    pub(crate) num_pairs: u32,
+    pub(crate) num_chunks: u32,
+    pub(crate) scale_group_chunks: u32,
+    pub(crate) num_scale_groups: u32,
+    pub(crate) pair_total_bytes: u32,
+    pub(crate) bits: u32,
+    pub(crate) chunk_bytes: u32,
 }
 
 /// One MoE layer on the GPU: its router and a zero-copy view of its expert records.
@@ -1135,7 +1135,7 @@ fn wrap_slice_nocopy(device: Id, bytes: &[u8], what: &str) -> Result<MtlObj, Str
     MtlObj::from_retained(raw, what)
 }
 
-fn wrap_nf4_matrix(device: Id, mat: &NfSdotMatrix, dummy: Id, label: &str) -> Result<GpuNf4Matrix, String> {
+pub(crate) fn wrap_nf4_matrix(device: Id, mat: &NfSdotMatrix, dummy: Id, label: &str) -> Result<GpuNf4Matrix, String> {
     if !(2..=5).contains(&mat.bits) {
         return Err(format!(
             "{label}: Metal GPU backend supports 2..=5-bit NfSdot (got {}-bit)",
@@ -2488,7 +2488,7 @@ impl MetalLlamaEngine {
     }
 }
 
-const METAL_SHADER_SOURCE: &str = r#"
+pub(crate) const METAL_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
 using namespace metal;
