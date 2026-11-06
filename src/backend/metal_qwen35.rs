@@ -1084,6 +1084,23 @@ struct Prof {
     steps: usize,
 }
 
+/// Saved engine state at a position, for reusing a processed prefix (system prompt, earlier turns).
+pub struct StateSnapshot {
+    pub pos: usize,
+    conv: Vec<u8>,
+    delta: Vec<u8>,
+    /// Per (KV slot, kv head): K rows, V rows, K scales, V scales for positions `0..pos`.
+    kv: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>,
+    mtp_last: Option<Vec<u8>>,
+}
+
+impl StateSnapshot {
+    /// Bytes held by this snapshot.
+    pub fn bytes(&self) -> usize {
+        self.conv.len() + self.delta.len() + self.kv.iter().map(|k| k.0.len() + k.1.len() + k.2.len() + k.3.len()).sum::<usize>()
+    }
+}
+
 pub struct MetalQwen35 {
     _device: MtlObj,
     queue: MtlObj,
@@ -1402,6 +1419,55 @@ impl MetalQwen35 {
             objc_autoreleasePoolPop(pool);
             res
         }
+    }
+
+    /// Copies everything needed to resume at the current position: recurrent conv/DeltaNet state,
+    /// the attention (and MTP) KV rows `0..pos`, and the last MTP hidden.
+    pub fn snapshot(&self) -> StateSnapshot {
+        let copy = |b: &MtlObj, off: usize, len: usize| -> Vec<u8> {
+            // SAFETY: shared buffer, GPU idle between calls, range inside the allocation.
+            unsafe { std::slice::from_raw_parts(b.contents_ptr().add(off), len).to_vec() }
+        };
+        let mut kv = Vec::new();
+        let slots = self.k_cache.byte_len() / (self.nkv * self.kv_cap * self.hd).max(1);
+        for slot_g in 0..slots * self.nkv {
+            let row0 = slot_g * self.kv_cap;
+            kv.push((
+                copy(&self.k_cache, row0 * self.hd, self.pos * self.hd),
+                copy(&self.v_cache, row0 * self.hd, self.pos * self.hd),
+                copy(&self.k_scale, row0 * 4, self.pos * 4),
+                copy(&self.v_scale, row0 * 4, self.pos * 4),
+            ));
+        }
+        StateSnapshot {
+            pos: self.pos,
+            conv: copy(&self.conv_state, 0, self.conv_state.byte_len()),
+            delta: copy(&self.delta_state, 0, self.delta_state.byte_len()),
+            kv,
+            mtp_last: self.mtp.as_ref().map(|m| copy(&m.last, 0, m.last.byte_len())),
+        }
+    }
+
+    /// Resumes from `s`; the next token is fed at `s.pos`.
+    pub fn restore(&mut self, s: &StateSnapshot) {
+        let put = |b: &MtlObj, off: usize, src: &[u8]| {
+            // SAFETY: as in `snapshot`; `src` was taken from the same range.
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), b.contents_ptr().add(off), src.len()) };
+        };
+        put(&self.conv_state, 0, &s.conv);
+        put(&self.delta_state, 0, &s.delta);
+        for (slot_g, (k, v, ks, vs)) in s.kv.iter().enumerate() {
+            let row0 = slot_g * self.kv_cap;
+            put(&self.k_cache, row0 * self.hd, k);
+            put(&self.v_cache, row0 * self.hd, v);
+            put(&self.k_scale, row0 * 4, ks);
+            put(&self.v_scale, row0 * 4, vs);
+        }
+        if let (Some(m), Some(last)) = (&self.mtp, &s.mtp_last) {
+            put(&m.last, 0, last);
+        }
+        self.pos = s.pos;
+        self.pending = None;
     }
 
     /// Clears the recurrent state and the KV position.
@@ -2147,6 +2213,28 @@ mod tests {
         }
         let e = max_rel(&dec, &cpu);
         eprintln!("NF3 decode max rel err {e:.4}");
+        assert!(e < 0.05);
+    }
+
+    /// Restoring a snapshot and continuing gives the same logits as never having left.
+    #[test]
+    fn snapshot_restore_matches_continuous() {
+        let model = Qwen35Model::synthetic(small_cfg(), 19, false);
+        let seq: Vec<usize> = (0..30).map(|i| (i * 31 + 9) % 512).collect();
+        let cpu = model.logits_cpu(&seq);
+        let v = model.cfg.vocab_size;
+        let mut eng = MetalQwen35::new(&model, 64).unwrap();
+        eng.forward(&model, &seq[..20], &[], &mut |_, _| {}).unwrap();
+        let snap = eng.snapshot();
+        // A different conversation overwrites every position, then the snapshot comes back.
+        eng.reset();
+        eng.forward(&model, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23], &[], &mut |_, _| {}).unwrap();
+        eng.restore(&snap);
+        let mut rest = vec![0.0f32; 10 * v];
+        let want: Vec<usize> = (0..10).collect();
+        eng.forward(&model, &seq[20..], &want, &mut |i, l| rest[i * v..(i + 1) * v].copy_from_slice(l)).unwrap();
+        let e = max_rel(&rest, &cpu[20 * v..]);
+        eprintln!("restore err {e:.4}");
         assert!(e < 0.05);
     }
 

@@ -408,6 +408,37 @@ fn main() {
                 out.len() as f64 / t1.elapsed().as_secs_f64()
             );
         }
+        "turn-bench" => {
+            let model = load(&a);
+            let file = a.get("file").unwrap_or("src/kernels/accel.rs");
+            let code = std::fs::read_to_string(file).expect("--file");
+            let system = format!("<|im_start|>system\nYou are a coding agent. The project file is below.\n```rust\n{code}\n```<|im_end|>\n");
+            let sys_ids = tok.encode(&system);
+            let turn = tok.encode("<|im_start|>user\nWhat does sgemm_xwt compute?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
+            let mut eng = MetalQwen35::new(&model, sys_ids.len() + turn.len() + 256).expect("Metal");
+            let full: Vec<usize> = sys_ids.iter().chain(&turn).copied().collect();
+            eng.reset();
+            eng.forward(&model, &full[..8], &[7], &mut |_, _| {}).expect("warm-up");
+            eng.reset();
+            let t = Instant::now();
+            let mut cold_tok = 0;
+            eng.forward(&model, &full, &[full.len() - 1], &mut |_, l| cold_tok = argmax(l)).expect("cold");
+            let cold = t.elapsed().as_secs_f64();
+            eng.reset();
+            eng.forward(&model, &sys_ids, &[], &mut |_, _| {}).expect("system");
+            let t = Instant::now();
+            let snap = eng.snapshot();
+            let t_snap = t.elapsed().as_secs_f64();
+            eng.reset();
+            let t = Instant::now();
+            eng.restore(&snap);
+            let t_restore = t.elapsed().as_secs_f64();
+            let mut warm_tok = 0;
+            eng.forward(&model, &turn, &[turn.len() - 1], &mut |_, l| warm_tok = argmax(l)).expect("warm");
+            let warm = t.elapsed().as_secs_f64();
+            println!("system prompt {} tokens, turn {} tokens, snapshot {:.1} MB", sys_ids.len(), turn.len(), snap.bytes() as f64 / 1e6);
+            println!("first token cold {:.0} ms | from snapshot {:.0} ms (restore {:.1} ms, snapshot {:.1} ms) | same token {}", cold * 1e3, warm * 1e3, t_restore * 1e3, t_snap * 1e3, cold_tok == warm_tok);
+        }
         "edit-bench" => {
             let model = load(&a);
             let file = a.get("file").unwrap_or("src/kernels/accel.rs");
