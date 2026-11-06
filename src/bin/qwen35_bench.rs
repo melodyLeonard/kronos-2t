@@ -434,6 +434,15 @@ fn main() {
             println!("system prompt {} tokens, turn {} tokens, snapshot {:.1} MB", sys_ids.len(), turn.len(), snap.bytes() as f64 / 1e6);
             println!("first token cold {:.0} ms | from snapshot {:.0} ms (restore {:.1} ms, snapshot {:.1} ms) | same token {}", cold * 1e3, warm * 1e3, t_restore * 1e3, t_snap * 1e3, cold_tok == warm_tok);
         }
+        "gemv-bench" => {
+            let model = load(&a);
+            let eng = MetalQwen35::new(&model, 64).expect("Metal");
+            // First pass only warms the GPU clocks.
+            eng.bench_projections(50);
+            for (label, bytes, secs) in eng.bench_projections(a.num("iters", 200)) {
+                println!("{label:<26} {:6.1} us  {:6.1} GB/s", secs * 1e6, bytes as f64 / secs / 1e9);
+            }
+        }
         "edit-bench" => {
             let model = load(&a);
             let file = a.get("file").unwrap_or("src/kernels/accel.rs");

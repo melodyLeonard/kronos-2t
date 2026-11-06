@@ -1584,6 +1584,61 @@ impl MetalQwen35 {
         self.draft_vocab = n;
     }
 
+    /// GPU time per single-token projection of one matrix of each kind, as (label, bytes, seconds).
+    pub fn bench_projections(&self, iters: usize) -> Vec<(String, usize, f64)> {
+        let mut mats: Vec<(String, &GpuNf4Matrix)> = Vec::new();
+        for layer in &self.layers {
+            let kind = match &layer.mixer {
+                GpuMixer::Linear(l) => {
+                    if mats.iter().any(|m| m.0 == "deltanet in") { continue; }
+                    mats.push(("deltanet in".into(), &l.in_proj));
+                    mats.push(("deltanet out".into(), &l.out_proj));
+                    "deltanet"
+                }
+                GpuMixer::Full(f) => {
+                    if mats.iter().any(|m| m.0 == "attn in") { continue; }
+                    mats.push(("attn in".into(), &f.in_proj));
+                    mats.push(("attn out".into(), &f.out_proj));
+                    "attn"
+                }
+            };
+            if kind == "deltanet" {
+                mats.push(("mlp gate_up".into(), &layer.gate_up));
+                mats.push(("mlp down".into(), &layer.down));
+            }
+        }
+        mats.push(("lm_head".into(), &self.lm_head));
+        let st = sels();
+        let (s0, s1) = unsafe {
+            (
+                crate::backend::metal_gpu::sel_registerName(c"GPUStartTime".as_ptr()),
+                crate::backend::metal_gpu::sel_registerName(c"GPUEndTime".as_ptr()),
+            )
+        };
+        let mut res = Vec::new();
+        for (label, m) in mats {
+            // SAFETY: scratch buffers are sized for any projection; GPU idle between command buffers.
+            let secs = unsafe {
+                let pool = objc_autoreleasePoolPush();
+                let cmd: Id = msg_sel!(self.queue.id(), st.cmd_buffer; Id);
+                let enc: Id = msg_sel!(cmd, st.compute_enc; Id);
+                for _ in 0..iters {
+                    self.proj(enc, m, None, self.sc.proj.id(), 1);
+                }
+                msg_sel!(enc, st.end_enc; ());
+                msg_sel!(cmd, st.commit; ());
+                msg_sel!(cmd, st.wait_done; ());
+                let t0: f64 = msg_sel!(cmd, s0; f64);
+                let t1: f64 = msg_sel!(cmd, s1; f64);
+                objc_autoreleasePoolPop(pool);
+                (t1 - t0) / iters as f64
+            };
+            let bytes = m.num_pairs as usize * m.pair_total_bytes as usize;
+            res.push((format!("{label} {}x{}", m.rows, m.cols), bytes, secs));
+        }
+        res
+    }
+
     #[inline]
     pub fn has_mtp(&self) -> bool {
         self.mtp.is_some()
