@@ -64,6 +64,15 @@ struct AttnPrepParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct MtpPrepParams {
+    h: u32,
+    n_tok: u32,
+    eps: f32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct AttnParams {
     nh: u32,
     nkv: u32,
@@ -346,6 +355,50 @@ kernel void q35_attn_reduce(
     float gv = gate[idx];
     out[idx] = (acc / lt) * (1.0f / (1.0f + exp(-gv)));
 }
+
+struct MtpPrepParams { uint h; uint n_tok; float eps; uint _pad; };
+
+inline float q35_block_sum(float v, threadgroup float* red, uint sg, uint lane) {
+    v = simd_sum(v);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) red[sg] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float s = 0.0f;
+    for (uint i = 0u; i < 8u; i++) s += red[i];
+    return s;
+}
+
+// MTP input row per token: `[rms(e) * w_pe | rms(rms(h) * w_h) * w_ph]`, 256 threads.
+kernel void q35_mtp_prep(
+    device const float* emb  [[buffer(0)]],
+    device const float* hid  [[buffer(1)]],
+    device const float* w_h  [[buffer(2)]],
+    device const float* w_pe [[buffer(3)]],
+    device const float* w_ph [[buffer(4)]],
+    device float*       u    [[buffer(5)]],
+    constant MtpPrepParams& p[[buffer(6)]],
+    uint t    [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float red[8];
+    const uint h = p.h;
+    device const float* e = emb + ulong(t) * h;
+    device const float* x = hid + ulong(t) * h;
+    float se = 0.0f, sx = 0.0f;
+    for (uint i = tid; i < h; i += 256u) { se += e[i] * e[i]; sx += x[i] * x[i]; }
+    float ie = rsqrt(q35_block_sum(se, red, sg, lane) / float(h) + p.eps);
+    float ix = rsqrt(q35_block_sum(sx, red, sg, lane) / float(h) + p.eps);
+    float sy = 0.0f;
+    for (uint i = tid; i < h; i += 256u) { float y = x[i] * ix * w_h[i]; sy += y * y; }
+    float iy = rsqrt(q35_block_sum(sy, red, sg, lane) / float(h) + p.eps);
+    device float* dst = u + ulong(t) * 2u * h;
+    for (uint i = tid; i < h; i += 256u) {
+        dst[i] = e[i] * ie * w_pe[i];
+        dst[h + i] = x[i] * ix * w_h[i] * iy * w_ph[i];
+    }
+}
 "#;
 
 struct GpuLinear {
@@ -381,6 +434,21 @@ struct GpuLayer {
     down: GpuNf4Matrix,
 }
 
+/// MTP draft head on the GPU; its attention layer uses the KV slot after the main layers.
+struct GpuMtp {
+    pre_emb: MtlObj,
+    pre_hid: MtlObj,
+    fc: GpuNf4Matrix,
+    layer: GpuLayer,
+    norm: MtlObj,
+    /// `[MAX_CHUNK, h]` token embeddings, `[.., 2h]` fc inputs, `[.., h]` residual stream.
+    emb: MtlObj,
+    u: MtlObj,
+    x: MtlObj,
+    /// Pre-norm MTP hidden of the last drafted row, input to the next chained step.
+    last: MtlObj,
+}
+
 struct Pipes {
     norm_fwht: MtlObj,
     transpose_f16: MtlObj,
@@ -393,6 +461,7 @@ struct Pipes {
     attn_prep: MtlObj,
     attn: MtlObj,
     attn_reduce: MtlObj,
+    mtp_prep: MtlObj,
 }
 
 struct Scratch {
@@ -442,6 +511,7 @@ pub struct MetalQwen35 {
     ckpt: Option<(MtlObj, MtlObj)>,
     /// `(pos0, n)` of the last `verify` call, until `accept` settles it.
     pending: Option<(usize, usize)>,
+    mtp: Option<GpuMtp>,
     // Shapes.
     h: usize,
     inter: usize,
@@ -542,9 +612,11 @@ impl MetalQwen35 {
                     attn_prep: bp("q35_attn_prep")?,
                     attn: bp("q35_attn")?,
                     attn_reduce: bp("q35_attn_reduce")?,
+                    mtp_prep: bp("q35_mtp_prep")?,
                 };
                 let dummy = alloc_shared_buffer(device.id(), 64, "dummy")?;
-                let max_rot = cfg.hidden_size.max(cfg.intermediate_size).max(cfg.q_dim()).max(cfg.lin_v_dim());
+                let mtp_cols = if model.mtp.is_some() { 2 * cfg.hidden_size } else { 0 };
+                let max_rot = cfg.hidden_size.max(cfg.intermediate_size).max(cfg.q_dim()).max(cfg.lin_v_dim()).max(mtp_cols);
                 let mut masks = Vec::with_capacity(max_rot);
                 for b in 0..max_rot / 64 {
                     masks.extend_from_slice(&rademacher_sign_masks_64(b));
@@ -618,7 +690,40 @@ impl MetalQwen35 {
                     n_lin * cfg.lin_v_heads * cfg.lin_k_dim * cfg.lin_v_dim * f32b,
                     "delta_state",
                 )?;
-                let kv_bytes = n_full.max(1) * cfg.num_kv_heads * max_ctx * cfg.head_dim * 2;
+                let mtp = match &model.mtp {
+                    Some(m) => {
+                        let QMixer::Full { in_proj, params, out_proj } = &m.layer.mixer else {
+                            return Err("MTP layer must be full attention".into());
+                        };
+                        let rows = MAX_CHUNK;
+                        Some(GpuMtp {
+                            pre_emb: up(&m.pre_emb, "mtp.pre_emb")?,
+                            pre_hid: up(&m.pre_hid, "mtp.pre_hid")?,
+                            fc: wrap(&m.fc, "mtp.fc")?,
+                            layer: GpuLayer {
+                                input_norm: up(&m.layer.input_norm, "mtp.input_norm")?,
+                                post_norm: up(&m.layer.post_norm, "mtp.post_norm")?,
+                                mixer: GpuMixer::Full(GpuFull {
+                                    in_proj: wrap(in_proj, "mtp.in")?,
+                                    out_proj: wrap(out_proj, "mtp.out")?,
+                                    q_norm: up(&params.q_norm, "mtp.q_norm")?,
+                                    k_norm: up(&params.k_norm, "mtp.k_norm")?,
+                                    slot: n_full,
+                                }),
+                                gate_up: wrap(&m.layer.gate_up, "mtp.gate_up")?,
+                                down: wrap(&m.layer.down, "mtp.down")?,
+                            },
+                            norm: up(&m.norm, "mtp.norm")?,
+                            emb: alloc_shared_buffer(device.id(), rows * cfg.hidden_size * f32b, "mtp.emb")?,
+                            u: alloc_shared_buffer(device.id(), rows * 2 * cfg.hidden_size * f32b, "mtp.u")?,
+                            x: alloc_shared_buffer(device.id(), rows * cfg.hidden_size * f32b, "mtp.x")?,
+                            last: alloc_shared_buffer(device.id(), cfg.hidden_size * f32b, "mtp.last")?,
+                        })
+                    }
+                    None => None,
+                };
+                let kv_slots = n_full + usize::from(mtp.is_some());
+                let kv_bytes = kv_slots.max(1) * cfg.num_kv_heads * max_ctx * cfg.head_dim * 2;
                 let k_cache = alloc_shared_buffer(device.id(), kv_bytes, "k_cache")?;
                 let v_cache = alloc_shared_buffer(device.id(), kv_bytes, "v_cache")?;
                 let prof = std::env::var_os("KRONOS_DECODE_PROF").map(|_| std::cell::RefCell::new(Prof {
@@ -647,6 +752,7 @@ impl MetalQwen35 {
                     logits_cap: 1,
                     ckpt: None,
                     pending: None,
+                    mtp,
                     h: cfg.hidden_size,
                     inter: cfg.intermediate_size,
                     vocab: cfg.vocab_size,
@@ -756,6 +862,112 @@ impl MetalQwen35 {
             unsafe { std::ptr::copy_nonoverlapping(ck.contents_ptr().add((keep - 1) * slot), live.contents_ptr(), slot) };
         }
         self.pos = pos0 + keep;
+    }
+
+    #[inline]
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    /// MTP pass pairing `next_toks[i]` with main hidden row `hid_row0 + i` of the last
+    /// forward/verify chunk, at MTP positions `pos0..`. Fills the MTP KV cache and, when
+    /// `want_draft`, returns the greedy draft that follows the last row.
+    pub fn mtp_fill(
+        &mut self,
+        model: &Qwen35Model,
+        next_toks: &[usize],
+        hid_row0: usize,
+        pos0: usize,
+        want_draft: bool,
+    ) -> Result<Option<usize>, String> {
+        self.mtp_pass(model, next_toks, Some(hid_row0), pos0, want_draft)
+    }
+
+    /// One chained MTP step from the previous MTP hidden: drafts the token after `tok`.
+    pub fn mtp_chain(&mut self, model: &Qwen35Model, tok: usize, pos: usize) -> Result<usize, String> {
+        Ok(self.mtp_pass(model, &[tok], None, pos, true)?.expect("draft"))
+    }
+
+    fn mtp_pass(
+        &mut self,
+        model: &Qwen35Model,
+        toks: &[usize],
+        hid_row0: Option<usize>,
+        pos0: usize,
+        want_draft: bool,
+    ) -> Result<Option<usize>, String> {
+        let n = toks.len();
+        let h = self.h;
+        let Some(m) = &self.mtp else { return Err("model has no MTP head".into()) };
+        if n == 0 || n > MAX_CHUNK || pos0 + n > self.kv_cap {
+            return Err(format!("MTP pass of {n} rows at {pos0} is out of range"));
+        }
+        {
+            // SAFETY: `m.emb` holds `MAX_CHUNK * h` floats and the GPU is idle.
+            let emb = unsafe { std::slice::from_raw_parts_mut(m.emb.contents_ptr().cast::<f32>(), n * h) };
+            for (i, &t) in toks.iter().enumerate() {
+                model.embed_into(t, &mut emb[i * h..(i + 1) * h]);
+            }
+        }
+        let mm = n >= 2;
+        let GpuMixer::Full(full) = &m.layer.mixer else { unreachable!() };
+        // SAFETY: every bound buffer is owned by `self` and outlives `waitUntilCompleted`.
+        unsafe {
+            let pool = objc_autoreleasePoolPush();
+            let res = (|| -> Result<(), String> {
+                let st = sels();
+                let cmd: Id = msg_sel!(self.queue.id(), st.cmd_buffer; Id);
+                let enc: Id = msg_sel!(cmd, st.compute_enc; Id);
+                let (hid, hid_off, w_h) = match hid_row0 {
+                    Some(r) => (self.sc.hidden.id(), r * h * 4, self.final_norm.id()),
+                    None => (m.last.id(), 0, m.norm.id()),
+                };
+                let pp = MtpPrepParams { h: h as u32, n_tok: n as u32, eps: self.eps, _pad: 0 };
+                set_buf(enc, m.emb.id(), 0, 0);
+                set_buf(enc, hid, hid_off, 1);
+                set_buf(enc, w_h, 0, 2);
+                set_buf(enc, m.pre_emb.id(), 0, 3);
+                set_buf(enc, m.pre_hid.id(), 0, 4);
+                set_buf(enc, m.u.id(), 0, 5);
+                set_bytes(enc, &pp, 6);
+                dispatch(enc, &self.pipes.mtp_prep, MtlSize::new(n, 1, 1), MtlSize::new(256, 1, 1));
+                self.norm_fwht(enc, m.u.id(), self.dummy.id(), 2 * h, n, 1, mm);
+                self.proj(enc, &m.fc, None, m.x.id(), n);
+
+                let layer = &m.layer;
+                self.norm_fwht(enc, m.x.id(), layer.input_norm.id(), h, n, 0, mm);
+                self.proj(enc, &full.in_proj, None, self.sc.proj.id(), n);
+                self.encode_attention(enc, full, n, pos0);
+                self.norm_fwht(enc, self.sc.core.id(), self.dummy.id(), self.nh * self.hd, n, 1, mm);
+                self.proj(enc, &full.out_proj, Some(m.x.id()), m.x.id(), n);
+                self.norm_fwht(enc, m.x.id(), layer.post_norm.id(), h, n, 0, mm);
+                self.proj(enc, &layer.gate_up, None, self.sc.gate_up.id(), n);
+                self.norm_fwht(enc, self.sc.gate_up.id(), self.dummy.id(), self.inter, n, 2, mm);
+                self.proj(enc, &layer.down, Some(m.x.id()), m.x.id(), n);
+                if want_draft {
+                    self.norm_fwht_at(enc, m.x.id(), (n - 1) * h * 4, m.norm.id(), h, 1, 0, false);
+                    self.proj(enc, &self.lm_head, None, self.sc.logits.id(), 1);
+                }
+                msg_sel!(enc, st.end_enc; ());
+                msg_sel!(cmd, st.commit; ());
+                msg_sel!(cmd, st.wait_done; ());
+                let status: usize = msg_sel!(cmd, st.cmd_status; usize);
+                if status != MTL_CMD_STATUS_COMPLETED {
+                    let e: Id = msg_sel!(cmd, st.cmd_error; Id);
+                    return Err(format!("Metal MTP pass failed: {}", ns_error_string(e)));
+                }
+                Ok(())
+            })();
+            objc_autoreleasePoolPop(pool);
+            res?;
+            std::ptr::copy_nonoverlapping(m.x.contents_ptr().add((n - 1) * h * 4), m.last.contents_ptr(), h * 4);
+        }
+        if !want_draft {
+            return Ok(None);
+        }
+        // SAFETY: `logits` holds at least one row of `vocab` floats; GPU idle.
+        let logits = unsafe { std::slice::from_raw_parts(self.sc.logits.contents_ptr().cast::<f32>(), self.vocab) };
+        Ok(Some(crate::model::real_llm::argmax(logits)))
     }
 
     fn run_chunk(
@@ -1152,7 +1364,7 @@ mod tests {
     /// GPU prefill, GPU token-by-token decode and the CPU reference agree on every position.
     #[test]
     fn gpu_matches_cpu_prefill_and_decode() {
-        let model = Qwen35Model::synthetic(small_cfg(), 7);
+        let model = Qwen35Model::synthetic(small_cfg(), 7, false);
         let seq: Vec<usize> = (0..40).map(|i| (i * 37 + 11) % 512).collect();
         let cpu = model.logits_cpu(&seq);
         let v = model.cfg.vocab_size;
@@ -1184,10 +1396,31 @@ mod tests {
         assert!(e_prefill < 0.05 && e_decode < 0.05, "GPU/CPU mismatch: {e_prefill} {e_decode}");
     }
 
+    /// GPU MTP drafts match the CPU MTP head row by row, whether filled singly or in a batch.
+    #[test]
+    fn mtp_matches_cpu() {
+        let model = Qwen35Model::synthetic(small_cfg(), 13, true);
+        let seq: Vec<usize> = (0..20).map(|i| (i * 29 + 3) % 512).collect();
+        let cpu = model.mtp_logits_cpu(&seq);
+        let v = model.cfg.vocab_size;
+        let mut eng = MetalQwen35::new(&model, 128).unwrap();
+        eng.forward(&model, &seq, &[], &mut |_, _| {}).unwrap();
+        let mut agree = 0;
+        for i in 0..seq.len() - 1 {
+            let d = eng.mtp_fill(&model, &seq[i + 1..i + 2], i, i, true).unwrap().unwrap();
+            agree += usize::from(d == crate::model::real_llm::argmax(&cpu[i * v..(i + 1) * v]));
+        }
+        // Batched fill over all rows must leave the same KV, so the last draft agrees too.
+        let last = eng.mtp_fill(&model, &seq[1..], 0, 0, true).unwrap().unwrap();
+        let want = crate::model::real_llm::argmax(&cpu[(seq.len() - 2) * v..]);
+        eprintln!("MTP argmax agree {agree}/{}, batched last {}", seq.len() - 1, last == want);
+        assert!(agree + 1 >= seq.len() - 1 && last == want);
+    }
+
     /// Rejected draft tokens leave no trace: verify junk, keep a prefix, then continue normally.
     #[test]
     fn verify_rollback_matches_plain_decode() {
-        let model = Qwen35Model::synthetic(small_cfg(), 11);
+        let model = Qwen35Model::synthetic(small_cfg(), 11, false);
         let seq: Vec<usize> = (0..24).map(|i| (i * 53 + 5) % 512).collect();
         let cpu = model.logits_cpu(&seq);
         let v = model.cfg.vocab_size;

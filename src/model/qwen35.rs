@@ -471,6 +471,22 @@ fn swiglu_rows(gu: &[f32], inter: usize) -> Vec<f32> {
     out
 }
 
+/// One quantized decoder layer on the CPU (dequantized weights) over sequences `lens`.
+fn layer_forward_cpu(cfg: &Qwen35Config, layer: &QLayer, full: bool, x: &mut [f32], lens: &[usize]) {
+    let t: usize = lens.iter().sum();
+    let xn = rms_norm_rows(x, &layer.input_norm, cfg.rms_norm_eps);
+    let proj = dequant_rotated(layer.mixer.in_proj()).apply(&xn, t);
+    let core = match (&layer.mixer, full) {
+        (QMixer::Full { params, .. }, true) => per_seq(lens, &proj, cfg.attn_in_rows(), |s, n| full_attn_seq(cfg, params, s, n)),
+        (QMixer::Linear { params, .. }, false) => per_seq(lens, &proj, cfg.lin_in_rows(), |s, n| deltanet_seq(cfg, params, s, n)),
+        _ => panic!("layer type mismatch"),
+    };
+    add_into(x, &dequant_rotated(layer.mixer.out_proj()).apply(&core, t));
+    let xn = rms_norm_rows(x, &layer.post_norm, cfg.rms_norm_eps);
+    let act = swiglu_rows(&dequant_rotated(&layer.gate_up).apply(&xn, t), cfg.intermediate_size);
+    add_into(x, &dequant_rotated(&layer.down).apply(&act, t));
+}
+
 /// Runs `f` on each sequence slice of a `[sum(lens), width]` buffer and concatenates the results.
 fn per_seq(lens: &[usize], x: &[f32], width: usize, mut f: impl FnMut(&[f32], usize) -> Vec<f32>) -> Vec<f32> {
     let mut out = Vec::new();
@@ -962,8 +978,31 @@ impl Qwen35Model {
         dequant_rotated(&self.lm_head).apply(&hn, t)
     }
 
+    /// MTP draft logits `[t - 1, vocab]` on the CPU: row `i` predicts `seq[i + 2]` from the main
+    /// hidden at `i` and the embedding of `seq[i + 1]`.
+    pub fn mtp_logits_cpu(&self, seq: &[usize]) -> Vec<f32> {
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let m = self.mtp.as_ref().expect("model has an MTP head");
+        let t = seq.len();
+        let mut x = vec![0.0f32; t * h];
+        for (i, &tok) in seq.iter().enumerate() {
+            self.embed_into(tok, &mut x[i * h..(i + 1) * h]);
+        }
+        for (l, layer) in self.layers.iter().enumerate() {
+            layer_forward_cpu(cfg, layer, cfg.full_attn[l], &mut x, &[t]);
+        }
+        let hn = rms_norm_rows(&x, &self.final_norm, cfg.rms_norm_eps);
+        let (u, lens) = mtp_inputs(cfg, &m.pre_emb, &m.pre_hid, &[seq.to_vec()], &hn, |tok, out| self.embed_into(tok, out));
+        let mt = t - 1;
+        let mut mx = dequant_rotated(&m.fc).apply(&u, mt);
+        layer_forward_cpu(cfg, &m.layer, true, &mut mx, &lens);
+        let on = rms_norm_rows(&mx, &m.norm, cfg.rms_norm_eps);
+        dequant_rotated(&self.lm_head).apply(&on, mt)
+    }
+
     /// Random model with the given shapes, for kernel parity tests.
-    pub fn synthetic(cfg: Qwen35Config, seed: u64) -> Self {
+    pub fn synthetic(cfg: Qwen35Config, seed: u64, with_mtp: bool) -> Self {
         let mut s = seed;
         let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
             (0..n)
@@ -1013,7 +1052,30 @@ impl Qwen35Model {
             .collect();
         let embed = NfSdotMatrix::from_bf16_u16_embeddings_nf4(&emb, cfg.vocab_size, h, 2, 4);
         let lm_head = q(rnd(cfg.vocab_size * h, 2.0 * ws), cfg.vocab_size, h);
-        Self { final_norm: vec![1.0; h], embed, layers, lm_head, cfg, mtp: None }
+        let mtp = with_mtp.then(|| {
+            let in_rows = cfg.attn_in_rows();
+            MtpHead {
+                pre_emb: rnd(h, 0.4).into_iter().map(|v| 1.0 + v).collect(),
+                pre_hid: rnd(h, 0.4).into_iter().map(|v| 1.0 + v).collect(),
+                fc: q(rnd(h * 2 * h, 2.0 / (2.0 * h as f32).sqrt()), h, 2 * h),
+                layer: QLayer {
+                    input_norm: rnd(h, 0.4).into_iter().map(|v| 1.0 + v).collect(),
+                    post_norm: rnd(h, 0.4).into_iter().map(|v| 1.0 + v).collect(),
+                    mixer: QMixer::Full {
+                        in_proj: q(rnd(in_rows * h, 2.0 * ws), in_rows, h),
+                        params: FullParams {
+                            q_norm: rnd(cfg.head_dim, 0.4).into_iter().map(|v| 1.0 + v).collect(),
+                            k_norm: rnd(cfg.head_dim, 0.4).into_iter().map(|v| 1.0 + v).collect(),
+                        },
+                        out_proj: q(rnd(h * cfg.q_dim(), 2.0 / (cfg.q_dim() as f32).sqrt()), h, cfg.q_dim()),
+                    },
+                    gate_up: q(rnd(2 * cfg.intermediate_size * h, 2.0 * ws), 2 * cfg.intermediate_size, h),
+                    down: q(rnd(h * cfg.intermediate_size, 2.0 / (cfg.intermediate_size as f32).sqrt()), h, cfg.intermediate_size),
+                },
+                norm: rnd(h, 0.4).into_iter().map(|v| 1.0 + v).collect(),
+            }
+        });
+        Self { final_norm: vec![1.0; h], embed, layers, lm_head, cfg, mtp }
     }
 
     /// Bytes of quantized weights the GPU reads per decoded token (all layers plus `lm_head`).

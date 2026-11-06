@@ -8,7 +8,7 @@
 //!   `bench`    prefill and decode tok/s (`--cache FILE --prompt-len N --gen N --ctx N --text F`)
 //!   `gen`      greedy chat completion (`--cache FILE --prompt TEXT --max-new N`)
 
-use kronos_2t::backend::metal_qwen35::MetalQwen35;
+use kronos_2t::backend::metal_qwen35::{MetalQwen35, MAX_CHUNK};
 use kronos_2t::model::bpe_tokenizer::BpeTokenizer;
 use kronos_2t::model::qwen35::{compile, reference_ppl, QuantSpec, Qwen35Model};
 use kronos_2t::model::real_llm::argmax;
@@ -112,6 +112,73 @@ fn gpu_ppl(model: &Qwen35Model, eng: &mut MetalQwen35, seqs: &[Vec<usize>]) -> f
     (nll / n as f64).exp()
 }
 
+/// Prefills `prompt`; with `mtp`, also fills the MTP cache for every prompt pair. Returns the first
+/// greedy token, which is not fed yet.
+fn prefill(model: &Qwen35Model, eng: &mut MetalQwen35, prompt: &[usize], mtp: bool) -> usize {
+    let p = prompt.len();
+    let mut next = 0usize;
+    let mut s = 0;
+    while s < p {
+        let e = (s + MAX_CHUNK).min(p);
+        let want: Vec<usize> = if e == p { vec![e - s - 1] } else { vec![] };
+        eng.forward(model, &prompt[s..e], &want, &mut |_, l| next = argmax(l)).expect("prefill");
+        if mtp {
+            let pairs = &prompt[s + 1..e.min(p)];
+            if !pairs.is_empty() {
+                eng.mtp_fill(model, pairs, 0, s, false).expect("MTP fill");
+            }
+        }
+        s = e;
+    }
+    next
+}
+
+fn decode_plain(model: &Qwen35Model, eng: &mut MetalQwen35, mut next: usize, gen: usize) -> Vec<usize> {
+    let mut out = Vec::with_capacity(gen);
+    for _ in 0..gen {
+        out.push(next);
+        eng.forward(model, &[next], &[0], &mut |_, l| next = argmax(l)).expect("decode");
+    }
+    out
+}
+
+/// Greedy decoding with MTP drafts of up to `k` tokens verified in one batched pass. Returns the
+/// tokens and the number of verify steps.
+fn decode_mtp(model: &Qwen35Model, eng: &mut MetalQwen35, first: usize, prompt_len: usize, gen: usize, k: usize) -> (Vec<usize>, usize) {
+    let last_row = (prompt_len - 1) % MAX_CHUNK;
+    let mut x = first;
+    let mut pos = prompt_len;
+    let mut d = eng.mtp_fill(model, &[x], last_row, pos - 1, true).expect("MTP").expect("draft");
+    let mut out = Vec::with_capacity(gen + k + 1);
+    let mut steps = 0;
+    while out.len() < gen {
+        let mut drafts = vec![d];
+        for j in 1..k {
+            drafts.push(eng.mtp_chain(model, drafts[j - 1], pos - 1 + j).expect("MTP chain"));
+        }
+        let mut feed = vec![x];
+        feed.extend(&drafts);
+        let mut am = vec![0usize; feed.len()];
+        eng.verify(model, &feed, &mut |i, l| am[i] = argmax(l)).expect("verify");
+        let mut m = 0;
+        while m < k && am[m] == drafts[m] {
+            m += 1;
+        }
+        eng.accept(m + 1);
+        out.push(x);
+        out.extend(&drafts[..m]);
+        let y = am[m];
+        let mut next_toks = drafts[..m].to_vec();
+        next_toks.push(y);
+        d = eng.mtp_fill(model, &next_toks, 0, pos, true).expect("MTP").expect("draft");
+        pos += m + 1;
+        x = y;
+        steps += 1;
+    }
+    out.truncate(gen);
+    (out, steps)
+}
+
 fn main() {
     let a = Args::parse();
     let tok = BpeTokenizer::from_model_dir(&a.model_dir).expect("tokenizer");
@@ -154,30 +221,41 @@ fn main() {
             let mut eng = MetalQwen35::new(&model, ctx + 256).expect("Metal");
             let ids = tok.encode(&std::fs::read_to_string(&text).expect("text"));
             let gen = a.num("gen", 128);
-            for &plen in &[a.num("prompt-len", 512), ctx.min(ids.len())] {
+            let draft = a.num("draft", 3);
+            for &plen in &[a.num("prompt-len", 512), ctx] {
                 let prompt: Vec<usize> = ids.iter().cycle().take(plen).copied().collect();
-                eng.reset();
                 // Warm-up so pipeline creation and first-touch faults are not timed.
+                eng.reset();
                 eng.forward(&model, &prompt[..8], &[7], &mut |_, _| {}).expect("warm-up");
+
                 eng.reset();
                 let t0 = Instant::now();
-                let mut next = 0usize;
-                eng.forward(&model, &prompt, &[plen - 1], &mut |_, l| next = argmax(l)).expect("prefill");
+                let first = prefill(&model, &mut eng, &prompt, false);
                 let pf = t0.elapsed().as_secs_f64();
                 let t1 = Instant::now();
-                let mut out = Vec::with_capacity(gen);
-                for _ in 0..gen {
-                    out.push(next);
-                    eng.forward(&model, &[next], &[0], &mut |_, l| next = argmax(l)).expect("decode");
-                }
+                let plain = decode_plain(&model, &mut eng, first, gen);
                 let dc = t1.elapsed().as_secs_f64();
-                println!(
-                    "prompt {plen:>5}: prefill {:7.1} tok/s ({pf:.2}s) | decode {:6.2} tok/s over {gen} tokens",
+                print!(
+                    "prompt {plen:>5}: prefill {:7.1} tok/s ({pf:.2}s) | decode {:6.2} tok/s",
                     plen as f64 / pf,
                     gen as f64 / dc
                 );
+                if eng.has_mtp() && draft > 0 {
+                    eng.reset();
+                    let first = prefill(&model, &mut eng, &prompt, true);
+                    let t2 = Instant::now();
+                    let (spec, steps) = decode_mtp(&model, &mut eng, first, plen, gen, draft);
+                    let sc = t2.elapsed().as_secs_f64();
+                    let same = spec.iter().zip(&plain).take_while(|(x, y)| x == y).count();
+                    print!(
+                        " | MTP x{draft} {:6.2} tok/s, {:.2} tokens/step, matches greedy for {same}/{gen}",
+                        gen as f64 / sc,
+                        gen as f64 / steps as f64
+                    );
+                }
+                println!();
                 if a.has("show") {
-                    println!("  continuation: {:?}", tok.decode(&out));
+                    println!("  continuation: {:?}", tok.decode(&plain));
                 }
             }
         }
