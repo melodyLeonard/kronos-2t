@@ -1484,6 +1484,14 @@ impl MetalQwen35 {
         self.pos
     }
 
+    /// Bytes of recurrent state plus attention KV buffers.
+    pub fn state_bytes(&self) -> usize {
+        [&self.conv_state, &self.delta_state, &self.k_cache, &self.v_cache, &self.k_scale, &self.v_scale]
+            .iter()
+            .map(|b| b.byte_len())
+            .sum()
+    }
+
     #[inline]
     pub fn vocab(&self) -> usize {
         self.vocab

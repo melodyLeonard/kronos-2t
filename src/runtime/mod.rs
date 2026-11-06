@@ -1,5 +1,6 @@
 //! Chat, agent loop, decisions, conversations, device context, and media.
 
+pub mod backend;
 pub mod chat;
 pub mod kv_sessions;
 pub mod agent;

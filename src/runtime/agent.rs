@@ -2017,7 +2017,8 @@ pub fn execute_tool(
         "list_dir" => exec_list_dir(workdir, &args),
         "search_files" => exec_search_files(workdir, &args),
         "run_command" => {
-            let Some(cmd) = args.get("cmd").and_then(Json::as_str) else {
+            // `command` is the name most models reach for.
+            let Some(cmd) = args.get("cmd").or_else(|| args.get("command")).and_then(Json::as_str) else {
                 return ToolExecOutcome {
                     ok: false,
                     validation_ok: true,

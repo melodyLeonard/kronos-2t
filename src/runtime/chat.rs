@@ -11,6 +11,7 @@ pub use crate::config::prompts::{CREATOR_PUBLIC_PROFILE, DEFAULT_SYSTEM, DEFAULT
 
 #[cfg(all(feature = "ane", target_os = "macos"))]
 use crate::config::limits::ANE_MIN_NEW_TOKENS;
+use crate::runtime::backend::{Backend, PrefixSnap};
 use crate::runtime::kv_sessions::{KvBlob, KvSource, SessionKvStore};
 
 
@@ -295,6 +296,21 @@ pub fn compile_moe(
     .map_err(|e| format!("streaming Sparse-MoE GPTQ compile: {e}"))
 }
 
+/// Loads the target engine: a Qwen3.5 hybrid when `model_dir` is one, else the Llama-family engine.
+fn load_target(
+    model_dir: &Path,
+    cache_dir: Option<&Path>,
+    mode_key: &str,
+    ctx: usize,
+    threads: usize,
+    calib: Option<(&Path, usize)>,
+) -> Result<Backend, String> {
+    if let Some(q) = crate::runtime::backend::load_qwen35(model_dir, cache_dir, mode_key, ctx, calib) {
+        return q;
+    }
+    load_or_compile_engine(model_dir, cache_dir, mode_key, ctx, threads, calib).map(Backend::Llama)
+}
+
 fn load_or_compile_engine(
     model_dir: &Path,
     cache_dir: Option<&Path>,
@@ -422,7 +438,7 @@ enum SpecSource {
 }
 
 /// Drops target and draft KV entries past `n` after a rejected speculative token.
-fn rollback_spec(engine: &mut RealLlamaEngine, draft: &mut Option<DraftEngine>, n: usize) {
+fn rollback_spec(engine: &mut Backend, draft: &mut Option<DraftEngine>, n: usize) {
     engine.truncate_context(n);
     if let Some(d) = draft.as_mut() {
         d.engine.truncate_context(n);
@@ -455,7 +471,7 @@ impl ChatScratch {
 
 /// Byte-budgeted LRU of KV snapshots keyed by their token prefix.
 struct ConvSnapshots {
-    entries: Vec<(Vec<usize>, crate::model::real_llm::KvPrefixSnapshot, u64)>,
+    entries: Vec<(Vec<usize>, PrefixSnap, u64)>,
     budget_bytes: usize,
     clock: u64,
 }
@@ -488,7 +504,7 @@ impl ConvSnapshots {
         self.entries[i].2 = self.clock;
     }
 
-    fn insert(&mut self, toks: Vec<usize>, snap: crate::model::real_llm::KvPrefixSnapshot) {
+    fn insert(&mut self, toks: Vec<usize>, snap: PrefixSnap) {
         if snap.byte_len() == 0 || snap.byte_len() > self.budget_bytes {
             return;
         }
@@ -507,7 +523,9 @@ impl ConvSnapshots {
 }
 
 pub struct ChatModel {
-    engine: RealLlamaEngine,
+    engine: Backend,
+    /// Qwen3.5-style template: the open assistant turn starts with an empty `<think>` block.
+    think_block: bool,
     draft: Option<DraftEngine>,
     tok: BpeTokenizer,
     im_start: usize,
@@ -557,11 +575,11 @@ impl ChatModel {
         threads: usize,
         calib: Option<(&Path, usize)>,
     ) -> Result<Self, String> {
-        let mut engine = load_or_compile_engine(model_dir, cache_dir, mode_key, ctx, threads, calib)?;
+        let mut engine = load_target(model_dir, cache_dir, mode_key, ctx, threads, calib)?;
         // Hadamard KV cache (`Q4` for `> 1B` models under `<= 8 GB` budget profile, `Q8` otherwise).
-        if matches!(engine.cfg.head_dim(), 64 | 128) {
+        if !engine.is_qwen35() && matches!(engine.head_dim(), 64 | 128) {
             let kv_bits = if crate::model::memory_budget::MemoryBudgetProfile::active().prefer_q4_kv
-                && engine.cfg.hidden_size > 1024
+                && engine.hidden_size() > 1024
             {
                 4
             } else {
@@ -569,9 +587,9 @@ impl ChatModel {
             };
             engine.set_kv_bits(kv_bits);
         }
-        let vocab_size = engine.cfg.vocab_size;
+        let vocab_size = engine.vocab_size();
         let mut tok = BpeTokenizer::from_model_dir(model_dir).map_err(|e| format!("tokenizer: {e}"))?;
-        let mut emb_probe = vec![0.0f32; engine.cfg.hidden_size];
+        let mut emb_probe = vec![0.0f32; engine.hidden_size()];
         tok.retain_added_tokens(|s, id| {
             if s.starts_with("<|") && s.ends_with("|>") {
                 return true;
@@ -590,8 +608,12 @@ impl ChatModel {
             "{}-kronos-{mode_key}",
             model_dir.file_name().map_or("model".into(), |n| n.to_string_lossy().to_lowercase())
         );
+        let think_block = std::fs::read_to_string(model_dir.join("chat_template.jinja"))
+            .or_else(|_| std::fs::read_to_string(model_dir.join("tokenizer_config.json")))
+            .is_ok_and(|t| t.contains("enable_thinking"));
         Ok(Self {
             engine,
+            think_block,
             draft: None,
             tok,
             im_start,
@@ -757,9 +779,10 @@ impl ChatModel {
     }
 
     /// Keeps the KV prefix of the last `slots` sessions in RAM and spills older ones under `dir/kv`.
+    /// Qwen3.5 has no position-sliced KV export, so it relies on the snapshot LRU instead.
     pub fn enable_session_kv(&mut self, slots: usize, dir: Option<&Path>) {
         self.active_session = None;
-        if slots == 0 {
+        if slots == 0 || self.engine.is_qwen35() {
             self.sessions = None;
             return;
         }
@@ -905,6 +928,9 @@ impl ChatModel {
         draft_mode_key: &str,
         calib: Option<(&Path, usize)>,
     ) -> Result<(), String> {
+        if self.engine.is_qwen35() {
+            return Err("Qwen3.5 drafts with prompt lookup; separate draft models are not supported".to_string());
+        }
         let draft_tok =
             BpeTokenizer::from_model_dir(draft_dir).map_err(|e| format!("draft tokenizer: {e}"))?;
         let threads = if self.engine.is_metal_enabled() {
@@ -915,7 +941,7 @@ impl ChatModel {
         let mut draft_eng =
             load_or_compile_engine(draft_dir, cache_dir, draft_mode_key, self.ctx, threads, calib)?;
         let draft_vocab = draft_eng.cfg.vocab_size;
-        let target_vocab = self.engine.cfg.vocab_size;
+        let target_vocab = self.engine.vocab_size();
         let shared_vocab = draft_vocab.min(target_vocab);
         let check_len = draft_tok
             .id_to_token
@@ -1026,7 +1052,7 @@ impl ChatModel {
         let vocab_cap = if let Some(d) = self.draft.as_ref() {
             d.draft_vocab
         } else {
-            self.engine.cfg.vocab_size
+            self.engine.vocab_size()
         };
 
         let mut candidate_sets: Vec<Vec<usize>> = Vec::with_capacity(anchors.len());
@@ -1193,13 +1219,18 @@ impl ChatModel {
         // Metal included: the scorer overwrites only the first `tokens.len()` KV positions, which are
         // snapshotted and restored, so the conversation KV (and `self.cached`) stay intact.
         let saved_total = self.cached.len();
-        eval_with_jev_prefix(
-            &mut self.engine,
-            saved_total,
-            &raw_tokens,
-            &mut self.jev_caches,
-            score_logits,
-        )
+        match &mut self.engine {
+            Backend::Llama(e) => eval_with_jev_prefix(e, saved_total, &raw_tokens, &mut self.jev_caches, score_logits),
+            Backend::Qwen35(q) => {
+                // The recurrent state cannot be partly overwritten, so score from a clean context and put the
+                // whole conversation state back afterwards.
+                let saved = q.snapshot();
+                q.reset();
+                let res = score_logits(q.forward_last(&raw_tokens));
+                q.restore(&saved);
+                Some(res)
+            }
+        }
     }
 
     /// Pre-warms the fixed system + tool-schema prefix into target and draft KV caches.
@@ -1293,7 +1324,7 @@ impl ChatModel {
             if seq <= self.ctx {
                 let mut m = CoreMlModel::load(&e.path(), ComputeUnits::CpuAndNeuralEngine)?;
                 // The first prediction pays a one-time Neural Engine setup cost.
-                let h = self.engine.cfg.hidden_size;
+                let h = self.engine.hidden_size();
                 m.predict("x", &[1, seq, h], &vec![0.0; seq * h], &["hidden"])?;
                 self.ane.push((seq, m));
             }
@@ -1305,17 +1336,21 @@ impl ChatModel {
     /// Prefills `prompt` from an empty cache on the Neural Engine, if a bucket fits.
     #[cfg(all(feature = "ane", target_os = "macos"))]
     fn ane_prefill(&mut self, prompt: &[usize]) -> Option<Result<Vec<f32>, String>> {
+        if self.engine.is_qwen35() {
+            return None;
+        }
         let n = prompt.len();
         let (seq, model) = self.ane.iter_mut().find(|(s, _)| *s >= n)?;
         let seq = *seq;
-        let h = self.engine.cfg.hidden_size;
+        let h = self.engine.hidden_size();
         let mut x = vec![0.0f32; seq * h];
         for (t, &tok) in prompt.iter().enumerate() {
             self.engine.embed(tok, &mut x[t * h..(t + 1) * h]);
         }
         Some(model.predict("x", &[1, seq, h], &x, &["hidden", "keys", "values"]).map(|out| {
-            self.engine.load_prefix_kv(&out[1], &out[2], seq, n);
-            self.engine.logits_from_hidden(&out[0][(n - 1) * h..n * h]).to_vec()
+            let Backend::Llama(e) = &mut self.engine else { unreachable!() };
+            e.load_prefix_kv(&out[1], &out[2], seq, n);
+            e.logits_from_hidden(&out[0][(n - 1) * h..n * h]).to_vec()
         }))
     }
 
@@ -1352,15 +1387,22 @@ impl ChatModel {
                     Some((_, toks)) => {
                         hits += 1;
                         buf.push_str("<|im_start|>assistant\n");
+                        if self.think_block {
+                            buf.push_str(THINK_EMPTY);
+                        }
                         ids.extend(self.tok.encode(&buf));
                         buf.clear();
                         ids.extend_from_slice(toks);
                         buf.push_str("<|im_end|>\n");
                     }
+                    None if self.think_block => buf.push_str(&with_think_block(&seg)),
                     None => buf.push_str(&seg),
                 }
             }
         });
+        if self.think_block {
+            buf.push_str(THINK_EMPTY);
+        }
         buf.push_str(assistant_prefix);
         ids.extend(self.tok.encode(&buf));
         if std::env::var_os("KRONOS_KV_DEBUG").is_some() {
@@ -1414,8 +1456,8 @@ impl ChatModel {
         }
         if let Some((i, n)) = if self.session_kv_enabled() { None } else { self.conv_snaps.best(prompt) } {
             let n = n.min(prompt.len().saturating_sub(1));
-            if n >= common + ConvSnapshots::MIN_TOKENS {
-                self.engine.restore_kv_prefix_slice(&self.conv_snaps.entries[i].1, n, n);
+            let n = Backend::usable_prefix(&self.conv_snaps.entries[i].1, n);
+            if n >= common + ConvSnapshots::MIN_TOKENS && self.engine.restore_prefix(&self.conv_snaps.entries[i].1, n) {
                 self.cached.clear();
                 self.cached.extend_from_slice(&prompt[..n]);
                 self.conv_snaps.touch(i);
@@ -1442,7 +1484,7 @@ impl ChatModel {
         }
         let common = self.align_kv(&prompt);
         let tail = &prompt[common..];
-        let vocab = self.engine.cfg.vocab_size;
+        let vocab = self.engine.vocab_size();
         let logits = self.engine.forward_prompt(tail);
         self.scratch.cur_logits[..vocab].copy_from_slice(&logits[..vocab]);
         self.cached.extend_from_slice(tail);
@@ -1471,7 +1513,7 @@ impl ChatModel {
         if self.cached.len() >= self.ctx {
             return Err(format!("context limit ({}) reached", self.ctx));
         }
-        let vocab = self.engine.cfg.vocab_size;
+        let vocab = self.engine.vocab_size();
         let logits = self.engine.forward_token(tok_id);
         self.scratch.cur_logits[..vocab].copy_from_slice(&logits[..vocab]);
         self.cached.push(tok_id);
@@ -1541,7 +1583,7 @@ impl ChatModel {
             prompt = render_prefixed(&msgs, self);
         }
         let max_new = params.max_tokens.min(self.ctx - prompt.len());
-        let vocab = self.engine.cfg.vocab_size;
+        let vocab = self.engine.vocab_size();
 
         // Reuse the cached prefix; at least one prompt token must run to produce logits.
         let mut common = self.align_kv(&prompt);
@@ -1767,8 +1809,9 @@ impl ChatModel {
             let avail_ctx = self.ctx.saturating_sub(self.cached.len() + 1);
             let greedy = params.temperature <= 0.0;
             let max_k = if greedy { SPEC_DRAFT_K_GREEDY } else { SPEC_DRAFT_K_SAMPLE };
-            let max_draft = rem.min(avail_ctx).min(cur_draft_k.min(max_k));
-            let max_lookup = rem.min(avail_ctx).min(cur_lookup_k);
+            let verify_cap = self.engine.max_verify_batch().saturating_sub(1);
+            let max_draft = rem.min(avail_ctx).min(cur_draft_k.min(max_k)).min(verify_cap);
+            let max_lookup = rem.min(avail_ctx).min(cur_lookup_k).min(verify_cap);
 
             let mut draft_tokens = [0usize; SPEC_LOOKUP_K_MAX];
             let mut drafted = 0usize;
@@ -2226,6 +2269,18 @@ fn parse_xml_function_block(body: &str, idx: usize) -> Option<ToolCall> {
     }
     args.push('}');
     Some(ToolCall { id: format!("call_{idx}"), name, arguments: args })
+}
+
+/// Empty reasoning block that opens a non-thinking Qwen3.5 assistant turn.
+const THINK_EMPTY: &str = "<think>\n\n</think>\n\n";
+
+/// An assistant segment with [`THINK_EMPTY`] after its role line, as Qwen3.5 renders history.
+fn with_think_block(seg: &str) -> String {
+    let head = "<|im_start|>assistant";
+    match seg.strip_prefix(head) {
+        Some(rest) => format!("{head}\n{THINK_EMPTY}{}", rest.strip_prefix('\n').unwrap_or(rest)),
+        None => seg.to_string(),
+    }
 }
 
 enum ChatPiece<'a> {
