@@ -522,6 +522,18 @@ pub struct Qwen35Model {
     pub layers: Vec<QLayer>,
     pub final_norm: Vec<f32>,
     pub lm_head: NfSdotMatrix,
+    /// Multi-token-prediction head used as the speculative draft model, when the checkpoint has one.
+    pub mtp: Option<MtpHead>,
+}
+
+/// Qwen3.5 MTP head: `fc([norm_e(e(x_{t+1})) | norm_h(h_t)])`, one full-attention layer, `norm`,
+/// then the shared `lm_head`.
+pub struct MtpHead {
+    pub pre_emb: Vec<f32>,
+    pub pre_hid: Vec<f32>,
+    pub fc: NfSdotMatrix,
+    pub layer: QLayer,
+    pub norm: Vec<f32>,
 }
 
 /// Quantization recipe: bits for layer projections and for `lm_head`.
@@ -717,6 +729,109 @@ pub fn reference_ppl(model_dir: &Path, seqs: &[Vec<usize>], log: &mut dyn FnMut(
     Ok((nll / n.max(1) as f64).exp())
 }
 
+/// Compiles one decoder layer at tensor prefix `lp` and advances the residual stream `x`
+/// (`[sum(lens), hidden]`) through the quantized weights.
+#[allow(clippy::too_many_arguments)]
+fn compile_layer(
+    cfg: &Qwen35Config,
+    store: &SafeTensorsStore,
+    lp: &str,
+    full: bool,
+    x: &mut [f32],
+    lens: &[usize],
+    spec: QuantSpec,
+    threads: usize,
+) -> io::Result<QLayer> {
+    let h = cfg.hidden_size;
+    let inter = cfg.intermediate_size;
+    let t = lens.iter().sum();
+    let (bits, sgc) = (spec.bits, spec.scale_group_chunks);
+    let hess = |x: &[f32], cols: usize| spec.gptq.then(|| hessian_of(x, cols));
+    let input_norm = load_norm(store, &format!("{lp}input_layernorm.weight"))?;
+    let post_norm = load_norm(store, &format!("{lp}post_attention_layernorm.weight"))?;
+
+    let xn = rms_norm_rows(x, &input_norm, cfg.rms_norm_eps);
+    let (in_names, out_name): (Vec<String>, String) = if full {
+        (
+            ["q_proj", "k_proj", "v_proj"].iter().map(|n| format!("{lp}self_attn.{n}.weight")).collect(),
+            format!("{lp}self_attn.o_proj.weight"),
+        )
+    } else {
+        (
+            ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"].iter().map(|n| format!("{lp}linear_attn.{n}.weight")).collect(),
+            format!("{lp}linear_attn.out_proj.weight"),
+        )
+    };
+    let in_w = load_rows(store, &in_names)?;
+    let in_rows = in_w.len() / h;
+    let in_q = quantize(&in_w, in_rows, h, bits, sgc, hess(&xn, h).as_ref(), threads);
+    drop(in_w);
+    let proj = dequant_rotated(&in_q).apply(&xn, t);
+    let (core, lin_p, full_p) = if full {
+        let p = FullParams {
+            q_norm: load_norm(store, &format!("{lp}self_attn.q_norm.weight"))?,
+            k_norm: load_norm(store, &format!("{lp}self_attn.k_norm.weight"))?,
+        };
+        (per_seq(lens, &proj, cfg.attn_in_rows(), |s, n| full_attn_seq(cfg, &p, s, n)), None, Some(p))
+    } else {
+        let la = format!("{lp}linear_attn.");
+        let conv_w = load_f32(store, &format!("{la}conv1d.weight"))?;
+        if conv_w.len() != cfg.conv_dim() * cfg.conv_kernel {
+            return Err(invalid(format!("{lp}: conv1d has {} weights", conv_w.len())));
+        }
+        let p = LinearParams {
+            conv_w,
+            dt_bias: load_f32(store, &format!("{la}dt_bias"))?,
+            a_neg: load_f32(store, &format!("{la}A_log"))?.into_iter().map(|a| -a.exp()).collect(),
+            norm_w: load_f32(store, &format!("{la}norm.weight"))?,
+        };
+        (per_seq(lens, &proj, cfg.lin_in_rows(), |s, n| deltanet_seq(cfg, &p, s, n)), Some(p), None)
+    };
+    drop(proj);
+    let out_w = load_f32(store, &out_name)?;
+    let core_cols = out_w.len() / h;
+    let out_q = quantize(&out_w, h, core_cols, bits, sgc, hess(&core, core_cols).as_ref(), threads);
+    drop(out_w);
+    add_into(x, &dequant_rotated(&out_q).apply(&core, t));
+    drop(core);
+
+    let xn = rms_norm_rows(x, &post_norm, cfg.rms_norm_eps);
+    let gu_w = load_rows(store, &[format!("{lp}mlp.gate_proj.weight"), format!("{lp}mlp.up_proj.weight")])?;
+    let gu_q = quantize(&gu_w, 2 * inter, h, bits, sgc, hess(&xn, h).as_ref(), threads);
+    drop(gu_w);
+    let act = swiglu_rows(&dequant_rotated(&gu_q).apply(&xn, t), inter);
+    let dn_w = load_f32(store, &format!("{lp}mlp.down_proj.weight"))?;
+    let dn_q = quantize(&dn_w, h, inter, bits, sgc, hess(&act, inter).as_ref(), threads);
+    drop(dn_w);
+    add_into(x, &dequant_rotated(&dn_q).apply(&act, t));
+
+    let mixer = match (lin_p, full_p) {
+        (Some(params), _) => QMixer::Linear { in_proj: in_q, params, out_proj: out_q },
+        (_, Some(params)) => QMixer::Full { in_proj: in_q, params, out_proj: out_q },
+        _ => unreachable!(),
+    };
+    Ok(QLayer { input_norm, post_norm, mixer, gate_up: gu_q, down: dn_q })
+}
+
+/// MTP input rows `[norm_e(e(x_{t+1})) | norm_h(h_t)]` for every position with a next token.
+fn mtp_inputs(cfg: &Qwen35Config, pre_emb: &[f32], pre_hid: &[f32], seqs: &[Vec<usize>], hn: &[f32], mut embed: impl FnMut(usize, &mut [f32])) -> (Vec<f32>, Vec<usize>) {
+    let h = cfg.hidden_size;
+    let mut rows = Vec::new();
+    let mut lens = Vec::new();
+    let mut e = vec![0.0f32; h];
+    let mut off = 0;
+    for s in seqs {
+        for t in 0..s.len().saturating_sub(1) {
+            embed(s[t + 1], &mut e);
+            rows.extend(rms_norm_rows(&e, pre_emb, cfg.rms_norm_eps));
+            rows.extend(rms_norm_rows(&hn[(off + t) * h..(off + t + 1) * h], pre_hid, cfg.rms_norm_eps));
+        }
+        lens.push(s.len().saturating_sub(1));
+        off += s.len();
+    }
+    (rows, lens)
+}
+
 /// Compiles `model_dir` layer by layer with Hadamard GPTQ, propagating calibration activations
 /// through the already-quantized layers.
 pub fn compile(model_dir: &Path, spec: QuantSpec, calib: &[Vec<usize>], threads: usize, log: &mut dyn FnMut(&str)) -> io::Result<Qwen35Model> {
@@ -724,11 +839,9 @@ pub fn compile(model_dir: &Path, spec: QuantSpec, calib: &[Vec<usize>], threads:
     let store = SafeTensorsStore::open_dir(model_dir)?;
     let pfx = text_prefix(&store);
     let h = cfg.hidden_size;
-    let inter = cfg.intermediate_size;
-    let (bits, sgc) = (spec.bits, spec.scale_group_chunks);
+    let sgc = spec.scale_group_chunks;
     let lens: Vec<usize> = calib.iter().map(|s| s.len()).collect();
     let flat: Vec<usize> = calib.concat();
-    let t = flat.len();
     let hess = |x: &[f32], cols: usize| spec.gptq.then(|| hessian_of(x, cols));
 
     let embed = {
@@ -741,62 +854,45 @@ pub fn compile(model_dir: &Path, spec: QuantSpec, calib: &[Vec<usize>], threads:
     let mut layers = Vec::with_capacity(cfg.num_layers);
     for l in 0..cfg.num_layers {
         let t0 = std::time::Instant::now();
-        let lp = format!("{pfx}layers.{l}.");
-        let input_norm = load_norm(&store, &format!("{lp}input_layernorm.weight"))?;
-        let post_norm = load_norm(&store, &format!("{lp}post_attention_layernorm.weight"))?;
-
-        let xn = rms_norm_rows(&x, &input_norm, cfg.rms_norm_eps);
-        let in_w = load_rows(&store, &mixer_in_names(&cfg, pfx, l))?;
-        let in_rows = in_w.len() / h;
-        let in_q = quantize(&in_w, in_rows, h, bits, sgc, hess(&xn, h).as_ref(), threads);
-        drop(in_w);
-        let proj = dequant_rotated(&in_q).apply(&xn, t);
-        let (lin_p, full_p) = if cfg.full_attn[l] {
-            (None, Some(load_full_params(&store, pfx, l)?))
-        } else {
-            (Some(load_linear_params(&cfg, &store, pfx, l)?), None)
-        };
-        let core = mixer_core(&cfg, l, lin_p.as_ref(), full_p.as_ref(), &lens, &proj);
-        drop(proj);
-        let out_w = load_f32(&store, &mixer_out_name(&cfg, pfx, l))?;
-        let core_cols = out_w.len() / h;
-        let out_q = quantize(&out_w, h, core_cols, bits, sgc, hess(&core, core_cols).as_ref(), threads);
-        drop(out_w);
-        add_into(&mut x, &dequant_rotated(&out_q).apply(&core, t));
-        drop(core);
-
-        let xn = rms_norm_rows(&x, &post_norm, cfg.rms_norm_eps);
-        let gu_w = load_rows(&store, &[format!("{lp}mlp.gate_proj.weight"), format!("{lp}mlp.up_proj.weight")])?;
-        let gu_q = quantize(&gu_w, 2 * inter, h, bits, sgc, hess(&xn, h).as_ref(), threads);
-        drop(gu_w);
-        let act = swiglu_rows(&dequant_rotated(&gu_q).apply(&xn, t), inter);
-        let dn_w = load_f32(&store, &format!("{lp}mlp.down_proj.weight"))?;
-        let dn_q = quantize(&dn_w, h, inter, bits, sgc, hess(&act, inter).as_ref(), threads);
-        drop(dn_w);
-        add_into(&mut x, &dequant_rotated(&dn_q).apply(&act, t));
-
-        let mixer = match (lin_p, full_p) {
-            (Some(params), _) => QMixer::Linear { in_proj: in_q, params, out_proj: out_q },
-            (_, Some(params)) => QMixer::Full { in_proj: in_q, params, out_proj: out_q },
-            _ => unreachable!(),
-        };
-        layers.push(QLayer { input_norm, post_norm, mixer, gate_up: gu_q, down: dn_q });
+        let full = cfg.full_attn[l];
+        layers.push(compile_layer(&cfg, &store, &format!("{pfx}layers.{l}."), full, &mut x, &lens, spec, threads)?);
         log(&format!(
             "compiled layer {}/{} ({}) in {:.1}s",
             l + 1,
             cfg.num_layers,
-            if cfg.full_attn[l] { "attention" } else { "deltanet" },
+            if full { "attention" } else { "deltanet" },
             t0.elapsed().as_secs_f64()
         ));
     }
     let final_norm = load_norm(&store, &format!("{pfx}norm.weight"))?;
     let hn = rms_norm_rows(&x, &final_norm, cfg.rms_norm_eps);
+    drop(x);
     let head_name = if cfg.tie_word_embeddings { format!("{pfx}embed_tokens.weight") } else { "lm_head.weight".to_string() };
     let t0 = std::time::Instant::now();
     let head_w = load_f32(&store, &head_name)?;
     let lm_head = quantize(&head_w, cfg.vocab_size, h, spec.head_bits, sgc, hess(&hn, h).as_ref(), threads);
+    drop(head_w);
     log(&format!("compiled lm_head in {:.1}s", t0.elapsed().as_secs_f64()));
-    Ok(Qwen35Model { cfg, embed, layers, final_norm, lm_head })
+
+    let mtp = if store.has_tensor("mtp.fc.weight") {
+        let t0 = std::time::Instant::now();
+        let pre_emb = load_norm(&store, "mtp.pre_fc_norm_embedding.weight")?;
+        let pre_hid = load_norm(&store, "mtp.pre_fc_norm_hidden.weight")?;
+        let emb = store.tensor(&format!("{pfx}embed_tokens.weight")).map_err(invalid)?;
+        let (u, mlens) = mtp_inputs(&cfg, &pre_emb, &pre_hid, calib, &hn, |tok, out| emb.copy_row_f32(tok, out));
+        let mt: usize = mlens.iter().sum();
+        let fc_w = load_f32(&store, "mtp.fc.weight")?;
+        let fc = quantize(&fc_w, h, 2 * h, spec.bits, sgc, hess(&u, 2 * h).as_ref(), threads);
+        drop(fc_w);
+        let mut mx = dequant_rotated(&fc).apply(&u, mt);
+        drop(u);
+        let layer = compile_layer(&cfg, &store, "mtp.layers.0.", true, &mut mx, &mlens, spec, threads)?;
+        log(&format!("compiled MTP head in {:.1}s", t0.elapsed().as_secs_f64()));
+        Some(MtpHead { pre_emb, pre_hid, fc, layer, norm: load_norm(&store, "mtp.norm.weight")? })
+    } else {
+        None
+    };
+    Ok(Qwen35Model { cfg, embed, layers, final_norm, lm_head, mtp })
 }
 
 impl Qwen35Model {
@@ -917,7 +1013,7 @@ impl Qwen35Model {
             .collect();
         let embed = NfSdotMatrix::from_bf16_u16_embeddings_nf4(&emb, cfg.vocab_size, h, 2, 4);
         let lm_head = q(rnd(cfg.vocab_size * h, 2.0 * ws), cfg.vocab_size, h);
-        Self { final_norm: vec![1.0; h], embed, layers, lm_head, cfg }
+        Self { final_norm: vec![1.0; h], embed, layers, lm_head, cfg, mtp: None }
     }
 
     /// Bytes of quantized weights the GPU reads per decoded token (all layers plus `lm_head`).
@@ -962,6 +1058,25 @@ impl Qwen35Model {
         }
         w_f32s(&mut w, &self.final_norm)?;
         w_mat(&mut w, &self.lm_head)?;
+        match &self.mtp {
+            Some(m) => {
+                w_u64(&mut w, 1)?;
+                w_f32s(&mut w, &m.pre_emb)?;
+                w_f32s(&mut w, &m.pre_hid)?;
+                w_mat(&mut w, &m.fc)?;
+                let QMixer::Full { in_proj, params, out_proj } = &m.layer.mixer else { unreachable!() };
+                w_f32s(&mut w, &m.layer.input_norm)?;
+                w_f32s(&mut w, &m.layer.post_norm)?;
+                w_f32s(&mut w, &params.q_norm)?;
+                w_f32s(&mut w, &params.k_norm)?;
+                w_mat(&mut w, in_proj)?;
+                w_mat(&mut w, out_proj)?;
+                w_mat(&mut w, &m.layer.gate_up)?;
+                w_mat(&mut w, &m.layer.down)?;
+                w_f32s(&mut w, &m.norm)?;
+            }
+            None => w_u64(&mut w, 0)?,
+        }
         w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
         std::fs::rename(&tmp, path)
     }
@@ -1003,7 +1118,20 @@ impl Qwen35Model {
         }
         let final_norm = r_f32s(&mut r)?;
         let lm_head = r_mat(&mut r)?;
-        Ok(Self { cfg, embed, layers, final_norm, lm_head })
+        let mtp = if r_u64(&mut r)? == 1 {
+            let pre_emb = r_f32s(&mut r)?;
+            let pre_hid = r_f32s(&mut r)?;
+            let fc = r_mat(&mut r)?;
+            let input_norm = r_f32s(&mut r)?;
+            let post_norm = r_f32s(&mut r)?;
+            let params = FullParams { q_norm: r_f32s(&mut r)?, k_norm: r_f32s(&mut r)? };
+            let mixer = QMixer::Full { in_proj: r_mat(&mut r)?, params, out_proj: r_mat(&mut r)? };
+            let layer = QLayer { input_norm, post_norm, mixer, gate_up: r_mat(&mut r)?, down: r_mat(&mut r)? };
+            Some(MtpHead { pre_emb, pre_hid, fc, layer, norm: r_f32s(&mut r)? })
+        } else {
+            None
+        };
+        Ok(Self { cfg, embed, layers, final_norm, lm_head, mtp })
     }
 }
 
