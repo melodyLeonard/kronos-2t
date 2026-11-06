@@ -205,7 +205,7 @@ not a free default.
 
 ## Agent context growth (`eval/`, Qwen2.5-Coder-14B + 0.5B draft, Metal)
 
-`eval/run_eval.py` runs the 10 hidden-check tasks in `eval/tasks/` through the live
+`kronos_eval` (`src/bin/kronos_eval.rs`) runs the 10 hidden-check tasks in `eval/tasks/` through the live
 `kronos_server` agent loop (`--ctx 32768`, temperature 0). Two full runs on the same M4 Pro 24 GB;
 the baseline shared the machine with a 3 GB model process and a `cargo test`, the after run did not.
 Per-task tables: `eval/results/baseline.md`, `eval/results/after.md`, `eval/results/before_after.md`.
