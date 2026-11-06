@@ -2,6 +2,7 @@
 
 pub mod real_llm;
 pub mod qwen35;
+pub mod lookup;
 pub mod sparse_moe;
 pub mod moe_800b;
 pub mod engine;

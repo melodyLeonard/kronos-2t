@@ -10,6 +10,7 @@
 
 use kronos_2t::backend::metal_qwen35::{MetalQwen35, MAX_CHUNK};
 use kronos_2t::model::bpe_tokenizer::BpeTokenizer;
+use kronos_2t::model::lookup::SessionLookup;
 use kronos_2t::model::qwen35::{compile, reference_ppl, QuantSpec, Qwen35Model};
 use kronos_2t::model::real_llm::argmax;
 use std::path::{Path, PathBuf};
@@ -191,38 +192,21 @@ fn decode_mtp(model: &Qwen35Model, eng: &mut MetalQwen35, first: usize, prompt_l
     (out, steps)
 }
 
-/// Prompt-lookup draft: the tokens that followed the most recent earlier occurrence of the longest
-/// (3..1-token) suffix of `ctx`, up to `k`.
-fn lookup_draft(ctx: &[usize], k: usize, min_n: usize) -> Vec<usize> {
-    for n in (min_n..=3usize).rev() {
-        if ctx.len() <= n {
-            continue;
-        }
-        let suffix = &ctx[ctx.len() - n..];
-        for start in (0..ctx.len() - n).rev() {
-            if &ctx[start..start + n] == suffix {
-                let from = start + n;
-                let end = (from + k).min(ctx.len());
-                if end > from {
-                    return ctx[from..end].to_vec();
-                }
-            }
-        }
-    }
-    Vec::new()
-}
-
 /// Greedy speculative decoding: prompt-lookup drafts of up to `k_lookup` tokens when the context
 /// repeats, else MTP drafts of `k_mtp` (0 disables either). Returns tokens and verify steps.
-/// With `auto`, lookup needs a 3-token match and 3+ drafts, and MTP runs only while its recent
-/// tokens per step beat the verify cost (probing every 8th step); other steps decode one token.
+/// With `auto`, lookup drafts need 3+ tokens and a recent acceptance that beats the verify cost
+/// (probing every 8th step); other steps use MTP drafts.
 #[allow(clippy::too_many_arguments)]
-fn decode_spec(model: &Qwen35Model, eng: &mut MetalQwen35, prompt: &[usize], first: usize, gen: usize, k_mtp: usize, k_lookup: usize, auto: bool) -> (Vec<usize>, usize) {
+fn decode_spec(model: &Qwen35Model, eng: &mut MetalQwen35, prompt: &[usize], corpus: &[Vec<usize>], first: usize, gen: usize, k_mtp: usize, k_lookup: usize, auto: bool) -> (Vec<usize>, usize) {
     // A verify of ~4 tokens costs about this many single-token steps.
     const VERIFY_COST: f64 = 2.4;
-    let mut mtp_rate = VERIFY_COST;
+    let mut look_rate = VERIFY_COST;
     let use_mtp = k_mtp > 0 && eng.has_mtp();
-    let mut ctx = prompt.to_vec();
+    let mut look = SessionLookup::new();
+    for doc in corpus {
+        look.add_doc(doc);
+    }
+    let ctx = look.add_doc(prompt);
     let mut x = first;
     let mut pos = prompt.len();
     let mut d = if use_mtp {
@@ -233,13 +217,13 @@ fn decode_spec(model: &Qwen35Model, eng: &mut MetalQwen35, prompt: &[usize], fir
     let mut out = Vec::with_capacity(gen + 8);
     let mut steps = 0;
     while out.len() < gen {
-        ctx.push(x);
-        let mut drafts = if k_lookup > 0 { lookup_draft(&ctx, k_lookup, if auto { 3 } else { 1 }) } else { Vec::new() };
-        if auto && drafts.len() < 3 {
+        look.push(ctx, x);
+        let mut drafts = if k_lookup > 0 { look.draft(ctx, k_lookup) } else { Vec::new() };
+        if auto && (drafts.len() < 3 || (look_rate < VERIFY_COST && steps % 8 != 0)) {
             drafts.clear();
         }
-        let try_mtp = !auto || mtp_rate >= VERIFY_COST || steps % 8 == 0;
-        let from_mtp = drafts.len() < 2 && use_mtp && try_mtp;
+        let from_look = !drafts.is_empty();
+        let from_mtp = drafts.len() < 2 && use_mtp;
         if from_mtp {
             drafts = vec![d.expect("draft")];
             for j in 1..k_mtp {
@@ -258,15 +242,17 @@ fn decode_spec(model: &Qwen35Model, eng: &mut MetalQwen35, prompt: &[usize], fir
         while m < drafts.len() && am[m] == drafts[m] {
             m += 1;
         }
-        if from_mtp {
-            mtp_rate = 0.7 * mtp_rate + 0.3 * (m + 1) as f64;
+        if from_look {
+            look_rate = 0.7 * look_rate + 0.3 * (m + 1) as f64;
         }
         if feed.len() > 1 {
             eng.accept(m + 1);
         }
         out.push(x);
         out.extend(&drafts[..m]);
-        ctx.extend(&drafts[..m]);
+        for &t in &drafts[..m] {
+            look.push(ctx, t);
+        }
         let y = am[m];
         if use_mtp {
             let mut next_toks = drafts[..m].to_vec();
@@ -449,6 +435,10 @@ fn main() {
                 None => format!("Add a one-line doc comment above every function that lacks one, and return the whole file unchanged otherwise.\n\n```rust\n{code}\n```"),
             };
             let prompt = tok.encode(&format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+            let corpus: Vec<Vec<usize>> = a
+                .get("corpus")
+                .map(|list| list.split(',').map(|f| tok.encode(&std::fs::read_to_string(f).expect("--corpus"))).collect())
+                .unwrap_or_default();
             let gen = a.num("gen", 400);
             let mut eng = MetalQwen35::new(&model, prompt.len() + gen + 64).expect("Metal");
             eng.set_draft_vocab(a.num("draft-vocab", 32768));
@@ -460,7 +450,7 @@ fn main() {
                     let o = decode_plain(&model, eng, first, gen);
                     (o, gen)
                 } else {
-                    decode_spec(&model, eng, &prompt, first, gen, k_mtp, k_lookup, auto)
+                    decode_spec(&model, eng, &prompt, &corpus, first, gen, k_mtp, k_lookup, auto)
                 };
                 (o, steps, t.elapsed().as_secs_f64())
             };
