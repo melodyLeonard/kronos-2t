@@ -434,6 +434,18 @@ fn main() {
             println!("system prompt {} tokens, turn {} tokens, snapshot {:.1} MB", sys_ids.len(), turn.len(), snap.bytes() as f64 / 1e6);
             println!("first token cold {:.0} ms | from snapshot {:.0} ms (restore {:.1} ms, snapshot {:.1} ms) | same token {}", cold * 1e3, warm * 1e3, t_restore * 1e3, t_snap * 1e3, cold_tok == warm_tok);
         }
+        "requant-head" => {
+            let mut model = load(&a);
+            let calib = a.path("calib", "../calib.txt");
+            let seqs = token_seqs(&tok, &calib, a.num("seq-len", 512), a.num("calib-seqs", 8));
+            let bits = a.num("head-bits", 3);
+            let t0 = Instant::now();
+            let threads = std::thread::available_parallelism().map_or(8, |p| p.get());
+            model.requantize_head(&a.model_dir, bits, &seqs, threads).expect("requantize");
+            let out = a.path("out", &format!("kronos-qwen35-head{bits}.k2tb"));
+            model.save(&out).expect("save");
+            log_line(&format!("wrote {} in {:.1} min", out.display(), t0.elapsed().as_secs_f64() / 60.0));
+        }
         "gemv-bench" => {
             let model = load(&a);
             let eng = MetalQwen35::new(&model, 64).expect("Metal");

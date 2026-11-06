@@ -993,6 +993,35 @@ impl Qwen35Model {
         (nll / n.max(1) as f64).exp()
     }
 
+    /// Final normalized hidden rows of `seqs` on the CPU (dequantized weights).
+    pub fn final_hidden_cpu(&self, seqs: &[Vec<usize>]) -> Vec<f32> {
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let lens: Vec<usize> = seqs.iter().map(|s| s.len()).collect();
+        let flat: Vec<usize> = seqs.concat();
+        let mut x = vec![0.0f32; flat.len() * h];
+        for (i, &tok) in flat.iter().enumerate() {
+            self.embed_into(tok, &mut x[i * h..(i + 1) * h]);
+        }
+        for (l, layer) in self.layers.iter().enumerate() {
+            layer_forward_cpu(cfg, layer, cfg.full_attn[l], &mut x, &lens);
+        }
+        rms_norm_rows(&x, &self.final_norm, cfg.rms_norm_eps)
+    }
+
+    /// Re-quantizes `lm_head` from the checkpoint at `bits` with GPTQ statistics from `calib`.
+    pub fn requantize_head(&mut self, model_dir: &Path, bits: usize, calib: &[Vec<usize>], threads: usize) -> io::Result<()> {
+        let store = SafeTensorsStore::open_dir(model_dir)?;
+        let pfx = text_prefix(&store);
+        let h = self.cfg.hidden_size;
+        let hn = self.final_hidden_cpu(calib);
+        let hess = hessian_of(&hn, h);
+        let name = if self.cfg.tie_word_embeddings { format!("{pfx}embed_tokens.weight") } else { "lm_head.weight".to_string() };
+        let w = load_f32(&store, &name)?;
+        self.lm_head = quantize(&w, self.cfg.vocab_size, h, bits, self.lm_head.scale_group_chunks, Some(&hess), threads);
+        Ok(())
+    }
+
     /// Logits `[t, vocab]` of one sequence on the CPU (small models and tests).
     pub fn logits_cpu(&self, seq: &[usize]) -> Vec<f32> {
         let cfg = &self.cfg;
