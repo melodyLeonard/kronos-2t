@@ -446,6 +446,66 @@ fn main() {
             model.save(&out).expect("save");
             log_line(&format!("wrote {} in {:.1} min", out.display(), t0.elapsed().as_secs_f64() / 60.0));
         }
+        "vq-study" => {
+            // Weight-space error of 3-bit codes on real MLP matrices (Hadamard-rotated, RTN, g128):
+            // NF3 and NF4 scalar codebooks vs a learned 64-centroid code over weight pairs (3.125 bpw).
+            use kronos_2t::kernels::hadamard::fwht64_signed_inplace;
+            use kronos_2t::model::compiler::compile_hadamard_gptq_nf;
+            use kronos_2t::storage::safetensors::SafeTensorsStore;
+            let store = SafeTensorsStore::open_dir(&a.model_dir).expect("weights");
+            let threads = std::thread::available_parallelism().map_or(8, |p| p.get());
+            for name in ["model.language_model.layers.0.mlp.gate_proj.weight", "model.language_model.layers.16.mlp.down_proj.weight"] {
+                let t = store.tensor(name).expect("tensor");
+                let (rows, cols) = (t.shape[0], t.shape[1]);
+                let rows = rows.min(2048);
+                let mut w = t.to_f32_vec();
+                w.truncate(rows * cols);
+                let mut wr = w.clone();
+                wr.chunks_exact_mut(cols).for_each(fwht64_signed_inplace);
+                let energy: f64 = wr.iter().map(|&v| (v as f64).powi(2)).sum();
+                let rel = |approx: &[f32]| wr.iter().zip(approx).map(|(a, b)| ((a - b) as f64).powi(2)).sum::<f64>() / energy;
+                let mut line = format!("{name} [{rows}x{cols}]:");
+                for bits in [4usize, 3] {
+                    let q = compile_hadamard_gptq_nf(&w, rows, cols, bits, 2, None, threads);
+                    let mut d = vec![0.0f32; rows * cols];
+                    for (r, row) in d.chunks_exact_mut(cols).enumerate() {
+                        q.dequantize_row_rotated(r, row);
+                    }
+                    line.push_str(&format!(" NF{bits} {:.5}", rel(&d)));
+                }
+                // Pair VQ: per (row, 128-col group) RMS scale, k-means on normalized pairs.
+                let g = 128;
+                let mut scales = vec![0.0f32; rows * cols / g];
+                for (i, grp) in wr.chunks_exact(g).enumerate() {
+                    scales[i] = (grp.iter().map(|v| v * v).sum::<f32>() / g as f32).sqrt().max(1e-12);
+                }
+                let pairs: Vec<[f32; 2]> = wr.chunks_exact(2).enumerate().map(|(i, p)| { let s = scales[i * 2 / g]; [p[0] / s, p[1] / s] }).collect();
+                let k = 64;
+                let mut cent: Vec<[f32; 2]> = (0..k).map(|i| pairs[(i * 7919) % pairs.len()]).collect();
+                let sample: Vec<[f32; 2]> = pairs.iter().step_by(17).copied().collect();
+                let nearest = |c: &[[f32; 2]], p: &[f32; 2]| -> usize {
+                    let mut best = (0, f32::INFINITY);
+                    for (j, q) in c.iter().enumerate() {
+                        let d = (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2);
+                        if d < best.1 { best = (j, d); }
+                    }
+                    best.0
+                };
+                for _ in 0..25 {
+                    let mut sum = vec![[0.0f64; 3]; k];
+                    for p in &sample {
+                        let j = nearest(&cent, p);
+                        sum[j][0] += p[0] as f64; sum[j][1] += p[1] as f64; sum[j][2] += 1.0;
+                    }
+                    for (c, s) in cent.iter_mut().zip(&sum) {
+                        if s[2] > 0.0 { *c = [(s[0] / s[2]) as f32, (s[1] / s[2]) as f32]; }
+                    }
+                }
+                let approx: Vec<f32> = pairs.iter().enumerate().flat_map(|(i, p)| { let c = cent[nearest(&cent, p)]; let s = scales[i * 2 / g]; [c[0] * s, c[1] * s] }).collect();
+                line.push_str(&format!(" pairVQ64 {:.5}", rel(&approx)));
+                println!("{line}");
+            }
+        }
         "gemv-bench" => {
             let model = load(&a);
             let eng = MetalQwen35::new(&model, 64).expect("Metal");
