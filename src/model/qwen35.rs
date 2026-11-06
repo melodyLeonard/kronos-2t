@@ -1013,7 +1013,8 @@ impl Qwen35Model {
                 .collect()
         };
         let h = cfg.hidden_size;
-        let q = |w: Vec<f32>, rows: usize, cols: usize| compile_hadamard_gptq_nf(&w, rows, cols, 4, 2, None, 4);
+        let threads = std::thread::available_parallelism().map_or(4, |p| p.get());
+        let q = |w: Vec<f32>, rows: usize, cols: usize| compile_hadamard_gptq_nf(&w, rows, cols, 4, 2, None, threads);
         let ws = 1.0 / (h as f32).sqrt();
         let mut layers = Vec::new();
         for l in 0..cfg.num_layers {
@@ -1050,7 +1051,7 @@ impl Qwen35Model {
             .into_iter()
             .map(crate::kernels::simd_lut::f32_to_bf16)
             .collect();
-        let embed = NfSdotMatrix::from_bf16_u16_embeddings_nf4(&emb, cfg.vocab_size, h, 2, 4);
+        let embed = NfSdotMatrix::from_bf16_u16_embeddings_nf4(&emb, cfg.vocab_size, h, 2, threads);
         let lm_head = q(rnd(cfg.vocab_size * h, 2.0 * ws), cfg.vocab_size, h);
         let mtp = with_mtp.then(|| {
             let in_rows = cfg.attn_in_rows();

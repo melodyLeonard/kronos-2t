@@ -512,6 +512,9 @@ pub struct MetalQwen35 {
     /// `(pos0, n)` of the last `verify` call, until `accept` settles it.
     pending: Option<(usize, usize)>,
     mtp: Option<GpuMtp>,
+    /// Row-prefix view of `lm_head` scored by MTP drafts (low BPE ids are the frequent tokens).
+    draft_head: Option<GpuNf4Matrix>,
+    draft_vocab: usize,
     // Shapes.
     h: usize,
     inter: usize,
@@ -584,7 +587,8 @@ impl MetalQwen35 {
                 let st = sels();
                 let device = MtlObj::from_retained(MTLCreateSystemDefaultDevice(), "MTLCreateSystemDefaultDevice")?;
                 let queue = MtlObj::from_retained(msg_sel!(device.id(), st.new_cmd_queue; Id), "newCommandQueue")?;
-                let src = format!("#define GEMV_EXP 0\n{METAL_SHADER_SOURCE}\n{QWEN35_SHADER_SOURCE}");
+                let exp = std::env::var("KRONOS_GEMV_EXP").unwrap_or_else(|_| "0".to_string());
+                let src = format!("#define GEMV_EXP {exp}\n{METAL_SHADER_SOURCE}\n{QWEN35_SHADER_SOURCE}");
                 let src_ns = nsstring(&src)?;
                 let mut err: Id = std::ptr::null_mut();
                 let raw_lib: Id = msg_sel!(
@@ -752,6 +756,8 @@ impl MetalQwen35 {
                     logits_cap: 1,
                     ckpt: None,
                     pending: None,
+                    draft_head: None,
+                    draft_vocab: 0,
                     mtp,
                     h: cfg.hidden_size,
                     inter: cfg.intermediate_size,
@@ -864,6 +870,36 @@ impl MetalQwen35 {
         self.pos = pos0 + keep;
     }
 
+    /// Scores MTP drafts over the first `n` vocabulary rows only (`0` = full vocabulary).
+    /// Verification always uses the full head, so outputs do not change, only draft cost.
+    pub fn set_draft_vocab(&mut self, n: usize) {
+        let n = (n / 32) * 32;
+        if n == 0 || n >= self.vocab {
+            self.draft_head = None;
+            return;
+        }
+        let m = &self.lm_head;
+        let st = sels();
+        // SAFETY: `retain` balances the release in `MtlObj::drop`; the view shares `lm_head`'s buffers.
+        let (pair, tail) = unsafe { (msg_sel!(m.pair_buf.id(), st.retain; Id), msg_sel!(self.dummy.id(), st.retain; Id)) };
+        self.draft_head = Some(GpuNf4Matrix {
+            pair_buf: MtlObj(pair),
+            tail_buf: MtlObj(tail),
+            cb_packed: m.cb_packed,
+            rows: n as u32,
+            cols: m.cols,
+            num_stripes: (n / 16) as u32,
+            num_pairs: (n / 32) as u32,
+            num_chunks: m.num_chunks,
+            scale_group_chunks: m.scale_group_chunks,
+            num_scale_groups: m.num_scale_groups,
+            pair_total_bytes: m.pair_total_bytes,
+            bits: m.bits,
+            chunk_bytes: m.chunk_bytes,
+        });
+        self.draft_vocab = n;
+    }
+
     #[inline]
     pub fn has_mtp(&self) -> bool {
         self.mtp.is_some()
@@ -946,7 +982,7 @@ impl MetalQwen35 {
                 self.proj(enc, &layer.down, Some(m.x.id()), m.x.id(), n);
                 if want_draft {
                     self.norm_fwht_at(enc, m.x.id(), (n - 1) * h * 4, m.norm.id(), h, 1, 0, false);
-                    self.proj(enc, &self.lm_head, None, self.sc.logits.id(), 1);
+                    self.proj(enc, self.draft_head.as_ref().unwrap_or(&self.lm_head), None, self.sc.logits.id(), 1);
                 }
                 msg_sel!(enc, st.end_enc; ());
                 msg_sel!(cmd, st.commit; ());
@@ -966,7 +1002,8 @@ impl MetalQwen35 {
             return Ok(None);
         }
         // SAFETY: `logits` holds at least one row of `vocab` floats; GPU idle.
-        let logits = unsafe { std::slice::from_raw_parts(self.sc.logits.contents_ptr().cast::<f32>(), self.vocab) };
+        let rows = if self.draft_head.is_some() { self.draft_vocab } else { self.vocab };
+        let logits = unsafe { std::slice::from_raw_parts(self.sc.logits.contents_ptr().cast::<f32>(), rows) };
         Ok(Some(crate::model::real_llm::argmax(logits)))
     }
 

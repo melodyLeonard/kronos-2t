@@ -216,7 +216,19 @@ fn main() {
             }
         }
         "bench" => {
-            let model = load(&a);
+            let model = if a.has("synthetic") {
+                let mut cfg = kronos_2t::model::qwen35::Qwen35Config::from_model_dir(&a.model_dir).expect("config");
+                if let Some(n) = a.get("layers").and_then(|v| v.parse::<usize>().ok()) {
+                    cfg.num_layers = n;
+                    cfg.full_attn.truncate(n);
+                }
+                let t0 = Instant::now();
+                let m = Qwen35Model::synthetic(cfg, 1, true);
+                log_line(&format!("built random-weight model with the real shapes in {:.0}s", t0.elapsed().as_secs_f64()));
+                m
+            } else {
+                load(&a)
+            };
             let ctx = a.num("ctx", 8192);
             let mut eng = MetalQwen35::new(&model, ctx + 256).expect("Metal");
             let ids = tok.encode(&std::fs::read_to_string(&text).expect("text"));
@@ -241,6 +253,7 @@ fn main() {
                     gen as f64 / dc
                 );
                 if eng.has_mtp() && draft > 0 {
+                    eng.set_draft_vocab(a.num("draft-vocab", 32768));
                     eng.reset();
                     let first = prefill(&model, &mut eng, &prompt, true);
                     let t2 = Instant::now();
