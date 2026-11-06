@@ -145,6 +145,8 @@ fn decode_plain(model: &Qwen35Model, eng: &mut MetalQwen35, mut next: usize, gen
 /// Greedy decoding with MTP drafts of up to `k` tokens verified in one batched pass. Returns the
 /// tokens and the number of verify steps.
 fn decode_mtp(model: &Qwen35Model, eng: &mut MetalQwen35, first: usize, prompt_len: usize, gen: usize, k: usize) -> (Vec<usize>, usize) {
+    let prof = std::env::var_os("QWEN35_SPEC_PROF").is_some();
+    let (mut t_draft, mut t_verify, mut t_fill) = (0.0f64, 0.0f64, 0.0f64);
     let last_row = (prompt_len - 1) % MAX_CHUNK;
     let mut x = first;
     let mut pos = prompt_len;
@@ -152,14 +154,18 @@ fn decode_mtp(model: &Qwen35Model, eng: &mut MetalQwen35, first: usize, prompt_l
     let mut out = Vec::with_capacity(gen + k + 1);
     let mut steps = 0;
     while out.len() < gen {
+        let tq = Instant::now();
         let mut drafts = vec![d];
         for j in 1..k {
             drafts.push(eng.mtp_chain(model, drafts[j - 1], pos - 1 + j).expect("MTP chain"));
         }
+        t_draft += tq.elapsed().as_secs_f64();
+        let tq = Instant::now();
         let mut feed = vec![x];
         feed.extend(&drafts);
         let mut am = vec![0usize; feed.len()];
         eng.verify(model, &feed, &mut |i, l| am[i] = argmax(l)).expect("verify");
+        t_verify += tq.elapsed().as_secs_f64();
         let mut m = 0;
         while m < k && am[m] == drafts[m] {
             m += 1;
@@ -170,10 +176,16 @@ fn decode_mtp(model: &Qwen35Model, eng: &mut MetalQwen35, first: usize, prompt_l
         let y = am[m];
         let mut next_toks = drafts[..m].to_vec();
         next_toks.push(y);
+        let tq = Instant::now();
         d = eng.mtp_fill(model, &next_toks, 0, pos, true).expect("MTP").expect("draft");
+        t_fill += tq.elapsed().as_secs_f64();
         pos += m + 1;
         x = y;
         steps += 1;
+    }
+    if prof {
+        let s = steps.max(1) as f64 * 1e-3;
+        eprintln!("per step: draft {:.1}ms verify {:.1}ms fill {:.1}ms", t_draft / s, t_verify / s, t_fill / s);
     }
     out.truncate(gen);
     (out, steps)
