@@ -198,6 +198,8 @@ fn decode_mtp(model: &Qwen35Model, eng: &mut MetalQwen35, first: usize, prompt_l
 /// (probing every 8th step); other steps use MTP drafts.
 #[allow(clippy::too_many_arguments)]
 fn decode_spec(model: &Qwen35Model, eng: &mut MetalQwen35, prompt: &[usize], corpus: &[Vec<usize>], first: usize, gen: usize, k_mtp: usize, k_lookup: usize, auto: bool) -> (Vec<usize>, usize) {
+    // MTP chains stop once the draft head's probability for a token falls below this.
+    let min_p: f32 = std::env::var("Q35_DRAFT_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.4);
     // A verify of ~4 tokens costs about this many single-token steps.
     const VERIFY_COST: f64 = 2.4;
     let mut look_rate = VERIFY_COST;
@@ -210,7 +212,7 @@ fn decode_spec(model: &Qwen35Model, eng: &mut MetalQwen35, prompt: &[usize], cor
     let mut x = first;
     let mut pos = prompt.len();
     let mut d = if use_mtp {
-        eng.mtp_fill(model, &[x], (pos - 1) % MAX_CHUNK, pos - 1, true).expect("MTP")
+        eng.mtp_fill(model, &[x], (pos - 1) % MAX_CHUNK, pos - 1, true).expect("MTP").map(|_| eng.last_draft_prob())
     } else {
         None
     };
@@ -225,9 +227,16 @@ fn decode_spec(model: &Qwen35Model, eng: &mut MetalQwen35, prompt: &[usize], cor
         let from_look = !drafts.is_empty();
         let from_mtp = drafts.len() < 2 && use_mtp;
         if from_mtp {
-            drafts = vec![d.expect("draft")];
+            let (d0, p0) = d.expect("draft");
+            drafts = vec![d0];
+            let mut p = p0;
             for j in 1..k_mtp {
-                drafts.push(eng.mtp_chain(model, drafts[j - 1], pos - 1 + j).expect("MTP chain"));
+                if p < min_p {
+                    break;
+                }
+                let (dj, pj) = eng.mtp_chain_p(model, drafts[j - 1], pos - 1 + j).expect("MTP chain");
+                drafts.push(dj);
+                p *= pj;
             }
         }
         let mut feed = vec![x];
@@ -257,7 +266,7 @@ fn decode_spec(model: &Qwen35Model, eng: &mut MetalQwen35, prompt: &[usize], cor
         if use_mtp {
             let mut next_toks = drafts[..m].to_vec();
             next_toks.push(y);
-            d = eng.mtp_fill(model, &next_toks, 0, pos, true).expect("MTP");
+            d = eng.mtp_fill(model, &next_toks, 0, pos, true).expect("MTP").map(|_| eng.last_draft_prob());
         }
         pos += m + 1;
         x = y;
@@ -457,7 +466,8 @@ fn main() {
             let (plain, _, tp) = run(&mut eng, 0, 0, false);
             println!("prompt {} tokens, {gen} generated", prompt.len());
             println!("plain               {:6.2} tok/s", gen as f64 / tp);
-            for (name, km, kl, auto) in [("MTP x3", 3usize, 0usize, false), ("lookup x7", 0, 7, false), ("auto: lookup + MTP", 3, 7, true)] {
+            let km = a.num("mtp-k", 3);
+            for (name, km, kl, auto) in [("MTP", km, 0usize, false), ("lookup x7", 0, 7, false), ("auto: lookup + MTP", km, 7, true)] {
                 let (o, steps, t) = run(&mut eng, km, kl, auto);
                 let same = o.iter().zip(&plain).take_while(|(x, y)| x == y).count();
                 println!("{name:<20}{:6.2} tok/s, {:.2} tokens/step, matches plain for {same}/{gen}", gen as f64 / t, gen as f64 / steps as f64);

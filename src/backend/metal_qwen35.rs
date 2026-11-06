@@ -1605,7 +1605,23 @@ impl MetalQwen35 {
 
     /// One chained MTP step from the previous MTP hidden: drafts the token after `tok`.
     pub fn mtp_chain(&mut self, model: &Qwen35Model, tok: usize, pos: usize) -> Result<usize, String> {
-        Ok(self.mtp_pass(model, &[tok], None, pos, true)?.expect("draft"))
+        Ok(self.mtp_chain_p(model, tok, pos)?.0)
+    }
+
+    /// [`Self::mtp_chain`] plus the draft head's probability for the token (over the draft vocabulary).
+    pub fn mtp_chain_p(&mut self, model: &Qwen35Model, tok: usize, pos: usize) -> Result<(usize, f32), String> {
+        self.mtp_pass(model, &[tok], None, pos, true)?;
+        Ok(self.last_draft_prob())
+    }
+
+    /// Argmax and its softmax probability from the logits of the last MTP draft.
+    pub fn last_draft_prob(&self) -> (usize, f32) {
+        let rows = if self.draft_head.is_some() { self.draft_vocab } else { self.vocab };
+        // SAFETY: `logits` holds at least one row of `vocab` floats; GPU idle.
+        let l = unsafe { std::slice::from_raw_parts(self.sc.logits.contents_ptr().cast::<f32>(), rows) };
+        let best = crate::model::real_llm::argmax(l);
+        let den: f32 = l.iter().map(|&v| (v - l[best]).exp()).sum();
+        (best, 1.0 / den)
     }
 
     fn mtp_pass(
