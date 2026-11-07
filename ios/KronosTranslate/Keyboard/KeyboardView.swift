@@ -12,7 +12,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
     /// `preview` carries the live translation of the field; `inserted` means it replaced the field.
     enum State: Equatable { case idle, translating, preview(String), inserted(String) }
 
-    static let stripHeight: CGFloat = 58
+    static let stripHeight: CGFloat = 46
     static let suggestHeight: CGFloat = 44
     static let rowsHeight: CGFloat = 212
     /// Strip only while there is something to show; suggestions row always, like the system keyboard.
@@ -141,7 +141,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
             accent.bottomAnchor.constraint(equalTo: bar.bottomAnchor),
             accent.widthAnchor.constraint(equalToConstant: 4),
             pill.leadingAnchor.constraint(equalTo: accent.trailingAnchor, constant: 8),
-            pill.topAnchor.constraint(equalTo: bar.topAnchor, constant: 4),
+            pill.topAnchor.constraint(equalTo: bar.topAnchor, constant: 2),
             pill.heightAnchor.constraint(equalToConstant: 18),
             pill.trailingAnchor.constraint(lessThanOrEqualTo: actionBtn.leadingAnchor, constant: -8),
             spinner.leadingAnchor.constraint(equalTo: pill.trailingAnchor, constant: 4),
@@ -213,7 +213,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         var y: CGFloat = 0
         bar.isHidden = !stripVisible
         if stripVisible {
-            bar.frame = CGRect(x: 8, y: 6, width: W - 16, height: 48)
+            bar.frame = CGRect(x: 8, y: 2, width: W - 16, height: 44)
             y = Self.stripHeight
         }
         suggestBar.frame = CGRect(x: 0, y: y, width: W, height: Self.suggestHeight)
@@ -273,7 +273,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
 
     func reload() {
         backgroundColor = .clear
-        bar.backgroundColor = keyFill
+        bar.backgroundColor = .clear   // sits straight on the backdrop like the suggestions row
         setSuggestions([])
         buildRows()
         var c = UIButton.Configuration.plain()
@@ -446,10 +446,10 @@ final class KeyButton: UIControl {
     init(label: String, fn: Bool, fill: UIColor, ink: UIColor, shadow: UIColor) {
         self.label = label; self.fn = fn
         super.init(frame: .zero)
-        layer.cornerRadius = 9
+        layer.cornerRadius = 10
         layer.cornerCurve = .continuous
         // Soft elevation like the system keycaps, not a hard 1pt line.
-        layer.shadowOpacity = 1; layer.shadowOffset = .init(width: 0, height: 1); layer.shadowRadius = 1.5
+        layer.shadowOpacity = 0   // flat, like the iOS 26 keycaps
         for v in [text, image] { v.translatesAutoresizingMaskIntoConstraints = false; v.isUserInteractionEnabled = false; addSubview(v) }
         text.textAlignment = .center
         image.contentMode = .center
@@ -485,11 +485,11 @@ final class KeyButton: UIControl {
         text.text = t
         // Apple's keycaps: SF Pro, light weight for single glyphs, regular 16pt for words.
         let small = fn || t.count > 1
-        text.font = small ? .systemFont(ofSize: 16, weight: .regular) : .systemFont(ofSize: 22, weight: .regular)
+        text.font = small ? .systemFont(ofSize: 16, weight: .regular) : .systemFont(ofSize: 23, weight: .light)
         image.isHidden = true; text.isHidden = false
     }
     func setSymbol(_ name: String) {
-        image.image = UIImage(systemName: name, withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .regular))
+        image.image = UIImage(systemName: name, withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .light))
         image.isHidden = false; text.isHidden = true
     }
     func restyle(fill: UIColor, ink: UIColor, shadow: UIColor) {
