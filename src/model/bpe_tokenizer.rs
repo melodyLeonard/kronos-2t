@@ -14,6 +14,8 @@ pub enum PreTokenizerKind {
     SmolLm2DigitsGpt2,
     /// `Qwen2` / `Qwen2.5-Coder` `Split` regex + `ByteLevel(use_regex=false)`.
     Qwen2,
+    /// HunYuan (`Hy-MT2`): `Split(\p{N}{1,3})`, CJK runs, then a letters/punct/space regex.
+    HunYuan,
 }
 
 /// Byte-level BPE tokenizer.
@@ -139,8 +141,8 @@ impl BpeTokenizer {
                         extra_added = parse_added_tokens_array(&mut cur)?;
                     }
                     "pre_tokenizer" => {
-                        if parse_pre_tokenizer_is_qwen2(&mut cur)? {
-                            pre_kind = PreTokenizerKind::Qwen2;
+                        if let Some(k) = parse_pre_tokenizer_kind(&mut cur)? {
+                            pre_kind = k;
                         }
                     }
                     "model" => {
@@ -230,8 +232,8 @@ impl BpeTokenizer {
                         }
                     }
                     "pre_tokenizer" => {
-                        if parse_pre_tokenizer_is_qwen2(&mut cur)? {
-                            self.pre_tokenizer = PreTokenizerKind::Qwen2;
+                        if let Some(k) = parse_pre_tokenizer_kind(&mut cur)? {
+                            self.pre_tokenizer = k;
                         }
                     }
                     _ => cur.skip_value()?,
@@ -434,6 +436,11 @@ impl BpeTokenizer {
                     self.encode_bpe_piece(piece.as_bytes(), ids);
                 }
             }
+            PreTokenizerKind::HunYuan => {
+                for piece in hunyuan_regex_split(text) {
+                    self.encode_bpe_piece(piece.as_bytes(), ids);
+                }
+            }
         }
     }
 
@@ -620,13 +627,14 @@ fn parse_added_tokens_array(cur: &mut JsonCursor<'_>) -> Result<Vec<(String, usi
     Ok(out)
 }
 
-fn parse_pre_tokenizer_is_qwen2(cur: &mut JsonCursor<'_>) -> Result<bool, String> {
+/// Pre-tokenizer family from the `Split` regexes in `tokenizer.json` (`None` = GPT-2 / SmolLM2).
+fn parse_pre_tokenizer_kind(cur: &mut JsonCursor<'_>) -> Result<Option<PreTokenizerKind>, String> {
     if cur.peek() == Some(b'n') {
         cur.consume_literal(b"null")?;
-        return Ok(false);
+        return Ok(None);
     }
-    let mut is_qwen2 = false;
-    fn scan_obj(cur: &mut JsonCursor<'_>, is_qwen2: &mut bool) -> Result<(), String> {
+    let mut kind = None;
+    fn scan_obj(cur: &mut JsonCursor<'_>, kind: &mut Option<PreTokenizerKind>) -> Result<(), String> {
         match cur.peek() {
             Some(b'{') => {
                 cur.expect_byte(b'{')?;
@@ -637,14 +645,17 @@ fn parse_pre_tokenizer_is_qwen2(cur: &mut JsonCursor<'_>) -> Result<bool, String
                         if k == "Regex" && cur.peek() == Some(b'"') {
                             let pat = cur.parse_string()?;
                             // Qwen3.5 widens letters to `[\p{L}\p{M}]+`; the splitter is the same for unmarked text.
-                            if pat.contains("[^\\r\\n\\p{L}\\p{N}]?\\p{L}+")
-                                || pat.contains("[^\r\n\\p{L}\\p{N}]?\\p{L}+")
-                                || pat.contains("[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+")
+                            if pat.contains("\\p{N}{1,3}") || pat.contains("\\p{P}\\p{S}]?[\\p{L}\\p{M}]+") {
+                                *kind = Some(PreTokenizerKind::HunYuan);
+                            } else if kind.is_none()
+                                && (pat.contains("[^\\r\\n\\p{L}\\p{N}]?\\p{L}+")
+                                    || pat.contains("[^\r\n\\p{L}\\p{N}]?\\p{L}+")
+                                    || pat.contains("[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+"))
                             {
-                                *is_qwen2 = true;
+                                *kind = Some(PreTokenizerKind::Qwen2);
                             }
                         } else {
-                            scan_obj(cur, is_qwen2)?;
+                            scan_obj(cur, kind)?;
                         }
                         if cur.peek() == Some(b',') {
                             cur.expect_byte(b',')?;
@@ -659,7 +670,7 @@ fn parse_pre_tokenizer_is_qwen2(cur: &mut JsonCursor<'_>) -> Result<bool, String
                 cur.expect_byte(b'[')?;
                 if cur.peek() != Some(b']') {
                     loop {
-                        scan_obj(cur, is_qwen2)?;
+                        scan_obj(cur, kind)?;
                         if cur.peek() == Some(b',') {
                             cur.expect_byte(b',')?;
                         } else {
@@ -672,8 +683,199 @@ fn parse_pre_tokenizer_is_qwen2(cur: &mut JsonCursor<'_>) -> Result<bool, String
             _ => cur.skip_value(),
         }
     }
-    scan_obj(cur, &mut is_qwen2)?;
-    Ok(is_qwen2)
+    scan_obj(cur, &mut kind)?;
+    Ok(kind)
+}
+
+/// Combining marks (`\p{M}`): the generic combining blocks plus the common script-specific ones.
+fn is_mark(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x0300..=0x036F
+            | 0x0483..=0x0489
+            | 0x0591..=0x05BD
+            | 0x05BF
+            | 0x05C1..=0x05C2
+            | 0x05C4..=0x05C5
+            | 0x05C7
+            | 0x0610..=0x061A
+            | 0x064B..=0x065F
+            | 0x0670
+            | 0x06D6..=0x06DC
+            | 0x06DF..=0x06E4
+            | 0x06E7..=0x06E8
+            | 0x06EA..=0x06ED
+            | 0x0900..=0x0903
+            | 0x093A..=0x093C
+            | 0x093E..=0x094F
+            | 0x0951..=0x0957
+            | 0x0962..=0x0963
+            | 0x0981..=0x0983
+            | 0x09BC
+            | 0x09BE..=0x09CD
+            | 0x0E31
+            | 0x0E34..=0x0E3A
+            | 0x0E47..=0x0E4E
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x20D0..=0x20FF
+            | 0x302A..=0x302F
+            | 0x3099..=0x309A
+            | 0xFE00..=0xFE0F
+            | 0xFE20..=0xFE2F
+    )
+}
+
+/// `[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]`: CJK ideographs, hiragana and katakana.
+fn is_cjk_run_char(c: char) -> bool {
+    matches!(c as u32, 0x4E00..=0x9FA5 | 0x3040..=0x309F | 0x30A0..=0x30FF)
+}
+
+/// Pure-Rust HunYuan pre-tokenizer (`Hy-MT2`, `HunYuan-7B`): the `tokenizer.json` sequence
+/// `Split(\p{N}{1,3})`, `Split(CJK+)`, then
+/// `[ascii-punct][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`,
+/// all `Isolated` (text between matches stays as its own piece).
+pub fn hunyuan_regex_split(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    // Stage 1: numbers in groups of at most three digits; everything else in maximal runs.
+    let mut run_start = 0usize;
+    let mut digit_start: Option<(usize, usize)> = None;
+    for (bi, ch) in text.char_indices() {
+        if ch.is_numeric() {
+            match digit_start {
+                Some((start, count)) if count < 3 => digit_start = Some((start, count + 1)),
+                Some((start, _)) => {
+                    out.push(&text[start..bi]);
+                    digit_start = Some((bi, 1));
+                }
+                None => {
+                    if run_start < bi {
+                        split_cjk_then_main(&text[run_start..bi], &mut out);
+                    }
+                    digit_start = Some((bi, 1));
+                }
+            }
+            run_start = bi + ch.len_utf8();
+        } else if let Some((start, _)) = digit_start.take() {
+            out.push(&text[start..bi]);
+            run_start = bi;
+        }
+    }
+    if let Some((start, _)) = digit_start {
+        out.push(&text[start..]);
+    } else if run_start < text.len() {
+        split_cjk_then_main(&text[run_start..], &mut out);
+    }
+    out
+}
+
+/// Stage 2 (`CJK+` runs isolated) feeding stage 3 for the rest.
+fn split_cjk_then_main<'a>(text: &'a str, out: &mut Vec<&'a str>) {
+    let mut run_start = 0usize;
+    let mut cjk_start: Option<usize> = None;
+    for (bi, ch) in text.char_indices() {
+        if is_cjk_run_char(ch) {
+            if cjk_start.is_none() {
+                if run_start < bi {
+                    hunyuan_main_split(&text[run_start..bi], out);
+                }
+                cjk_start = Some(bi);
+            }
+        } else if let Some(start) = cjk_start.take() {
+            out.push(&text[start..bi]);
+            run_start = bi;
+        }
+    }
+    match cjk_start {
+        Some(start) => out.push(&text[start..]),
+        None if run_start < text.len() => hunyuan_main_split(&text[run_start..], out),
+        None => {}
+    }
+}
+
+/// Stage 3 of [`hunyuan_regex_split`].
+fn hunyuan_main_split<'a>(text: &'a str, out: &mut Vec<&'a str>) {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let n = chars.len();
+    let slice_chars = |start_c: usize, end_c: usize| -> &'a str {
+        let sb = chars[start_c].0;
+        let eb = if end_c < n { chars[end_c].0 } else { text.len() };
+        &text[sb..eb]
+    };
+    let is_lm = |c: char| c.is_alphabetic() || is_mark(c);
+    let is_punct_sym = |c: char| !c.is_whitespace() && !c.is_alphabetic() && !c.is_numeric() && !is_mark(c) && !c.is_control();
+    // End (exclusive, in chars) of the leftmost-alternative match starting at `i`, if any.
+    let match_at = |i: usize| -> Option<usize> {
+        let ch = chars[i].1;
+        // 1. `[ascii-punct][A-Za-z]+`
+        if ch.is_ascii_punctuation() && i + 1 < n && chars[i + 1].1.is_ascii_alphabetic() {
+            let mut j = i + 2;
+            while j < n && chars[j].1.is_ascii_alphabetic() {
+                j += 1;
+            }
+            return Some(j);
+        }
+        // 2. `[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+`
+        if is_lm(ch) {
+            let mut j = i + 1;
+            while j < n && is_lm(chars[j].1) {
+                j += 1;
+            }
+            return Some(j);
+        }
+        if ch != '\r' && ch != '\n' && !is_punct_sym(ch) && i + 1 < n && is_lm(chars[i + 1].1) {
+            let mut j = i + 2;
+            while j < n && is_lm(chars[j].1) {
+                j += 1;
+            }
+            return Some(j);
+        }
+        // 3. ` ?[\p{P}\p{S}]+[\r\n]*`
+        if is_punct_sym(ch) || (ch == ' ' && i + 1 < n && is_punct_sym(chars[i + 1].1)) {
+            let mut j = if ch == ' ' { i + 2 } else { i + 1 };
+            while j < n && is_punct_sym(chars[j].1) {
+                j += 1;
+            }
+            while j < n && matches!(chars[j].1, '\r' | '\n') {
+                j += 1;
+            }
+            return Some(j);
+        }
+        // 4-6. `\s*[\r\n]+|\s+(?!\S)|\s+`
+        if ch.is_whitespace() {
+            let mut j = i + 1;
+            let mut last_nl: Option<usize> = matches!(ch, '\r' | '\n').then_some(i);
+            while j < n && chars[j].1.is_whitespace() {
+                if matches!(chars[j].1, '\r' | '\n') {
+                    last_nl = Some(j);
+                }
+                j += 1;
+            }
+            return Some(match last_nl {
+                Some(nl) => nl + 1,
+                None if j < n && j - i > 1 => j - 1,
+                None => j,
+            });
+        }
+        None
+    };
+    let mut i = 0usize;
+    while i < n {
+        match match_at(i) {
+            Some(end) => {
+                out.push(slice_chars(i, end));
+                i = end;
+            }
+            None => {
+                let mut j = i + 1;
+                while j < n && match_at(j).is_none() {
+                    j += 1;
+                }
+                out.push(slice_chars(i, j));
+                i = j;
+            }
+        }
+    }
 }
 
 fn build_gpt2_byte_unicode_tables() -> ([char; 256], HashMap<char, u8>) {
@@ -918,6 +1120,41 @@ mod tests {
                 "\n\n"
             ]
         );
+
+        assert_eq!(
+            hunyuan_regex_split("Hello world 12345, don't stop! 今天天气\n\nok"),
+            vec![
+                "Hello", " world", " ", "123", "45", ",", " don", "'t", " stop", "!", " ", "今天天气", "\n\n", "ok"
+            ]
+        );
+        assert_eq!(hunyuan_regex_split("à bientôt .com"), vec!["à", " bientôt", " .", "com"]);
+
+        // Reference ids from HF `tokenizers` on the same `tokenizer.json`.
+        let hy_dir = Path::new("/Users/melodyleonard/Documents/project/kronos-2t/models/Hy-MT2-1.8B");
+        if hy_dir.join("tokenizer.json").exists() {
+            let tk = BpeTokenizer::from_model_dir(hy_dir).unwrap();
+            assert_eq!(tk.pre_tokenizer, PreTokenizerKind::HunYuan);
+            assert!(tk.eos_token_ids.contains(&120020));
+            let cases: [(&str, &[usize]); 4] = [
+                ("see you tomorrow", &[6759, 444, 32104]),
+                (
+                    "Hello world 12345, don't stop! 今天天气\n\nok",
+                    &[16883, 2385, 206, 7827, 2445, 11, 2475, 1638, 4800, 0, 206, 7331, 12523, 286, 821],
+                ),
+                (
+                    "<｜hy_begin▁of▁sentence｜><｜hy_User｜>Translate the following text into Spanish:\n\nsee you tomorrow<｜hy_Assistant｜>",
+                    &[120000, 120006, 26403, 252, 1873, 2602, 1079, 12920, 1015, 6759, 444, 32104, 120007],
+                ),
+                (
+                    "à bientôt .com Ẹ káàbọ̀ 😂 ça va?",
+                    &[4116, 273, 1116, 44890, 1102, 1004, 206, 3018, 116, 633, 2451, 4116, 65, 16912, 74317, 82457, 210, 72941, 21106, 30],
+                ),
+            ];
+            for (text, ids) in cases {
+                assert_eq!(tk.encode(text), ids, "{text:?}");
+                assert_eq!(tk.decode(ids), text);
+            }
+        }
 
         let model_dir = Path::new("/Users/melodyleonard/Documents/project/kronos-2t/models/SmolLM2-135M");
         if model_dir.join("vocab.json").exists() {
