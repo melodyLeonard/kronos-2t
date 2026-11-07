@@ -37,7 +37,7 @@ use kronos_2t::runtime::agent::{
 };
 use kronos_2t::runtime::attachments::{ingest_attachment, AttachmentIngestion};
 use kronos_2t::runtime::kv_sessions::KvSource;
-use kronos_2t::runtime::chat::{ChatModel, Completion, GenParams, Message, ToolCall};
+use kronos_2t::runtime::chat::{ChatModel, Completion, GenParams, Message, PromptStyle, ToolCall};
 use kronos_2t::runtime::device::{global_device_manager, use_computer_tool_definition_json};
 use kronos_2t::util::json::{quote, Json};
 use kronos_2t::runtime::vision::analyze_image_payload;
@@ -905,10 +905,16 @@ fn translate(srv: &Server, stream: &mut TcpStream, req: &Request) {
     let from = body.get("from").and_then(Json::as_str).unwrap_or("auto");
     let tone = body.get("tone").and_then(Json::as_str).unwrap_or("neutral");
     let context = translate_context(&body);
-    let messages = [
-        Message::new("system", &kronos_2t::config::prompts::translate_system(to, from, tone, &context)),
-        Message::new("user", text),
-    ];
+    let mut model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
+    let messages = match model.prompt_style() {
+        PromptStyle::HunYuan => {
+            vec![Message::new("user", &kronos_2t::config::prompts::translate_user_hunyuan(to, from, tone, &context, text))]
+        }
+        PromptStyle::ChatMl => vec![
+            Message::new("system", &kronos_2t::config::prompts::translate_system(to, from, tone, &context)),
+            Message::new("user", text),
+        ],
+    };
     let params = GenParams {
         temperature: 0.0,
         top_k: 40,
@@ -918,7 +924,6 @@ fn translate(srv: &Server, stream: &mut TcpStream, req: &Request) {
         seed: 0,
     };
     let prefix = if srv.name.to_ascii_lowercase().contains("qwen3") { "<think>\n\n</think>\n\n" } else { "" };
-    let mut model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
     match model.generate_with_tools_prefixed(&messages, &[], prefix, &params, |_| true) {
         Ok(c) => respond(stream, 200, "application/json", &format!(r#"{{"text":{}}}"#, quote(&clean_translation(&c.text)))),
         Err(e) => error(stream, 400, &e),

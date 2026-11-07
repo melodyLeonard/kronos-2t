@@ -57,6 +57,43 @@ impl ToolFormat {
     }
 }
 
+/// Which chat template the model was trained on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptStyle {
+    /// `<|im_start|>role\n...<|im_end|>\n` (Qwen, SmolLM2).
+    ChatMl,
+    /// HunYuan / Hy-MT2: `<bos>[system<sys_end>]<user>...<assistant>...<eos>`, no newlines, no
+    /// default system prompt, no tool-calling markup.
+    HunYuan,
+}
+
+impl PromptStyle {
+    /// Picks the template from the tokenizer's special tokens.
+    pub fn detect(tok: &BpeTokenizer) -> Self {
+        if tok.token_to_id.contains_key(crate::config::markup::HY_USER) {
+            Self::HunYuan
+        } else {
+            Self::ChatMl
+        }
+    }
+
+    /// Text that opens an assistant turn (up to where the reply tokens start).
+    fn assistant_open(self) -> &'static str {
+        match self {
+            Self::ChatMl => "<|im_start|>assistant\n",
+            Self::HunYuan => crate::config::markup::HY_ASSISTANT,
+        }
+    }
+
+    /// Text that closes an assistant turn.
+    fn assistant_close(self) -> &'static str {
+        match self {
+            Self::ChatMl => "<|im_end|>\n",
+            Self::HunYuan => crate::config::markup::HY_EOS,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub role: String,
@@ -577,6 +614,7 @@ pub struct ChatModel {
     active_session: Option<String>,
     pub name: String,
     tool_format: ToolFormat,
+    style: PromptStyle,
     #[cfg(all(feature = "ane", target_os = "macos"))]
     ane: Vec<(usize, crate::backend::coreml::CoreMlModel)>,
 }
@@ -630,8 +668,12 @@ impl ChatModel {
         });
         let special =
             |s: &str| tok.token_to_id.get(s).copied().ok_or(format!("tokenizer lacks {s}; use an Instruct model"));
-        let im_start = special(crate::config::markup::IM_START)?;
-        let im_end = special(crate::config::markup::IM_END)?;
+        let style = PromptStyle::detect(&tok);
+        // HunYuan: the user-turn marker is masked like `<|im_start|>` and `<eos>` ends the reply.
+        let (im_start, im_end) = match style {
+            PromptStyle::ChatMl => (special(crate::config::markup::IM_START)?, special(crate::config::markup::IM_END)?),
+            PromptStyle::HunYuan => (special(crate::config::markup::HY_USER)?, special(crate::config::markup::HY_EOS)?),
+        };
         let name = format!(
             "{}-kronos-{mode_key}",
             model_dir.file_name().map_or("model".into(), |n| n.to_string_lossy().to_lowercase())
@@ -662,6 +704,7 @@ impl ChatModel {
             active_session: None,
             name,
             tool_format: ToolFormat::detect(model_dir),
+            style,
             #[cfg(all(feature = "ane", target_os = "macos"))]
             ane: Vec::new(),
         })
@@ -788,7 +831,14 @@ impl ChatModel {
         match self.tok.pre_tokenizer {
             PreTokenizerKind::Qwen2 => DEFAULT_SYSTEM_QWEN,
             PreTokenizerKind::SmolLm2DigitsGpt2 => DEFAULT_SYSTEM,
+            // Hy-MT2 is trained without a system prompt.
+            PreTokenizerKind::HunYuan => "",
         }
+    }
+
+    /// The chat template this model uses.
+    pub fn prompt_style(&self) -> PromptStyle {
+        self.style
     }
 
     /// Clears the target and draft KV caches.
@@ -1049,8 +1099,11 @@ impl ChatModel {
 
     /// Returns true if the target KV cache already holds the exact `system + tools` prefix.
     pub fn has_hot_prefix(&self, system_prompt: &str, tools_json: &[String]) -> bool {
-        let full = render_chatml_prompt_with(&[Message::new("system", system_prompt)], tools_json, "", self.tool_format);
-        let prefix_str = full.strip_suffix("assistant\n").unwrap_or(&full);
+        let full = render_prompt_with(&[Message::new("system", system_prompt)], tools_json, "", self.tool_format, self.style);
+        let prefix_str = match self.style {
+            PromptStyle::ChatMl => full.strip_suffix("assistant\n").unwrap_or(&full),
+            PromptStyle::HunYuan => full.strip_suffix(self.style.assistant_open()).unwrap_or(&full),
+        };
         let tokens = self.tok.encode(prefix_str);
         !tokens.is_empty()
             && self.cached.len() >= tokens.len()
@@ -1285,8 +1338,11 @@ impl ChatModel {
 
     /// Pre-warms the fixed system + tool-schema prefix into target and draft KV caches.
     pub fn prewarm_prefix(&mut self, system_prompt: &str, tools_json: &[String]) -> usize {
-        let full = render_chatml_prompt_with(&[Message::new("system", system_prompt)], tools_json, "", self.tool_format);
-        let prefix_str = full.strip_suffix("assistant\n").unwrap_or(&full);
+        let full = render_prompt_with(&[Message::new("system", system_prompt)], tools_json, "", self.tool_format, self.style);
+        let prefix_str = match self.style {
+            PromptStyle::ChatMl => full.strip_suffix("assistant\n").unwrap_or(&full),
+            PromptStyle::HunYuan => full.strip_suffix(self.style.assistant_open()).unwrap_or(&full),
+        };
         let tokens = self.tok.encode(prefix_str);
         if tokens.is_empty() || tokens.len() >= self.ctx {
             return 0;
@@ -1422,27 +1478,27 @@ impl ChatModel {
         let mut buf = String::new();
         let mut hits = 0usize;
         let mut ctx_hash = std::collections::hash_map::DefaultHasher::new();
-        render_chatml_pieces(messages, tools_json, self.default_system(), self.tool_format, &mut |piece| match piece {
+        render_chatml_pieces(messages, tools_json, self.default_system(), self.tool_format, self.style, &mut |piece| match piece {
             ChatPiece::Text(t) => {
                 t.hash(&mut ctx_hash);
                 buf.push_str(t);
             }
             ChatPiece::Assistant(m) => {
                 let mut seg = String::new();
-                push_assistant_segment(m, self.tool_format, &mut seg);
+                push_assistant_segment(m, self.tool_format, self.style, &mut seg);
                 seg.hash(&mut ctx_hash);
                 let key = ctx_hash.clone().finish();
                 match self.gen_memo.iter().rev().find(|(k, _)| *k == key) {
                     Some((_, toks)) => {
                         hits += 1;
-                        buf.push_str("<|im_start|>assistant\n");
+                        buf.push_str(self.style.assistant_open());
                         if self.think_block {
                             buf.push_str(THINK_EMPTY);
                         }
                         ids.extend(self.tok.encode(&buf));
                         buf.clear();
                         ids.extend_from_slice(toks);
-                        buf.push_str("<|im_end|>\n");
+                        buf.push_str(self.style.assistant_close());
                     }
                     None if self.think_block => buf.push_str(&with_think_block(&seg)),
                     None => buf.push_str(&seg),
@@ -1483,11 +1539,11 @@ impl ChatModel {
         }
         let mut ctx_hash = std::collections::hash_map::DefaultHasher::new();
         let mut key = 0u64;
-        render_chatml_pieces(messages, tools_json, self.default_system(), self.tool_format, &mut |piece| match piece {
+        render_chatml_pieces(messages, tools_json, self.default_system(), self.tool_format, self.style, &mut |piece| match piece {
             ChatPiece::Text(t) => t.hash(&mut ctx_hash),
             ChatPiece::Assistant(m) => {
                 let mut seg = String::new();
-                push_assistant_segment(m, self.tool_format, &mut seg);
+                push_assistant_segment(m, self.tool_format, self.style, &mut seg);
                 seg.hash(&mut ctx_hash);
                 key = ctx_hash.clone().finish();
             }
@@ -2435,8 +2491,15 @@ enum ChatPiece<'a> {
     Assistant(&'a Message),
 }
 
-/// Canonical ChatML text of an assistant message, `<|im_start|>assistant` through `<|im_end|>\n`.
-fn push_assistant_segment(m: &Message, fmt: ToolFormat, out: &mut String) {
+/// Canonical text of an assistant message: ChatML `<|im_start|>assistant` through `<|im_end|>\n`,
+/// or HunYuan `<assistant>content<eos>` (tool calls are not part of that template).
+fn push_assistant_segment(m: &Message, fmt: ToolFormat, style: PromptStyle, out: &mut String) {
+    if style == PromptStyle::HunYuan {
+        out.push_str(style.assistant_open());
+        out.push_str(&m.content);
+        out.push_str(style.assistant_close());
+        return;
+    }
     if m.tool_calls.is_empty() {
         out.push_str(crate::config::markup::IM_START);
         out.push_str("assistant\n");
@@ -2474,12 +2537,51 @@ pub fn render_chatml_prompt_with(
     default_system: &str,
     fmt: ToolFormat,
 ) -> String {
+    render_prompt_with(messages, tools_json, default_system, fmt, PromptStyle::ChatMl)
+}
+
+/// Renders a conversation in `style`, ending with an open assistant turn.
+pub fn render_prompt_with(
+    messages: &[Message],
+    tools_json: &[String],
+    default_system: &str,
+    fmt: ToolFormat,
+    style: PromptStyle,
+) -> String {
     let mut out = String::new();
-    render_chatml_pieces(messages, tools_json, default_system, fmt, &mut |piece| match piece {
+    render_chatml_pieces(messages, tools_json, default_system, fmt, style, &mut |piece| match piece {
         ChatPiece::Text(t) => out.push_str(t),
-        ChatPiece::Assistant(m) => push_assistant_segment(m, fmt, &mut out),
+        ChatPiece::Assistant(m) => push_assistant_segment(m, fmt, style, &mut out),
     });
     out
+}
+
+/// HunYuan template (`chat_template.jinja` of Hy-MT2): tools are not rendered and tool results
+/// are passed as user turns.
+fn render_hunyuan_pieces(messages: &[Message], default_system: &str, sink: &mut dyn FnMut(ChatPiece<'_>)) {
+    use crate::config::markup::{HY_ASSISTANT, HY_BOS, HY_SYSTEM_END, HY_USER};
+    let mut out = String::from(HY_BOS);
+    let (sys_content, start_idx) = if messages.first().is_some_and(|m| m.role == "system") {
+        (messages[0].content.as_str(), 1usize)
+    } else {
+        (default_system, 0usize)
+    };
+    if !sys_content.is_empty() {
+        out.push_str(sys_content);
+        out.push_str(HY_SYSTEM_END);
+    }
+    for m in &messages[start_idx..] {
+        if m.role == "assistant" {
+            sink(ChatPiece::Text(&out));
+            out.clear();
+            sink(ChatPiece::Assistant(m));
+        } else {
+            out.push_str(HY_USER);
+            out.push_str(&m.content);
+        }
+    }
+    out.push_str(HY_ASSISTANT);
+    sink(ChatPiece::Text(&out));
 }
 
 fn render_chatml_pieces(
@@ -2487,8 +2589,12 @@ fn render_chatml_pieces(
     tools_json: &[String],
     default_system: &str,
     fmt: ToolFormat,
+    style: PromptStyle,
     sink: &mut dyn FnMut(ChatPiece<'_>),
 ) {
+    if style == PromptStyle::HunYuan {
+        return render_hunyuan_pieces(messages, default_system, sink);
+    }
     let mut out = String::new();
     let (sys_content, start_idx) = if messages.first().is_some_and(|m| m.role == "system") {
         (messages[0].content.as_str(), 1usize)
@@ -3958,6 +4064,26 @@ mod tests {
             Message::tool_result("call_0", "ok"),
         ];
         let p = render_chatml_prompt_with(&msgs, &tools, "sys", ToolFormat::Xml);
+        // HunYuan: `chat_template.jinja` of Hy-MT2 (no newlines, tools dropped, no default system).
+        let hy = render_prompt_with(
+            &[Message::new("system", "sys"), Message::new("user", "hi")],
+            &tools,
+            "",
+            ToolFormat::Json,
+            PromptStyle::HunYuan,
+        );
+        assert_eq!(hy, "<｜hy_begin▁of▁sentence｜>sys<｜hy_place▁holder▁no▁3｜><｜hy_User｜>hi<｜hy_Assistant｜>");
+        let hy_turns = render_prompt_with(
+            &[Message::new("user", "a"), Message::new("assistant", "b"), Message::new("user", "c")],
+            &[],
+            "",
+            ToolFormat::Json,
+            PromptStyle::HunYuan,
+        );
+        assert_eq!(
+            hy_turns,
+            "<｜hy_begin▁of▁sentence｜><｜hy_User｜>a<｜hy_Assistant｜>b<｜hy_place▁holder▁no▁2｜><｜hy_User｜>c<｜hy_Assistant｜>"
+        );
         assert!(p.contains("<function>\n<name>write_file</name>\n<description>Write a file.</description>\n<parameters>\n<parameter>\n<name>path</name>\n<type>string</type>"));
         assert!(p.contains("<required>[\"path\"]</required>"));
         assert!(p.contains("<tool_call>\n<function=write_file>\n<parameter=path>\na.py\n</parameter>"));

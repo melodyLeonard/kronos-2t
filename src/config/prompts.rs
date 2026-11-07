@@ -92,9 +92,53 @@ pub fn translate_system(to: &str, from: &str, tone: &str, context: &[String]) ->
     s
 }
 
+/// Register clause for Hy-MT2 prompts, in the model card's `[style]` form.
+fn hunyuan_style(tone: &str) -> Option<&'static str> {
+    match tone.to_ascii_lowercase().as_str() {
+        "casual" => Some("casual and informal chat between friends, using informal address (tu/du)"),
+        "formal" => Some("formal and polite, using formal address (vous/Sie)"),
+        _ => None,
+    }
+}
+
+/// Single user turn for Hy-MT2 (`/translate` on HunYuan models), mirroring the model card's
+/// default, style and background-information prompts. Hy-MT2 has no system prompt.
+pub fn translate_user_hunyuan(to: &str, from: &str, tone: &str, context: &[String], text: &str) -> String {
+    let mut s = String::new();
+    if !context.is_empty() {
+        s.push_str("[Background Information]\nEarlier messages from the same sender in this chat, oldest first (use them for pronouns, slang, idioms and register; do not translate them):");
+        for c in context {
+            s.push_str("\n- ");
+            s.push_str(c.trim());
+        }
+        s.push_str("\n\nPlease translate the following text into ");
+    } else {
+        s.push_str("Translate the following text into ");
+    }
+    s.push_str(to);
+    if !from.is_empty() && !from.eq_ignore_ascii_case("auto") {
+        s.push_str(&format!(" (the source language is {from})"));
+    }
+    if !context.is_empty() {
+        s.push_str(", taking the provided background information into consideration");
+    }
+    s.push('.');
+    if let Some(style) = hunyuan_style(tone) {
+        s.push_str(&format!(" Note that the translation style must strictly conform to [{style}]."));
+    }
+    s.push_str(" Note that you should only output the translated result without any additional explanation:\n\n");
+    if context.is_empty() {
+        s.push_str(text);
+    } else {
+        s.push_str("[Source Text]\n");
+        s.push_str(text);
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
-    use super::translate_system;
+    use super::{translate_system, translate_user_hunyuan};
 
     #[test]
     fn translate_system_includes_tone_and_context() {
@@ -106,5 +150,20 @@ mod tests {
         assert!(s.contains("- Are you coming to Ana's party?\n- It starts at 8"));
         let f = translate_system("German", "English", "formal", &[]);
         assert!(f.contains("Source language: English.") && f.contains("vous/Sie") && !f.contains("Earlier messages"));
+    }
+
+    #[test]
+    fn hunyuan_translate_prompt_follows_model_card() {
+        let plain = translate_user_hunyuan("Spanish", "auto", "neutral", &[], "see you tomorrow");
+        assert_eq!(
+            plain,
+            "Translate the following text into Spanish. Note that you should only output the translated result without any additional explanation:\n\nsee you tomorrow"
+        );
+        let ctx = vec!["Are you coming to Ana's party?".to_string(), "It starts at 8".to_string()];
+        let rich = translate_user_hunyuan("French", "English", "casual", &ctx, "see you there");
+        assert!(rich.starts_with("[Background Information]\n"));
+        assert!(rich.contains("- Are you coming to Ana's party?\n- It starts at 8\n\nPlease translate the following text into French (the source language is English), taking the provided background information into consideration."));
+        assert!(rich.contains("strictly conform to [casual and informal chat between friends, using informal address (tu/du)]."));
+        assert!(rich.ends_with("explanation:\n\n[Source Text]\nsee you there"));
     }
 }
