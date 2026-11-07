@@ -158,6 +158,19 @@ reuses the KV cache when a request extends the previous conversation. Requests m
 conversations (default 3) stays in RAM and older ones are written under `--state-dir/kv`, so
 switching conversations or restarting the server resumes without reprocessing the history.
 
+`POST /translate` (alias `/v1/translate`) translates a message with thinking disabled and a token
+cap derived from the input length. Request `{"text": "...", "to": "French", "from": "auto",
+"tone": "casual|formal|neutral", "context": ["earlier sent message", ...]}` (`context` is the sender's
+last few messages in that chat, oldest first, capped at 8 / ~1k tokens, used for pronouns, slang and
+register), response `{"text": "..."}`. It sends CORS headers (and answers `OPTIONS`), so browser extensions and
+keyboard apps can call it directly; bind with `--host 0.0.0.0` to reach it from a phone on the LAN.
+Smoke test:
+
+```bash
+curl -s -X POST localhost:18085/translate -H 'Content-Type: application/json' \
+  -d '{"text":"see you tomorrow","to":"Spanish"}'
+```
+
 To embed Kronos in another Rust program, use `kronos_2t::chat::ChatModel` directly.
 
 ### Benchmarking
