@@ -71,6 +71,43 @@ impl Json {
         out
     }
 
+    /// Serializes this value with 2-space indentation and a trailing newline (file-style JSON).
+    pub fn pretty(&self) -> String {
+        let mut out = String::new();
+        self.write_pretty(&mut out, 0);
+        out.push('\n');
+        out
+    }
+
+    fn write_pretty(&self, out: &mut String, depth: usize) {
+        let pad = |out: &mut String, d: usize| out.extend(std::iter::repeat_n(' ', 2 * d));
+        match self {
+            Json::Arr(items) if !items.is_empty() => {
+                out.push_str("[\n");
+                for (i, item) in items.iter().enumerate() {
+                    pad(out, depth + 1);
+                    item.write_pretty(out, depth + 1);
+                    out.push_str(if i + 1 < items.len() { ",\n" } else { "\n" });
+                }
+                pad(out, depth);
+                out.push(']');
+            }
+            Json::Obj(kv) if !kv.is_empty() => {
+                out.push_str("{\n");
+                for (i, (k, v)) in kv.iter().enumerate() {
+                    pad(out, depth + 1);
+                    out.push_str(&quote(k));
+                    out.push_str(": ");
+                    v.write_pretty(out, depth + 1);
+                    out.push_str(if i + 1 < kv.len() { ",\n" } else { "\n" });
+                }
+                pad(out, depth);
+                out.push('}');
+            }
+            _ => self.write_into(out),
+        }
+    }
+
     fn write_into(&self, out: &mut String) {
         match self {
             Json::Null => out.push_str("null"),

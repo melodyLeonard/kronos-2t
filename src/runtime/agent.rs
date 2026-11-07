@@ -2565,10 +2565,19 @@ fn exec_write_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
     let Some(rel) = args.get("path").and_then(Json::as_str) else {
         return err_outcome("error: `write_file` requires string argument `path`");
     };
-    let Some(content) = args.get("content").and_then(Json::as_str) else {
-        return err_outcome(
-            "error: `write_file` requires string arguments `path` and `content` (pass full file text in `content`)",
-        );
+    // Models sometimes pass JSON files as objects rather than text; serialize those.
+    let content_owned;
+    let content: &str = match args.get("content") {
+        Some(Json::Str(s)) => s,
+        Some(v @ (Json::Obj(_) | Json::Arr(_))) => {
+            content_owned = v.pretty();
+            &content_owned
+        }
+        _ => {
+            return err_outcome(
+                "error: `write_file` requires string arguments `path` and `content` (pass full file text in `content`)",
+            )
+        }
     };
     let lower_rel_check = rel.trim().trim_start_matches("./").to_ascii_lowercase();
     if lower_rel_check == ".kronos_media" || lower_rel_check.starts_with(".kronos_media/") {
@@ -5444,6 +5453,17 @@ pub fn run_agent_turn_with_lock<'a>(
     )
 }
 
+/// Final reply when the step budget runs out with work on disk.
+fn budget_summary(max_steps: usize, modified_files: &[String]) -> String {
+    if modified_files.is_empty() {
+        return format!("Stopped after {max_steps} steps without changing any file.");
+    }
+    format!(
+        "Reached the {max_steps}-step budget. Files written so far: {}. Ask me to continue to finish the remaining pieces.",
+        modified_files.join(", ")
+    )
+}
+
 fn run_agent_turn_inner(
     mut with_model: impl FnMut(&mut dyn FnMut(&mut ChatModel)),
     history: &mut Vec<Message>,
@@ -5562,6 +5582,10 @@ fn run_agent_turn_inner(
     for step in 1..=cfg.max_steps {
         if dup_cmd_blocks >= 3 {
             return Err("stopped: re-ran the same failing command 3 times without editing any file".to_string());
+        }
+        // The last step of the budget is a wrap-up: tool calls are dropped and the reply stands.
+        if step == cfg.max_steps {
+            finalize_only = true;
         }
         let mut comp_rep_opt = None;
         with_model(&mut |model| {
@@ -5690,7 +5714,11 @@ fn run_agent_turn_inner(
         if finalize_only && !comp.tool_calls.is_empty() {
             comp.tool_calls.clear();
             if comp.text.trim().is_empty() {
-                comp.text = "I stopped repeating the same tool call; the last result above is where the work stands.".to_string();
+                comp.text = if step == cfg.max_steps {
+                    budget_summary(cfg.max_steps, &modified_files)
+                } else {
+                    "I stopped repeating the same tool call; the last result above is where the work stands.".to_string()
+                };
             }
         }
         if alive && !aborted_fence_prose {
@@ -7078,6 +7106,20 @@ mod tests {
         );
         assert!(validate_markdown_script(Path::new("script.md"), &full_md).is_ok());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_serializes_object_content() {
+        let dir = std::env::temp_dir().join(format!("kronos_wf_obj_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let args = Json::parse(r#"{"path":"app/package.json","content":{"name":"app","scripts":{"start":"node server.js"},"deps":[]}}"#).unwrap();
+        let out = exec_write_file(&dir, &args);
+        assert!(out.ok, "{}", out.output);
+        let text = fs::read_to_string(dir.join("app/package.json")).unwrap();
+        assert_eq!(text, "{\n  \"name\": \"app\",\n  \"scripts\": {\n    \"start\": \"node server.js\"\n  },\n  \"deps\": []\n}\n");
+        assert_eq!(Json::parse(&text).unwrap().stringify(), args.get("content").unwrap().stringify());
         let _ = fs::remove_dir_all(&dir);
     }
 
