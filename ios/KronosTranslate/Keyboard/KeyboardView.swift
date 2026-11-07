@@ -422,12 +422,13 @@ final class KeyButton: UIControl {
     func setPressed(_ on: Bool) { backgroundColor = on ? fill.withAlphaComponent(fn ? 0.7 : 0.85) : fill }
     func setTitle(_ t: String) {
         text.text = t
+        // Apple's keycaps: SF Pro, light weight for single glyphs, regular 16pt for words.
         let small = fn || t.count > 1
-        text.font = .systemFont(ofSize: small ? 16 : 24, weight: .regular)
+        text.font = small ? .systemFont(ofSize: 16, weight: .regular) : .systemFont(ofSize: 25, weight: .light)
         image.isHidden = true; text.isHidden = false
     }
     func setSymbol(_ name: String) {
-        image.image = UIImage(systemName: name, withConfiguration: UIImage.SymbolConfiguration(pointSize: 18, weight: .regular))
+        image.image = UIImage(systemName: name, withConfiguration: UIImage.SymbolConfiguration(pointSize: 18, weight: .light))
         image.isHidden = false; text.isHidden = true
     }
     func restyle(fill: UIColor, ink: UIColor, shadow: UIColor) {
