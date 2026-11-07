@@ -14,9 +14,8 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
 
     static let stripHeight: CGFloat = 46
     static let suggestHeight: CGFloat = 44
-    static let rowsHeight: CGFloat = 212
     /// Strip only while there is something to show; suggestions row always, like the system keyboard.
-    var height: CGFloat { (stripVisible ? Self.stripHeight : 0) + Self.suggestHeight + Self.rowsHeight }
+    var height: CGFloat { (stripVisible ? Self.stripHeight : 0) + Self.suggestHeight + rowsHeight }
     private var stripVisible: Bool { state != .idle && !sheetOpen && page != .emoji }
 
     var onKey: ((Key) -> Void)?
@@ -207,8 +206,33 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         return r
     }
 
+    /// Cap bottoms measured from the screen bottom, cap height and top padding of the system keyboard,
+    /// per screen height. 874 (iPhone 17 Pro) from accessibility hit rects; 926 (iPhone 12 Pro Max) from
+    /// a device screenshot at 3x. Other heights scale the 874 table.
+    static func metrics(screenHeight h: CGFloat) -> (bottoms: [CGFloat], capH: CGFloat, topPad: CGFloat) {
+        switch Int(h.rounded()) {
+        case 926: return ([83.33, 138, 194, 250], 45, 10)
+        case 874: return ([74, 127.2, 181, 235.2], 40, 8.8)
+        default:
+            let k = h / 874
+            return ([74, 127.2, 181, 235.2].map { $0 * k }, (40 * k).rounded(), 8.8 * k)
+        }
+    }
+    /// Space iOS leaves under a third-party keyboard for its globe/dictation strip (75 on Face ID phones);
+    /// measured from the window each layout so the caps land where the system ones do.
+    private(set) var systemGap: CGFloat = 75
+    private var screenH: CGFloat { UIScreen.main.bounds.height }
+    var rowsHeight: CGFloat {
+        let m = Self.metrics(screenHeight: screenH)
+        return m.bottoms[3] + m.capH + m.topPad - systemGap
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
+        if let win = window {
+            let gap = screenH - convert(bounds, to: win).maxY
+            if gap > 0, gap < 200, abs(gap - systemGap) > 0.5 { systemGap = gap; onHeightChange?(height) }
+        }
         let W = bounds.width
         var y: CGFloat = 0
         bar.isHidden = !stripVisible
@@ -221,29 +245,62 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         for (i, b) in suggestButtons.enumerated() { b.frame = CGRect(x: third * CGFloat(i) + 6, y: 0, width: third - 12, height: Self.suggestHeight) }
         for (i, d) in suggestDividers.enumerated() { d.frame = CGRect(x: third * CGFloat(i + 1) - 0.5, y: 10, width: 1, height: Self.suggestHeight - 20) }
         y += Self.suggestHeight
-        keysView.frame = CGRect(x: 0, y: y, width: W, height: Self.rowsHeight)
+        let rowsH = rowsHeight
+        keysView.frame = CGRect(x: 0, y: y, width: W, height: rowsH)
         emojiView?.frame = bounds
         sheet?.frame = bounds
-        let gap: CGFloat = 6, margin: CGFloat = 3
-        // Letter width from the widest letter row (10 on QWERTY, 11 on Cyrillic/Arabic).
-        let widest = max(10, rows.prefix(2).map { $0.filter { $0.1 == 1 }.count }.max() ?? 10)
-        let unit = floor((W - 2 * margin - CGFloat(widest - 1) * gap) / CGFloat(widest))
-        let rowH: CGFloat = 40, rowGap: CGFloat = 13   // measured from the system keyboard on iOS 26
+
+        // Horizontal geometry of the system keyboard: caps start 7pt in, pitch p with a gap of 0.143p
+        // ((402 - 12.5) / 9.857 = 39.5 on a 402pt screen, 42.1 on 428), function keys 1.25p / 1.3p / 2.5p.
+        let x0: CGFloat = 7
+        let widest = max(10, rows.prefix(2).map { $0.filter { !$0.0.fn }.count }.max() ?? 10)
+        let p = (W - 12.5) / (CGFloat(widest) - 0.143)
+        let gap = 0.143 * p, cap = p - gap
+        let mR = W - (x0 + CGFloat(widest) * p - gap)
+        let met = Self.metrics(screenHeight: screenH)
+        let capH = met.capH
+        func place(_ b: KeyButton, _ x: CGFloat, _ w: CGFloat, _ row: Int) {
+            let bottom = rowsH - (met.bottoms[min(row, 3)] - systemGap)
+            b.frame = CGRect(x: x, y: bottom - capH, width: w, height: capH)
+            let pitch = row == 0 ? capH + met.topPad : met.bottoms[row - 1] - met.bottoms[row]
+            b.hitInsets = UIEdgeInsets(top: -1, left: -gap / 2, bottom: -(pitch - capH - 1), right: -gap / 2)
+            b.setCapHeight(capH)
+        }
         for (i, r) in rows.enumerated() {
-            var fixed = r.map { $0.1 * unit }.reduce(0, +)
-            let flexCount = r.filter { $0.1 == 0 }.count
-            let avail = W - 2 * margin - gap * CGFloat(r.count - 1)
-            // A row wider than the screen (11 letters + delete) shrinks evenly.
-            let squeeze = flexCount == 0 && fixed > avail ? avail / fixed : 1
-            fixed *= squeeze
-            let flexW = flexCount > 0 ? (avail - fixed) / CGFloat(flexCount) : 0
-            let total = fixed + flexW * CGFloat(flexCount) + gap * CGFloat(r.count - 1)
-            var x = (W - total) / 2
-            let y = CGFloat(i) * (rowH + rowGap)
-            for (b, u) in r {
-                let w = u == 0 ? flexW : u * unit * squeeze
-                b.frame = CGRect(x: x, y: y, width: floor(w), height: rowH)
-                x += floor(w) + gap
+            // Rows are indexed from the top; the metrics table counts from the bottom.
+            let row = 3 - min(i, 3)
+            switch i {
+            case 0:
+                for (j, (b, _)) in r.enumerated() { place(b, x0 + CGFloat(j) * p, cap, row) }
+            case 1:
+                let start = r.count == widest ? x0 : x0 + p / 2
+                for (j, (b, _)) in r.enumerated() { place(b, start + CGFloat(j) * p, cap, row) }
+            case 2:
+                let letters = r.filter { !$0.0.fn }.count
+                var pitch = p
+                var start = x0 + 1.5 * p
+                let sideW = 1.5 * p - 8 - gap
+                if letters < 7 {   // punctuation rows on the number/symbol pages spread between the side keys
+                    start = x0 + sideW + 8 + gap
+                    pitch = (W - mR - gap - start) / CGFloat(letters)
+                }
+                var li = 0
+                for (idx, (b, _)) in r.enumerated() {
+                    if b.fn {
+                        if idx == 0 { place(b, x0, sideW, row) }
+                        else { let x = start + CGFloat(letters) * pitch + 8; place(b, x, W - mR - x, row) }
+                    } else {
+                        place(b, start + CGFloat(li) * pitch, pitch - gap, row); li += 1
+                    }
+                }
+            default:
+                let retW = 2.5 * p - gap
+                var x = x0
+                for (b, _) in r {
+                    if b.label == "sf:return" { place(b, W - mR - retW, retW, row) }
+                    else if b.label == " " { place(b, x, W - mR - retW - gap - x, row); x = W - mR - retW }
+                    else { place(b, x, 1.25 * p - gap, row); x += 1.25 * p }
+                }
             }
         }
     }
@@ -452,6 +509,7 @@ final class KeyButton: UIControl {
     let label: String
     let fn: Bool
     var variants: [String] = []
+    var hitInsets = UIEdgeInsets.zero   // negative: the touch area extends past the drawn cap like the system keys
     var onTap: (() -> Void)?
     var onLongPress: ((UILongPressGestureRecognizer) -> Void)?
     private let text = UILabel()
@@ -466,14 +524,13 @@ final class KeyButton: UIControl {
         layer.cornerCurve = .continuous
         // Soft elevation like the system keycaps, not a hard 1pt line.
         layer.shadowOpacity = 0   // flat, like the iOS 26 keycaps
-        for v in [text, image] { v.translatesAutoresizingMaskIntoConstraints = false; v.isUserInteractionEnabled = false; addSubview(v) }
+        for v in [text, image] { v.isUserInteractionEnabled = false; addSubview(v) }
         text.textAlignment = .center
         image.contentMode = .center
-        NSLayoutConstraint.activate([
-            text.centerXAnchor.constraint(equalTo: centerXAnchor), text.centerYAnchor.constraint(equalTo: centerYAnchor),
-            image.centerXAnchor.constraint(equalTo: centerXAnchor), image.centerYAnchor.constraint(equalTo: centerYAnchor),
-        ])
         if label.hasPrefix("sf:") { setSymbol(String(label.dropFirst(3))) } else { setTitle(label) }
+        isAccessibilityElement = true
+        accessibilityLabel = label.hasPrefix("sf:") ? String(label.dropFirst(3)) : label
+        accessibilityTraits = .keyboardKey
         restyle(fill: fill, ink: ink, shadow: shadow)
         let lp = UILongPressGestureRecognizer(target: self, action: #selector(longPress(_:)))
         lp.minimumPressDuration = 0.35
@@ -481,11 +538,13 @@ final class KeyButton: UIControl {
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { bounds.inset(by: hitInsets).contains(point) }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) { super.touchesBegan(touches, with: event); setPressed(true) }
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesEnded(touches, with: event)
         setPressed(false)
-        if let t = touches.first, bounds.insetBy(dx: -8, dy: -8).contains(t.location(in: self)), !longPressed { onTap?() }
+        if let t = touches.first, bounds.inset(by: hitInsets).contains(t.location(in: self)), !longPressed { onTap?() }
         longPressed = false
     }
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { super.touchesCancelled(touches, with: event); setPressed(false); longPressed = false }
@@ -497,12 +556,26 @@ final class KeyButton: UIControl {
     }
 
     func setPressed(_ on: Bool) { backgroundColor = on ? fill.withAlphaComponent(fn ? 0.7 : 0.85) : fill }
+    private var capH: CGFloat = 40
+    /// Measured on the system keyboard: 25pt Regular letters on a 45pt cap (19pt for words), baseline at 0.65 of the cap.
+    func setCapHeight(_ h: CGFloat) {
+        guard h != capH else { return }
+        capH = h
+        if let t = text.text { setTitle(t) }
+    }
     func setTitle(_ t: String) {
         text.text = t
-        // Apple's keycaps: SF Pro, light weight for single glyphs, regular 16pt for words.
         let small = fn || t.count > 1
-        text.font = small ? .systemFont(ofSize: 16, weight: .regular) : .systemFont(ofSize: 22, weight: .regular)
+        text.font = .systemFont(ofSize: (capH * (small ? 19 : 25) / 45).rounded(), weight: .regular)
         image.isHidden = true; text.isHidden = false
+        setNeedsLayout()
+    }
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        image.frame = bounds
+        guard let f = text.font else { return }
+        let top = 0.65 * bounds.height - f.ascender
+        text.frame = CGRect(x: 0, y: top, width: bounds.width, height: f.lineHeight)
     }
     func setSymbol(_ name: String) {
         image.image = UIImage(systemName: name, withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .regular))

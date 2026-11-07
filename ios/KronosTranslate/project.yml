@@ -58,3 +58,27 @@ targets:
             PrefersRightToLeft: false
             PrimaryLanguage: en-US
             RequestsOpenAccess: true
+  KronosTranslateUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    settings:
+      base:
+        TEST_TARGET_NAME: KronosTranslate
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - target: KronosTranslate
+schemes:
+  KronosTranslate:
+    build:
+      targets:
+        KronosTranslate: all
+        KronosKeyboard: all
+        KronosTranslateUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - KronosTranslateUITests
