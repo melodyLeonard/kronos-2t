@@ -158,6 +158,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
     private func key(_ label: String, _ k: Key, fn: Bool = false) -> KeyButton {
         let b = KeyButton(label: label, fn: fn, fill: fn ? fnFill : keyFill, ink: ink, shadow: keyShadow)
         b.onTap = { [weak self] in self?.onKey?(k) }
+        if case .backspace = k { b.repeats = true }
         if case .char(let c) = k, let v = Layouts.accents[c] {
             b.variants = v
             b.onLongPress = { [weak self, weak b] g in if let b { self?.accent(g, on: b) } }
@@ -508,7 +509,13 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
 final class KeyButton: UIControl {
     let label: String
     let fn: Bool
-    var variants: [String] = []
+    var variants: [String] = [] {
+        didSet { if !variants.isEmpty, longPress == nil { let lp = UILongPressGestureRecognizer(target: self, action: #selector(longPress(_:))); lp.minimumPressDuration = 0.35; addGestureRecognizer(lp); longPress = lp } }
+    }
+    /// Backspace fires on touch down and repeats while held, like the system key.
+    var repeats = false
+    private var longPress: UILongPressGestureRecognizer?
+    private var repeatTimer: Timer?
     var hitInsets = UIEdgeInsets.zero   // negative: the touch area extends past the drawn cap like the system keys
     var onTap: (() -> Void)?
     var onLongPress: ((UILongPressGestureRecognizer) -> Void)?
@@ -532,22 +539,30 @@ final class KeyButton: UIControl {
         accessibilityLabel = label.hasPrefix("sf:") ? String(label.dropFirst(3)) : label
         accessibilityTraits = .keyboardKey
         restyle(fill: fill, ink: ink, shadow: shadow)
-        let lp = UILongPressGestureRecognizer(target: self, action: #selector(longPress(_:)))
-        lp.minimumPressDuration = 0.35
-        addGestureRecognizer(lp)
     }
     required init?(coder: NSCoder) { fatalError() }
 
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool { bounds.inset(by: hitInsets).contains(point) }
 
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) { super.touchesBegan(touches, with: event); setPressed(true) }
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesBegan(touches, with: event)
+        setPressed(true)
+        if repeats {
+            onTap?()
+            repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in
+                self?.repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in self?.onTap?() }
+            }
+        }
+    }
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesEnded(touches, with: event)
         setPressed(false)
-        if let t = touches.first, bounds.inset(by: hitInsets).contains(t.location(in: self)), !longPressed { onTap?() }
+        stopRepeat()
+        if !repeats, let t = touches.first, bounds.inset(by: hitInsets).contains(t.location(in: self)), !longPressed { onTap?() }
         longPressed = false
     }
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { super.touchesCancelled(touches, with: event); setPressed(false); longPressed = false }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { super.touchesCancelled(touches, with: event); setPressed(false); stopRepeat(); longPressed = false }
+    private func stopRepeat() { repeatTimer?.invalidate(); repeatTimer = nil }
     private var longPressed = false
     @objc private func longPress(_ g: UILongPressGestureRecognizer) {
         guard !variants.isEmpty else { return }
