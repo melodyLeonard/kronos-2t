@@ -163,7 +163,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         if needsGlobe { r.append((key("sf:globe", .globe, fn: true), 1.27)) }
         r.append((key("sf:face.smiling", .page(.emoji), fn: true), 1.27))
         r.append((key("space", .space), 0))
-        r.append((key("return", .ret, fn: true), 2.73))
+        r.append((key("sf:return", .ret, fn: true), 2.73))
         return r
     }
 
@@ -176,7 +176,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         // Letter width from the widest letter row (10 on QWERTY, 11 on Cyrillic/Arabic).
         let widest = max(10, rows.prefix(2).map { $0.filter { $0.1 == 1 }.count }.max() ?? 10)
         let unit = floor((W - 2 * margin - CGFloat(widest - 1) * gap) / CGFloat(widest))
-        let rowH: CGFloat = 42, rowGap: CGFloat = 12
+        let rowH: CGFloat = 40, rowGap: CGFloat = 13   // measured from the system keyboard on iOS 26
         for (i, r) in rows.enumerated() {
             var fixed = r.map { $0.1 * unit }.reduce(0, +)
             let flexCount = r.filter { $0.1 == 0 }.count
@@ -326,10 +326,10 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
     }
 
     private func applyReturn() {
-        for (b, _) in rows.flatMap({ $0 }) where b.label == "return" {
+        for (b, _) in rows.flatMap({ $0 }) where b.label == "sf:return" {
             var send = false
             if case .inserted = state { send = true }
-            b.setTitle(send ? "send" : "return")
+            if send { b.setTitle("send") } else { b.setSymbol("return") }
             b.restyle(fill: send ? blue : fnFill, ink: send ? .white : ink, shadow: send ? blueShadow : keyShadow)
         }
     }
@@ -393,7 +393,7 @@ final class KeyButton: UIControl {
     init(label: String, fn: Bool, fill: UIColor, ink: UIColor, shadow: UIColor) {
         self.label = label; self.fn = fn
         super.init(frame: .zero)
-        layer.cornerRadius = 5
+        layer.cornerRadius = 7
         layer.cornerCurve = .continuous
         layer.shadowOpacity = 1; layer.shadowOffset = .init(width: 0, height: 1); layer.shadowRadius = 0
         for v in [text, image] { v.translatesAutoresizingMaskIntoConstraints = false; v.isUserInteractionEnabled = false; addSubview(v) }
@@ -431,11 +431,11 @@ final class KeyButton: UIControl {
         text.text = t
         // Apple's keycaps: SF Pro, light weight for single glyphs, regular 16pt for words.
         let small = fn || t.count > 1
-        text.font = small ? .systemFont(ofSize: 16, weight: .regular) : .systemFont(ofSize: 25, weight: .light)
+        text.font = small ? .systemFont(ofSize: 16, weight: .regular) : .systemFont(ofSize: 22, weight: .regular)
         image.isHidden = true; text.isHidden = false
     }
     func setSymbol(_ name: String) {
-        image.image = UIImage(systemName: name, withConfiguration: UIImage.SymbolConfiguration(pointSize: 18, weight: .light))
+        image.image = UIImage(systemName: name, withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .regular))
         image.isHidden = false; text.isHidden = true
     }
     func restyle(fill: UIColor, ink: UIColor, shadow: UIColor) {
