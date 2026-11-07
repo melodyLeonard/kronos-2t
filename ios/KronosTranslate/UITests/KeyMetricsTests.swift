@@ -22,6 +22,18 @@ final class KeyMetricsTests: XCTestCase {
             app.keys["h"].tap(); app.keys["l"].tap(); app.keys["delete.left"].tap()
             sleep(1)
             XCTAssertEqual((field.value as? String) ?? "", "H")
+            // Number and symbol pages: every key fully on screen, delete and return included.
+            let screenW = XCUIScreen.main.screenshot().image.size.width
+            app.keys["123"].tap(); sleep(1)
+            for page in ["numbers", "symbols"] {
+                for k in app.keys.allElementsBoundByIndex {
+                    let f = k.frame
+                    XCTAssertTrue(f.minX >= 0 && f.maxX <= screenW + 0.5, "\(page) key \(k.label) off screen: \(f)")
+                }
+                XCTAssertTrue(app.keys["delete.left"].exists && app.keys["return"].exists, "\(page): delete/return missing")
+                if page == "numbers" { app.keys["#+="].tap(); sleep(1) }
+            }
+            app.keys["ABC"].tap()
         }
     }
 

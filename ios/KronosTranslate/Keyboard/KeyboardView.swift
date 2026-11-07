@@ -231,8 +231,10 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
     override func layoutSubviews() {
         super.layoutSubviews()
         if let win = window {
-            let gap = screenH - convert(bounds, to: win).maxY
-            if gap > 0, gap < 200, abs(gap - systemGap) > 0.5 { systemGap = gap; onHeightChange?(height) }
+            // Screen coordinates, not window ones: on a device the keyboard window is not the full screen.
+            let inScreen = win.convert(convert(bounds, to: win), to: win.screen.coordinateSpace)
+            let gap = win.screen.bounds.height - inScreen.maxY
+            if gap >= 40, gap <= 120, abs(gap - systemGap) > 0.5 { systemGap = gap; onHeightChange?(height) }
         }
         let W = bounds.width
         var y: CGFloat = 0
@@ -284,7 +286,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
                 let sideW = 1.5 * p - 8 - gap
                 if letters < 7 {   // punctuation rows on the number/symbol pages spread between the side keys
                     start = x0 + sideW + 8 + gap
-                    pitch = (W - mR - gap - start) / CGFloat(letters)
+                    pitch = (W - mR - sideW - 8 - start) / CGFloat(letters)
                 }
                 var li = 0
                 for (idx, (b, _)) in r.enumerated() {
