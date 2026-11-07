@@ -164,7 +164,12 @@ cap derived from the input length. Request `{"text": "...", "to": "French", "fro
 last few messages in that chat, oldest first, capped at 8 / ~1k tokens, used for pronouns, slang and
 register), response `{"text": "..."}`. It sends CORS headers (and answers `OPTIONS`), so browser extensions and
 keyboard apps can call it directly; bind with `--host 0.0.0.0` to reach it from a phone on the LAN.
-Smoke test:
+`--translate-model models/Hy-MT2-1.8B` loads Tencent's translation-only Hy-MT2-1.8B (HunYuan dense:
+NTK-alpha RoPE, QK-norm after RoPE, its own pre-tokenizer and chat template) beside the main model;
+`/translate` then uses it for the 38 languages on its card, with tone and context inside its single
+user turn and the card's sampling, and the main model for the rest (Yoruba, Igbo, Hausa, Swahili).
+See [eval/results/translate-models.md](eval/results/translate-models.md) for quality, size and
+latency against Qwen3.5-9B. Smoke test:
 
 ```bash
 curl -s -X POST localhost:18085/translate -H 'Content-Type: application/json' \
