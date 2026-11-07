@@ -11,7 +11,7 @@ final class KeyboardViewController: UIInputViewController {
     private var previewFor = ""            // source text the current preview belongs to
     private var cache: [String: String] = [:]
     private var sheetSide: LanguageSheet.Side = .to
-    private let debounceInterval: TimeInterval = 0.5
+    private let debounceInterval: TimeInterval = 0.14
     private var heightConstraint: NSLayoutConstraint?
     private let checker = UITextChecker()
 
@@ -48,7 +48,7 @@ final class KeyboardViewController: UIInputViewController {
     }
 
     /// Called after every edit: keeps shift/context bookkeeping and schedules the live preview.
-    private func textChanged() {
+    private func textChanged(immediate: Bool = false) {
         let text = fieldText()
         if let t = inserted, text.isEmpty {
             // The field emptied after an insert: the host app sent it. Keep it as context.
@@ -59,7 +59,7 @@ final class KeyboardViewController: UIInputViewController {
         refreshSuggestions()
         if let t = inserted, text == t { return }          // translation is in the field; nothing to preview
         inserted = nil; original = nil
-        scheduleTranslate(text)
+        scheduleTranslate(text, now: immediate)
     }
 
     // MARK: suggestions / autocorrect (UITextChecker, the system's own dictionaries)
@@ -187,8 +187,15 @@ final class KeyboardViewController: UIInputViewController {
             if !open { scheduleTranslate(fieldText(), now: true) }
         }
         UIDevice.current.playInputClick()
-        // The proxy's document context updates after the current run loop turn.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in self?.textChanged() }
+        // Trigger immediately on word/clause boundaries (space, return, sentence punctuation).
+        let isWordBoundary: Bool = {
+            switch key {
+            case .space, .ret: return true
+            case .char(let s): return ".!?,;:".contains(s)
+            default: return false
+            }
+        }()
+        DispatchQueue.main.async { [weak self] in self?.textChanged(immediate: isWordBoundary) }
     }
 
     private func fieldText() -> String {
@@ -218,14 +225,18 @@ final class KeyboardViewController: UIInputViewController {
         let ctx = Prefs.contextOn ? Prefs.context : []
         task = Task { [weak self] in
             do {
-                let out = try await TranslateClient.translate(text, from: from, to: code, context: ctx)
+                let out = try await TranslateClient.translateStream(text, from: from, to: code, context: ctx) { [weak self] partial in
+                    guard let self, !Task.isCancelled else { return }
+                    guard self.fieldText().trimmingCharacters(in: .whitespacesAndNewlines) == text else { return }
+                    self.board.setStreamingPreview(partial, active: true)
+                }
                 guard !Task.isCancelled, let self else { return }
                 self.task = nil
                 self.cache[self.cacheKey(text)] = out
                 // Only show it if the field still says the same thing.
                 guard self.fieldText().trimmingCharacters(in: .whitespacesAndNewlines) == text else { return }
                 self.previewFor = text
-                self.board.setState(.preview(out))
+                self.board.setStreamingPreview(out, active: false)
             } catch {
                 guard let self, !Task.isCancelled else { return }
                 self.task = nil

@@ -473,7 +473,10 @@ fn encode_base64(bytes: &[u8]) -> String {
 fn read_request(stream: &mut TcpStream) -> Result<Request, (u16, String)> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| (400, e.to_string()))?;
+    let n0 = reader.read_line(&mut line).map_err(|e| (0, e.to_string()))?;
+    if n0 == 0 {
+        return Err((0, String::new()));
+    }
     let mut parts = line.split_whitespace();
     let (method, path, query) = match (parts.next(), parts.next()) {
         (Some(m), Some(target)) => {
@@ -896,21 +899,28 @@ fn format_completion_response(
     )
 }
 
-/// `/translate`: `{"text","to","from","tone","context":[..]}` -> `{"text"}`. Targets Hy-MT2 covers go to
-/// `--translate-model` when loaded (single user turn, model-card sampling); the rest to the main model, with
-/// thinking suppressed by an empty `<think>` prefix on Qwen3. Output is capped from the input length.
-fn translate(srv: &Server, stream: &mut TcpStream, req: &Request) {
+/// `/translate`: `{"text","to","from","tone","context":[..],"stream":bool}` -> `{"text"}` (or SSE stream).
+/// Targets Hy-MT2 covers go to `--translate-model` when loaded; the rest to the main model, with thinking
+/// suppressed by an empty `<think>` prefix on Qwen3. Greedy decoding (`temperature: 0.0`) is used by default
+/// so incremental live typing stays stable and reuses the previous translation via speculative lookup.
+fn translate(srv: &Server, stream: &mut TcpStream, req: &Request, keep_alive: bool) -> bool {
     let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
         Ok(b) => b,
-        Err(e) => return error(stream, 400, &format!("invalid JSON: {e}")),
+        Err(e) => {
+            error(stream, 400, &format!("invalid JSON: {e}"));
+            return false;
+        }
     };
     let text = body.get("text").and_then(Json::as_str).unwrap_or("").trim();
     if text.is_empty() {
-        return error(stream, 400, "`text` is required");
+        error(stream, 400, "`text` is required");
+        return false;
     }
+    let streaming = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
     let to = body.get("to").and_then(Json::as_str).map(str::trim).filter(|s| !s.is_empty()).unwrap_or("French");
     let from = body.get("from").and_then(Json::as_str).unwrap_or("auto");
     let tone = body.get("tone").and_then(Json::as_str).unwrap_or("neutral");
+    let temp = body.get("temperature").and_then(Json::as_f64).map_or(0.0, |v| v as f32);
     let context = translate_context(&body);
     let routed = srv.translate_model.as_ref().filter(|_| kronos_2t::config::prompts::hy_mt2_supports(to));
     let mut model = routed.unwrap_or(&srv.model).lock().unwrap_or_else(|p| p.into_inner());
@@ -918,21 +928,115 @@ fn translate(srv: &Server, stream: &mut TcpStream, req: &Request) {
     let (messages, params) = match model.prompt_style() {
         PromptStyle::HunYuan => (
             vec![Message::new("user", &kronos_2t::config::prompts::translate_user_hunyuan(to, from, tone, &context, text))],
-            // Hy-MT2 model card: temperature 0.7, top_p 0.6, top_k 20, repetition_penalty 1.05.
-            GenParams { temperature: 0.7, top_k: 20, top_p: 0.6, repeat_penalty: 1.05, max_tokens, seed: 0 },
+            GenParams {
+                temperature: temp,
+                top_k: 20,
+                top_p: 0.6,
+                repeat_penalty: if temp <= 0.0 { 1.0 } else { 1.05 },
+                max_tokens,
+                seed: 0,
+            },
         ),
         PromptStyle::ChatMl => (
             vec![
                 Message::new("system", &kronos_2t::config::prompts::translate_system(to, from, tone, &context)),
                 Message::new("user", text),
             ],
-            GenParams { temperature: 0.0, top_k: 40, top_p: 0.9, repeat_penalty: 1.02, max_tokens, seed: 0 },
+            GenParams {
+                temperature: temp,
+                top_k: 40,
+                top_p: 0.9,
+                repeat_penalty: if temp <= 0.0 { 1.0 } else { 1.02 },
+                max_tokens,
+                seed: 0,
+            },
         ),
     };
     let prefix = if model.name.to_ascii_lowercase().contains("qwen3") { "<think>\n\n</think>\n\n" } else { "" };
-    match model.generate_with_tools_prefixed(&messages, &[], prefix, &params, |_| true) {
-        Ok(c) => respond(stream, 200, "application/json", &format!(r#"{{"text":{}}}"#, quote(&clean_translation(&c.text)))),
-        Err(e) => error(stream, 400, &e),
+    if !streaming {
+        return match model.generate_with_tools_prefixed(&messages, &[], prefix, &params, |_| true) {
+            Ok(c) => {
+                let payload = format!(r#"{{"text":{},"usage":{}}}"#, quote(&clean_translation(&c.text)), usage(&c, None));
+                let conn_hdr = if keep_alive {
+                    "Connection: keep-alive\r\nKeep-Alive: timeout=30\r\n"
+                } else {
+                    "Connection: close\r\n"
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{CORS}{conn_hdr}\r\n",
+                    payload.len()
+                );
+                stream
+                    .write_all(head.as_bytes())
+                    .and_then(|_| stream.write_all(payload.as_bytes()))
+                    .and_then(|_| stream.flush())
+                    .is_ok()
+                    && keep_alive
+            }
+            Err(e) => {
+                error(stream, 400, &e);
+                false
+            }
+        };
+    }
+
+    let head = if keep_alive {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n{CORS}Connection: keep-alive\r\nKeep-Alive: timeout=30\r\n\r\n"
+        )
+    } else {
+        format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{CORS}Connection: close\r\n\r\n")
+    };
+    if stream.write_all(head.as_bytes()).and_then(|_| stream.flush()).is_err() {
+        return false;
+    }
+    let write_sse = |s: &mut TcpStream, ev: &str| -> bool {
+        if keep_alive {
+            let chunk = format!("{:x}\r\n{ev}\r\n", ev.len());
+            s.write_all(chunk.as_bytes()).and_then(|_| s.flush()).is_ok()
+        } else {
+            s.write_all(ev.as_bytes()).and_then(|_| s.flush()).is_ok()
+        }
+    };
+    let mut acc = String::new();
+    let mut last_sent = String::new();
+    let mut client_alive = true;
+    match model.generate_with_tools_prefixed(&messages, &[], prefix, &params, |piece| {
+        acc.push_str(piece);
+        if !prefix.is_empty() && acc.len() <= prefix.len() {
+            return true;
+        }
+        let cur = clean_translation(&acc);
+        if !cur.is_empty() && cur != last_sent {
+            last_sent.clone_from(&cur);
+            let ev = format!("data: {{\"text\":{}}}\n\n", quote(&cur));
+            client_alive = write_sse(stream, &ev);
+            return client_alive;
+        }
+        true
+    }) {
+        Ok(c) if client_alive => {
+            let final_text = clean_translation(&c.text);
+            let done_ev = format!(
+                "data: {{\"text\":{},\"done\":true,\"usage\":{}}}\n\ndata: [DONE]\n\n",
+                quote(&final_text),
+                usage(&c, None)
+            );
+            let mut ok = write_sse(stream, &done_ev);
+            if ok && keep_alive {
+                ok = stream.write_all(b"0\r\n\r\n").and_then(|_| stream.flush()).is_ok();
+            }
+            ok && keep_alive
+        }
+        Ok(_) => false,
+        Err(e) => {
+            let err_ev = format!("data: {{\"error\":{}}}\n\ndata: [DONE]\n\n", quote(&e));
+            let _ = write_sse(stream, &err_ev);
+            if keep_alive {
+                let _ = stream.write_all(b"0\r\n\r\n").and_then(|_| stream.flush());
+            }
+            false
+        }
     }
 }
 
@@ -2640,11 +2744,31 @@ fn serve_preview(srv: &Server, stream: &mut TcpStream, req: &Request) {
 }
 
 fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
+    let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let req = match read_request(&mut stream) {
-        Ok(r) => r,
-        Err((status, msg)) => return error(&mut stream, status, &msg),
-    };
+    loop {
+        let req = match read_request(&mut stream) {
+            Ok(r) => r,
+            Err((0, _)) => return,
+            Err((status, msg)) => return error(&mut stream, status, &msg),
+        };
+        let want_keep_alive = !req.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
+        if req.method == "POST" && (req.path == "/translate" || req.path == "/v1/translate") {
+            if let Some(key) = &srv.api_key {
+                if req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")) != Some(key.as_str()) {
+                    return error(&mut stream, 401, "missing or invalid API key");
+                }
+            }
+            if translate(srv, &mut stream, &req, want_keep_alive) {
+                continue;
+            }
+            return;
+        }
+        return handle_once(srv, &mut stream, &req);
+    }
+}
+
+fn handle_once(srv: &Arc<Server>, mut stream: &mut TcpStream, req: &Request) {
     if req.method == "OPTIONS" {
         return respond(&mut stream, 204, "text/plain", "");
     }
@@ -2792,7 +2916,6 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
             ),
         ),
         ("POST", "/v1/chat/completions") => chat_completions(srv, &mut stream, &req),
-        ("POST", "/translate") | ("POST", "/v1/translate") => translate(srv, &mut stream, &req),
         ("POST", "/v1/agent/chat") => agent_chat_sse(srv, &mut stream, &req),
         ("POST", "/v1/turn") => unified_turn_sse(srv, &mut stream, &req),
         ("POST", "/v1/compact") => compact_history_http(srv, &mut stream, &req),
@@ -3261,6 +3384,10 @@ fn main() {
             });
         } else if !force_cpu {
             let _ = m.enable_metal();
+        }
+        let locked = m.mlock_weights();
+        if locked > 0 {
+            eprintln!("pinned {:.1} MiB of translate model weights in RAM (mlock)", locked as f64 / (1024.0 * 1024.0));
         }
         Mutex::new(m)
     });

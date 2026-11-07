@@ -124,7 +124,8 @@ fn pct(v: &mut [f64], p: f64) -> f64 {
     v[((v.len() as f64 - 1.0) * p).round() as usize]
 }
 
-/// `--latency`: first request per case (new context) vs the follow-ups sharing it.
+/// `--latency`: first request per case (new context) vs the follow-ups sharing it, plus incremental
+/// word-by-word typing over keep-alive SSE streaming (measuring TTFT and total completion).
 fn latency(host: &str, port: u16) {
     let (mut first, mut warm) = (Vec::new(), Vec::new());
     println!("| # | to | first (new context) | follow-ups (same context) |");
@@ -150,6 +151,115 @@ fn latency(host: &str, port: u16) {
         pct(&mut warm, 0.95) * 1e3,
         warm.len()
     );
+
+    // Simulate incremental word-boundary typing in the keyboard over a persistent keep-alive SSE connection.
+    println!("#### Incremental Word-by-Word Typing (Keep-Alive + SSE Streaming + Self-Speculative Lookup)\n");
+    println!("| step | typed prefix | streamed translation | TTFT | total | drafted / accepted |");
+    println!("|---|---|---|---|---|---|");
+    let steps = [
+        "I'm running",
+        "I'm running late,",
+        "I'm running late, start",
+        "I'm running late, start without me",
+        "I'm running late, start without me tonight",
+    ];
+    let c = &CASES[1]; // French casual with chat context
+    let s = TcpStream::connect((host, port)).expect("connect");
+    let _ = s.set_nodelay(true);
+    s.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
+    let mut reader = std::io::BufReader::new(s);
+    let mut ttfts = Vec::new();
+    let mut totals = Vec::new();
+    for (idx, step_text) in steps.iter().enumerate() {
+        let ctx: Vec<Json> = c.context.iter().map(|x| Json::Str((*x).to_string())).collect();
+        let body = Json::Obj(vec![
+            ("text".into(), Json::Str((*step_text).into())),
+            ("to".into(), Json::Str(c.to.into())),
+            ("tone".into(), Json::Str(c.tone.into())),
+            ("context".into(), Json::Arr(ctx)),
+            ("stream".into(), Json::Bool(true)),
+        ])
+        .stringify();
+        let t0 = Instant::now();
+        write!(
+            reader.get_mut(),
+            "POST /translate HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("write");
+        reader.get_mut().flush().expect("flush");
+        let (out, ttft, total, drafted, accepted) = read_chunked_sse(&mut reader, t0);
+        ttfts.push(ttft.as_secs_f64());
+        totals.push(total.as_secs_f64());
+        println!(
+            "| {} | `{}` | {} | **{:.0} ms** | {:.0} ms | {} / {} |",
+            idx + 1,
+            step_text,
+            cell(&out),
+            ttft.as_secs_f64() * 1e3,
+            total.as_secs_f64() * 1e3,
+            drafted,
+            accepted
+        );
+    }
+    println!(
+        "\nincremental typing: TTFT p50 **{:.0} ms** · full sentence completion p50 **{:.0} ms**\n",
+        pct(&mut ttfts, 0.5) * 1e3,
+        pct(&mut totals, 0.5) * 1e3,
+    );
+}
+
+fn read_chunked_sse(
+    reader: &mut std::io::BufReader<TcpStream>,
+    t0: Instant,
+) -> (String, Duration, Duration, usize, usize) {
+    use std::io::BufRead;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("header line");
+        if line == "\r\n" || line == "\n" || line.is_empty() {
+            break;
+        }
+    }
+    let mut ttft: Option<Duration> = None;
+    let mut text = String::new();
+    let mut drafted = 0usize;
+    let mut accepted = 0usize;
+    loop {
+        let mut size_line = String::new();
+        reader.read_line(&mut size_line).expect("chunk size");
+        let sz = usize::from_str_radix(size_line.trim(), 16).unwrap_or(0);
+        if sz == 0 {
+            let mut crlf = String::new();
+            let _ = reader.read_line(&mut crlf);
+            break;
+        }
+        let mut buf = vec![0u8; sz + 2];
+        reader.read_exact(&mut buf).expect("chunk payload");
+        let chunk_str = String::from_utf8_lossy(&buf[..sz]);
+        for line in chunk_str.lines() {
+            if let Some(raw) = line.strip_prefix("data:") {
+                let raw = raw.trim();
+                if raw == "[DONE]" {
+                    continue;
+                }
+                if let Ok(j) = Json::parse(raw) {
+                    if let Some(t) = j.get("text").and_then(Json::as_str) {
+                        if ttft.is_none() && !t.is_empty() {
+                            ttft = Some(t0.elapsed());
+                        }
+                        text = t.to_string();
+                    }
+                    if let Some(u) = j.get("usage") {
+                        drafted = u.get("drafted_tokens").and_then(Json::as_f64).unwrap_or(0.0) as usize;
+                        accepted = u.get("accepted_tokens").and_then(Json::as_f64).unwrap_or(0.0) as usize;
+                    }
+                }
+            }
+        }
+    }
+    let total = t0.elapsed();
+    (text, ttft.unwrap_or(total), total, drafted, accepted)
 }
 
 fn cell(s: &str) -> String {

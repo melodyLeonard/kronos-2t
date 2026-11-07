@@ -682,6 +682,13 @@ impl LinearBackend {
         }
     }
 
+    fn mlock_weights(&self) -> usize {
+        match self {
+            Self::NfSdot(m) => m.pair_stream.mlock() + m.tail_stream.mlock(),
+            _ => 0,
+        }
+    }
+
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn forward_exec(
@@ -5394,6 +5401,19 @@ impl RealLlamaEngine {
             + self.embed_f32_rows.len() * std::mem::size_of::<f32>()
             + self.embed_bf16_rows.len() * std::mem::size_of::<u16>()
             + self.embed_nf4.as_ref().map_or(0, |m| m.physical_bytes())
+    }
+
+    /// Pins compiled weight pages in physical RAM (`mlock`) so the OS never pages them out.
+    pub fn mlock_weights(&self) -> usize {
+        let mut locked = self.lm_head.mlock_weights()
+            + self.embed_nf4.as_ref().map_or(0, |m| m.pair_stream.mlock() + m.tail_stream.mlock());
+        for l in &self.layers {
+            locked += l.qkv_proj.mlock_weights()
+                + l.o_proj.mlock_weights()
+                + l.gate_up_proj.mlock_weights()
+                + l.down_proj.mlock_weights();
+        }
+        locked
     }
 
     /// Physical bits per weight across all transformer layers + `lm_head` (including full `.k2tm` shard on MoE).

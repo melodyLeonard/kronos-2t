@@ -429,4 +429,11 @@ impl Backend {
             Backend::Qwen35(q) => q.gpu.state_bytes(),
         }
     }
+
+    pub(crate) fn mlock_weights(&self) -> usize {
+        match self {
+            Backend::Llama(e) => e.mlock_weights(),
+            Backend::Qwen35(_) => 0,
+        }
+    }
 }

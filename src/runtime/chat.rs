@@ -605,6 +605,7 @@ pub struct ChatModel {
     /// and including it, so the re-rendered history reuses the KV written during decoding.
     gen_memo: Vec<(u64, Vec<usize>)>,
     last_gen: Option<Vec<usize>>,
+    prev_reply: Vec<usize>,
     ctx: usize,
     scratch: ChatScratch,
     /// Lookup and draft speculation (off = plain token-by-token decoding).
@@ -697,6 +698,7 @@ impl ChatModel {
             conv_snaps: ConvSnapshots::new(),
             gen_memo: Vec::new(),
             last_gen: None,
+            prev_reply: Vec::new(),
             ctx,
             scratch: ChatScratch::new(vocab_size),
             spec_enabled: true,
@@ -821,6 +823,10 @@ impl ChatModel {
 
     pub fn kv_cache_bytes(&self) -> usize {
         self.engine.kv_cache_bytes()
+    }
+
+    pub fn mlock_weights(&self) -> usize {
+        self.engine.mlock_weights()
     }
 
     pub fn tool_format(&self) -> ToolFormat {
@@ -1597,7 +1603,7 @@ impl ChatModel {
             let sys_end = self.cached.iter().chain(tail).enumerate().filter(|(_, &t)| t == self.im_start).nth(1).map(|(i, _)| i);
             loop {
                 let mut mark = ((start + done) / Q35_CKPT_TOKENS + 1) * Q35_CKPT_TOKENS - start;
-                if let Some(s) = sys_end.filter(|&s| s > start + done && s - start < mark && s >= ConvSnapshots::MIN_TOKENS) {
+                if let Some(s) = sys_end.filter(|&s| s > start + done && s - start < mark && s >= 16) {
                     mark = s - start;
                 }
                 if mark >= tail.len() {
@@ -1633,10 +1639,11 @@ impl ChatModel {
                 self.conv_snaps.insert(self.cached.clone(), snap);
             }
         }
+        let min_restore = if self.engine.is_qwen35() { 16 } else { ConvSnapshots::MIN_TOKENS };
         if let Some((i, n)) = if self.session_kv_enabled() { None } else { self.conv_snaps.best(prompt) } {
             let n = n.min(prompt.len().saturating_sub(1));
             let n = Backend::usable_prefix(&self.conv_snaps.entries[i].1, n);
-            if n >= common + ConvSnapshots::MIN_TOKENS && self.engine.restore_prefix(&self.conv_snaps.entries[i].1, n) {
+            if n >= common + min_restore && self.engine.restore_prefix(&self.conv_snaps.entries[i].1, n) {
                 self.cached.clear();
                 self.cached.extend_from_slice(&prompt[..n]);
                 self.conv_snaps.touch(i);
@@ -1995,18 +2002,21 @@ impl ChatModel {
             let mut drafted = 0usize;
             let mut source = SpecSource::None;
 
-            // Tier 1: prompt/history suffix lookup (greedy only; copies up to 16 tokens).
+            // Tier 1: previous-reply continuation or prompt/history suffix lookup (greedy only).
             if lookup_cooldown > 0 {
                 lookup_cooldown -= 1;
-            } else if spec_ok && greedy && max_lookup >= 3 {
-                drafted = if self.engine.is_qwen35() {
-                    self.sync_lookup();
-                    let d = self.look.draft_with(self.look_ctx, &[next], max_lookup);
-                    draft_tokens[..d.len()].copy_from_slice(&d);
-                    d.len()
-                } else {
-                    find_suffix_continuation(&self.cached, next, max_lookup, &mut draft_tokens)
-                };
+            } else if spec_ok && greedy && max_lookup >= 2 {
+                drafted = draft_from_prev_reply(&self.prev_reply, &reply, max_lookup, &mut draft_tokens);
+                if drafted < 2 && max_lookup >= 3 {
+                    drafted = if self.engine.is_qwen35() {
+                        self.sync_lookup();
+                        let d = self.look.draft_with(self.look_ctx, &[next], max_lookup);
+                        draft_tokens[..d.len()].copy_from_slice(&d);
+                        d.len()
+                    } else {
+                        find_suffix_continuation(&self.cached, next, max_lookup, &mut draft_tokens)
+                    };
+                }
                 if drafted >= 2 {
                     source = SpecSource::Lookup;
                 } else {
@@ -2314,6 +2324,7 @@ impl ChatModel {
         };
 
         self.save_active_session();
+        self.prev_reply.clone_from(&reply);
         let completion_tokens = reply.len();
         // Everything after `<|im_start|>assistant\n` in the KV cache: forced prefix + reply.
         let base_len = if assistant_prefix.is_empty() { prompt.len() } else { self.render_tokens(&msgs, tools_json, "").len() };
@@ -3749,6 +3760,37 @@ fn find_balanced_json_object_end(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Drafts up to `max_k` continuation tokens from `prev` (the previous turn's reply) when `reply`
+/// matches a prefix or a 2..=3-token n-gram of `prev` (e.g. incremental live translation edits).
+fn draft_from_prev_reply(prev: &[usize], reply: &[usize], max_k: usize, out: &mut [usize]) -> usize {
+    let r_len = reply.len();
+    let limit = max_k.min(out.len());
+    if r_len == 0 || prev.len() <= r_len || limit == 0 {
+        return 0;
+    }
+    if prev.starts_with(reply) {
+        let count = (prev.len() - r_len).min(limit);
+        out[..count].copy_from_slice(&prev[r_len..r_len + count]);
+        return count;
+    }
+    for ngram in [3usize, 2] {
+        if r_len < ngram || prev.len() <= ngram {
+            continue;
+        }
+        let pat = &reply[r_len - ngram..];
+        for i in (ngram..prev.len()).rev() {
+            if &prev[i - ngram..i] == pat {
+                let count = (prev.len() - i).min(limit);
+                if count >= 2 {
+                    out[..count].copy_from_slice(&prev[i..i + count]);
+                    return count;
+                }
+            }
+        }
+    }
+    0
 }
 
 /// Scans `cached` + `next` backwards for a 6-, 5-, or 4-token suffix match and copies up to `max_k` continuation tokens.

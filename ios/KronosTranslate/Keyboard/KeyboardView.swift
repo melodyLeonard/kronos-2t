@@ -346,13 +346,29 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         onHeightChange?(height)
     }
 
+    /// Fast path for live token streaming: avoids rebuilding button configurations on every token.
+    func setStreamingPreview(_ t: String, active: Bool) {
+        if case .preview = state {
+            state = .preview(t)
+            status.text = t
+            status.textColor = ink
+            if active { spinner.startAnimating() } else { spinner.stopAnimating() }
+            return
+        }
+        setState(.preview(t))
+        if active { spinner.startAnimating() }
+    }
+
     /// Keeps the previous preview visible while a newer one is in flight.
     func setTranslating() {
         let keep = state
         if case .translating = keep { return }   // already spinning; nothing to redraw
+        if case .preview = keep {
+            spinner.startAnimating()
+            return
+        }
         state = .translating
         setState(.translating)
-        if case .preview(let old) = keep { status.text = old }
     }
 
     func flash(_ message: String) {

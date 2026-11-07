@@ -4699,6 +4699,24 @@ impl PageAlignedBytes {
     pub fn page_alloc_bytes(&self) -> usize {
         self.alloc_bytes
     }
+
+    /// Locks the allocation into physical RAM (`mlock`) so the OS never pages it out to swap.
+    pub fn mlock(&self) -> usize {
+        if self.alloc_bytes == 0 {
+            return 0;
+        }
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn mlock(addr: *const std::ffi::c_void, len: usize) -> i32;
+            }
+            // SAFETY: `ptr` is page-aligned and valid for `alloc_bytes`.
+            if unsafe { mlock(self.ptr.as_ptr().cast(), self.alloc_bytes) } == 0 {
+                return self.alloc_bytes;
+            }
+        }
+        0
+    }
 }
 
 impl Default for PageAlignedBytes {
