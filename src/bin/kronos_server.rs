@@ -100,6 +100,9 @@ struct LiveTurnBroadcast {
 
 struct Server {
     model: Mutex<ChatModel>,
+    /// `--translate-model`: a translation-only model (Hy-MT2) that `/translate` uses for the
+    /// languages it covers; other targets go to `model`.
+    translate_model: Option<Mutex<ChatModel>>,
     name: String,
     api_key: Option<String>,
     workdir: Mutex<PathBuf>,
@@ -217,8 +220,11 @@ fn admin_status_json(srv: &Server) -> String {
         .map(|(n, f, c, w, h)| format!(r#"{{"name":{},"threads":{},"ctx":{c},"wire_gib":{w},"hot_shard":{h}}}"#, quote(n), ((cores as f64 * f).round() as usize).max(1)))
         .collect();
     format!(
-        r#"{{"model":{},"model_dir":{},"mode":{},"ctx":{ctx},"threads":{threads},"cores":{cores},"weights_gib":{:.2},"kv_gib":{:.2},"effort":{},"hot_shard":{},"uptime_s":{:.0},"pid":{},"efforts":[{}]}}"#,
+        r#"{{"model":{},"translate_model":{},"model_dir":{},"mode":{},"ctx":{ctx},"threads":{threads},"cores":{cores},"weights_gib":{:.2},"kv_gib":{:.2},"effort":{},"hot_shard":{},"uptime_s":{:.0},"pid":{},"efforts":[{}]}}"#,
         quote(&srv.name),
+        srv.translate_model
+            .as_ref()
+            .map_or("null".to_string(), |m| quote(&m.lock().unwrap_or_else(|p| p.into_inner()).name)),
         quote(&srv.launch_args[1]),
         quote(&arg_value(&srv.launch_args, "--mode").unwrap_or_else(|| "p55454".to_string())),
         weights as f64 / (1u64 << 30) as f64,
@@ -890,8 +896,9 @@ fn format_completion_response(
     )
 }
 
-/// `/translate`: `{"text","to","from","tone","context":[..]}` -> `{"text"}`. Thinking is suppressed with an empty
-/// `<think>` prefix on Qwen3 models; output is capped from the input length.
+/// `/translate`: `{"text","to","from","tone","context":[..]}` -> `{"text"}`. Targets Hy-MT2 covers go to
+/// `--translate-model` when loaded (single user turn, model-card sampling); the rest to the main model, with
+/// thinking suppressed by an empty `<think>` prefix on Qwen3. Output is capped from the input length.
 fn translate(srv: &Server, stream: &mut TcpStream, req: &Request) {
     let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
         Ok(b) => b,
@@ -905,25 +912,24 @@ fn translate(srv: &Server, stream: &mut TcpStream, req: &Request) {
     let from = body.get("from").and_then(Json::as_str).unwrap_or("auto");
     let tone = body.get("tone").and_then(Json::as_str).unwrap_or("neutral");
     let context = translate_context(&body);
-    let mut model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
-    let messages = match model.prompt_style() {
-        PromptStyle::HunYuan => {
-            vec![Message::new("user", &kronos_2t::config::prompts::translate_user_hunyuan(to, from, tone, &context, text))]
-        }
-        PromptStyle::ChatMl => vec![
-            Message::new("system", &kronos_2t::config::prompts::translate_system(to, from, tone, &context)),
-            Message::new("user", text),
-        ],
+    let routed = srv.translate_model.as_ref().filter(|_| kronos_2t::config::prompts::hy_mt2_supports(to));
+    let mut model = routed.unwrap_or(&srv.model).lock().unwrap_or_else(|p| p.into_inner());
+    let max_tokens = (text.len() / 2 + TRANSLATE_TOKENS_BASE).clamp(TRANSLATE_TOKENS_MIN, TRANSLATE_TOKENS_MAX);
+    let (messages, params) = match model.prompt_style() {
+        PromptStyle::HunYuan => (
+            vec![Message::new("user", &kronos_2t::config::prompts::translate_user_hunyuan(to, from, tone, &context, text))],
+            // Hy-MT2 model card: temperature 0.7, top_p 0.6, top_k 20, repetition_penalty 1.05.
+            GenParams { temperature: 0.7, top_k: 20, top_p: 0.6, repeat_penalty: 1.05, max_tokens, seed: 0 },
+        ),
+        PromptStyle::ChatMl => (
+            vec![
+                Message::new("system", &kronos_2t::config::prompts::translate_system(to, from, tone, &context)),
+                Message::new("user", text),
+            ],
+            GenParams { temperature: 0.0, top_k: 40, top_p: 0.9, repeat_penalty: 1.02, max_tokens, seed: 0 },
+        ),
     };
-    let params = GenParams {
-        temperature: 0.0,
-        top_k: 40,
-        top_p: 0.9,
-        repeat_penalty: 1.02,
-        max_tokens: (text.len() / 2 + TRANSLATE_TOKENS_BASE).clamp(TRANSLATE_TOKENS_MIN, TRANSLATE_TOKENS_MAX),
-        seed: 0,
-    };
-    let prefix = if srv.name.to_ascii_lowercase().contains("qwen3") { "<think>\n\n</think>\n\n" } else { "" };
+    let prefix = if model.name.to_ascii_lowercase().contains("qwen3") { "<think>\n\n</think>\n\n" } else { "" };
     match model.generate_with_tools_prefixed(&messages, &[], prefix, &params, |_| true) {
         Ok(c) => respond(stream, 200, "application/json", &format!(r#"{{"text":{}}}"#, quote(&clean_translation(&c.text)))),
         Err(e) => error(stream, 400, &e),
@@ -3134,7 +3140,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args[1].starts_with("--") {
         eprintln!(
-            "usage: {} <model_dir> [--draft DIR] [--workdir DIR] [--state-dir DIR] [--cache-dir DIR] [--host 127.0.0.1] [--port 18080] [--api-key KEY] [--mode nf4g128] ...",
+            "usage: {} <model_dir> [--draft DIR] [--translate-model DIR] [--workdir DIR] [--state-dir DIR] [--cache-dir DIR] [--host 127.0.0.1] [--port 18080] [--api-key KEY] [--mode nf4g128] ...",
             args[0]
         );
         std::process::exit(2);
@@ -3232,6 +3238,32 @@ fn main() {
                 std::process::exit(1);
             });
     }
+    // Translation-only model for `/translate` (same mode/calibration flags unless `--translate-mode`).
+    let translate_model = flag("--translate-model").map(|dir| {
+        let t_mode = flag("--translate-mode").unwrap_or_else(|| mode.clone());
+        eprintln!("loading translate model {dir} ({t_mode})...");
+        let mut m = ChatModel::load_with_cache_dir(
+            Path::new(&dir),
+            cache_dir_opt,
+            &t_mode,
+            flag("--translate-ctx").map_or(4096, |v| v.parse().expect("numeric --translate-ctx")),
+            num("--threads", default_threads) as usize,
+            calib_opt,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("translate model: {e}");
+            std::process::exit(1);
+        });
+        if require_metal {
+            m.enable_metal().unwrap_or_else(|e| {
+                eprintln!("metal error: {e}");
+                std::process::exit(1);
+            });
+        } else if !force_cpu {
+            let _ = m.enable_metal();
+        }
+        Mutex::new(m)
+    });
     if args.iter().any(|a| a == "--ane") {
         #[cfg(all(feature = "ane", target_os = "macos"))]
         match model.enable_ane(&model_dir.join("ane")) {
@@ -3334,6 +3366,7 @@ fn main() {
     let srv = Arc::new(Server {
         name: model.name.clone(),
         model: Mutex::new(model),
+        translate_model,
         api_key: flag("--api-key"),
         workdir: Mutex::new(workdir.clone()),
         state_dir,

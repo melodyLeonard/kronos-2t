@@ -2,7 +2,11 @@
 //! with one to three context lines) to a running `kronos_server` and prints a Markdown table
 //! with the output and latency of each, plus the decode rate the server reports.
 //!
-//! Usage: `translate_eval [--url http://127.0.0.1:18085] [--label name] [--repeat 1]`
+//! `--latency` instead sends, per case, three short variants of the text with the same context
+//! and tone (as the keyboard does while the user types) and prints p50/p95 of the first request
+//! (fresh prefix) and of the follow-ups (prefix reused).
+//!
+//! Usage: `translate_eval [--url http://127.0.0.1:18085] [--label name] [--repeat 1] [--latency]`
 
 use kronos_2t::util::json::Json;
 use std::io::{Read, Write};
@@ -29,6 +33,13 @@ const CASES: &[Case] = &[
     Case { text: "Please find attached the revised contract for your review.", to: "Spanish", tone: "formal", context: &["Following up on our call this morning.", "Legal has approved the changes.", "Let me know if you have questions."] },
 ];
 
+/// Short (5 to 15 word) follow-up texts sent with each case's context in `--latency` mode.
+const VARIANTS: [&str; 3] = [
+    "ok see you there at eight",
+    "sorry I can't make it tonight, maybe next week?",
+    "thanks a lot, that really helps me out",
+];
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned());
@@ -37,11 +48,13 @@ fn main() {
     let repeat: usize = flag("--repeat").map_or(1, |v| v.parse().expect("numeric --repeat"));
     let (host, port) = parse_url(&url);
 
-    let model = http(&host, port, "GET", "/v1/admin/status", "")
-        .and_then(|b| Json::parse(&b).ok())
-        .and_then(|j| j.get("model").and_then(Json::as_str).map(String::from))
-        .unwrap_or_else(|| "?".to_string());
-    println!("### {label}\n\nmodel: `{model}`\n");
+    let status = http(&host, port, "GET", "/v1/admin/status", "").and_then(|b| Json::parse(&b).ok());
+    let model = status.as_ref().and_then(|j| j.get("model").and_then(Json::as_str).map(String::from)).unwrap_or_else(|| "?".to_string());
+    let tmodel = status.as_ref().and_then(|j| j.get("translate_model").and_then(Json::as_str).map(String::from));
+    println!("### {label}\n\nmodel: `{model}`{}\n", tmodel.map_or(String::new(), |t| format!(" · translate model: `{t}`")));
+    if args.iter().any(|a| a == "--latency") {
+        return latency(&host, port);
+    }
     println!("| # | to | tone | input | output | latency |");
     println!("|---|---|---|---|---|---|");
     let mut total = Duration::ZERO;
@@ -84,6 +97,58 @@ fn main() {
         total.as_secs_f64(),
         CASES.len(),
         out_chars as f64 / total.as_secs_f64().max(1e-9)
+    );
+}
+
+fn request(host: &str, port: u16, c: &Case, text: &str) -> (String, Duration) {
+    let ctx: Vec<Json> = c.context.iter().map(|s| Json::Str((*s).to_string())).collect();
+    let body = Json::Obj(vec![
+        ("text".into(), Json::Str(text.into())),
+        ("to".into(), Json::Str(c.to.into())),
+        ("tone".into(), Json::Str(c.tone.into())),
+        ("context".into(), Json::Arr(ctx)),
+    ])
+    .stringify();
+    let t0 = Instant::now();
+    let resp = http(host, port, "POST", "/translate", &body).unwrap_or_default();
+    let dt = t0.elapsed();
+    let text = Json::parse(&resp)
+        .ok()
+        .and_then(|j| j.get("text").and_then(Json::as_str).map(String::from))
+        .unwrap_or_else(|| format!("<error: {}>", resp.trim()));
+    (text, dt)
+}
+
+fn pct(v: &mut [f64], p: f64) -> f64 {
+    v.sort_by(f64::total_cmp);
+    v[((v.len() as f64 - 1.0) * p).round() as usize]
+}
+
+/// `--latency`: first request per case (new context) vs the follow-ups sharing it.
+fn latency(host: &str, port: u16) {
+    let (mut first, mut warm) = (Vec::new(), Vec::new());
+    println!("| # | to | first (new context) | follow-ups (same context) |");
+    println!("|---|---|---|---|");
+    for (i, c) in CASES.iter().enumerate() {
+        let (_, d0) = request(host, port, c, c.text);
+        let mut ds = Vec::new();
+        for v in VARIANTS {
+            let (out, d) = request(host, port, c, v);
+            assert!(!out.starts_with("<error"), "{out}");
+            ds.push(d.as_secs_f64());
+        }
+        first.push(d0.as_secs_f64());
+        warm.extend(ds.iter().copied());
+        let cells: Vec<String> = ds.iter().map(|d| format!("{:.0} ms", d * 1e3)).collect();
+        println!("| {} | {} | {:.0} ms | {} |", i + 1, c.to, d0.as_secs_f64() * 1e3, cells.join(" / "));
+    }
+    println!(
+        "\nfirst request: p50 {:.0} ms, p95 {:.0} ms · follow-ups with the same context: p50 {:.0} ms, p95 {:.0} ms (n={})\n",
+        pct(&mut first, 0.5) * 1e3,
+        pct(&mut first, 0.95) * 1e3,
+        pct(&mut warm, 0.5) * 1e3,
+        pct(&mut warm, 0.95) * 1e3,
+        warm.len()
     );
 }
 

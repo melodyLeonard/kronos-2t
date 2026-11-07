@@ -92,6 +92,33 @@ pub fn translate_system(to: &str, from: &str, tone: &str, context: &[String]) ->
     s
 }
 
+/// Languages Hy-MT2 translates (model card), as English names and ISO codes; `/translate` routes
+/// other targets (Yoruba, Igbo, Hausa, Swahili, ...) to the general model.
+pub const HY_MT2_LANGUAGES: &[(&str, &str)] = &[
+    ("zh", "Chinese"), ("en", "English"), ("fr", "French"), ("pt", "Portuguese"), ("es", "Spanish"),
+    ("ja", "Japanese"), ("tr", "Turkish"), ("ru", "Russian"), ("ar", "Arabic"), ("ko", "Korean"),
+    ("th", "Thai"), ("it", "Italian"), ("de", "German"), ("vi", "Vietnamese"), ("ms", "Malay"),
+    ("id", "Indonesian"), ("fil", "Filipino"), ("hi", "Hindi"), ("zh-Hant", "Traditional Chinese"),
+    ("pl", "Polish"), ("cs", "Czech"), ("nl", "Dutch"), ("km", "Khmer"), ("my", "Burmese"),
+    ("fa", "Persian"), ("gu", "Gujarati"), ("ur", "Urdu"), ("te", "Telugu"), ("mr", "Marathi"),
+    ("he", "Hebrew"), ("bn", "Bengali"), ("ta", "Tamil"), ("uk", "Ukrainian"), ("bo", "Tibetan"),
+    ("kk", "Kazakh"), ("mn", "Mongolian"), ("ug", "Uyghur"), ("yue", "Cantonese"),
+];
+
+/// Whether Hy-MT2 covers `lang` (English name or ISO code, case-insensitive; `Mandarin`,
+/// `Tagalog`, `Farsi` and `Simplified Chinese` are accepted aliases).
+pub fn hy_mt2_supports(lang: &str) -> bool {
+    let l = lang.trim().to_ascii_lowercase();
+    let l = match l.as_str() {
+        "mandarin" | "simplified chinese" | "chinese (simplified)" => "chinese",
+        "chinese (traditional)" => "traditional chinese",
+        "tagalog" => "filipino",
+        "farsi" => "persian",
+        other => other,
+    };
+    HY_MT2_LANGUAGES.iter().any(|(code, name)| code.eq_ignore_ascii_case(l) || name.eq_ignore_ascii_case(l))
+}
+
 /// Register clause for Hy-MT2 prompts, in the model card's `[style]` form.
 fn hunyuan_style(tone: &str) -> Option<&'static str> {
     match tone.to_ascii_lowercase().as_str() {
@@ -138,7 +165,17 @@ pub fn translate_user_hunyuan(to: &str, from: &str, tone: &str, context: &[Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{translate_system, translate_user_hunyuan};
+    use super::{hy_mt2_supports, translate_system, translate_user_hunyuan};
+
+    #[test]
+    fn hy_mt2_language_routing() {
+        for l in ["French", "spanish", "de", "zh-Hant", "Cantonese", "Farsi", "Tagalog"] {
+            assert!(hy_mt2_supports(l), "{l}");
+        }
+        for l in ["Yoruba", "Igbo", "Hausa", "Swahili", "yo", ""] {
+            assert!(!hy_mt2_supports(l), "{l}");
+        }
+    }
 
     #[test]
     fn translate_system_includes_tone_and_context() {
