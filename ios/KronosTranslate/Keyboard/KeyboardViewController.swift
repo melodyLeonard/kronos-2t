@@ -61,7 +61,8 @@ final class KeyboardViewController: UIInputViewController {
     private func handle(_ key: KeyboardView.Key) {
         switch key {
         case .char(let s):
-            textDocumentProxy.insertText(board.shift == .off ? s : s.uppercased())
+            let cased = Layouts.layout(for: Prefs.sourceCode).cased
+            textDocumentProxy.insertText(board.shift == .off || !cased ? s : s.uppercased())
             if board.shift == .on { board.setShift(.off) }
         case .space:
             textDocumentProxy.insertText(" ")

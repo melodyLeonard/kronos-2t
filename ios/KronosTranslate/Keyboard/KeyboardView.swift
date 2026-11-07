@@ -136,7 +136,8 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
             let l = Layouts.layout(for: Prefs.sourceCode)
             rows.append(letters(l.rows[0]))
             rows.append(letters(l.rows[1]))
-            rows.append([(key("sf:shift", .shift, fn: true), fn)] + letters(l.rows[2]) + [(key("sf:delete.left", .backspace, fn: true), fn)])
+            let shiftKey: [(KeyButton, CGFloat)] = l.cased ? [(key("sf:shift", .shift, fn: true), fn)] : []
+            rows.append(shiftKey + letters(l.rows[2]) + [(key("sf:delete.left", .backspace, fn: true), fn)])
             rows.append(bottom(left: (key("123", .page(.numbers), fn: true), big)))
         case .numbers:
             rows.append(letters("1234567890"))
@@ -172,18 +173,23 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         emojiView?.frame = bounds
         sheet?.frame = bounds
         let W = bounds.width, gap: CGFloat = 6, margin: CGFloat = 3
-        let unit = floor((W - 2 * margin - 9 * gap) / 10)
+        // Letter width from the widest letter row (10 on QWERTY, 11 on Cyrillic/Arabic).
+        let widest = max(10, rows.prefix(2).map { $0.filter { $0.1 == 1 }.count }.max() ?? 10)
+        let unit = floor((W - 2 * margin - CGFloat(widest - 1) * gap) / CGFloat(widest))
         let rowH: CGFloat = 42, rowGap: CGFloat = 12
         for (i, r) in rows.enumerated() {
-            let fixed = r.map { $0.1 * unit }.reduce(0, +)
+            var fixed = r.map { $0.1 * unit }.reduce(0, +)
             let flexCount = r.filter { $0.1 == 0 }.count
             let avail = W - 2 * margin - gap * CGFloat(r.count - 1)
+            // A row wider than the screen (11 letters + delete) shrinks evenly.
+            let squeeze = flexCount == 0 && fixed > avail ? avail / fixed : 1
+            fixed *= squeeze
             let flexW = flexCount > 0 ? (avail - fixed) / CGFloat(flexCount) : 0
             let total = fixed + flexW * CGFloat(flexCount) + gap * CGFloat(r.count - 1)
             var x = (W - total) / 2
             let y = CGFloat(i) * (rowH + rowGap)
             for (b, u) in r {
-                let w = u == 0 ? flexW : u * unit
+                let w = u == 0 ? flexW : u * unit * squeeze
                 b.frame = CGRect(x: x, y: y, width: floor(w), height: rowH)
                 x += floor(w) + gap
             }
@@ -264,8 +270,9 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         actionBtn.isHidden = false
         switch s {
         case .idle:
-            status.text = "Translation shows here as you type"
-            status.textColor = dark ? UIColor(white: 0.55, alpha: 1) : UIColor(white: 0.6, alpha: 1)
+            status.text = "Translation appears here as you type"
+            status.font = .systemFont(ofSize: 12)
+            status.textColor = dark ? UIColor(white: 0.55, alpha: 1) : UIColor(white: 0.62, alpha: 1)
             accent.backgroundColor = dark ? UIColor(white: 0.45, alpha: 1) : UIColor(white: 0.75, alpha: 1)
             actionBtn.isHidden = true
         case .translating:
@@ -312,7 +319,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         for (b, _) in rows.flatMap({ $0 }) {
             if b.label == "sf:shift" {
                 b.setSymbol(shift == .lock ? "capslock.fill" : (shift == .on ? "shift.fill" : "shift"))
-            } else if !b.fn, b.label.count == 1, b.label.first!.isLetter {
+            } else if !b.fn, b.label.count == 1, b.label.first!.isLetter, Layouts.layout(for: Prefs.sourceCode).cased {
                 b.setTitle(shift == .off ? b.label : b.label.uppercased())
             }
         }
@@ -500,16 +507,35 @@ final class LanguageSheet: UIView {
         let blue = UIColor(red: 0, green: 0.478, blue: 1, alpha: 1)
         let current = side == .to ? Prefs.targetCode : Prefs.sourceCode
 
-        let title = UILabel()
-        title.text = side == .to ? "Translate to" : "I type in"
-        title.font = .systemFont(ofSize: 17, weight: .semibold); title.textColor = ink
+        // Two selectors; the active one is highlighted and the list below fills it.
+        func selector(_ label: String, _ code: String, active: Bool, _ k: KeyboardView.Key) -> UIButton {
+            var c = UIButton.Configuration.filled()
+            c.cornerStyle = .medium
+            c.baseBackgroundColor = active ? blue : card
+            c.contentInsets = .init(top: 6, leading: 12, bottom: 6, trailing: 10)
+            let a = NSMutableAttributedString(string: label + "\n", attributes: [.font: UIFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: active ? UIColor(white: 1, alpha: 0.8) : UIColor.systemGray])
+            a.append(NSAttributedString(string: Languages.by(code: code).name, attributes: [.font: UIFont.systemFont(ofSize: 15, weight: .semibold), .foregroundColor: active ? UIColor.white : ink]))
+            c.attributedTitle = AttributedString(a)
+            c.titleAlignment = .leading
+            c.image = UIImage(systemName: "chevron.up.chevron.down", withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .bold))
+            c.imagePlacement = .trailing
+            c.imagePadding = 6
+            c.baseForegroundColor = active ? .white : .systemGray
+            let b = UIButton(configuration: c)
+            b.contentHorizontalAlignment = .fill
+            b.addAction(UIAction { _ in send(k) }, for: .touchUpInside)
+            return b
+        }
+        let fromSel = selector("I TYPE IN", Prefs.sourceCode, active: side == .from, .pickSource(Prefs.sourceCode))
+        let toSel = selector("THEY RECEIVE IN", Prefs.targetCode, active: side == .to, .pickLanguage(Prefs.targetCode))
         let done = UIButton(type: .system)
         done.setTitle("Done", for: .normal)
         done.titleLabel?.font = .systemFont(ofSize: 17, weight: .semibold)
         done.addAction(UIAction { _ in send(.sheet(false)) }, for: .touchUpInside)
         done.setContentHuggingPriority(.required, for: .horizontal)
-        let head = UIStackView(arrangedSubviews: [title, UIView(), done]); head.axis = .horizontal
-        head.layoutMargins = .init(top: 0, left: 6, bottom: 0, right: 6); head.isLayoutMarginsRelativeArrangement = true
+        let head = UIStackView(arrangedSubviews: [fromSel, toSel, done]); head.axis = .horizontal; head.spacing = 8
+        head.distribution = .fill
+        fromSel.widthAnchor.constraint(equalTo: toSel.widthAnchor).isActive = true
 
         // Recently used first, then the rest alphabetically; the current one is checked.
         let recent = (side == .to ? Prefs.recents : [Prefs.sourceCode]).map(Languages.by)
@@ -552,17 +578,7 @@ final class LanguageSheet: UIView {
             list.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor),
         ])
 
-        // One quiet link to the other side; picking the typing language also picks the key layout.
-        let foot = UIButton(type: .system)
-        var fc = UIButton.Configuration.plain()
-        fc.contentInsets = .init(top: 4, leading: 6, bottom: 4, trailing: 6)
-        let other = side == .to ? "I type in \(Languages.by(code: Prefs.sourceCode).name)" : "Translate to \(Languages.by(code: Prefs.targetCode).name)"
-        fc.attributedTitle = AttributedString(other + "  ›", attributes: .init([.font: UIFont.systemFont(ofSize: 13), .foregroundColor: UIColor.systemGray]))
-        foot.configuration = fc
-        foot.contentHorizontalAlignment = .leading
-        foot.addAction(UIAction { _ in send(side == .to ? .pickSource(Prefs.sourceCode) : .pickLanguage(Prefs.targetCode)) }, for: .touchUpInside)
-
-        let v = UIStackView(arrangedSubviews: [head, scroll, foot])
+        let v = UIStackView(arrangedSubviews: [head, scroll])
         v.axis = .vertical; v.spacing = 8
         v.translatesAutoresizingMaskIntoConstraints = false
         addSubview(v)

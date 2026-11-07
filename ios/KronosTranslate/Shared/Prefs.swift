@@ -62,6 +62,7 @@ struct Language: Identifiable, Hashable {
     var id: String { code }
 }
 
+/// Every language the server can serve: Hy-MT2's 38 plus the ones the general model covers.
 enum Languages {
     static let all: [Language] = [
         .init(code: "EN", name: "English", native: "English"),
@@ -73,22 +74,40 @@ enum Languages {
         .init(code: "NL", name: "Dutch", native: "Nederlands"),
         .init(code: "PL", name: "Polish", native: "Polski"),
         .init(code: "CS", name: "Czech", native: "Čeština"),
+        .init(code: "SK", name: "Slovak", native: "Slovenčina"),
+        .init(code: "HU", name: "Hungarian", native: "Magyar"),
+        .init(code: "RO", name: "Romanian", native: "Română"),
+        .init(code: "SV", name: "Swedish", native: "Svenska"),
+        .init(code: "DA", name: "Danish", native: "Dansk"),
+        .init(code: "NO", name: "Norwegian", native: "Norsk"),
+        .init(code: "FI", name: "Finnish", native: "Suomi"),
+        .init(code: "EL", name: "Greek", native: "Ελληνικά"),
         .init(code: "UK", name: "Ukrainian", native: "Українська"),
         .init(code: "RU", name: "Russian", native: "Русский"),
+        .init(code: "KK", name: "Kazakh", native: "Қазақша"),
+        .init(code: "MN", name: "Mongolian", native: "Монгол"),
         .init(code: "TR", name: "Turkish", native: "Türkçe"),
         .init(code: "AR", name: "Arabic", native: "العربية"),
         .init(code: "FA", name: "Persian", native: "فارسی"),
+        .init(code: "UR", name: "Urdu", native: "اردو"),
+        .init(code: "UG", name: "Uyghur", native: "ئۇيغۇرچە"),
         .init(code: "HE", name: "Hebrew", native: "עברית"),
         .init(code: "HI", name: "Hindi", native: "हिन्दी"),
         .init(code: "BN", name: "Bengali", native: "বাংলা"),
-        .init(code: "UR", name: "Urdu", native: "اردو"),
+        .init(code: "GU", name: "Gujarati", native: "ગુજરાતી"),
+        .init(code: "MR", name: "Marathi", native: "मराठी"),
         .init(code: "TA", name: "Tamil", native: "தமிழ்"),
         .init(code: "TE", name: "Telugu", native: "తెలుగు"),
-        .init(code: "ZH", name: "Chinese", native: "中文"),
+        .init(code: "BO", name: "Tibetan", native: "བོད་སྐད"),
+        .init(code: "ZH", name: "Chinese (Simplified)", native: "简体中文"),
+        .init(code: "ZT", name: "Chinese (Traditional)", native: "繁體中文"),
+        .init(code: "YUE", name: "Cantonese", native: "粵語"),
         .init(code: "JA", name: "Japanese", native: "日本語"),
         .init(code: "KO", name: "Korean", native: "한국어"),
         .init(code: "VI", name: "Vietnamese", native: "Tiếng Việt"),
         .init(code: "TH", name: "Thai", native: "ไทย"),
+        .init(code: "KM", name: "Khmer", native: "ខ្មែរ"),
+        .init(code: "MY", name: "Burmese", native: "မြန်မာ"),
         .init(code: "ID", name: "Indonesian", native: "Bahasa Indonesia"),
         .init(code: "MS", name: "Malay", native: "Bahasa Melayu"),
         .init(code: "FIL", name: "Filipino", native: "Filipino"),
@@ -96,6 +115,8 @@ enum Languages {
         .init(code: "IG", name: "Igbo", native: "Igbo"),
         .init(code: "HA", name: "Hausa", native: "Hausa"),
         .init(code: "SW", name: "Swahili", native: "Kiswahili"),
+        .init(code: "AM", name: "Amharic", native: "አማርኛ"),
+        .init(code: "ZU", name: "Zulu", native: "isiZulu"),
     ]
     static func by(code: String) -> Language { all.first { $0.code == code } ?? all[0] }
 }
