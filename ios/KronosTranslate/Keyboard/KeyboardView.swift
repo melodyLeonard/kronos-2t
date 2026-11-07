@@ -236,7 +236,6 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         c.attributedTitle = AttributedString(a)
         pill.configuration = c
         setState(state)
-        if sheetOpen { setSheet(true) }
     }
 
     private func shadow(_ v: UIView, _ color: UIColor) {
@@ -494,100 +493,91 @@ final class AccentPopup: UIView {
     }
 }
 
-/// Language + tone picker that takes the place of the key rows. `from` picks the typing
-/// language (and key layout), `to` the translation target.
-final class LanguageSheet: UIView {
+/// Language picker: the system wheel, two columns (typing language | receiving language).
+final class LanguageSheet: UIView, UIPickerViewDataSource, UIPickerViewDelegate {
     enum Side { case from, to }
+    private let send: (KeyboardView.Key) -> Void
+    private let wheel = UIPickerView()
+    private let dark: Bool
+    private let langs = Languages.all
 
     init(dark: Bool, side: Side, send: @escaping (KeyboardView.Key) -> Void) {
+        self.send = send
+        self.dark = dark
         super.init(frame: .zero)
         backgroundColor = dark ? UIColor(white: 0.17, alpha: 1) : UIColor(red: 0.82, green: 0.827, blue: 0.851, alpha: 1)
         let ink: UIColor = dark ? .white : .black
-        let card: UIColor = dark ? UIColor(white: 0.353, alpha: 1) : .white
-        let blue = UIColor(red: 0, green: 0.478, blue: 1, alpha: 1)
-        let current = side == .to ? Prefs.targetCode : Prefs.sourceCode
 
-        // Two selectors; the active one is highlighted and the list below fills it.
-        func selector(_ label: String, _ code: String, active: Bool, _ k: KeyboardView.Key) -> UIButton {
-            var c = UIButton.Configuration.filled()
-            c.cornerStyle = .medium
-            c.baseBackgroundColor = active ? blue : card
-            c.contentInsets = .init(top: 6, leading: 12, bottom: 6, trailing: 10)
-            let a = NSMutableAttributedString(string: label + "\n", attributes: [.font: UIFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: active ? UIColor(white: 1, alpha: 0.8) : UIColor.systemGray])
-            a.append(NSAttributedString(string: Languages.by(code: code).name, attributes: [.font: UIFont.systemFont(ofSize: 15, weight: .semibold), .foregroundColor: active ? UIColor.white : ink]))
-            c.attributedTitle = AttributedString(a)
-            c.titleAlignment = .leading
-            c.image = UIImage(systemName: "chevron.up.chevron.down", withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .bold))
-            c.imagePlacement = .trailing
-            c.imagePadding = 6
-            c.baseForegroundColor = active ? .white : .systemGray
-            let b = UIButton(configuration: c)
-            b.contentHorizontalAlignment = .fill
-            b.addAction(UIAction { _ in send(k) }, for: .touchUpInside)
-            return b
+        func header(_ s: String) -> UILabel {
+            let l = UILabel(); l.text = s.uppercased(); l.textAlignment = .center
+            l.font = .systemFont(ofSize: 11, weight: .semibold); l.textColor = .systemGray
+            return l
         }
-        let fromSel = selector("I TYPE IN", Prefs.sourceCode, active: side == .from, .pickSource(Prefs.sourceCode))
-        let toSel = selector("THEY RECEIVE IN", Prefs.targetCode, active: side == .to, .pickLanguage(Prefs.targetCode))
         let done = UIButton(type: .system)
         done.setTitle("Done", for: .normal)
         done.titleLabel?.font = .systemFont(ofSize: 17, weight: .semibold)
-        done.addAction(UIAction { _ in send(.sheet(false)) }, for: .touchUpInside)
-        done.setContentHuggingPriority(.required, for: .horizontal)
-        let head = UIStackView(arrangedSubviews: [fromSel, toSel, done]); head.axis = .horizontal; head.spacing = 8
-        head.distribution = .fill
-        fromSel.widthAnchor.constraint(equalTo: toSel.widthAnchor).isActive = true
+        done.addAction(UIAction { [weak self] _ in self?.commit(); send(.sheet(false)) }, for: .touchUpInside)
+        let heads = UIStackView(arrangedSubviews: [header("I type in"), header("They receive in")])
+        heads.axis = .horizontal; heads.distribution = .fillEqually
 
-        // Recently used first, then the rest alphabetically; the current one is checked.
-        let recent = (side == .to ? Prefs.recents : [Prefs.sourceCode]).map(Languages.by)
-        let rest = Languages.all.filter { l in !recent.contains { $0.code == l.code } }.sorted { $0.name < $1.name }
-        let list = UIStackView(); list.axis = .vertical
-        list.backgroundColor = card; list.layer.cornerRadius = 10; list.clipsToBounds = true
-        for (i, l) in (recent + rest).enumerated() {
-            let row = UIButton(type: .system)
-            var c = UIButton.Configuration.plain()
-            c.contentInsets = .init(top: 0, leading: 14, bottom: 0, trailing: 14)
-            c.titleAlignment = .leading
-            let a = NSMutableAttributedString(string: l.code.padding(toLength: 4, withPad: " ", startingAt: 0), attributes: [.font: UIFont.monospacedSystemFont(ofSize: 12, weight: .bold), .foregroundColor: dark ? UIColor(white: 0.75, alpha: 1) : UIColor.darkGray])
-            a.append(NSAttributedString(string: l.name + "  ", attributes: [.font: UIFont.systemFont(ofSize: 17), .foregroundColor: ink]))
-            a.append(NSAttributedString(string: l.native, attributes: [.font: UIFont.systemFont(ofSize: 14), .foregroundColor: UIColor.systemGray]))
-            c.attributedTitle = AttributedString(a)
-            if l.code == current {
-                c.image = UIImage(systemName: "checkmark", withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .bold))
-                c.imagePlacement = .trailing; c.baseForegroundColor = blue
-            }
-            row.configuration = c
-            row.contentHorizontalAlignment = l.code == current ? .fill : .leading
-            row.heightAnchor.constraint(equalToConstant: 44).isActive = true
-            row.addAction(UIAction { _ in send(side == .to ? .pickLanguage(l.code) : .pickSource(l.code)) }, for: .touchUpInside)
-            if i > 0 {
-                let sep = UIView(); sep.backgroundColor = dark ? UIColor(white: 0.45, alpha: 1) : UIColor(white: 0.9, alpha: 1)
-                sep.heightAnchor.constraint(equalToConstant: 0.5).isActive = true
-                list.addArrangedSubview(sep)
-            }
-            list.addArrangedSubview(row)
-        }
-        let scroll = UIScrollView()
-        scroll.disableEdgeBlur()
-        scroll.addSubview(list)
-        list.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            list.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
-            list.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
-            list.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
-            list.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
-            list.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor),
-        ])
+        wheel.dataSource = self
+        wheel.delegate = self
+        wheel.overrideUserInterfaceStyle = dark ? .dark : .light
+        let from = langs.firstIndex { $0.code == Prefs.sourceCode } ?? 0
+        let to = langs.firstIndex { $0.code == Prefs.targetCode } ?? 1
+        wheel.selectRow(from, inComponent: 0, animated: false)
+        wheel.selectRow(to, inComponent: 1, animated: false)
 
-        let v = UIStackView(arrangedSubviews: [head, scroll])
-        v.axis = .vertical; v.spacing = 8
-        v.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(v)
+        for v in [heads, wheel, done] { v.translatesAutoresizingMaskIntoConstraints = false; addSubview(v) }
         NSLayoutConstraint.activate([
-            v.topAnchor.constraint(equalTo: topAnchor, constant: 8),
-            v.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-            v.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            v.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
+            heads.topAnchor.constraint(equalTo: topAnchor, constant: 10),
+            heads.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            heads.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            heads.heightAnchor.constraint(equalToConstant: 16),
+            done.centerYAnchor.constraint(equalTo: wheel.centerYAnchor),
+            done.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            done.widthAnchor.constraint(equalToConstant: 52),
+            wheel.topAnchor.constraint(equalTo: heads.bottomAnchor, constant: -4),
+            wheel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            wheel.trailingAnchor.constraint(equalTo: done.leadingAnchor, constant: -4),
+            wheel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
+            heads.trailingAnchor.constraint(equalTo: wheel.trailingAnchor),
         ])
+        _ = ink
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    /// Writes both wheels back; the controller reloads the layout and preview.
+    private func commit() {
+        let from = langs[wheel.selectedRow(inComponent: 0)].code
+        let to = langs[wheel.selectedRow(inComponent: 1)].code
+        if from != Prefs.sourceCode { send(.pickSource(from)) }
+        if to != Prefs.targetCode { send(.pickLanguage(to)) }
+    }
+
+    func numberOfComponents(in pickerView: UIPickerView) -> Int { 2 }
+    func pickerView(_ pickerView: UIPickerView, numberOfRowsInComponent component: Int) -> Int { langs.count }
+    func pickerView(_ pickerView: UIPickerView, rowHeightForComponent component: Int) -> CGFloat { 34 }
+    func pickerView(_ pickerView: UIPickerView, viewForRow row: Int, forComponent component: Int, reusing view: UIView?) -> UIView {
+        let l = (view as? UILabel) ?? UILabel()
+        let lang = langs[row]
+        let a = NSMutableAttributedString(string: lang.name, attributes: [.font: UIFont.systemFont(ofSize: 17), .foregroundColor: dark ? UIColor.white : UIColor.black])
+        if lang.native != lang.name {
+            a.append(NSAttributedString(string: "  " + lang.native, attributes: [.font: UIFont.systemFont(ofSize: 13), .foregroundColor: UIColor.systemGray]))
+        }
+        l.attributedText = a
+        l.textAlignment = .center
+        l.adjustsFontSizeToFitWidth = true
+        l.minimumScaleFactor = 0.8
+        return l
+    }
+    func pickerView(_ pickerView: UIPickerView, didSelectRow row: Int, inComponent component: Int) {
+        // Same language on both sides: nudge the other wheel to what this one was.
+        let other = component == 0 ? 1 : 0
+        if wheel.selectedRow(inComponent: other) == row {
+            let prev = langs.firstIndex { $0.code == (component == 0 ? Prefs.sourceCode : Prefs.targetCode) } ?? 0
+            wheel.selectRow(prev, inComponent: other, animated: true)
+        }
+        commit()
+    }
 }

@@ -88,12 +88,12 @@ final class KeyboardViewController: UIInputViewController {
             if code == Prefs.sourceCode { Prefs.sourceCode = Prefs.targetCode }
             Prefs.targetCode = code; Prefs.touchRecent(code); sheetSide = .to
             cache.removeAll(); previewFor = ""
-            board.reload(); board.setSheet(true, side: .to)
+            board.reload()
         case .pickSource(let code):
             if code == Prefs.targetCode { Prefs.targetCode = Prefs.sourceCode }
             Prefs.sourceCode = code; sheetSide = .from
             cache.removeAll(); previewFor = ""
-            board.reload(); board.setSheet(true, side: .from)
+            board.reload()
         case .sheet(let open):
             board.setSheet(open, side: sheetSide)
             if !open { scheduleTranslate(fieldText(), now: true) }
