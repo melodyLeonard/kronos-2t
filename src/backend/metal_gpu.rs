@@ -333,6 +333,7 @@ struct RopeKvParams {
     sink_tokens: u32,
     ring_len: u32,
     has_qk_norm: u32,
+    qk_norm_after_rope: u32,
     eps: f32,
 }
 
@@ -1791,6 +1792,7 @@ impl MetalLlamaEngine {
                             sink_tokens: self.kv.sink_tokens as u32,
                             ring_len: self.kv.ring_len as u32,
                             has_qk_norm: u32::from(layer.qk_norm.is_some()),
+                            qk_norm_after_rope: u32::from(cfg.qk_norm_after_rope),
                             eps: cfg.rms_norm_eps,
                         };
                         msg_sel!(
@@ -2606,6 +2608,7 @@ struct RopeKvParams {
     uint sink_tokens;
     uint ring_len;
     uint has_qk_norm;
+    uint qk_norm_after_rope;
     float eps;
 };
 
@@ -4082,9 +4085,22 @@ kernel void qkv_rope_kv_store(
     device float* head = qkv + ulong(t) * ulong(p.qkv_rows) + ulong(b * hd);
     device const float* rope = rope_tab + ulong(pos) * ulong(hd);
 
-    // Per-head RMSNorm on Q and K before RoPE (Qwen3).
+    // Per-head RMSNorm on Q and K: before RoPE (Qwen3) or after it (HunYuan, rotated here first).
+    bool rot = true;
     if (p.has_qk_norm != 0u && b < p.num_q_heads + p.num_kv_heads) {
         device const float* w = (b < p.num_q_heads) ? q_norm : k_norm;
+        if (p.qk_norm_after_rope != 0u) {
+            for (uint e = 0u; e < (half_d >> 5u); ++e) {
+                uint i = e * 32u + lane;
+                float x0 = head[i];
+                float x1 = head[half_d + i];
+                float c = rope[i];
+                float s = rope[half_d + i];
+                head[i] = x0 * c - x1 * s;
+                head[half_d + i] = x1 * c + x0 * s;
+            }
+            rot = false;
+        }
         float ss = 0.0f;
         for (uint e = 0u; e < (half_d >> 5u); ++e) {
             uint i = e * 32u + lane;
@@ -4106,8 +4122,8 @@ kernel void qkv_rope_kv_store(
             uint i = e * 32u + lane;
             float x0 = head[i];
             float x1 = head[half_d + i];
-            float c = rope[i];
-            float s = rope[half_d + i];
+            float c = rot ? rope[i] : 1.0f;
+            float s = rot ? rope[half_d + i] : 0.0f;
             float rx0 = x0 * c - x1 * s;
             float rx1 = x1 * c + x0 * s;
             if (p.kv_bits == 4u) {
@@ -4129,8 +4145,8 @@ kernel void qkv_rope_kv_store(
                 uint i = e * 32u + lane;
                 float x0 = head[i];
                 float x1 = head[half_d + i];
-                float c = rope[i];
-                float s = rope[half_d + i];
+                float c = rot ? rope[i] : 1.0f;
+                float s = rot ? rope[half_d + i] : 0.0f;
                 float rx0 = x0 * c - x1 * s;
                 float rx1 = x1 * c + x0 * s;
                 head[i] = rx0;
@@ -4145,8 +4161,8 @@ kernel void qkv_rope_kv_store(
                 uint i = e * 32u + lane;
                 float x0 = head[i];
                 float x1 = head[half_d + i];
-                float c = rope[i];
-                float s = rope[half_d + i];
+                float c = rot ? rope[i] : 1.0f;
+                float s = rot ? rope[half_d + i] : 0.0f;
                 float rx0 = x0 * c - x1 * s;
                 float rx1 = x1 * c + x0 * s;
                 head[i] = rx0;

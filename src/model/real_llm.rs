@@ -97,6 +97,11 @@ pub struct LlamaConfig {
     pub head_dim_override: Option<usize>,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    /// NTK-alpha RoPE stretch (`rope_scaling.alpha`, HunYuan): the base becomes
+    /// `rope_theta * alpha^(head_dim / (head_dim - 2))`. `1.0` leaves it unscaled.
+    pub rope_ntk_alpha: f32,
+    /// Apply the per-head Q/K RMSNorm after RoPE (HunYuan) instead of before it (Qwen3).
+    pub qk_norm_after_rope: bool,
     pub tie_word_embeddings: bool,
     pub max_seq_len: usize,
     pub sliding_window: Option<usize>,
@@ -128,6 +133,8 @@ impl LlamaConfig {
         let mut head_dim_override: Option<usize> = None;
         let mut rms_norm_eps = 1e-5f32;
         let mut rope_theta = 100_000.0f32;
+        let mut rope_ntk_alpha = 1.0f32;
+        let mut qk_norm_after_rope = false;
         let mut tie_word_embeddings = true;
         let mut raw_sliding_window: Option<usize> = None;
         let mut use_sliding_window: Option<bool> = None;
@@ -207,6 +214,53 @@ impl LlamaConfig {
                 "head_dim" => head_dim_override = parse_opt_usize(&mut cur)?,
                 "rms_norm_eps" => rms_norm_eps = cur.parse_f64().unwrap() as f32,
                 "rope_theta" => rope_theta = cur.parse_f64().unwrap() as f32,
+                "model_type" => {
+                    let mt = cur
+                        .parse_string()
+                        .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                    if mt.starts_with("hunyuan") {
+                        qk_norm_after_rope = true;
+                    }
+                }
+                "rope_scaling" => {
+                    if cur.peek() == Some(b'{') {
+                        cur.expect_byte(b'{').unwrap();
+                        let mut alpha = 0.0f64;
+                        let mut dynamic = false;
+                        while cur.peek() != Some(b'}') {
+                            let k = cur
+                                .parse_string()
+                                .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                            cur.expect_byte(b':')
+                                .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                            match k.as_str() {
+                                "alpha" => alpha = cur.parse_f64().unwrap_or(0.0),
+                                "type" | "rope_type" => {
+                                    let t = cur
+                                        .parse_string()
+                                        .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                                    dynamic = t == "dynamic";
+                                }
+                                _ => cur
+                                    .skip_value()
+                                    .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?,
+                            }
+                            if cur.peek() == Some(b',') {
+                                cur.expect_byte(b',').unwrap();
+                            } else {
+                                break;
+                            }
+                        }
+                        cur.expect_byte(b'}')
+                            .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                        if dynamic && alpha > 1.0 {
+                            rope_ntk_alpha = alpha as f32;
+                        }
+                    } else {
+                        cur.skip_value()
+                            .map_err(|m| io::Error::new(io::ErrorKind::InvalidData, m))?;
+                    }
+                }
                 "tie_word_embeddings" => tie_word_embeddings = parse_bool(&mut cur)?,
                 "sliding_window" => raw_sliding_window = parse_opt_usize(&mut cur)?,
                 "use_sliding_window" => use_sliding_window = Some(parse_bool(&mut cur)?),
@@ -327,6 +381,8 @@ impl LlamaConfig {
             head_dim_override,
             rms_norm_eps,
             rope_theta,
+            rope_ntk_alpha,
+            qk_norm_after_rope,
             tie_word_embeddings,
             max_seq_len,
             sliding_window,
@@ -352,6 +408,17 @@ impl LlamaConfig {
     #[inline]
     pub fn q_dim(&self) -> usize {
         self.num_attention_heads * self.head_dim()
+    }
+
+    /// RoPE base after NTK-alpha stretching (`theta * alpha^(d / (d - 2))`).
+    pub fn effective_rope_theta(&self) -> f64 {
+        let d = self.head_dim() as f64;
+        let alpha = f64::from(self.rope_ntk_alpha);
+        if alpha > 1.0 && d > 2.0 {
+            f64::from(self.rope_theta) * alpha.powf(d / (d - 2.0))
+        } else {
+            f64::from(self.rope_theta)
+        }
     }
 
     #[inline]
@@ -1853,13 +1920,12 @@ impl RealLlamaEngine {
             } else {
                 None
             };
-            let q_norm_name = format!("{pfx}.self_attn.q_norm.weight");
+            let (q_norm_name, k_norm_name) = qk_norm_tensor_names(&store, &pfx);
             let q_norm = if store.has_tensor(&q_norm_name) {
                 Some(get_f32(&q_norm_name)?)
             } else {
                 None
             };
-            let k_norm_name = format!("{pfx}.self_attn.k_norm.weight");
             let k_norm = if store.has_tensor(&k_norm_name) {
                 Some(get_f32(&k_norm_name)?)
             } else {
@@ -2956,9 +3022,8 @@ impl RealLlamaEngine {
             let input_norm = get_f32_and_release(&format!("{pfx}.input_layernorm.weight"))?;
             let post_attn_norm =
                 get_f32_and_release(&format!("{pfx}.post_attention_layernorm.weight"))?;
-            let q_norm_name = format!("{pfx}.self_attn.q_norm.weight");
+            let (q_norm_name, k_norm_name) = qk_norm_tensor_names(&store, &pfx);
             let q_norm = if store.has_tensor(&q_norm_name) { Some(get_f32_and_release(&q_norm_name)?) } else { None };
-            let k_norm_name = format!("{pfx}.self_attn.k_norm.weight");
             let k_norm = if store.has_tensor(&k_norm_name) { Some(get_f32_and_release(&k_norm_name)?) } else { None };
 
             // 1. Pre-attention normalized activations -> compile `qkv_proj`
@@ -3021,14 +3086,19 @@ impl RealLlamaEngine {
                     let rope_row = &rope_cos_sin[pos * head_dim..(pos + 1) * head_dim];
                     let (q_slice, kv_rest) = qkv_buf.split_at_mut(q_dim);
                     let (k_slice, v_slice) = kv_rest.split_at_mut(kv_dim);
-                    if let Some(ref qn) = q_norm {
-                        apply_per_head_rms_norm(q_slice, head_dim, qn, cfg.rms_norm_eps);
-                    }
-                    if let Some(ref kn) = k_norm {
-                        apply_per_head_rms_norm(k_slice, head_dim, kn, cfg.rms_norm_eps);
-                    }
-                    apply_llama_rope_precomp(q_slice, cfg.num_attention_heads, head_dim, half_dim, rope_row);
-                    apply_llama_rope_precomp(k_slice, cfg.num_key_value_heads, head_dim, half_dim, rope_row);
+                    apply_qk_norm_rope(
+                        q_slice,
+                        k_slice,
+                        q_norm.as_deref(),
+                        k_norm.as_deref(),
+                        cfg.num_attention_heads,
+                        cfg.num_key_value_heads,
+                        head_dim,
+                        half_dim,
+                        rope_row,
+                        cfg.rms_norm_eps,
+                        cfg.qk_norm_after_rope,
+                    );
                     k_seq_cache[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(k_slice);
                     v_seq_cache[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(v_slice);
                     causal_gqa_attention(
@@ -3970,13 +4040,12 @@ impl RealLlamaEngine {
             let post_attn_norm =
                 get_f32_and_release(&format!("{pfx}.post_attention_layernorm.weight"))?;
 
-            let q_norm_name = format!("{pfx}.self_attn.q_norm.weight");
+            let (q_norm_name, k_norm_name) = qk_norm_tensor_names(&store, &pfx);
             let q_norm = if store.has_tensor(&q_norm_name) {
                 Some(get_f32_and_release(&q_norm_name)?)
             } else {
                 None
             };
-            let k_norm_name = format!("{pfx}.self_attn.k_norm.weight");
             let k_norm = if store.has_tensor(&k_norm_name) {
                 Some(get_f32_and_release(&k_norm_name)?)
             } else {
@@ -4057,25 +4126,18 @@ impl RealLlamaEngine {
                         let rope_row = &rope_cos_sin[pos * head_dim..(pos + 1) * head_dim];
                         let (q_slice, kv_rest) = qkv_buf.split_at_mut(q_dim);
                         let (k_slice, v_slice) = kv_rest.split_at_mut(kv_dim);
-                        if let Some(ref qn) = q_norm {
-                            apply_per_head_rms_norm(q_slice, head_dim, qn, cfg.rms_norm_eps);
-                        }
-                        if let Some(ref kn) = k_norm {
-                            apply_per_head_rms_norm(k_slice, head_dim, kn, cfg.rms_norm_eps);
-                        }
-                        apply_llama_rope_precomp(
+                        apply_qk_norm_rope(
                             q_slice,
-                            cfg.num_attention_heads,
-                            head_dim,
-                            half_dim,
-                            rope_row,
-                        );
-                        apply_llama_rope_precomp(
                             k_slice,
+                            q_norm.as_deref(),
+                            k_norm.as_deref(),
+                            cfg.num_attention_heads,
                             cfg.num_key_value_heads,
                             head_dim,
                             half_dim,
                             rope_row,
+                            cfg.rms_norm_eps,
+                            cfg.qk_norm_after_rope,
                         );
                         k_seq_cache[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(k_slice);
                         v_seq_cache[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(v_slice);
@@ -6178,14 +6240,19 @@ impl RealLlamaEngine {
             // 2. Optional QK-Norm + Precomputed RoPE + KV Cache Store + Causal GQA Attention
             let (q_slice, kv_rest) = ws.qkv_buf.split_at_mut(q_dim);
             let (k_slice, v_slice) = kv_rest.split_at_mut(kv_dim);
-            if let Some(ref qn) = layer.q_norm {
-                apply_per_head_rms_norm(q_slice, head_dim, qn, eps);
-            }
-            if let Some(ref kn) = layer.k_norm {
-                apply_per_head_rms_norm(k_slice, head_dim, kn, eps);
-            }
-            apply_llama_rope_precomp(q_slice, num_q_heads, head_dim, half_dim, rope_row);
-            apply_llama_rope_precomp(k_slice, num_kv_heads, head_dim, half_dim, rope_row);
+            apply_qk_norm_rope(
+                q_slice,
+                k_slice,
+                layer.q_norm.as_deref(),
+                layer.k_norm.as_deref(),
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                half_dim,
+                rope_row,
+                eps,
+                self.cfg.qk_norm_after_rope,
+            );
 
             if let Some(q8) = ws.q8_kv.as_mut() {
                 for kvh in 0..num_kv_heads {
@@ -7160,14 +7227,19 @@ impl RealLlamaEngine {
                             let rope_row = &rope[pos * head_dim..(pos + 1) * head_dim];
                             let (q, kv) = row.split_at_mut(q_dim);
                             let (k, v) = kv.split_at_mut(kv_dim);
-                            if let Some(qn) = q_norm {
-                                apply_per_head_rms_norm(q, head_dim, qn, eps);
-                            }
-                            if let Some(kn) = k_norm {
-                                apply_per_head_rms_norm(k, head_dim, kn, eps);
-                            }
-                            apply_llama_rope_precomp(q, cfg.num_attention_heads, head_dim, half_dim, rope_row);
-                            apply_llama_rope_precomp(k, num_kv_heads, head_dim, half_dim, rope_row);
+                            apply_qk_norm_rope(
+                                q,
+                                k,
+                                q_norm,
+                                k_norm,
+                                cfg.num_attention_heads,
+                                num_kv_heads,
+                                head_dim,
+                                half_dim,
+                                rope_row,
+                                eps,
+                                cfg.qk_norm_after_rope,
+                            );
                             for kvh in 0..num_kv_heads {
                                 raw.store_k(l_idx, kvh, pos, &k[kvh * head_dim..(kvh + 1) * head_dim]);
                                 raw.store_v(l_idx, kvh, pos, &v[kvh * head_dim..(kvh + 1) * head_dim]);
@@ -7259,14 +7331,19 @@ impl RealLlamaEngine {
                         let rope_row = &rope[pos * head_dim..(pos + 1) * head_dim];
                         let (q, kv) = row.split_at_mut(q_dim);
                         let (k, v) = kv.split_at_mut(kv_dim);
-                        if let Some(qn) = q_norm {
-                            apply_per_head_rms_norm(q, head_dim, qn, eps);
-                        }
-                        if let Some(kn) = k_norm {
-                            apply_per_head_rms_norm(k, head_dim, kn, eps);
-                        }
-                        apply_llama_rope_precomp(q, cfg.num_attention_heads, head_dim, half_dim, rope_row);
-                        apply_llama_rope_precomp(k, num_kv_heads, head_dim, half_dim, rope_row);
+                        apply_qk_norm_rope(
+                            q,
+                            k,
+                            q_norm,
+                            k_norm,
+                            cfg.num_attention_heads,
+                            num_kv_heads,
+                            head_dim,
+                            half_dim,
+                            rope_row,
+                            eps,
+                            cfg.qk_norm_after_rope,
+                        );
                         let off = kv_base + pos * kv_dim;
                         unsafe {
                             std::ptr::copy_nonoverlapping(k.as_ptr(), (k_ptr as *mut f32).add(off), kv_dim);
@@ -7665,6 +7742,49 @@ where
             });
         }
     });
+}
+
+/// Names of the per-head Q/K norm weights: Qwen3 `q_norm`/`k_norm` or HunYuan `query_layernorm`/`key_layernorm`.
+fn qk_norm_tensor_names(store: &SafeTensorsStore, pfx: &str) -> (String, String) {
+    let hy = format!("{pfx}.self_attn.query_layernorm.weight");
+    if store.has_tensor(&hy) {
+        (hy, format!("{pfx}.self_attn.key_layernorm.weight"))
+    } else {
+        (format!("{pfx}.self_attn.q_norm.weight"), format!("{pfx}.self_attn.k_norm.weight"))
+    }
+}
+
+/// Optional per-head Q/K RMSNorm plus RoPE on one token's `q` and `k` heads. Qwen3 normalises
+/// before the rotation, HunYuan (`after_rope`) after it.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn apply_qk_norm_rope(
+    q: &mut [f32],
+    k: &mut [f32],
+    q_norm: Option<&[f32]>,
+    k_norm: Option<&[f32]>,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    half_dim: usize,
+    rope_row: &[f32],
+    eps: f32,
+    after_rope: bool,
+) {
+    if after_rope {
+        apply_llama_rope_precomp(q, num_q_heads, head_dim, half_dim, rope_row);
+        apply_llama_rope_precomp(k, num_kv_heads, head_dim, half_dim, rope_row);
+    }
+    if let Some(qn) = q_norm {
+        apply_per_head_rms_norm(q, head_dim, qn, eps);
+    }
+    if let Some(kn) = k_norm {
+        apply_per_head_rms_norm(k, head_dim, kn, eps);
+    }
+    if !after_rope {
+        apply_llama_rope_precomp(q, num_q_heads, head_dim, half_dim, rope_row);
+        apply_llama_rope_precomp(k, num_kv_heads, head_dim, half_dim, rope_row);
+    }
 }
 
 #[inline]
@@ -8697,10 +8817,11 @@ unsafe fn attn_values_head128_q8_accum_neon(
 fn build_rope_table(cfg: &LlamaConfig) -> Vec<f32> {
     let head_dim = cfg.head_dim();
     let half_dim = head_dim / 2;
+    let theta = cfg.effective_rope_theta();
     let inv_freq: Vec<f32> = (0..half_dim)
         .map(|i| {
             let exp = (2 * i) as f64 / (head_dim as f64);
-            (1.0 / (cfg.rope_theta as f64).powf(exp)) as f32
+            (1.0 / theta.powf(exp)) as f32
         })
         .collect();
 
@@ -9685,6 +9806,8 @@ mod tests {
                 head_dim_override: None,
                 rms_norm_eps: 1e-5,
                 rope_theta: 10_000.0,
+                rope_ntk_alpha: 1.0,
+                qk_norm_after_rope: false,
                 tie_word_embeddings: true,
                 max_seq_len: 64,
                 sliding_window: None,
