@@ -12,11 +12,16 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
     /// `preview` carries the live translation of the field; `inserted` means it replaced the field.
     enum State: Equatable { case idle, translating, preview(String), inserted(String) }
 
-    static let barHeight: CGFloat = 60
-    static let rowsHeight: CGFloat = 216
-    static var totalHeight: CGFloat { barHeight + rowsHeight }
+    static let stripHeight: CGFloat = 58
+    static let suggestHeight: CGFloat = 44
+    static let rowsHeight: CGFloat = 212
+    /// Strip only while there is something to show; suggestions row always, like the system keyboard.
+    var height: CGFloat { (stripVisible ? Self.stripHeight : 0) + Self.suggestHeight + Self.rowsHeight }
+    private var stripVisible: Bool { state != .idle && !sheetOpen && page != .emoji }
 
     var onKey: ((Key) -> Void)?
+    var onSuggestion: ((String) -> Void)?
+    var onHeightChange: ((CGFloat) -> Void)?
     var enableInputClicksWhenVisible: Bool { true }
     private(set) var shift: Shift = .off
     private var page: Page = .letters
@@ -31,6 +36,9 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
     private let spinner = UIActivityIndicatorView(style: .medium)
     private let actionBtn = UIButton(type: .custom)
     private let keysView = UIView()
+    private let suggestBar = UIView()
+    private var suggestButtons: [UIButton] = []
+    private var suggestDividers: [UIView] = []
     private var rows: [[(KeyButton, CGFloat)]] = []   // button + width in letter units (0 = flex)
     private var sheet: UIView?
     private var emojiView: EmojiKeyboard?
@@ -64,18 +72,49 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
     // MARK: build
 
     private func build() {
-        backgroundColor = bed
-        bar.translatesAutoresizingMaskIntoConstraints = false
+        // Clear: the system draws its keyboard backdrop (blur/material) behind extensions.
+        backgroundColor = .clear
         addSubview(bar)
+        addSubview(suggestBar)
         addSubview(keysView)
-        NSLayoutConstraint.activate([
-            bar.topAnchor.constraint(equalTo: topAnchor, constant: 6),
-            bar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-            bar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            bar.heightAnchor.constraint(equalToConstant: 48),
-        ])
         buildBar()
+        buildSuggestBar()
         buildRows()
+    }
+
+    private func buildSuggestBar() {
+        for i in 0..<3 {
+            let b = UIButton(type: .custom)
+            b.titleLabel?.font = .systemFont(ofSize: 17)
+            b.titleLabel?.lineBreakMode = .byTruncatingTail
+            b.tag = i
+            b.addTarget(self, action: #selector(suggestTap(_:)), for: .touchUpInside)
+            suggestBar.addSubview(b)
+            suggestButtons.append(b)
+            if i < 2 {
+                let d = UIView()
+                suggestBar.addSubview(d)
+                suggestDividers.append(d)
+            }
+        }
+    }
+
+    func setSuggestions(_ s: [String]) {
+        for (i, b) in suggestButtons.enumerated() {
+            let t = i < s.count ? s[i] : ""
+            b.setTitle(t, for: .normal)
+            b.setTitleColor(ink, for: .normal)
+            b.isHidden = t.isEmpty
+        }
+        for (i, d) in suggestDividers.enumerated() {
+            d.backgroundColor = dark ? UIColor(white: 1, alpha: 0.18) : UIColor(white: 0, alpha: 0.16)
+            d.isHidden = i + 1 >= s.count
+        }
+    }
+
+    @objc private func suggestTap(_ b: UIButton) {
+        guard let t = b.title(for: .normal), !t.isEmpty else { return }
+        onSuggestion?(t.hasPrefix("\u{201C}") ? String(t.dropFirst().dropLast()) : t)
     }
 
     private func buildBar() {
@@ -161,7 +200,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
     private func bottom(left: (KeyButton, CGFloat)) -> [(KeyButton, CGFloat)] {
         var r = [left]
         if needsGlobe { r.append((key("sf:globe", .globe, fn: true), 1.27)) }
-        r.append((key("sf:face.smiling", .page(.emoji), fn: true), 1.27))
+        r.append((key("sf:face.smiling.inverse", .page(.emoji), fn: true), 1.27))
         r.append((key("space", .space), 0))
         r.append((key("sf:return", .ret, fn: true), 2.73))
         return r
@@ -169,10 +208,22 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        keysView.frame = CGRect(x: 0, y: Self.barHeight + 6, width: bounds.width, height: Self.rowsHeight - 6)
+        let W = bounds.width
+        var y: CGFloat = 0
+        bar.isHidden = !stripVisible
+        if stripVisible {
+            bar.frame = CGRect(x: 8, y: 6, width: W - 16, height: 48)
+            y = Self.stripHeight
+        }
+        suggestBar.frame = CGRect(x: 0, y: y, width: W, height: Self.suggestHeight)
+        let third = W / 3
+        for (i, b) in suggestButtons.enumerated() { b.frame = CGRect(x: third * CGFloat(i) + 6, y: 0, width: third - 12, height: Self.suggestHeight) }
+        for (i, d) in suggestDividers.enumerated() { d.frame = CGRect(x: third * CGFloat(i + 1) - 0.5, y: 10, width: 1, height: Self.suggestHeight - 20) }
+        y += Self.suggestHeight
+        keysView.frame = CGRect(x: 0, y: y, width: W, height: Self.rowsHeight)
         emojiView?.frame = bounds
         sheet?.frame = bounds
-        let W = bounds.width, gap: CGFloat = 6, margin: CGFloat = 3
+        let gap: CGFloat = 6, margin: CGFloat = 3
         // Letter width from the widest letter row (10 on QWERTY, 11 on Cyrillic/Arabic).
         let widest = max(10, rows.prefix(2).map { $0.filter { $0.1 == 1 }.count }.max() ?? 10)
         let unit = floor((W - 2 * margin - CGFloat(widest - 1) * gap) / CGFloat(widest))
@@ -220,8 +271,9 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
     // MARK: state
 
     func reload() {
-        backgroundColor = bed
+        backgroundColor = .clear
         bar.backgroundColor = keyFill
+        setSuggestions([])
         buildRows()
         var c = UIButton.Configuration.plain()
         c.contentInsets = .zero
@@ -269,11 +321,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         actionBtn.isHidden = false
         switch s {
         case .idle:
-            status.text = "Translation appears here as you type"
-            status.font = .systemFont(ofSize: 12)
-            status.textColor = dark ? UIColor(white: 0.55, alpha: 1) : UIColor(white: 0.62, alpha: 1)
-            accent.backgroundColor = dark ? UIColor(white: 0.45, alpha: 1) : UIColor(white: 0.75, alpha: 1)
-            actionBtn.isHidden = true
+            actionBtn.isHidden = true   // strip is hidden entirely
         case .translating:
             spinner.startAnimating()
             if case .preview(let old) = state { status.text = old } else { status.text = "…" }
@@ -293,6 +341,8 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         c.titleTextAttributesTransformer = .init { var x = $0; x.font = UIFont.systemFont(ofSize: 14, weight: .semibold); return x }
         actionBtn.configuration = c
         applyReturn()
+        setNeedsLayout()
+        onHeightChange?(height)
     }
 
     /// Keeps the previous preview visible while a newer one is in flight.
@@ -337,8 +387,8 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         page = p
         emojiView?.removeFromSuperview(); emojiView = nil
         let emoji = p == .emoji
-        bar.isHidden = emoji
         keysView.isHidden = emoji
+        suggestBar.isHidden = emoji
         if emoji {
             let e = EmojiKeyboard(dark: dark)
             e.onEmoji = { [weak self] s in self?.onKey?(.emoji(s)) }
@@ -350,6 +400,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
             buildRows()
         }
         setNeedsLayout()
+        onHeightChange?(height)
     }
 
     func showGlobe(_ on: Bool) { if on != needsGlobe { needsGlobe = on; buildRows() } }
@@ -360,12 +411,13 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         sheetOpen = open
         sheet?.removeFromSuperview(); sheet = nil
         keysView.isHidden = open
-        bar.isHidden = open
+        suggestBar.isHidden = open
+        setNeedsLayout()
+        onHeightChange?(height)
         guard open else { return }
         let s = LanguageSheet(dark: dark, side: side) { [weak self] k in self?.onKey?(k) }
         addSubview(s)
         sheet = s
-        setNeedsLayout()
     }
 
     /// Anywhere on the strip opens the picker: the source code on the far left, the target elsewhere.

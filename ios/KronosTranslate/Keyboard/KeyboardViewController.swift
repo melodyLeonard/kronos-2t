@@ -12,6 +12,8 @@ final class KeyboardViewController: UIInputViewController {
     private var cache: [String: String] = [:]
     private var sheetSide: LanguageSheet.Side = .to
     private let debounceInterval: TimeInterval = 0.5
+    private var heightConstraint: NSLayoutConstraint?
+    private let checker = UITextChecker()
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -24,10 +26,13 @@ final class KeyboardViewController: UIInputViewController {
             board.topAnchor.constraint(equalTo: view.topAnchor),
             board.bottomAnchor.constraint(equalTo: view.bottomAnchor),
         ])
-        let h = view.heightAnchor.constraint(equalToConstant: KeyboardView.totalHeight)
+        let h = view.heightAnchor.constraint(equalToConstant: board.height)
         h.priority = .init(999)
         h.isActive = true
+        heightConstraint = h
         board.onKey = { [weak self] in self?.handle($0) }
+        board.onSuggestion = { [weak self] in self?.accept(suggestion: $0) }
+        board.onHeightChange = { [weak self] in self?.heightConstraint?.constant = $0 }
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -51,9 +56,73 @@ final class KeyboardViewController: UIInputViewController {
             inserted = nil; original = nil
         }
         if text.isEmpty, board.shift == .off { board.setShift(.on) }
+        board.setSuggestions(suggestions())
         if let t = inserted, text == t { return }          // translation is in the field; nothing to preview
         inserted = nil; original = nil
         scheduleTranslate(text)
+    }
+
+    // MARK: suggestions / autocorrect (UITextChecker, the system's own dictionaries)
+
+    private var checkerLanguage: String {
+        let code = Prefs.sourceCode.lowercased()
+        return code == "en" ? "en_US" : (code == "zt" ? "zh-Hant" : code)
+    }
+
+    /// The word being typed: everything after the last whitespace before the caret.
+    private var currentWord: String {
+        let before = textDocumentProxy.documentContextBeforeInput ?? ""
+        if let r = before.rangeOfCharacter(from: .whitespacesAndNewlines, options: .backwards) { return String(before[r.upperBound...]) }
+        return before
+    }
+
+    private func suggestions() -> [String] {
+        let word = currentWord
+        let before = textDocumentProxy.documentContextBeforeInput ?? ""
+        if word.isEmpty {
+            // Sentence start: the system's usual openers; otherwise nothing.
+            let sentenceStart = before.trimmingCharacters(in: .whitespaces).isEmpty || before.trimmingCharacters(in: .whitespaces).last.map { ".!?".contains($0) } == true
+            return sentenceStart && Prefs.sourceCode == "EN" ? ["I", "The", "I'm"] : []
+        }
+        let ns = word as NSString
+        let all = NSRange(location: 0, length: ns.length)
+        let miss = checker.rangeOfMisspelledWord(in: word, range: all, startingAt: 0, wrap: false, language: checkerLanguage)
+        var out: [String] = []
+        if miss.location != NSNotFound {
+            out += checker.guesses(forWordRange: all, in: word, language: checkerLanguage) ?? []
+        } else {
+            out += checker.completions(forPartialWordRange: all, in: word, language: checkerLanguage) ?? []
+        }
+        out = out.filter { $0.lowercased() != word.lowercased() }
+        let capped = Array(out.prefix(2)).map { matchCase($0, to: word) }
+        return ["\u{201C}\(word)\u{201D}"] + capped
+    }
+
+    private func matchCase(_ s: String, to word: String) -> String {
+        guard let f = word.first, f.isUppercase else { return s }
+        return word.count > 1 && word == word.uppercased() ? s.uppercased() : s.prefix(1).uppercased() + s.dropFirst()
+    }
+
+    private func accept(suggestion: String) {
+        replaceCurrentWord(with: suggestion + " ")
+    }
+
+    /// Space after a misspelled word applies the first guess, as the system keyboard does.
+    private func autocorrectIfNeeded() {
+        let word = currentWord
+        guard word.count > 1, Prefs.sourceCode != "EN" || !word.contains("'") else { return }
+        let ns = word as NSString
+        let all = NSRange(location: 0, length: ns.length)
+        let miss = checker.rangeOfMisspelledWord(in: word, range: all, startingAt: 0, wrap: false, language: checkerLanguage)
+        guard miss.location == 0, miss.length == ns.length,
+              let g = checker.guesses(forWordRange: all, in: word, language: checkerLanguage)?.first,
+              g.count <= word.count + 2 else { return }
+        replaceCurrentWord(with: matchCase(g, to: word))
+    }
+
+    private func replaceCurrentWord(with s: String) {
+        for _ in 0..<currentWord.count { textDocumentProxy.deleteBackward() }
+        textDocumentProxy.insertText(s)
     }
 
     // MARK: keys
@@ -65,7 +134,11 @@ final class KeyboardViewController: UIInputViewController {
             textDocumentProxy.insertText(board.shift == .off || !cased ? s : s.uppercased())
             if board.shift == .on { board.setShift(.off) }
         case .space:
+            autocorrectIfNeeded()
             textDocumentProxy.insertText(" ")
+            // Sentence start capitalises, like the system keyboard.
+            let before = (textDocumentProxy.documentContextBeforeInput ?? "").trimmingCharacters(in: .whitespaces)
+            if let l = before.last, ".!?".contains(l) { board.setShift(.on) }
         case .backspace:
             textDocumentProxy.deleteBackward()
             if fieldText().isEmpty { board.setShift(.on) }
