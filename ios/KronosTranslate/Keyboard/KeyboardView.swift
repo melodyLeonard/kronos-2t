@@ -263,8 +263,9 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         func place(_ b: KeyButton, _ x: CGFloat, _ w: CGFloat, _ row: Int) {
             let bottom = rowsH - (met.bottoms[min(row, 3)] - systemGap)
             b.frame = CGRect(x: x, y: bottom - capH, width: w, height: capH)
-            let pitch = row == 0 ? capH + met.topPad : met.bottoms[row - 1] - met.bottoms[row]
+            let pitch = row < 3 ? met.bottoms[row + 1] - met.bottoms[row] : met.bottoms[3] - met.bottoms[2]   // always positive
             b.hitInsets = UIEdgeInsets(top: -1, left: -gap / 2, bottom: -(pitch - capH - 1), right: -gap / 2)
+            assert(pitch > capH, "row pitch must exceed the cap height")
             b.setCapHeight(capH)
         }
         for (i, r) in rows.enumerated() {

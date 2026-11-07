@@ -17,6 +17,12 @@ final class KeyMetricsTests: XCTestCase {
         globe.tap()
         sleep(2)
         dump(app, "b")
+        // Touch routing on our keyboard: each tap must land on the key under it, delete must delete.
+        if app.keys["delete.left"].exists {
+            app.keys["h"].tap(); app.keys["l"].tap(); app.keys["delete.left"].tap()
+            sleep(1)
+            XCTAssertEqual((field.value as? String) ?? "", "H")
+        }
     }
 
     private func dump(_ app: XCUIApplication, _ tag: String) {
