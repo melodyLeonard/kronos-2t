@@ -485,11 +485,11 @@ final class KeyButton: UIControl {
         text.text = t
         // Apple's keycaps: SF Pro, light weight for single glyphs, regular 16pt for words.
         let small = fn || t.count > 1
-        text.font = small ? .systemFont(ofSize: 16, weight: .regular) : .systemFont(ofSize: 23, weight: .light)
+        text.font = small ? .systemFont(ofSize: 16, weight: .regular) : .systemFont(ofSize: 22, weight: .regular)
         image.isHidden = true; text.isHidden = false
     }
     func setSymbol(_ name: String) {
-        image.image = UIImage(systemName: name, withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .light))
+        image.image = UIImage(systemName: name, withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .regular))
         image.isHidden = false; text.isHidden = true
     }
     func restyle(fill: UIColor, ink: UIColor, shadow: UIColor) {
