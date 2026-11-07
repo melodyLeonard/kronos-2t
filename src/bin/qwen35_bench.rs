@@ -548,8 +548,8 @@ fn main() {
             let model = load(&a);
             let eng = MetalQwen35::new(&model, 64).expect("Metal");
             // First pass only warms the GPU clocks.
-            eng.bench_projections(50);
-            for (label, bytes, secs) in eng.bench_projections(a.num("iters", 200)) {
+            eng.bench_projections(50, a.num("n", 1));
+            for (label, bytes, secs) in eng.bench_projections(a.num("iters", 200), a.num("n", 1)) {
                 println!("{label:<26} {:6.1} us  {:6.1} GB/s", secs * 1e6, bytes as f64 / secs / 1e9);
             }
         }

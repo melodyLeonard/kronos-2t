@@ -852,7 +852,9 @@ kernel void q35_nf3_gemv1(
     out[row] = sum;
 }
 
-// `q35_nf4_gemv1` for up to MAXT tokens: each 16-byte load is unpacked and scaled once, then
+// `q35_nf4_gemv1` for exactly MAXT tokens (256 threads): simdgroups 0-3 take stripe a and 4-7 stripe
+// b of each pair, so a thread keeps 4 rows x MAXT accumulators and stays within the register budget
+// that keeps the kernel memory-bound. Each 16-byte weight load is unpacked and scaled once, then
 // applied to every token. Partials go to `q35_gemv_multi_reduce` when columns are split.
 template <uint MAXT>
 inline void q35_nf4_gemv_multi(
@@ -869,74 +871,70 @@ inline void q35_nf4_gemv_multi(
     const uint nt = min(p.n_tok, MAXT);
 
     l_pair[tid_tg] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg);
-    l_pair[tid_tg + 128u] = make_nf4_pair(p.cb0, p.cb1, p.cb2, p.cb3, tid_tg + 128u);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint k = T >> 3u;
     const uint g = (T & 7u) >> 1u;
     const uint hf = T & 1u;
-    float acc[MAXT][8];
-    for (uint m = 0u; m < MAXT; ++m) for (uint r = 0u; r < 8u; ++r) acc[m][r] = 0.0f;
+    const uint stripe = sg_id >> 2u;
+    const uint sgq = sg_id & 3u;
+    float acc[MAXT][4];
+    for (uint m = 0u; m < MAXT; ++m) for (uint r = 0u; r < 4u; ++r) acc[m][r] = 0.0f;
     device const uchar* p_base = pair_stream + ulong(pair_idx) * ulong(p.pair_total_bytes);
     const uint sg_stride = 64u + p.scale_group_chunks * 1024u;
     const ulong xs = p.cols;
-    for (uint sg = sg_lo + sg_id; sg < sg_hi; sg += 4u) {
+    for (uint sg = sg_lo + sgq; sg < sg_hi; sg += 4u) {
         device const uchar* sg_ptr = p_base + ulong(sg) * ulong(sg_stride);
-        uint2 sra = *(device const uint2*)(sg_ptr + g * 8u);
-        uint2 srb = *(device const uint2*)(sg_ptr + 32u + g * 8u);
-        float sc[8] = {as_type<float>(sra.x << 16), as_type<float>(sra.x & 0xFFFF0000u),
-                       as_type<float>(sra.y << 16), as_type<float>(sra.y & 0xFFFF0000u),
-                       as_type<float>(srb.x << 16), as_type<float>(srb.x & 0xFFFF0000u),
-                       as_type<float>(srb.y << 16), as_type<float>(srb.y & 0xFFFF0000u)};
+        uint2 sr = *(device const uint2*)(sg_ptr + stripe * 32u + g * 8u);
+        float sc[4] = {as_type<float>(sr.x << 16), as_type<float>(sr.x & 0xFFFF0000u),
+                       as_type<float>(sr.y << 16), as_type<float>(sr.y & 0xFFFF0000u)};
         uint c0 = sg * p.scale_group_chunks;
         uint c1 = min(c0 + p.scale_group_chunks, p.num_chunks);
         for (uint c = c0; c < c1; ++c) {
-            device const uchar* da = sg_ptr + 64u + (c - c0) * 1024u;
-            uint4 wa = *(device const uint4*)(da + T * 16u);
-            uint4 wb = *(device const uint4*)(da + 512u + T * 16u);
+            device const uchar* da = sg_ptr + 64u + (c - c0) * 1024u + stripe * 512u;
+            uint4 w = *(device const uint4*)(da + T * 16u);
             const uint col = c * 64u + k * 16u + hf * 8u;
             half4 xl[MAXT], xh[MAXT];
             #pragma unroll
             for (uint m = 0u; m < MAXT; ++m) {
-                if (m < nt) {
-                    device const half4* xp = (device const half4*)(x_h + ulong(m) * xs + col);
-                    xl[m] = xp[0];
-                    xh[m] = xp[1];
-                }
+                device const half4* xp = (device const half4*)(x_h + ulong(m) * xs + col);
+                xl[m] = xp[0];
+                xh[m] = xp[1];
             }
             #pragma unroll
-            for (uint r = 0u; r < 8u; ++r) {
-                uint u = (r < 4u) ? wa[r] : wb[r - 4u];
+            for (uint r = 0u; r < 4u; ++r) {
+                uint u = w[r];
                 half2 q0 = l_pair[u & 0xFFu], q1 = l_pair[(u >> 8) & 0xFFu], q2 = l_pair[(u >> 16) & 0xFFu], q3 = l_pair[u >> 24];
                 half s = half(sc[r]);
                 half4 lo = half4(q0.x, q1.x, q2.x, q3.x) * s;
                 half4 hi = half4(q0.y, q1.y, q2.y, q3.y) * s;
                 #pragma unroll
                 for (uint m = 0u; m < MAXT; ++m) {
-                    if (m < nt) acc[m][r] += float(dot(lo, xl[m]) + dot(hi, xh[m]));
+                    acc[m][r] += float(dot(lo, xl[m]) + dot(hi, xh[m]));
                 }
             }
         }
     }
     for (uint m = 0u; m < MAXT; ++m) {
         float ts = (m < nt) ? x_scale[m] : 0.0f;
-        for (uint r = 0u; r < 8u; ++r) acc[m][r] *= ts;
+        for (uint r = 0u; r < 4u; ++r) acc[m][r] *= ts;
     }
+    // Lanes that share row group g differ in bits 0, 3 and 4 of T.
     #pragma unroll
     for (uint m = 0u; m < MAXT; ++m) {
         #pragma unroll
-        for (uint r = 0u; r < 8u; ++r) {
+        for (uint r = 0u; r < 4u; ++r) {
             float a = acc[m][r];
             a += simd_shuffle_xor(a, ushort(1));
             a += simd_shuffle_xor(a, ushort(8));
             a += simd_shuffle_xor(a, ushort(16));
-            if (T < 8u && hf == 0u) tg_red[(sg_id * MAXT + m) * 32u + (r >> 2u) * 16u + g * 4u + (r & 3u)] = a;
+            if (T < 8u && hf == 0u) tg_red[(sgq * MAXT + m) * 32u + stripe * 16u + g * 4u + r] = a;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint row = pair_idx * 32u + T;
     if (row >= p.rows) return;
-    for (uint m = sg_id; m < nt; m += 4u) {
+    for (uint m = sg_id; m < nt; m += 8u) {
         float sum = 0.0f;
         for (uint s = 0u; s < 4u; ++s) sum += tg_red[(s * MAXT + m) * 32u + T];
         if (p.n_splits > 1u) {
@@ -975,8 +973,9 @@ kernel void NAME( \
     threadgroup float tg_red[4 * MAXT * 32]; \
     q35_nf4_gemv_multi<MAXT>(pair_stream, x_h, x_scale, residual, out, p, part, tg_pos, sg_id, T, tid_tg, l_pair, tg_red); \
 }
+Q35_MULTI_KERNEL(q35_nf4_gemv_multi2, 2u)
+Q35_MULTI_KERNEL(q35_nf4_gemv_multi3, 3u)
 Q35_MULTI_KERNEL(q35_nf4_gemv_multi4, 4u)
-Q35_MULTI_KERNEL(q35_nf4_gemv_multi8, 8u)
 
 struct MtpPrepParams { uint h; uint n_tok; float eps; uint _pad; };
 
@@ -1088,8 +1087,8 @@ struct Pipes {
     gemv_batch_split: MtlObj,
     nf4_gemv1: MtlObj,
     nf3_gemv1: MtlObj,
-    nf4_multi4: MtlObj,
-    nf4_multi8: MtlObj,
+    /// Exact-width multi-token GEMVs for 2..=4 tokens (index n - 2); wider batches lose occupancy.
+    nf4_multi: [MtlObj; 3],
     x_to_half: MtlObj,
     gemv_multi_reduce: MtlObj,
 }
@@ -1283,8 +1282,11 @@ impl MetalQwen35 {
                     gemv_batch_split: bp("q35_gemv_batch_split")?,
                     nf4_gemv1: bp("q35_nf4_gemv1")?,
                     nf3_gemv1: bp("q35_nf3_gemv1")?,
-                    nf4_multi4: bp("q35_nf4_gemv_multi4")?,
-                    nf4_multi8: bp("q35_nf4_gemv_multi8")?,
+                    nf4_multi: [
+                        bp("q35_nf4_gemv_multi2")?,
+                        bp("q35_nf4_gemv_multi3")?,
+                        bp("q35_nf4_gemv_multi4")?,
+                    ],
                     x_to_half: bp("q35_x_to_half")?,
                     gemv_multi_reduce: bp("q35_gemv_multi_reduce")?,
                 };
@@ -1653,7 +1655,7 @@ impl MetalQwen35 {
     }
 
     /// GPU time per single-token projection of one matrix of each kind, as (label, bytes, seconds).
-    pub fn bench_projections(&self, iters: usize) -> Vec<(String, usize, f64)> {
+    pub fn bench_projections(&self, iters: usize, n: usize) -> Vec<(String, usize, f64)> {
         let mut mats: Vec<(String, &GpuNf4Matrix)> = Vec::new();
         for layer in &self.layers {
             let kind = match &layer.mixer {
@@ -1691,7 +1693,7 @@ impl MetalQwen35 {
                 let cmd: Id = msg_sel!(self.queue.id(), st.cmd_buffer; Id);
                 let enc: Id = msg_sel!(cmd, st.compute_enc; Id);
                 for _ in 0..iters {
-                    self.proj(enc, m, None, self.sc.proj.id(), 1);
+                    self.proj(enc, m, None, self.sc.proj.id(), n);
                 }
                 msg_sel!(enc, st.end_enc; ());
                 msg_sel!(cmd, st.commit; ());
@@ -2100,7 +2102,7 @@ impl MetalQwen35 {
                 set_buf(enc, self.sc.x_h.id(), 0, 2);
                 set_bytes(enc, &dims, 3);
                 dispatch_only(enc, MtlSize::new((mat.cols as usize).div_ceil(256), n, 1), MtlSize::new(256, 1, 1));
-                set_cps(enc, if n <= 4 { &self.pipes.nf4_multi4 } else { &self.pipes.nf4_multi8 });
+                set_cps(enc, &self.pipes.nf4_multi[n - 2]);
                 set_buf(enc, mat.pair_buf.id(), 0, 0);
                 set_buf(enc, self.sc.x_h.id(), 0, 2);
                 set_buf(enc, self.sc.x_tok_scale.id(), 0, 3);
@@ -2108,7 +2110,7 @@ impl MetalQwen35 {
                 set_buf(enc, out, 0, 5);
                 set_bytes(enc, &params, 6);
                 set_buf(enc, self.sc.gemv_part.id(), 0, 7);
-                dispatch_only(enc, MtlSize::new(mat.num_pairs as usize, splits, 1), MtlSize::new(128, 1, 1));
+                dispatch_only(enc, MtlSize::new(mat.num_pairs as usize, splits, 1), MtlSize::new(256, 1, 1));
                 if splits > 1 {
                     set_cps(enc, &self.pipes.gemv_multi_reduce);
                     set_buf(enc, self.sc.gemv_part.id(), 0, 0);
