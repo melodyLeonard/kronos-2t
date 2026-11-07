@@ -4,7 +4,6 @@ struct SettingsView: View {
     @State private var server = Prefs.serverURL
     @State private var source = Prefs.sourceCode
     @State private var target = Prefs.targetCode
-    @State private var tone = Prefs.tone
     @State private var contextOn = Prefs.contextOn
     @State private var status: Status = .idle
     @State private var sample = ""
@@ -58,29 +57,12 @@ struct SettingsView: View {
                         ForEach(Languages.all) { Text("\($0.name) · \($0.native)").tag($0.code) }
                     } label: { Label("Translate to", systemImage: "globe").settingsLabel(.orange) }
                     .onChange(of: target) { Prefs.targetCode = target; Prefs.touchRecent(target) }
-                    Picker(selection: $tone) {
-                        Text("Casual").tag("casual"); Text("Neutral").tag("neutral"); Text("Formal").tag("formal")
-                    } label: { Label("Tone", systemImage: "textformat").settingsLabel(.purple) }
-                    .onChange(of: tone) { Prefs.tone = tone }
                     Toggle(isOn: $contextOn) { Label("Use chat context", systemImage: "bubble.left.and.bubble.right").settingsLabel(.green) }
                         .onChange(of: contextOn) { Prefs.contextOn = contextOn }
                 } header: {
                     Text("Defaults")
                 } footer: {
                     Text("The typing language also picks the key layout (AZERTY for French, QWERTZ for German). Context keeps the last \(Prefs.contextMax) messages you sent, on this iPhone only, so names, pronouns and slang translate the way you meant them.")
-                }
-                Section {
-                    Link(destination: URL(string: Prefs.githubURL)!) {
-                        HStack(spacing: 12) {
-                            Image("Logo").resizable().frame(width: 29, height: 29).clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text("Powered by Kronos").foregroundStyle(.primary)
-                                Text("Open-source local LLM engine · github.com/melodyLeonard/kronos-2t").font(.footnote).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Image(systemName: "arrow.up.right").foregroundStyle(.tertiary)
-                        }
-                    }
                 }
             }
             .navigationTitle("Translate")

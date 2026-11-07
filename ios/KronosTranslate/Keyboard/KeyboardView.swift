@@ -5,7 +5,7 @@ import UIKit
 final class KeyboardView: UIView, UIInputViewAudioFeedback {
     enum Key {
         case char(String), space, backspace, ret, shift, capsLock, action, globe
-        case page(Page), emoji(String), pickLanguage(String), pickSource(String), tone(String), sheet(Bool)
+        case page(Page), emoji(String), pickLanguage(String), pickSource(String), sheet(Bool)
     }
     enum Page { case letters, numbers, symbols, emoji }
     enum Shift { case off, on, lock }
@@ -226,7 +226,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         a.append(icon("arrow.right", 9, .bold, blue))
         a.append(NSAttributedString(string: " \(Languages.by(code: Prefs.targetCode).name) ", attributes: [.font: f, .foregroundColor: blue]))
         a.append(icon("chevron.down", 8, .heavy, blue))
-        a.append(NSAttributedString(string: "  ·  \(Prefs.tone.capitalized)", attributes: [.font: UIFont.systemFont(ofSize: 12), .foregroundColor: gray]))
+        _ = gray
         c.attributedTitle = AttributedString(a)
         pill.configuration = c
         setState(state)
@@ -500,40 +500,23 @@ final class LanguageSheet: UIView {
         let blue = UIColor(red: 0, green: 0.478, blue: 1, alpha: 1)
         let current = side == .to ? Prefs.targetCode : Prefs.sourceCode
 
-        let seg = UISegmentedControl(items: ["I type in · \(Prefs.sourceCode)", "Translate to · \(Prefs.targetCode)"])
-        seg.selectedSegmentIndex = side == .from ? 0 : 1
-        seg.addAction(UIAction { _ in send(.sheet(true)); send(seg.selectedSegmentIndex == 0 ? .pickSource(Prefs.sourceCode) : .pickLanguage(Prefs.targetCode)) }, for: .valueChanged)
+        let title = UILabel()
+        title.text = side == .to ? "Translate to" : "I type in"
+        title.font = .systemFont(ofSize: 17, weight: .semibold); title.textColor = ink
         let done = UIButton(type: .system)
         done.setTitle("Done", for: .normal)
         done.titleLabel?.font = .systemFont(ofSize: 17, weight: .semibold)
         done.addAction(UIAction { _ in send(.sheet(false)) }, for: .touchUpInside)
         done.setContentHuggingPriority(.required, for: .horizontal)
-        let head = UIStackView(arrangedSubviews: [seg, done]); head.axis = .horizontal; head.spacing = 12
+        let head = UIStackView(arrangedSubviews: [title, UIView(), done]); head.axis = .horizontal
+        head.layoutMargins = .init(top: 0, left: 6, bottom: 0, right: 6); head.isLayoutMarginsRelativeArrangement = true
 
-        let chips = UIStackView(); chips.axis = .horizontal; chips.spacing = 8
-        let chipCodes = side == .to ? Prefs.recents : ["EN", "FR", "ES", "DE"]
-        for code in chipCodes {
-            let l = Languages.by(code: code)
-            var c = UIButton.Configuration.filled(); c.cornerStyle = .capsule
-            let on = code == current
-            c.baseBackgroundColor = on ? blue : card; c.baseForegroundColor = on ? .white : ink
-            c.contentInsets = .init(top: 0, leading: 10, bottom: 0, trailing: 12)
-            let a = NSMutableAttributedString(string: l.code + "  ", attributes: [.font: UIFont.systemFont(ofSize: 11, weight: .bold)])
-            a.append(NSAttributedString(string: l.name, attributes: [.font: UIFont.systemFont(ofSize: 15, weight: .semibold)]))
-            c.attributedTitle = AttributedString(a)
-            let b = UIButton(configuration: c); b.heightAnchor.constraint(equalToConstant: 34).isActive = true
-            b.addAction(UIAction { _ in send(side == .to ? .pickLanguage(code) : .pickSource(code)) }, for: .touchUpInside)
-            chips.addArrangedSubview(b)
-        }
-        chips.addArrangedSubview(UIView())
-
-        let tone = UISegmentedControl(items: ["Casual", "Neutral", "Formal"])
-        tone.selectedSegmentIndex = ["casual", "neutral", "formal"].firstIndex(of: Prefs.tone) ?? 0
-        tone.addAction(UIAction { _ in send(.tone(["casual", "neutral", "formal"][tone.selectedSegmentIndex])) }, for: .valueChanged)
-
+        // Recently used first, then the rest alphabetically; the current one is checked.
+        let recent = (side == .to ? Prefs.recents : [Prefs.sourceCode]).map(Languages.by)
+        let rest = Languages.all.filter { l in !recent.contains { $0.code == l.code } }.sorted { $0.name < $1.name }
         let list = UIStackView(); list.axis = .vertical
         list.backgroundColor = card; list.layer.cornerRadius = 10; list.clipsToBounds = true
-        for (i, l) in Languages.all.enumerated() {
+        for (i, l) in (recent + rest).enumerated() {
             let row = UIButton(type: .system)
             var c = UIButton.Configuration.plain()
             c.contentInsets = .init(top: 0, leading: 14, bottom: 0, trailing: 14)
@@ -569,11 +552,17 @@ final class LanguageSheet: UIView {
             list.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor),
         ])
 
-        let foot = UILabel()
-        foot.text = side == .from ? "Picks the key layout too: AZERTY for French, QWERTZ for German." : "Powered by Kronos · context uses your last \(Prefs.contextMax) sent messages, on this phone only"
-        foot.font = .systemFont(ofSize: 11); foot.textColor = .systemGray; foot.textAlignment = .center
+        // One quiet link to the other side; picking the typing language also picks the key layout.
+        let foot = UIButton(type: .system)
+        var fc = UIButton.Configuration.plain()
+        fc.contentInsets = .init(top: 4, leading: 6, bottom: 4, trailing: 6)
+        let other = side == .to ? "I type in \(Languages.by(code: Prefs.sourceCode).name)" : "Translate to \(Languages.by(code: Prefs.targetCode).name)"
+        fc.attributedTitle = AttributedString(other + "  ›", attributes: .init([.font: UIFont.systemFont(ofSize: 13), .foregroundColor: UIColor.systemGray]))
+        foot.configuration = fc
+        foot.contentHorizontalAlignment = .leading
+        foot.addAction(UIAction { _ in send(side == .to ? .pickSource(Prefs.sourceCode) : .pickLanguage(Prefs.targetCode)) }, for: .touchUpInside)
 
-        let v = UIStackView(arrangedSubviews: [head, chips, tone, scroll, foot])
+        let v = UIStackView(arrangedSubviews: [head, scroll, foot])
         v.axis = .vertical; v.spacing = 8
         v.translatesAutoresizingMaskIntoConstraints = false
         addSubview(v)

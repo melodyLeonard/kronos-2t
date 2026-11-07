@@ -7,7 +7,8 @@ enum TranslateClient {
         var errorDescription: String? { message }
     }
 
-    static func translate(_ text: String, from: String, to code: String, tone: String, context: [String]) async throws -> String {
+    /// The model keeps the register of the input; chat context does the rest, so no tone knob.
+    static func translate(_ text: String, from: String, to code: String, context: [String]) async throws -> String {
         guard let url = URL(string: Prefs.serverURL.trimmingCharacters(in: .whitespaces) + "/translate") else {
             throw Failure(message: "Bad server address")
         }
@@ -16,7 +17,7 @@ enum TranslateClient {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let body: [String: Any] = [
             "text": text, "to": Languages.by(code: code).name, "from": Languages.by(code: from).name,
-            "tone": tone, "context": context,
+            "tone": "neutral", "context": context,
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
@@ -34,7 +35,7 @@ enum TranslateClient {
     static func ping() async -> Result<TimeInterval, Error> {
         let t0 = Date()
         do {
-            _ = try await translate("hello", from: "EN", to: "FR", tone: "neutral", context: [])
+            _ = try await translate("hello", from: "EN", to: "FR", context: [])
             return .success(Date().timeIntervalSince(t0))
         } catch {
             return .failure(error)

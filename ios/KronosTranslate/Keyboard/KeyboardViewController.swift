@@ -93,9 +93,6 @@ final class KeyboardViewController: UIInputViewController {
             Prefs.sourceCode = code; sheetSide = .from
             cache.removeAll(); previewFor = ""
             board.reload(); board.setSheet(true, side: .from)
-        case .tone(let t):
-            Prefs.tone = t; cache.removeAll(); previewFor = ""
-            board.reload(); board.setSheet(true, side: sheetSide)
         case .sheet(let open):
             board.setSheet(open, side: sheetSide)
             if !open { scheduleTranslate(fieldText(), now: true) }
@@ -123,16 +120,16 @@ final class KeyboardViewController: UIInputViewController {
         }
     }
 
-    private func cacheKey(_ t: String) -> String { "\(Prefs.sourceCode)>\(Prefs.targetCode)|\(Prefs.tone)|\(t)" }
+    private func cacheKey(_ t: String) -> String { "\(Prefs.sourceCode)>\(Prefs.targetCode)|\(t)" }
 
     private func translate(_ text: String) {
         guard hasFullAccess else { board.flash("Allow Full Access in Settings"); return }
         task?.cancel()
-        let from = Prefs.sourceCode, code = Prefs.targetCode, tone = Prefs.tone
+        let from = Prefs.sourceCode, code = Prefs.targetCode
         let ctx = Prefs.contextOn ? Prefs.context : []
         task = Task { [weak self] in
             do {
-                let out = try await TranslateClient.translate(text, from: from, to: code, tone: tone, context: ctx)
+                let out = try await TranslateClient.translate(text, from: from, to: code, context: ctx)
                 guard !Task.isCancelled, let self else { return }
                 self.task = nil
                 self.cache[self.cacheKey(text)] = out

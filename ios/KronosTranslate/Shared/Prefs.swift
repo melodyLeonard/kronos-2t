@@ -20,10 +20,6 @@ enum Prefs {
         get { defaults.string(forKey: "targetCode") ?? "FR" }
         set { defaults.set(newValue, forKey: "targetCode") }
     }
-    static var tone: String {
-        get { defaults.string(forKey: "tone") ?? "casual" }
-        set { defaults.set(newValue, forKey: "tone") }
-    }
     static var contextOn: Bool {
         get { defaults.object(forKey: "contextOn") as? Bool ?? true }
         set { defaults.set(newValue, forKey: "contextOn") }
