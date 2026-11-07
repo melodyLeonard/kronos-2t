@@ -23,7 +23,7 @@ pub const MAX_SEARCH_MATCHES: usize = 60;
 /// Tool results above this are capped head+tail in the prompt; the full text is saved to disk.
 pub const TOOL_RESULT_MAX_BYTES: usize = 2 * KIB;
 /// Agent history is compacted once the rendered prompt passes this many tokens.
-pub const AGENT_COMPACT_BUDGET_TOKENS: usize = 12288;
+pub const AGENT_COMPACT_BUDGET_TOKENS: usize = 20480;
 /// A write_file that changes at most this share of an existing file gets an edit_file nudge.
 pub const WRITE_FILE_SMALL_CHANGE_PERCENT: usize = 25;
 pub const MAX_CONSECUTIVE_NO_TOOL_STEPS: usize = 5;
