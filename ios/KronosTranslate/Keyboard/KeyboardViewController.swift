@@ -56,7 +56,7 @@ final class KeyboardViewController: UIInputViewController {
             inserted = nil; original = nil
         }
         if text.isEmpty, board.shift == .off { board.setShift(.on) }
-        board.setSuggestions(suggestions())
+        refreshSuggestions()
         if let t = inserted, text == t { return }          // translation is in the field; nothing to preview
         inserted = nil; original = nil
         scheduleTranslate(text)
@@ -76,13 +76,28 @@ final class KeyboardViewController: UIInputViewController {
         return before
     }
 
-    private func suggestions() -> [String] {
+    private let suggestQueue = DispatchQueue(label: "kronos.suggest", qos: .userInteractive)
+    private var suggestGen = 0
+
+    /// Dictionary lookups take tens of ms; they never run on the key-handling thread.
+    private func refreshSuggestions() {
+        suggestGen += 1
+        let gen = suggestGen
         let word = currentWord
         let before = textDocumentProxy.documentContextBeforeInput ?? ""
+        let lang = checkerLanguage, src = Prefs.sourceCode
+        suggestQueue.async { [weak self] in
+            guard let self else { return }
+            let s = self.suggestions(word: word, before: before, lang: lang, source: src)
+            DispatchQueue.main.async { if gen == self.suggestGen { self.board.setSuggestions(s) } }
+        }
+    }
+
+    private func suggestions(word: String, before: String, lang checkerLanguage: String, source: String) -> [String] {
         if word.isEmpty {
             // Sentence start: the system's usual openers; otherwise nothing.
             let sentenceStart = before.trimmingCharacters(in: .whitespaces).isEmpty || before.trimmingCharacters(in: .whitespaces).last.map { ".!?".contains($0) } == true
-            return sentenceStart && Prefs.sourceCode == "EN" ? ["I", "The", "I'm"] : []
+            return sentenceStart && source == "EN" ? ["I", "The", "I'm"] : []
         }
         let ns = word as NSString
         let all = NSRange(location: 0, length: ns.length)

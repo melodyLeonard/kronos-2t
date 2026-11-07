@@ -57,10 +57,11 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
     var dark: Bool { traitCollection.userInterfaceStyle == .dark }
     private var bed: UIColor { dark ? UIColor(white: 0.17, alpha: 1) : UIColor(red: 0.82, green: 0.827, blue: 0.851, alpha: 1) }
     private var keyFill: UIColor { dark ? UIColor(white: 0.353, alpha: 1) : .white }
-    private var fnFill: UIColor { dark ? UIColor(white: 0.227, alpha: 1) : UIColor(red: 0.678, green: 0.702, blue: 0.737, alpha: 1) }
+    // Function keys on iOS 26 are a translucent tint of the backdrop, not solid grey.
+    private var fnFill: UIColor { dark ? UIColor(white: 1, alpha: 0.12) : UIColor(red: 0.86, green: 0.87, blue: 0.89, alpha: 0.9) }
     private var ink: UIColor { dark ? .white : .black }
     private var muted: UIColor { dark ? UIColor(white: 0.82, alpha: 1) : UIColor(red: 0.235, green: 0.235, blue: 0.263, alpha: 1) }
-    private var keyShadow: UIColor { dark ? UIColor(white: 0.08, alpha: 1) : UIColor(red: 0.537, green: 0.541, blue: 0.553, alpha: 1) }
+    private var keyShadow: UIColor { dark ? UIColor(white: 0, alpha: 0.5) : UIColor(white: 0, alpha: 0.22) }
     private var blue: UIColor { UIColor(red: 0, green: 0.478, blue: 1, alpha: 1) }
     private var blueShadow: UIColor { UIColor(red: 0.04, green: 0.37, blue: 0.75, alpha: 1) }
 
@@ -200,8 +201,8 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
     private func bottom(left: (KeyButton, CGFloat)) -> [(KeyButton, CGFloat)] {
         var r = [left]
         if needsGlobe { r.append((key("sf:globe", .globe, fn: true), 1.27)) }
-        r.append((key("sf:face.smiling.inverse", .page(.emoji), fn: true), 1.27))
-        r.append((key("space", .space), 0))
+        r.append((key("sf:face.smiling", .page(.emoji), fn: true), 1.27))
+        r.append((key(" ", .space), 0))
         r.append((key("sf:return", .ret, fn: true), 2.73))
         return r
     }
@@ -348,6 +349,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
     /// Keeps the previous preview visible while a newer one is in flight.
     func setTranslating() {
         let keep = state
+        if case .translating = keep { return }   // already spinning; nothing to redraw
         state = .translating
         setState(.translating)
         if case .preview(let old) = keep { status.text = old }
@@ -444,9 +446,10 @@ final class KeyButton: UIControl {
     init(label: String, fn: Bool, fill: UIColor, ink: UIColor, shadow: UIColor) {
         self.label = label; self.fn = fn
         super.init(frame: .zero)
-        layer.cornerRadius = 7
+        layer.cornerRadius = 9
         layer.cornerCurve = .continuous
-        layer.shadowOpacity = 1; layer.shadowOffset = .init(width: 0, height: 1); layer.shadowRadius = 0
+        // Soft elevation like the system keycaps, not a hard 1pt line.
+        layer.shadowOpacity = 1; layer.shadowOffset = .init(width: 0, height: 1); layer.shadowRadius = 1.5
         for v in [text, image] { v.translatesAutoresizingMaskIntoConstraints = false; v.isUserInteractionEnabled = false; addSubview(v) }
         text.textAlignment = .center
         image.contentMode = .center
