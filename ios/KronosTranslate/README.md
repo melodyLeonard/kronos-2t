@@ -1,7 +1,9 @@
 # Kronos Translate keyboard (iOS)
 
-System-style keyboard with one extra bar: language pill · status · Translate. Type English, tap
-Translate, the field is replaced with the translation (Undo restores it), then send as usual.
+System-style keyboard (QWERTY / AZERTY / QWERTZ by typing language, long-press accents, full
+system emoji set) with a reply-style reference strip above the keys. The field always stays in
+your language; the strip shows the translation live (debounced 0.5 s) and **Use** swaps it in
+before you send (Undo restores). Tap the strip to pick the typing language, target and tone.
 Translation runs on Kronos `POST /translate` with tone and your last 5 sent messages as context.
 
 Design: https://www.figma.com/design/USzClG0m8LjwRQwbfufETU

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @State private var server = Prefs.serverURL
+    @State private var source = Prefs.sourceCode
     @State private var target = Prefs.targetCode
     @State private var tone = Prefs.tone
     @State private var contextOn = Prefs.contextOn
@@ -13,11 +14,22 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section {
+                    HStack(spacing: 14) {
+                        Image("Logo").resizable().frame(width: 64, height: 64).clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Kronos Translate").font(.title3.bold())
+                            Text("Type in your language, send in theirs.").foregroundStyle(.secondary).font(.subheadline)
+                        }
+                    }
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(.init(top: 0, leading: 4, bottom: 8, trailing: 0))
+                }
                 Section("Try it") {
                     TextField("Switch to the Kronos keyboard and type here", text: $sample, axis: .vertical).lineLimit(3...6)
                 }
                 Section("Set up") {
-                    step(1, "Add the keyboard", "Settings › General › Keyboard › Keyboards › Add New Keyboard › Kronos")
+                    step(1, "Add the keyboard", "Settings › General › Keyboard › Keyboards › Add New Keyboard › Translate")
                     step(2, "Allow Full Access", "Needed to reach your Mac. Nothing leaves your Wi‑Fi.")
                     step(3, "Connect to your Mac", "Run kronos_server with --host 0.0.0.0, then enter its address below")
                     Button {
@@ -38,6 +50,10 @@ struct SettingsView: View {
                     }
                 }
                 Section {
+                    Picker(selection: $source) {
+                        ForEach(Languages.all) { Text("\($0.name) · \($0.native)").tag($0.code) }
+                    } label: { Label("I type in", systemImage: "keyboard").settingsLabel(.gray) }
+                    .onChange(of: source) { Prefs.sourceCode = source }
                     Picker(selection: $target) {
                         ForEach(Languages.all) { Text("\($0.name) · \($0.native)").tag($0.code) }
                     } label: { Label("Translate to", systemImage: "globe").settingsLabel(.orange) }
@@ -51,7 +67,20 @@ struct SettingsView: View {
                 } header: {
                     Text("Defaults")
                 } footer: {
-                    Text("Context keeps the last \(Prefs.contextMax) messages you sent, on this iPhone only, so names, pronouns and slang translate the way you meant them.")
+                    Text("The typing language also picks the key layout (AZERTY for French, QWERTZ for German). Context keeps the last \(Prefs.contextMax) messages you sent, on this iPhone only, so names, pronouns and slang translate the way you meant them.")
+                }
+                Section {
+                    Link(destination: URL(string: Prefs.githubURL)!) {
+                        HStack(spacing: 12) {
+                            Image("Logo").resizable().frame(width: 29, height: 29).clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("Powered by Kronos").foregroundStyle(.primary)
+                                Text("Open-source local LLM engine · github.com/melodyLeonard/kronos-2t").font(.footnote).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "arrow.up.right").foregroundStyle(.tertiary)
+                        }
+                    }
                 }
             }
             .navigationTitle("Translate")
