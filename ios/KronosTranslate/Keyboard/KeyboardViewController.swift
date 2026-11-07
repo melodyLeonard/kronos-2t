@@ -14,6 +14,7 @@ final class KeyboardViewController: UIInputViewController {
     private let debounceInterval: TimeInterval = 0.14
     private var heightConstraint: NSLayoutConstraint?
     private let checker = UITextChecker()
+    private var lastSpace = Date.distantPast, lastShift = Date.distantPast
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -32,6 +33,7 @@ final class KeyboardViewController: UIInputViewController {
         heightConstraint = h
         board.onKey = { [weak self] in self?.handle($0) }
         board.onSuggestion = { [weak self] in self?.accept(suggestion: $0) }
+        board.onCursorMove = { [weak self] in self?.textDocumentProxy.adjustTextPosition(byCharacterOffset: $0) }
         board.onHeightChange = { [weak self] in self?.heightConstraint?.constant = $0 }
     }
 
@@ -149,17 +151,29 @@ final class KeyboardViewController: UIInputViewController {
             textDocumentProxy.insertText(board.shift == .off || !cased ? s : s.uppercased())
             if board.shift == .on { board.setShift(.off) }
         case .space:
+            let before = textDocumentProxy.documentContextBeforeInput ?? ""
+            if Date().timeIntervalSince(lastSpace) < 0.35, before.hasSuffix(" "), before.dropLast().last?.isLetter == true {
+                // Double-tap space: ". " and capitalise, like the system keyboard.
+                textDocumentProxy.deleteBackward()
+                textDocumentProxy.insertText(". ")
+                board.setShift(.on)
+                lastSpace = .distantPast
+                break
+            }
+            lastSpace = Date()
             autocorrectIfNeeded()
             textDocumentProxy.insertText(" ")
             // Sentence start capitalises, like the system keyboard.
-            let before = (textDocumentProxy.documentContextBeforeInput ?? "").trimmingCharacters(in: .whitespaces)
-            if let l = before.last, ".!?".contains(l) { board.setShift(.on) }
+            let tail = (textDocumentProxy.documentContextBeforeInput ?? "").trimmingCharacters(in: .whitespaces)
+            if let l = tail.last, ".!?".contains(l) { board.setShift(.on) }
         case .backspace:
             textDocumentProxy.deleteBackward()
             if fieldText().isEmpty { board.setShift(.on) }
         case .ret:
             textDocumentProxy.insertText("\n")
         case .shift:
+            if Date().timeIntervalSince(lastShift) < 0.35 { board.setShift(.lock); lastShift = .distantPast; break }
+            lastShift = Date()
             board.setShift(board.shift == .off ? .on : .off)
         case .capsLock:
             board.setShift(.lock)

@@ -20,6 +20,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
 
     var onKey: ((Key) -> Void)?
     var onSuggestion: ((String) -> Void)?
+    var onCursorMove: ((Int) -> Void)?
     var onHeightChange: ((CGFloat) -> Void)?
     var enableInputClicksWhenVisible: Bool { true }
     private(set) var shift: Shift = .off
@@ -202,7 +203,9 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         var r = [left]
         if needsGlobe { r.append((key("sf:globe", .globe, fn: true), 1.27)) }
         r.append((key("sf:face.smiling", .page(.emoji), fn: true), 1.27))
-        r.append((key(" ", .space), 0))
+        let space = key(" ", .space)
+        space.onCursorMove = { [weak self] in self?.onCursorMove?($0) }
+        r.append((space, 0))
         r.append((key("sf:return", .ret, fn: true), 2.73))
         return r
     }
@@ -556,24 +559,62 @@ final class KeyButton: UIControl {
                 self?.repeatTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in self?.onTap?() }
             }
         }
+        if onCursorMove != nil, let t = touches.first {
+            // Hold the space bar 0.4s without moving, then drag to move the cursor (system trackpad gesture).
+            trackX = t.location(in: self).x
+            cursorMode = false
+            trackTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in
+                guard let self else { return }
+                self.cursorMode = true
+                self.setPressed(false)
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            }
+        }
+    }
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesMoved(touches, with: event)
+        guard onCursorMove != nil, let t = touches.first else { return }
+        let x = t.location(in: self).x
+        if cursorMode {
+            let steps = Int((x - trackX) / 9)
+            if steps != 0 { onCursorMove?(steps); trackX += CGFloat(steps) * 9 }
+        } else if abs(x - trackX) > 12 {
+            trackTimer?.invalidate(); trackTimer = nil   // moved too early: not a hold
+        }
     }
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesEnded(touches, with: event)
         setPressed(false)
         stopRepeat()
-        if !repeats, let t = touches.first, bounds.inset(by: hitInsets).contains(t.location(in: self)), !longPressed { onTap?() }
+        let wasTracking = cursorMode
+        trackTimer?.invalidate(); trackTimer = nil; cursorMode = false
+        if !repeats, !wasTracking, let t = touches.first, bounds.inset(by: hitInsets).contains(t.location(in: self)), !longPressed { onTap?() }
         longPressed = false
     }
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { super.touchesCancelled(touches, with: event); setPressed(false); stopRepeat(); longPressed = false }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesCancelled(touches, with: event)
+        setPressed(false); stopRepeat(); longPressed = false
+        trackTimer?.invalidate(); trackTimer = nil; cursorMode = false
+    }
     private func stopRepeat() { repeatTimer?.invalidate(); repeatTimer = nil }
+    var onCursorMove: ((Int) -> Void)?
+    private var trackX: CGFloat = 0
+    private var cursorMode = false
+    private var trackTimer: Timer?
     private var longPressed = false
     @objc private func longPress(_ g: UILongPressGestureRecognizer) {
-        guard !variants.isEmpty else { return }
-        if g.state == .began { longPressed = true }
+        guard onLongPress != nil else { return }
+        if g.state == .began { longPressed = true; setPressed(false) }
         onLongPress?(g)
     }
 
-    func setPressed(_ on: Bool) { backgroundColor = on ? fill.withAlphaComponent(fn ? 0.7 : 0.85) : fill }
+    /// System keycaps go lighter when pressed (no balloon on iOS 26).
+    func setPressed(_ on: Bool) {
+        guard on else { backgroundColor = fill; return }
+        var w: CGFloat = 0, a: CGFloat = 0
+        fill.getWhite(&w, alpha: &a)
+        backgroundColor = w > 0.6 ? UIColor(white: 0.84, alpha: 1) : UIColor(white: 0.56, alpha: 1)
+    }
     private var capH: CGFloat = 40
     /// Measured on the system keyboard: 25pt Regular letters on a 45pt cap (19pt for words), baseline at 0.65 of the cap.
     func setCapHeight(_ h: CGFloat) {
