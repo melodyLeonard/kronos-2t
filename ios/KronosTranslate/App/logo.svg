@@ -11,11 +11,14 @@
   </defs>
   <rect width="1024" height="1024" rx="228" fill="url(#bg)"/>
   <!-- outgoing bubble: what you type -->
-  <path d="M246 200h364c53 0 96 43 96 96v212c0 53-43 96-96 96H364l-112 96v-96h-6c-53 0-96-43-96-96V296c0-53 43-96 96-96z" fill="#fff"/>
-  <text x="428" y="500" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="240" font-weight="700" text-anchor="middle" fill="#1C1C3A">A</text>
+  <path d="M226 180h344c53 0 96 43 96 96v196c0 53-43 96-96 96H344l-112 96v-96h-6c-53 0-96-43-96-96V276c0-53 43-96 96-96z" fill="#fff"/>
+  <text x="398" y="462" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="230" font-weight="700" text-anchor="middle" fill="#1C1C3A">A</text>
   <!-- incoming bubble: what they receive -->
-  <path d="M510 452h268c53 0 96 43 96 96v212c0 53-43 96-96 96h-6v96l-112-96H510c-53 0-96-43-96-96V548c0-53 43-96 96-96z" fill="url(#mint)"/>
-  <text x="644" y="752" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="240" font-weight="700" text-anchor="middle" fill="#0B3B2C">é</text>
-  <!-- arrow: the translation step -->
-  <path d="M660 330h118M734 286l44 44-44 44" fill="none" stroke="#fff" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M454 456h344c53 0 96 43 96 96v196c0 53-43 96-96 96h-6v96l-112-96H454c-53 0-96-43-96-96V552c0-53 43-96 96-96z" fill="url(#mint)"/>
+  <text x="626" y="738" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="230" font-weight="700" text-anchor="middle" fill="#0B3B2C">é</text>
+  <!-- both ways: sits fully on the blue, clear of both bubbles -->
+  <g fill="none" stroke="#fff" stroke-width="34" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M730 300h160M846 256l44 44-44 44"/>
+    <path d="M890 384H730M774 340l-44 44 44 44"/>
+  </g>
 </svg>
