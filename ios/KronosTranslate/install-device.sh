@@ -12,7 +12,7 @@ PROF=$(for f in ~/Library/Developer/Xcode/UserData/Provisioning\ Profiles/*.mobi
 
 xcodegen generate >/dev/null
 xcodebuild -project KronosTranslate.xcodeproj -scheme KronosTranslate -destination 'generic/platform=iOS' \
-  -configuration Debug -derivedDataPath build-device CODE_SIGNING_ALLOWED=NO build 2>&1 | grep -E "error:|BUILD"
+  -configuration Debug -derivedDataPath build-device CODE_SIGNING_ALLOWED=NO ENABLE_DEBUG_DYLIB=NO build 2>&1 | grep -E "error:|BUILD"
 
 OUT=build-device/Build/Products/Debug-iphoneos
 APP=$OUT/KronosTranslate.app
@@ -30,6 +30,8 @@ EOF
 ent "$OUT/ent-app.plist" com.melodyleonard.KronosTranslate
 ent "$OUT/ent-ext.plist" com.melodyleonard.KronosTranslate.keyboard
 cp "$PROF" "$EXT/embedded.mobileprovision"; cp "$PROF" "$APP/embedded.mobileprovision"
+# Any leftover nested binaries (debug dylibs, frameworks) must be signed before their bundle.
+find "$APP" -name "*.dylib" -o -name "*.framework" | while read -r f; do codesign --force --sign "$ID" --timestamp=none "$f"; done
 codesign --force --sign "$ID" --entitlements "$OUT/ent-ext.plist" --timestamp=none "$EXT"
 codesign --force --sign "$ID" --entitlements "$OUT/ent-app.plist" --timestamp=none "$APP"
 codesign --verify --deep --strict "$APP"
