@@ -31,3 +31,11 @@ pub const MAX_CONSECUTIVE_NO_TOOL_STEPS: usize = 5;
 pub const MAX_LEARNED_FACTS: usize = 256;
 /// MTP drafts per verify round (verify of 4 tokens costs ~1.25x a single token).
 pub const SPEC_MTP_K: usize = 3;
+
+/// `/translate` output cap: `bytes / 2 + TRANSLATE_TOKENS_BASE`, clamped to the range.
+pub const TRANSLATE_TOKENS_BASE: usize = 48;
+pub const TRANSLATE_TOKENS_MIN: usize = 48;
+pub const TRANSLATE_TOKENS_MAX: usize = 2048;
+/// `/translate` context: newest items kept, oldest first, trimmed to the byte budget (~1k tokens).
+pub const TRANSLATE_CONTEXT_MAX_ITEMS: usize = 8;
+pub const TRANSLATE_CONTEXT_MAX_BYTES: usize = 4096;

@@ -62,3 +62,49 @@ pub const JEV_CLASSIFY_SYSTEM: &str =
     "Classify the request by answering with only one listed label token and nothing else.";
 
 pub const JEV_VERIFY_SYSTEM: &str = "Answer with only Yes or No.";
+
+pub const TRANSLATE_SYSTEM: &str = concat!(
+    "You are a translation engine. Translate the user's message faithfully into the target language. ",
+    "Preserve tone, register, emoji, punctuation and line breaks. ",
+    "Output only the translation: no quotes, no prefix, no notes, no alternatives."
+);
+
+/// System prompt for `/translate`. `from` is `auto` or a language; `tone` is casual, formal or
+/// neutral; `context` holds the sender's earlier messages in the chat, oldest first.
+pub fn translate_system(to: &str, from: &str, tone: &str, context: &[String]) -> String {
+    let mut s = format!("{TRANSLATE_SYSTEM} Target language: {to}.");
+    if !from.is_empty() && !from.eq_ignore_ascii_case("auto") {
+        s.push_str(&format!(" Source language: {from}."));
+    }
+    match tone.to_ascii_lowercase().as_str() {
+        "casual" => s.push_str(" Register: casual and informal, as between friends (informal address such as tu/du)."),
+        "formal" => s.push_str(" Register: formal and polite (formal address such as vous/Sie)."),
+        _ => {}
+    }
+    if !context.is_empty() {
+        s.push_str("\n\nEarlier messages from the same sender in this chat, oldest first. Use them to resolve pronouns, slang, idioms and register consistently; do not translate them:");
+        for c in context {
+            s.push_str("\n- ");
+            s.push_str(c.trim());
+        }
+        s.push_str("\n\nTranslate only the next user message.");
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::translate_system;
+
+    #[test]
+    fn translate_system_includes_tone_and_context() {
+        let ctx = vec!["Are you coming to Ana's party?".to_string(), "It starts at 8".to_string()];
+        let s = translate_system("French", "auto", "casual", &ctx);
+        assert!(s.contains("Target language: French."));
+        assert!(!s.contains("Source language"));
+        assert!(s.contains("tu/du"));
+        assert!(s.contains("- Are you coming to Ana's party?\n- It starts at 8"));
+        let f = translate_system("German", "English", "formal", &[]);
+        assert!(f.contains("Source language: English.") && f.contains("vous/Sie") && !f.contains("Earlier messages"));
+    }
+}

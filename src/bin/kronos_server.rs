@@ -52,6 +52,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kronos_2t::config::server::{MAX_BODY_BYTES as MAX_BODY, MAX_HEADER_BYTES as MAX_HEADER, MAX_REVERT_SNAPSHOT_BYTES};
+use kronos_2t::config::limits::{
+    TRANSLATE_CONTEXT_MAX_BYTES, TRANSLATE_CONTEXT_MAX_ITEMS, TRANSLATE_TOKENS_BASE, TRANSLATE_TOKENS_MAX, TRANSLATE_TOKENS_MIN,
+};
 const CHAT_PAGE: &str = include_str!("../web/chat.html");
 const QUICK_PAGE: &str = include_str!("../web/quick.html");
 
@@ -521,7 +524,7 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, X-Kronos-Tab, Range\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
+const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Private-Network: true\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, X-Kronos-Tab, Range\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
 
 fn respond_bytes(
     stream: &mut TcpStream,
@@ -885,6 +888,87 @@ fn format_completion_response(
         c.finish.as_str(),
         usage(c, kv)
     )
+}
+
+/// `/translate`: `{"text","to","from","tone","context":[..]}` -> `{"text"}`. Thinking is suppressed with an empty
+/// `<think>` prefix on Qwen3 models; output is capped from the input length.
+fn translate(srv: &Server, stream: &mut TcpStream, req: &Request) {
+    let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
+        Ok(b) => b,
+        Err(e) => return error(stream, 400, &format!("invalid JSON: {e}")),
+    };
+    let text = body.get("text").and_then(Json::as_str).unwrap_or("").trim();
+    if text.is_empty() {
+        return error(stream, 400, "`text` is required");
+    }
+    let to = body.get("to").and_then(Json::as_str).map(str::trim).filter(|s| !s.is_empty()).unwrap_or("French");
+    let from = body.get("from").and_then(Json::as_str).unwrap_or("auto");
+    let tone = body.get("tone").and_then(Json::as_str).unwrap_or("neutral");
+    let context = translate_context(&body);
+    let messages = [
+        Message::new("system", &kronos_2t::config::prompts::translate_system(to, from, tone, &context)),
+        Message::new("user", text),
+    ];
+    let params = GenParams {
+        temperature: 0.0,
+        top_k: 40,
+        top_p: 0.9,
+        repeat_penalty: 1.02,
+        max_tokens: (text.len() / 2 + TRANSLATE_TOKENS_BASE).clamp(TRANSLATE_TOKENS_MIN, TRANSLATE_TOKENS_MAX),
+        seed: 0,
+    };
+    let prefix = if srv.name.to_ascii_lowercase().contains("qwen3") { "<think>\n\n</think>\n\n" } else { "" };
+    let mut model = srv.model.lock().unwrap_or_else(|p| p.into_inner());
+    match model.generate_with_tools_prefixed(&messages, &[], prefix, &params, |_| true) {
+        Ok(c) => respond(stream, 200, "application/json", &format!(r#"{{"text":{}}}"#, quote(&clean_translation(&c.text)))),
+        Err(e) => error(stream, 400, &e),
+    }
+}
+
+/// Last `TRANSLATE_CONTEXT_MAX_ITEMS` non-empty `context` strings within the byte budget, oldest first.
+fn translate_context(body: &Json) -> Vec<String> {
+    let items: Vec<String> = body
+        .get("context")
+        .and_then(Json::as_arr)
+        .map(|a| a.iter().filter_map(Json::as_str).map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    let mut bytes = 0;
+    for item in items.into_iter().rev().take(TRANSLATE_CONTEXT_MAX_ITEMS) {
+        bytes += item.len();
+        if bytes > TRANSLATE_CONTEXT_MAX_BYTES {
+            break;
+        }
+        out.push(item);
+    }
+    out.reverse();
+    out
+}
+
+/// Strips think blocks, `Translation:`-style prefixes and wrapping quotes from model output.
+fn clean_translation(raw: &str) -> String {
+    let mut s = raw;
+    if let Some(end) = s.find("</think>") {
+        s = &s[end + "</think>".len()..];
+    }
+    let mut s = s.trim();
+    loop {
+        let before = s;
+        for p in ["translation:", "translated text:", "translated:", "output:"] {
+            if s.is_char_boundary(p.len()) && s[..p.len()].eq_ignore_ascii_case(p) {
+                s = s[p.len()..].trim();
+            }
+        }
+        for (open, close) in [('"', '"'), ('“', '”'), ('«', '»'), ('\'', '\''), ('`', '`')] {
+            if s.starts_with(open) && s.ends_with(close) && s.chars().count() > 1 {
+                s = s[open.len_utf8()..s.len() - close.len_utf8()].trim();
+            }
+        }
+        if s == before {
+            break;
+        }
+    }
+    s.to_string()
 }
 
 fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
@@ -2697,6 +2781,7 @@ fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
             ),
         ),
         ("POST", "/v1/chat/completions") => chat_completions(srv, &mut stream, &req),
+        ("POST", "/translate") | ("POST", "/v1/translate") => translate(srv, &mut stream, &req),
         ("POST", "/v1/agent/chat") => agent_chat_sse(srv, &mut stream, &req),
         ("POST", "/v1/turn") => unified_turn_sse(srv, &mut stream, &req),
         ("POST", "/v1/compact") => compact_history_http(srv, &mut stream, &req),
@@ -3275,6 +3360,16 @@ fn main() {
 mod tests {
     use super::*;
     use kronos_2t::runtime::chat::FinishReason;
+
+    #[test]
+    fn test_clean_translation() {
+        assert_eq!(clean_translation("\"Hasta mañana\""), "Hasta mañana");
+        assert_eq!(clean_translation("Translation: «À demain»\n"), "À demain");
+        assert_eq!(clean_translation("<think>\nhmm\n</think>\n\nSalut 👋\nça va ?"), "Salut 👋\nça va ?");
+        assert_eq!(clean_translation("“Ciao”"), "Ciao");
+        assert_eq!(clean_translation("I'm fine"), "I'm fine");
+        assert_eq!(clean_translation("\""), "\"");
+    }
 
     #[test]
     fn test_openai_tool_request_and_response_wire_format() {
