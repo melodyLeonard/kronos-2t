@@ -10,9 +10,9 @@ Qwen with greedy decoding.
 |---|---|---|
 | NF4 g128 file (`kronos-*.k2tb`) | 4.0 GiB | 881 MiB |
 | resident weights (server) | 4.30 GiB | 0.86 GiB |
-| quality probe, 10 sentences, total | 7.67 s | 1.86 s |
-| first request with a new context, p50 / p95 | 715 / 1664 ms | 267 / 344 ms |
-| follow-ups sharing context + tone (5–15 words), p50 / p95, n=30 | 727 / 1109 ms | 197 / 408 ms |
+| quality probe, 10 sentences, total | 7.67 s | 1.58 s |
+| first request with a new context, p50 / p95 | 715 / 1664 ms | 255 / 300 ms |
+| follow-ups sharing context + tone (5–15 words), p50 / p95, n=30 | 727 / 1109 ms | 183 / 330 ms |
 | FR/ES/DE fidelity (8 sentences) | 8/8 usable, best register | 7/8 usable, 2 wording slips |
 | Yoruba (2 sentences) | wrong but Yoruba-shaped | gibberish (not a supported language) |
 
@@ -26,24 +26,40 @@ prefix, so each request re-prefills the system turn.
 | # | to / tone | input | Qwen3.5-9B | Hy-MT2-1.8B |
 |---|---|---|---|---|
 | 1 | Spanish, casual | see you tomorrow | te veo mañana | ¿Nos vemos mañana? |
-| 2 | French, casual | I'm running late, start without me | Je suis en retard, commence sans moi ! | Je suis en retard, on commence sans moi |
-| 3 | German, formal | Could you send me the invoice by Friday? | Könnten Sie mir die Rechnung bis Freitag senden? | Könnten Sie mir die Rechnung bis Freitag zusenden? |
-| 4 | French, casual | lol no way, he actually said that?? | lol impossible, il a vraiment dit ça ?? | lol non, il a vraiment dit ça ??? |
-| 5 | Yoruba, casual | Happy birthday! Hope you have a great day 🎉 | Ojọ ibi-ọjọ́ rẹ! Níwọ̀n bí ẹni pé ọjọ́ yìí yóò jẹ́ ọjọ́ tí ó tọ́ fún ẹni. 🎉 | Biyi o ṣe! Fẹ́n ọrọ ọpọ ọdẹ́ lẹ́yin 🎉 |
-| 6 | Spanish, formal | We regret to inform you that the position has been filled. | Lamentamos informarle que la posición ha sido ocupada. | Lamentamos informarle que el puesto ya ha sido ocupado. |
+| 2 | French, casual | I'm running late, start without me | Je suis en retard, commence sans moi ! | Je suis en retard, commence sans moi |
+| 3 | German, formal | Could you send me the invoice by Friday? | Könnten Sie mir die Rechnung bis Freitag senden? | Könnten Sie mir den Rechnungsstück am Freitag zusenden? |
+| 4 | French, casual | lol no way, he actually said that?? | lol impossible, il a vraiment dit ça ?? | lol non, vraiment il a dit ça?? |
+| 5 | Yoruba, casual | Happy birthday! Hope you have a great day 🎉 | Ojọ ibi-ọjọ́ rẹ! Níwọ̀n bí ẹni pé ọjọ́ yìí yóò jẹ́ ọjọ́ tí ó tọ́ fún ẹni. 🎉 | Blessed birthday! Hope you have a great day 🎉 |
+| 6 | Spanish, formal | We regret to inform you that the position has been filled. | Lamentamos informarle que la posición ha sido ocupada. | Lamentamos informarle que el puesto ya ha sido cubierto. |
 | 7 | German, casual | Can you pick up the kids? I'm stuck at work | Kannst du die Kids abholen? Ich stecke hier im Job fest. | Kannst du die Kinder abholen? Ich bin bei der Arbeit festgefangen. |
-| 8 | French, formal | The package arrived broken, I'd like a refund. | Le colis est arrivé endommagé ; je souhaiterais obtenir un remboursement. | Le colis est arrivé endommagé, je souhaite un remboursement. |
-| 9 | Yoruba, casual | Good morning! Did you sleep well? | Oye! Ṣe o nira? | Good morning! Nigbari, dua ọmọ ti ṣe ọmọ? |
+| 8 | French, formal | The package arrived broken, I'd like a refund. | Le colis est arrivé endommagé ; je souhaiterais obtenir un remboursement. | Le colis est arrivé endommagé, je souhaiterais un remboursement. |
+| 9 | Yoruba, casual | Good morning! Did you sleep well? | Oye! Ṣe o nira? | Gud morning! Ní ba lọ sí? |
 | 10 | Spanish, formal | Please find attached the revised contract for your review. | Adjunto encontrará el contrato revisado para su revisión. | Por favor, tenga a su disposición el contrato revisado para su revisión. |
 
 Judgement. Both models honour tone (tu/vous, du/Sie, usted) and keep emoji and punctuation. Hy-MT2 is
-idiomatic on 6, 3 and 4 (`el puesto`, `zusenden`, keeps `lol`), slips on 7 (`festgefangen` is not
-German for "stuck") and 10 (`tenga a su disposición` drifts from "please find attached"), and the
-sampling adds variation between identical requests (1 gained question marks from the question in its
-context; a greedy run gave `Nos vemos mañana`). Qwen3.5-9B is more careful on the formal sentences (8,
-10) and more colloquial on 7, at 3.5–4x the latency and 4.7x the size. Neither handles Yoruba: Qwen's
-output is wrong Yoruba, Hy-MT2's is noise, so `/translate` routes Yoruba, Igbo, Hausa and Swahili to
-the general model (`hy_mt2_supports` in `src/config/prompts.rs`).
+idiomatic on 2, 4, 6 and 8 (`el puesto ... cubierto`, keeps `lol`, `je souhaiterais`), slips on 3
+(`den Rechnungsstück` is not German), 7 (`festgefangen` is not German for "stuck") and 10 (`tenga a
+su disposición` drifts from "please find attached"), and the sampling adds variation between identical
+requests (1 gained question marks from the question in its context; a greedy run gave `Nos vemos
+mañana`). Qwen3.5-9B is more careful on the formal sentences (3, 10) and more colloquial on 7, at
+3.5–4x the latency and 4.7x the size. Neither handles Yoruba (Hy-MT2 now mostly leaves it in English),
+so `/translate` routes Yoruba, Igbo, Hausa and Swahili to the general model (`hy_mt2_supports` in
+`src/config/prompts.rs`).
+
+Prompt wording matters for Hy-MT2. The first wording of the background block ("Earlier messages from
+the same sender ... do not translate them") made it echo a French context line: `yes! see you there,
+can't wait` with context `On se voit demain ? J'ai réservé pour 19h` came back as `Oui ! On se voit
+demain ? J'ai réservé pour 19h`. A grid over three headings and three task lines (five context cases,
+card sampling) found only the short heading `Previous messages in this chat (context only, never
+translate or repeat them):` free of echoes; it is now combined with an explicit `Translate only the
+[Source Text].` and covered by `hunyuan_prompt_keeps_context_apart_from_source`. That case now gives
+`Oui ! À demain, je te vois là-bas, j'attends avec impatience.`
+
+Cold calls. A first request after the server has sat idle took 3.45 s: on this 24 GB machine with the
+Qwen3.5-9B server, a second Qwen3.5 copy and a `cargo test` build running, the idle Hy-MT2 process had
+been paged out (RSS 31 MB, 8 GB of pageouts), so the call re-faulted the 0.86 GiB of weights from swap.
+Warm calls on the same server measured 0.21–0.38 s right after. Keeping the model resident is a matter
+of memory headroom on the host; Kronos has no `mlock` option.
 
 ## Running it
 
