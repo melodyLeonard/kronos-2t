@@ -29,3 +29,5 @@ pub const WRITE_FILE_SMALL_CHANGE_PERCENT: usize = 25;
 pub const MAX_CONSECUTIVE_NO_TOOL_STEPS: usize = 5;
 
 pub const MAX_LEARNED_FACTS: usize = 256;
+/// MTP drafts per verify round (verify of 4 tokens costs ~1.25x a single token).
+pub const SPEC_MTP_K: usize = 3;

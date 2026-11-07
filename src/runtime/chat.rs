@@ -16,7 +16,7 @@ use crate::runtime::kv_sessions::{KvBlob, KvSource, SessionKvStore};
 
 
 
-use crate::config::limits::{
+use crate::config::limits::{SPEC_MTP_K, 
     SPEC_DRAFT_K_GREEDY, SPEC_DRAFT_K_INIT, SPEC_DRAFT_K_SAMPLE, SPEC_LOOKUP_K_INIT, SPEC_LOOKUP_K_MAX,
 };
 
@@ -435,6 +435,7 @@ enum SpecSource {
     None,
     Lookup,
     Draft,
+    Mtp,
 }
 
 /// Drops target and draft KV entries past `n` after a rejected speculative token.
@@ -2042,6 +2043,19 @@ impl ChatModel {
                 }
             }
 
+            // Tier 3: the model's own MTP head (greedy only; a 2-4 token verify costs ~1.2x one token).
+            if source == SpecSource::None && spec_ok && greedy && self.engine.has_mtp() {
+                let k = SPEC_MTP_K.min(verify_cap).min(rem).min(avail_ctx);
+                if k >= 1 {
+                    let d = self.engine.mtp_draft(next, k);
+                    if !d.is_empty() {
+                        draft_tokens[..d.len()].copy_from_slice(&d);
+                        drafted = d.len();
+                        source = SpecSource::Mtp;
+                    }
+                }
+            }
+
             if source != SpecSource::None {
                 // Verify `[next, d_0, ..., d_{drafted-1}]` in one batched target pass.
                 let mut batch = [0usize; SPEC_LOOKUP_K_MAX + 1];
@@ -2130,6 +2144,7 @@ impl ChatModel {
                 }
 
                 match source {
+                    SpecSource::Mtp => {}
                     SpecSource::Draft => {
                         let round_rate = (accepted_in_round as f32) / (drafted.max(1) as f32);
                         ewma_accept = 0.75 * ewma_accept + 0.25 * round_rate;

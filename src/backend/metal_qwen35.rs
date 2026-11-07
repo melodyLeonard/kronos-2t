@@ -1129,12 +1129,14 @@ pub struct StateSnapshot {
     /// Per (KV slot, kv head): K rows, V rows, K scales, V scales for positions `0..pos`.
     kv: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>,
     mtp_last: Option<Vec<u8>>,
+    /// Hidden row, position and supplied token of the pending MTP entry (see `mtp_pend`).
+    mtp_pend: Option<(Vec<u8>, usize, Option<usize>)>,
 }
 
 impl StateSnapshot {
     /// Bytes held by this snapshot.
     pub fn bytes(&self) -> usize {
-        self.conv.len() + self.delta.len() * 2 + self.delta_f32.len() + self.kv.iter().map(|k| k.0.len() + k.1.len() + k.2.len() + k.3.len()).sum::<usize>()
+        self.conv.len() + self.delta.len() * 2 + self.delta_f32.len() + self.mtp_pend.as_ref().map_or(0, |p| p.0.len()) + self.kv.iter().map(|k| k.0.len() + k.1.len() + k.2.len() + k.3.len()).sum::<usize>()
     }
 }
 
@@ -1167,6 +1169,10 @@ pub struct MetalQwen35 {
     ckpt: Option<(MtlObj, MtlObj)>,
     /// `(pos0, n)` of the last `verify` call, until `accept` settles it.
     pending: Option<(usize, usize)>,
+    /// MTP cache tracking: `(hidden row, position, token)` of the last fed token, whose MTP entry still
+    /// needs the token that follows it (`token` once a draft fill supplied one).
+    mtp_track: bool,
+    mtp_pend: Option<(usize, usize, Option<usize>)>,
     mtp: Option<GpuMtp>,
     /// Row-prefix view of `lm_head` scored by MTP drafts (low BPE ids are the frequent tokens).
     draft_head: Option<GpuNf4Matrix>,
@@ -1434,6 +1440,8 @@ impl MetalQwen35 {
                     logits_cap: 1,
                     ckpt: None,
                     pending: None,
+                    mtp_track: false,
+                    mtp_pend: None,
                     draft_head: None,
                     draft_vocab: 0,
                     wide_gemv: std::env::var("Q35_GEMV").map_or(true, |v| v != "old"),
@@ -1501,6 +1509,7 @@ impl MetalQwen35 {
             delta_f32,
             kv,
             mtp_last: self.mtp.as_ref().map(|m| copy(&m.last, 0, m.last.byte_len())),
+            mtp_pend: self.mtp_pend.map(|(row, pos, t)| (copy(&self.sc.hidden, row * self.h * 4, self.h * 4), pos, t)),
         }
     }
 
@@ -1528,12 +1537,21 @@ impl MetalQwen35 {
         if let (Some(m), Some(last)) = (&self.mtp, &s.mtp_last) {
             put(&m.last, 0, last);
         }
+        self.mtp_pend = if self.mtp_track {
+            s.mtp_pend.as_ref().map(|(hid, pos, t)| {
+                put(&self.sc.hidden, 0, hid);
+                (0, *pos, *t)
+            })
+        } else {
+            None
+        };
         self.pos = s.pos;
         self.pending = None;
     }
 
     /// Clears the recurrent state and the KV position.
     pub fn reset(&mut self) {
+        self.mtp_pend = None;
         for b in [&self.conv_state, &self.delta_state] {
             // SAFETY: shared buffer, GPU idle between calls.
             unsafe { std::ptr::write_bytes(b.contents_ptr(), 0, b.byte_len()) };
@@ -1580,7 +1598,10 @@ impl MetalQwen35 {
         while start < tokens.len() {
             let end = (start + MAX_CHUNK).min(tokens.len());
             let chunk_want: Vec<usize> = want.iter().filter(|&&w| w >= start && w < end).map(|&w| w - start).collect();
+            self.mtp_flush(model, tokens[start])?;
+            let pos0 = self.pos;
             self.run_chunk(model, &tokens[start..end], &chunk_want, &mut |i, l| on_logits(start + i, l), false)?;
+            self.mtp_after(model, &tokens[start..end], pos0)?;
             start = end;
         }
         Ok(())
@@ -1601,9 +1622,11 @@ impl MetalQwen35 {
         if self.pos + n > self.kv_cap {
             return Err(format!("context {} exceeds capacity {}", self.pos + n, self.kv_cap));
         }
+        self.mtp_flush(model, tokens[0])?;
         let pos0 = self.pos;
         let want: Vec<usize> = (0..n).collect();
         self.run_chunk(model, tokens, &want, on_logits, true)?;
+        self.mtp_after(model, tokens, pos0)?;
         self.pending = Some((pos0, n));
         Ok(())
     }
@@ -1615,6 +1638,9 @@ impl MetalQwen35 {
         if keep == n {
             return;
         }
+        if self.mtp_track {
+            self.mtp_pend = Some((keep - 1, pos0 + keep - 1, None));
+        }
         let (conv_ck, delta_ck) = self.ckpt.as_ref().expect("verify allocates checkpoints");
         for (live, ck) in [(&self.conv_state, conv_ck), (&self.delta_state, delta_ck)] {
             let slot = live.byte_len();
@@ -1622,6 +1648,60 @@ impl MetalQwen35 {
             unsafe { std::ptr::copy_nonoverlapping(ck.contents_ptr().add((keep - 1) * slot), live.contents_ptr(), slot) };
         }
         self.pos = pos0 + keep;
+    }
+
+    /// Keeps the MTP cache current through every forward and verify, so [`Self::mtp_draft`] works at
+    /// any point of a conversation (costs one MTP-layer pass per chunk).
+    pub fn set_mtp_tracking(&mut self, on: bool) {
+        self.mtp_track = on && self.mtp.is_some();
+        self.mtp_pend = None;
+    }
+
+    pub fn mtp_tracking(&self) -> bool {
+        self.mtp_track
+    }
+
+    /// Writes the pending MTP entry with the token that follows it, unless a draft fill already did.
+    fn mtp_flush(&mut self, model: &Qwen35Model, tok: usize) -> Result<(), String> {
+        if let Some((row, pos, filled)) = self.mtp_pend.take() {
+            if filled != Some(tok) {
+                self.mtp_pass(model, &[tok], Some(row), pos, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// After feeding `tokens` at `pos0`: fills MTP entries for all but the last token, which waits.
+    fn mtp_after(&mut self, model: &Qwen35Model, tokens: &[usize], pos0: usize) -> Result<(), String> {
+        if !self.mtp_track {
+            return Ok(());
+        }
+        if tokens.len() > 1 {
+            self.mtp_pass(model, &tokens[1..], Some(0), pos0, false)?;
+        }
+        self.mtp_pend = Some((tokens.len() - 1, pos0 + tokens.len() - 1, None));
+        Ok(())
+    }
+
+    /// Greedy MTP drafts of up to `k` tokens after `next` (the token about to be fed), stopping where
+    /// the draft head is less than `min_p` sure. Empty without tracking.
+    pub fn mtp_draft(&mut self, model: &Qwen35Model, next: usize, k: usize, min_p: f32) -> Result<Vec<usize>, String> {
+        let Some((row, pos, _)) = self.mtp_pend else { return Ok(Vec::new()) };
+        if !self.mtp_track || k == 0 || pos + 1 + k >= self.kv_cap {
+            return Ok(Vec::new());
+        }
+        self.mtp_pass(model, &[next], Some(row), pos, true)?;
+        self.mtp_pend = Some((row, pos, Some(next)));
+        let (mut d, mut p) = self.last_draft_prob();
+        let mut out = Vec::with_capacity(k);
+        while p >= min_p && out.len() < k {
+            out.push(d);
+            if out.len() == k {
+                break;
+            }
+            (d, p) = self.mtp_chain_p(model, d, pos + out.len())?;
+        }
+        Ok(out)
     }
 
     /// Scores MTP drafts over the first `n` vocabulary rows only (`0` = full vocabulary).
@@ -2438,6 +2518,39 @@ mod tests {
         let e = max_rel(&dec, &cpu);
         eprintln!("NF5 decode {e:.4}");
         assert!(e < 0.05);
+    }
+
+    /// MTP tracking through prefill, single steps, a partly rejected verify and a snapshot round trip
+    /// drafts what an explicit fill of the same accepted tokens drafts.
+    #[test]
+    fn mtp_tracking_matches_explicit_fill() {
+        let model = Qwen35Model::synthetic(small_cfg(), 13, true);
+        let seq: Vec<usize> = (0..40).map(|i| (i * 29 + 3) % 512).collect();
+        let draft_ref = |n: usize, next: usize| -> usize {
+            let mut e = MetalQwen35::new(&model, 128).unwrap();
+            e.forward(&model, &seq[..n], &[], &mut |_, _| {}).unwrap();
+            e.mtp_fill(&model, &seq[1..n], 0, 0, false).unwrap();
+            e.mtp_fill(&model, &[next], n - 1, n - 1, true).unwrap().unwrap()
+        };
+        let mut eng = MetalQwen35::new(&model, 128).unwrap();
+        eng.set_mtp_tracking(true);
+        eng.forward(&model, &seq[..20], &[], &mut |_, _| {}).unwrap();
+        for i in 20..25 {
+            eng.forward(&model, &seq[i..i + 1], &[], &mut |_, _| {}).unwrap();
+        }
+        assert_eq!(eng.mtp_draft(&model, seq[25], 1, 0.0).unwrap(), vec![draft_ref(25, seq[25])]);
+        // Verify two good tokens and two junk ones; keep the good ones.
+        eng.verify(&model, &[seq[25], seq[26], 7, 7], &mut |_, _| {}).unwrap();
+        eng.accept(2);
+        assert_eq!(eng.mtp_draft(&model, seq[27], 1, 0.0).unwrap(), vec![draft_ref(27, seq[27])]);
+        // The pending entry survives a snapshot round trip through unrelated work.
+        let snap = eng.snapshot();
+        eng.reset();
+        eng.forward(&model, &seq[5..30], &[], &mut |_, _| {}).unwrap();
+        eng.restore(&snap);
+        eng.forward(&model, &seq[27..28], &[], &mut |_, _| {}).unwrap();
+        assert_eq!(eng.mtp_draft(&model, seq[28], 2, 0.0).unwrap().len(), 2);
+        assert_eq!(eng.mtp_draft(&model, seq[28], 1, 0.0).unwrap(), vec![draft_ref(28, seq[28])]);
     }
 
     /// Restoring a snapshot and continuing gives the same logits as never having left.

@@ -32,6 +32,9 @@ impl PrefixSnap {
     }
 }
 
+/// Vocabulary rows the MTP draft head scores.
+const MTP_DRAFT_VOCAB: usize = 32768;
+
 pub(crate) struct Qwen35Backend {
     model: Qwen35Model,
     gpu: MetalQwen35,
@@ -39,6 +42,8 @@ pub(crate) struct Qwen35Backend {
     logits: Vec<f32>,
     /// `(pos0, n)` of the last verify until a cut or the next forward settles it.
     pending: Option<(usize, usize)>,
+    /// MTP chains stop once the draft head is less sure than this (`Q35_DRAFT_MIN_P`).
+    mtp_min_p: f32,
 }
 
 impl Qwen35Backend {
@@ -141,9 +146,15 @@ pub(crate) fn load_qwen35(
                 m
             }
         };
-        let gpu = MetalQwen35::new(&model, ctx)?;
+        let mut gpu = MetalQwen35::new(&model, ctx)?;
         let _ = cfg;
-        Ok(Backend::Qwen35(Box::new(Qwen35Backend { model, gpu, logits: Vec::new(), pending: None })))
+        // MTP drafts (`KRONOS_MTP=0` disables); the draft head scores the 32k most common tokens.
+        if gpu.has_mtp() && std::env::var("KRONOS_MTP").map_or(true, |v| v != "0") {
+            gpu.set_mtp_tracking(true);
+            gpu.set_draft_vocab(MTP_DRAFT_VOCAB);
+        }
+        let mtp_min_p = std::env::var("Q35_DRAFT_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.4);
+        Ok(Backend::Qwen35(Box::new(Qwen35Backend { model, gpu, logits: Vec::new(), pending: None, mtp_min_p })))
     })())
 }
 
@@ -270,6 +281,19 @@ impl Backend {
                 }
                 q.pending = Some((pos0, tokens.len()));
             }
+        }
+    }
+
+    /// Whether the model drafts with its own MTP head.
+    pub(crate) fn has_mtp(&self) -> bool {
+        matches!(self, Backend::Qwen35(q) if q.gpu.mtp_tracking())
+    }
+
+    /// Up to `k` greedy MTP drafts after `next`; empty when unavailable or unsure.
+    pub(crate) fn mtp_draft(&mut self, next: usize, k: usize) -> Vec<usize> {
+        match self {
+            Backend::Llama(_) => Vec::new(),
+            Backend::Qwen35(q) => q.gpu.mtp_draft(&q.model, next, k, q.mtp_min_p).unwrap_or_else(|e| panic!("Qwen3.5 MTP: {e}")),
         }
     }
 
