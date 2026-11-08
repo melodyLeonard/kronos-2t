@@ -1055,6 +1055,69 @@ pub extern "C" fn kronos_session_process_rss_bytes() -> usize {
     current_resident_bytes()
 }
 
+fn parse_context_json(ctx_json: Option<&str>) -> Vec<String> {
+    ctx_json
+        .and_then(|j| Json::parse(j).ok())
+        .and_then(|j| j.as_arr().map(|a| a.iter().filter_map(Json::as_str).map(String::from).collect::<Vec<_>>()))
+        .map(crate::runtime::translate::trim_context)
+        .unwrap_or_default()
+}
+
+/// Prefills the translation prompt for `to`/`from`/`context` with empty text, so the first real
+/// translation only has to prefill the typed words (the text comes last in the prompt). Returns
+/// the number of tokens prefilled, or `-1` on error.
+///
+/// # Safety
+/// `session` and `to_utf8` must be valid pointers; `from_utf8` and `context_json_utf8` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn kronos_session_translate_warm(
+    session: *mut KronosMobileSession,
+    to_utf8: *const c_char,
+    from_utf8: *const c_char,
+    context_json_utf8: *const c_char,
+) -> i32 {
+    if session.is_null() {
+        return -1;
+    }
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: Validated non-null exclusive session pointer; other pointers per the contract.
+        let sess = unsafe { &mut *session };
+        let parsed = unsafe {
+            (|| -> Result<(&str, Option<&str>, Option<&str>), String> {
+                Ok((cstr_to_str(to_utf8)?, opt_cstr_to_str(from_utf8)?, opt_cstr_to_str(context_json_utf8)?))
+            })()
+        };
+        let (to, from, ctx_json) = match parsed {
+            Ok(v) => v,
+            Err(e) => {
+                sess.set_error(e);
+                return -1;
+            }
+        };
+        let context = parse_context_json(ctx_json);
+        let req = crate::runtime::translate::TranslateRequest {
+            text: "",
+            to,
+            from: from.unwrap_or("auto"),
+            tone: "neutral",
+            context: &context,
+            temperature: 0.0,
+        };
+        let (messages, _, _) = crate::runtime::translate::prompt(&sess.model, &req);
+        match sess.model.prefill_messages(&messages) {
+            Ok((_, n)) => {
+                sess.clear_error();
+                n as i32
+            }
+            Err(e) => {
+                sess.set_error(e);
+                -1
+            }
+        }
+    }));
+    res.unwrap_or(-1)
+}
+
 /// Caps tokens per CPU prefill batch (`0` = tier default: 16 on phones). Smaller = less scratch.
 #[no_mangle]
 pub extern "C" fn kronos_set_cpu_prompt_chunk(tokens: usize) {
@@ -1112,11 +1175,7 @@ pub unsafe extern "C" fn kronos_session_translate(
                 return -1;
             }
         };
-        let context = ctx_json
-            .and_then(|j| Json::parse(j).ok())
-            .and_then(|j| j.as_arr().map(|a| a.iter().filter_map(Json::as_str).map(String::from).collect::<Vec<_>>()))
-            .map(crate::runtime::translate::trim_context)
-            .unwrap_or_default();
+        let context = parse_context_json(ctx_json);
         let req = crate::runtime::translate::TranslateRequest {
             text: text.trim(),
             to,

@@ -131,6 +131,14 @@ void kronos_set_cpu_prompt_chunk(size_t tokens);
 /* Sessions created afterwards map NF weights read-only instead of copying them (no Metal). */
 void kronos_set_zero_copy_weights(int32_t enabled);
 
+/* Prefills the prompt for these languages/context with empty text; returns tokens prefilled or -1. */
+int32_t kronos_session_translate_warm(
+    KronosMobileSession *session,
+    const char *to_utf8,
+    const char *from_utf8,
+    const char *context_json_utf8
+);
+
 /* Streams the cleaned translation-so-far; `from_utf8` and `context_json_utf8` (JSON string array) may be NULL. */
 int32_t kronos_session_translate(
     KronosMobileSession *session,

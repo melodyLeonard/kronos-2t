@@ -171,8 +171,10 @@ impl BpeTokenizer {
             Self::from_str_parts(&vocab_text, &merges_text)
                 .map_err(|msg| io::Error::new(io::ErrorKind::InvalidData, msg))?
         } else if tok_json_path.exists() {
-            let tj = fs::read_to_string(&tok_json_path)?;
-            Self::from_tokenizer_json_str(&tj)
+            // Mapped, not read: a 9 MB `tokenizer.json` on the heap would otherwise stay in the
+            // footprint (the allocator keeps freed large blocks) on memory-capped hosts.
+            let mapped = MappedText::open(&tok_json_path)?;
+            Self::from_tokenizer_json_str(mapped.as_str())
                 .map_err(|msg| io::Error::new(io::ErrorKind::InvalidData, msg))?
         } else {
             return Err(io::Error::new(
@@ -182,8 +184,8 @@ impl BpeTokenizer {
         };
 
         if tok_json_path.exists() {
-            if let Ok(tj) = fs::read_to_string(&tok_json_path) {
-                tok.apply_tokenizer_json_metadata(&tj)
+            if let Ok(mapped) = MappedText::open(&tok_json_path) {
+                tok.apply_tokenizer_json_metadata(mapped.as_str())
                     .map_err(|msg| io::Error::new(io::ErrorKind::InvalidData, msg))?;
             }
         }
@@ -272,6 +274,7 @@ impl BpeTokenizer {
                                     "vocab" => {
                                         let mut v = Vocab::default();
                                         parse_vocab_object(&mut cur, &mut v)?;
+                                        crate::model::memory_budget::mem_trace("tok: vocab parsed");
                                         vocab = Some(v);
                                     }
                                     "merges" => match &vocab {
@@ -301,6 +304,7 @@ impl BpeTokenizer {
         }
         cur.expect_byte(b'}')?;
 
+        crate::model::memory_budget::mem_trace("tok: json scanned (vocab + ranks built)");
         let mut vocab = vocab.ok_or_else(|| "tokenizer.json missing model.vocab".to_string())?;
         if let Some(max_added) = extra_added.iter().map(|&(_, id)| id).max() {
             vocab.reserve_ids(max_added + 1);
@@ -655,6 +659,26 @@ fn parse_vocab_object(cur: &mut JsonCursor<'_>, vocab: &mut Vocab) -> Result<(),
     Ok(())
 }
 
+/// A read-only mapping of a UTF-8 file.
+struct MappedText(crate::storage::mmap_pager::sys::RawMmap);
+
+impl MappedText {
+    fn open(path: &Path) -> io::Result<Self> {
+        let file = fs::File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        if len == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "empty file"));
+        }
+        let mapped = crate::storage::mmap_pager::sys::RawMmap::map_read_only(&file, len)?;
+        std::str::from_utf8(mapped.as_slice()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(Self(mapped))
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(self.0.as_slice()).unwrap_or("")
+    }
+}
+
 /// Merge pairs in rank order; keyed by token ids, which is what the merge loop compares.
 type MergeRanks = HashMap<(u32, u32), (u32, u32)>;
 
@@ -688,7 +712,7 @@ fn build_byte_char_ids(byte_to_char: &[char; 256], vocab: &Vocab) -> [u32; 256] 
 fn parse_merges_array(cur: &mut JsonCursor<'_>, vocab: Option<&Vocab>) -> Result<(Vec<(String, String)>, MergeRanks), String> {
     cur.expect_byte(b'[')?;
     let mut merges = Vec::new();
-    let mut ranks = HashMap::new();
+    let mut ranks = HashMap::with_capacity(vocab.map_or(0, Vocab::len));
     let mut rank = 0usize;
     let mut push = |merges: &mut Vec<(String, String)>, rank: usize, a: &str, b: &str| match vocab {
         Some(v) => add_merge(&mut ranks, v, rank, a, b),
