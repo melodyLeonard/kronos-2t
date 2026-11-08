@@ -249,7 +249,7 @@ pub fn current_resident_bytes() -> usize {
             fn task_info(
                 target_task: u32,
                 flavor: u32,
-                task_info_out: *mut MachTaskBasicInfo,
+                task_info_out: *mut std::ffi::c_void,
                 task_info_out_cnt: *mut u32,
             ) -> i32;
         }
@@ -269,7 +269,7 @@ pub fn current_resident_bytes() -> usize {
             task_info(
                 mach_task_self(),
                 MACH_TASK_BASIC_INFO,
-                &mut info,
+                (&raw mut info).cast(),
                 &mut count,
             )
         };
@@ -278,6 +278,50 @@ pub fn current_resident_bytes() -> usize {
         }
     }
     peak_resident_bytes()
+}
+
+/// Returns the process's `phys_footprint` (what iOS jetsam limits count: dirty + compressed +
+/// purgeable, not clean file-backed pages); RSS on other platforms.
+pub fn current_footprint_bytes() -> usize {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        const TASK_VM_INFO: u32 = 22;
+        unsafe extern "C" {
+            fn mach_task_self() -> u32;
+            fn task_info(target_task: u32, flavor: u32, out: *mut std::ffi::c_void, count: *mut u32) -> i32;
+        }
+        // task_vm_info up to and including `phys_footprint` (19th 8-byte slot).
+        let mut info = [0u64; 19];
+        let mut count = (info.len() * 2) as u32;
+        // SAFETY: `info` is at least `count` natural_t words, the REV0 prefix of task_vm_info.
+        let kr = unsafe { task_info(mach_task_self(), TASK_VM_INFO, info.as_mut_ptr().cast(), &mut count) };
+        if kr == 0 {
+            return info[18] as usize;
+        }
+    }
+    current_resident_bytes()
+}
+
+/// Hands freed malloc pages back to the kernel so they stop counting toward the footprint
+/// (the tokenizer's JSON parse leaves tens of MB of dirty-but-free small blocks behind).
+pub fn release_freed_memory() {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        unsafe extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: null zone means every zone; goal 0 means release as much as possible.
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+}
+
+/// Prints `label` with the current footprint to stderr when `KRONOS_MEM_TRACE` is set.
+pub fn mem_trace(label: &str) {
+    if std::env::var_os("KRONOS_MEM_TRACE").is_some() {
+        eprintln!("[mem] {label}: footprint {} MB", current_footprint_bytes() >> 20);
+    }
 }
 
 /// Returns peak physical resident set size (`ru_maxrss`) of this process in bytes.

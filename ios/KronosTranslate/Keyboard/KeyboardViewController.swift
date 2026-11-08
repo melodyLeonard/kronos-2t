@@ -16,8 +16,16 @@ final class KeyboardViewController: UIInputViewController {
     private let checker = UITextChecker()
     private var lastSpace = Date.distantPast, lastShift = Date.distantPast
 
+    /// Launch count and the phase the previous instance was in when it died (diagnostics).
+    private var launchInfo = ""
+
     override func viewDidLoad() {
         super.viewDidLoad()
+        let d = Prefs.defaults
+        let n = d.integer(forKey: "diag.launches") + 1
+        d.set(n, forKey: "diag.launches")
+        launchInfo = "launch #\(n) prev \(d.string(forKey: "diag.phase") ?? "-") · base \(LocalEngine.memorySummary)"
+        d.set("ui", forKey: "diag.phase")
         board = KeyboardView(needsGlobe: needsInputModeSwitchKey)
         board.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(board)
@@ -49,7 +57,7 @@ final class KeyboardViewController: UIInputViewController {
     /// Load time, last decode and memory headroom, readable by the UI test through the strip label.
     private var lastDecode = "", lastError = ""
     private func updateDiagnostics() {
-        board.diagnostics = String(format: "load %.0f ms · warm %.0f ms · %d thr", LocalEngine.shared.loadMillis, LocalEngine.shared.warmMillis, ProcessInfo.processInfo.activeProcessorCount) + (lastDecode.isEmpty ? "" : " · \(lastDecode)") + " · " + LocalEngine.memorySummary
+        board.diagnostics = launchInfo + String(format: " · load %.0f ms · %@", LocalEngine.shared.loadMillis, LocalEngine.shared.jobSummary) + (lastDecode.isEmpty ? "" : " · \(lastDecode)") + " · " + LocalEngine.memorySummary + (lastError.isEmpty ? "" : " · err \(lastError)")
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -166,14 +174,12 @@ final class KeyboardViewController: UIInputViewController {
             textDocumentProxy.insertText(board.shift == .off || !cased ? s : s.uppercased())
             if board.shift == .on { board.setShift(.off) }
         case .space:
-            #if DEBUG
             if currentWord == "zzdiag" {   // test hook: engine diagnostics into the field
                 updateDiagnostics()
                 let st: String = { switch LocalEngine.shared.state { case .idle: return "idle"; case .loading: return "loading"; case .ready: return "ready"; case .unavailable(let w): return "unavailable: \(w)" } }()
                 replaceCurrentWord(with: "[\(st) · \(board.diagnostics) · err \(lastError)]")
                 break
             }
-            #endif
             let before = textDocumentProxy.documentContextBeforeInput ?? ""
             if Date().timeIntervalSince(lastSpace) < 0.35, before.hasSuffix(" "), before.dropLast().last?.isLetter == true {
                 // Double-tap space: ". " and capitalise, like the system keyboard.
@@ -248,6 +254,7 @@ final class KeyboardViewController: UIInputViewController {
         if t == previewFor { return }
         if let hit = cache[cacheKey(t)] { previewFor = t; board.setState(.preview(hit)); return }
         board.setTranslating()
+        updateDiagnostics()
         debounce = Timer.scheduledTimer(withTimeInterval: now ? 0 : debounceInterval, repeats: false) { [weak self] _ in
             self?.translate(t)
         }
@@ -261,7 +268,9 @@ final class KeyboardViewController: UIInputViewController {
         let from = Prefs.sourceCode, code = Prefs.targetCode
         let ctx = Prefs.contextOn ? Prefs.context : []
         let t0 = Date()
+        Prefs.defaults.set("translating '\(text)' · \(LocalEngine.memorySummary)", forKey: "diag.phase")
         task = Task { [weak self] in
+            defer { Prefs.defaults.set("idle", forKey: "diag.phase") }
             do {
                 let out = try await TranslateClient.translateStream(text, from: from, to: code, context: ctx) { [weak self] partial in
                     guard let self, !Task.isCancelled else { return }
@@ -281,6 +290,7 @@ final class KeyboardViewController: UIInputViewController {
                 guard let self, !Task.isCancelled else { return }
                 self.task = nil
                 self.lastError = error.localizedDescription
+                self.updateDiagnostics()
                 self.board.flash(error.localizedDescription)
             }
         }

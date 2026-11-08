@@ -25,7 +25,7 @@ struct SettingsView: View {
                     .listRowInsets(.init(top: 0, leading: 4, bottom: 8, trailing: 0))
                 }
                 Section("Try it") {
-                    TextField("Switch to the Kronos keyboard and type here", text: $sample, axis: .vertical).lineLimit(3...6)
+                    TextField("Switch to the Kronos keyboard and type here", text: $sample, axis: .vertical).lineLimit(3...6).autocorrectionDisabled()
                 }
                 Section("Set up") {
                     step(1, "Add the keyboard", "Settings › General › Keyboard › Keyboards › Add New Keyboard › Translate")

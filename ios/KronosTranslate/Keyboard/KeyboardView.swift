@@ -205,6 +205,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         if needsGlobe { r.append((key("sf:globe", .globe, fn: true), 1.27)) }
         r.append((key("sf:face.smiling", .page(.emoji), fn: true), 1.27))
         let space = key(" ", .space)
+        space.accessibilityIdentifier = "space"
         space.onCursorMove = { [weak self] in self?.onCursorMove?($0) }
         r.append((space, 0))
         r.append((key("sf:return", .ret, fn: true), 2.73))

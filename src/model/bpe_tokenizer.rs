@@ -20,22 +20,144 @@ pub enum PreTokenizerKind {
 
 /// Byte-level BPE tokenizer.
 pub struct BpeTokenizer {
-    pub token_to_id: HashMap<String, usize>,
-    pub id_to_token: Vec<String>,
+    vocab: Vocab,
     /// Literal tokens matched prior to BPE regex splitting (`<|im_start|>`, `<tool_call>`, etc.).
     added_tokens: Vec<(String, usize)>,
     /// Marks IDs whose `id_to_token` string is raw UTF-8 rather than GPT-2 byte-mapped characters.
     is_raw_special: Vec<bool>,
     added_first_bytes: [bool; 256],
-    merge_ranks: HashMap<(String, String), usize>,
-    byte_to_char: [char; 256],
+    /// `(left id, right id)` → `(rank, merged id)`; keyed by ids so a 120k-merge vocab costs a few MB.
+    merge_ranks: HashMap<(u32, u32), (u32, u32)>,
+    /// Vocab id of each GPT-2 byte character (`u32::MAX` when the byte has no token).
+    byte_char_ids: [u32; 256],
     char_to_byte: HashMap<char, u8>,
     pub pre_tokenizer: PreTokenizerKind,
     pub eos_token_id: usize,
     pub eos_token_ids: Vec<usize>,
 }
 
+/// Token strings in one arena plus an open-addressing id table: a few MB for a 120k vocab where
+/// `HashMap<String, usize>` + `Vec<String>` cost ~30 MB of heap.
+#[derive(Clone, Debug, Default)]
+pub struct Vocab {
+    text: String,
+    /// `(start, len)` into `text` per id; `(0, 0)` for ids with no token.
+    spans: Vec<(u32, u32)>,
+    /// Linear-probing table of ids (`u32::MAX` = empty), at most half full.
+    table: Vec<u32>,
+}
+
+fn hash_bytes(b: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &x in b {
+        h = (h ^ u64::from(x)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h ^ (h >> 29)
+}
+
+impl Vocab {
+    fn ensure_table(&mut self) {
+        if self.table.is_empty() {
+            self.table = vec![u32::MAX; 16];
+        }
+    }
+
+    /// Grows the id range to at least `n` ids (new ids hold no token).
+    pub fn reserve_ids(&mut self, n: usize) {
+        if n > self.spans.len() {
+            self.spans.resize(n, (0, 0));
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    pub fn get(&self, id: usize) -> Option<&str> {
+        let &(start, len) = self.spans.get(id)?;
+        Some(&self.text[start as usize..(start + len) as usize])
+    }
+
+    pub fn id(&self, s: &str) -> Option<usize> {
+        if s.is_empty() || self.table.is_empty() {
+            return None;
+        }
+        let mask = self.table.len() - 1;
+        let mut i = hash_bytes(s.as_bytes()) as usize & mask;
+        loop {
+            let id = self.table[i];
+            if id == u32::MAX {
+                return None;
+            }
+            if self.get(id as usize) == Some(s) {
+                return Some(id as usize);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Sets the string of `id` (growing the vocab if needed); an earlier string for `id` stops resolving.
+    pub fn set(&mut self, id: usize, s: &str) {
+        if id >= self.spans.len() {
+            self.spans.resize(id + 1, (0, 0));
+        }
+        let start = self.text.len() as u32;
+        self.text.push_str(s);
+        self.spans[id] = (start, s.len() as u32);
+        if s.is_empty() {
+            return;
+        }
+        self.ensure_table();
+        if (self.spans.len() + 1) * 2 > self.table.len() {
+            self.table = vec![u32::MAX; (self.spans.len() * 4).next_power_of_two()];
+            for i in 0..self.spans.len() {
+                if self.spans[i].1 != 0 && i != id {
+                    self.insert(i);
+                }
+            }
+        }
+        self.insert(id);
+    }
+
+    fn insert(&mut self, id: usize) {
+        let (start, len) = self.spans[id];
+        let mask = self.table.len() - 1;
+        let mut i = hash_bytes(&self.text.as_bytes()[start as usize..(start + len) as usize]) as usize & mask;
+        loop {
+            let cur = self.table[i];
+            if cur == u32::MAX || cur as usize == id || self.get(cur as usize) == self.get(id) {
+                self.table[i] = id as u32;
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
+
 impl BpeTokenizer {
+    /// Id of the exact token string `s`, if it is in the vocabulary.
+    pub fn token_id(&self, s: &str) -> Option<usize> {
+        self.vocab.id(s)
+    }
+
+    /// The vocabulary string of `id` (byte-mapped for regular tokens).
+    pub fn token_str(&self, id: usize) -> Option<&str> {
+        self.vocab.get(id)
+    }
+
+    pub fn vocab_len(&self) -> usize {
+        self.vocab.len()
+    }
+
+    /// True when the first `n` ids of both vocabularies hold identical strings.
+    pub fn same_vocab_prefix(&self, other: &Self, n: usize) -> bool {
+        (0..n).all(|i| self.vocab.get(i) == other.vocab.get(i))
+    }
+
     /// Loads tokenizer from `model_dir` (`vocab.json` + `merges.txt` and/or `tokenizer.json` + `tokenizer_config.json`).
     pub fn from_model_dir(model_dir: &Path) -> io::Result<Self> {
         let vocab_path = model_dir.join("vocab.json");
@@ -78,41 +200,36 @@ impl BpeTokenizer {
     /// Parses `vocab.json` and `merges.txt` strings directly.
     pub fn from_str_parts(vocab_json: &str, merges_txt: &str) -> Result<Self, String> {
         let mut cur = JsonCursor::new(vocab_json);
-        let (token_to_id, max_id) = parse_vocab_object(&mut cur)?;
-
-        let vocab_size = max_id + 1;
-        let mut id_to_token = vec![String::new(); vocab_size];
+        let mut vocab = Vocab::default();
+        parse_vocab_object(&mut cur, &mut vocab)?;
+        let vocab_size = vocab.len();
         let mut is_raw_special = vec![false; vocab_size];
         let mut added_tokens = Vec::new();
-        for (tok, &id) in &token_to_id {
-            id_to_token[id] = tok.clone();
+        for id in 0..vocab_size {
+            let tok = vocab.get(id).unwrap_or("");
             if tok.starts_with("<|") && tok.ends_with("|>") {
                 is_raw_special[id] = true;
-                added_tokens.push((tok.clone(), id));
+                added_tokens.push((tok.to_string(), id));
             }
         }
 
-        let mut merge_ranks = HashMap::new();
-        for (rank, line) in merges_txt
+        let merges = merges_txt
             .lines()
             .filter(|l| !l.is_empty() && !l.starts_with("#version"))
-            .enumerate()
-        {
-            if let Some((a, b)) = line.split_once(' ') {
-                merge_ranks.insert((a.to_string(), b.to_string()), rank);
-            }
-        }
+            .filter_map(|l| l.split_once(' '))
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        let merge_ranks = build_merge_ranks(merges, &vocab);
 
         let (byte_to_char, char_to_byte) = build_gpt2_byte_unicode_tables();
-        let eos_opt = token_to_id.get("<|endoftext|>").copied();
+        let eos_opt = vocab.id("<|endoftext|>");
         let mut out = Self {
-            token_to_id,
-            id_to_token,
+            byte_char_ids: build_byte_char_ids(&byte_to_char, &vocab),
+            vocab,
             added_tokens,
             is_raw_special,
             added_first_bytes: [false; 256],
             merge_ranks,
-            byte_to_char,
             char_to_byte,
             pre_tokenizer: PreTokenizerKind::SmolLm2DigitsGpt2,
             eos_token_id: eos_opt.unwrap_or(usize::MAX),
@@ -126,8 +243,8 @@ impl BpeTokenizer {
     pub fn from_tokenizer_json_str(tok_json: &str) -> Result<Self, String> {
         let mut cur = JsonCursor::new(tok_json);
         cur.expect_byte(b'{')?;
-        let mut token_to_id: Option<HashMap<String, usize>> = None;
-        let mut max_id = 0usize;
+        let mut vocab: Option<Vocab> = None;
+        let mut merges = Vec::new();
         let mut merge_ranks = HashMap::new();
         let mut extra_added: Vec<(String, usize)> = Vec::new();
         let mut pre_kind = PreTokenizerKind::SmolLm2DigitsGpt2;
@@ -153,13 +270,15 @@ impl BpeTokenizer {
                                 cur.expect_byte(b':')?;
                                 match mkey.as_str() {
                                     "vocab" => {
-                                        let (v, m) = parse_vocab_object(&mut cur)?;
-                                        max_id = max_id.max(m);
-                                        token_to_id = Some(v);
+                                        let mut v = Vocab::default();
+                                        parse_vocab_object(&mut cur, &mut v)?;
+                                        vocab = Some(v);
                                     }
-                                    "merges" => {
-                                        merge_ranks = parse_merges_array(&mut cur)?;
-                                    }
+                                    "merges" => match &vocab {
+                                        // Usual order (vocab first): rank the merges as they stream by.
+                                        Some(v) => merge_ranks = parse_merges_array(&mut cur, Some(v))?.1,
+                                        None => merges = parse_merges_array(&mut cur, None)?.0,
+                                    },
                                     _ => cur.skip_value()?,
                                 }
                                 if cur.peek() == Some(b',') {
@@ -182,30 +301,31 @@ impl BpeTokenizer {
         }
         cur.expect_byte(b'}')?;
 
-        let token_to_id = token_to_id.ok_or_else(|| "tokenizer.json missing model.vocab".to_string())?;
-        for &(_, id) in &extra_added {
-            max_id = max_id.max(id);
+        let mut vocab = vocab.ok_or_else(|| "tokenizer.json missing model.vocab".to_string())?;
+        if let Some(max_added) = extra_added.iter().map(|&(_, id)| id).max() {
+            vocab.reserve_ids(max_added + 1);
         }
-        let vocab_size = max_id + 1;
-        let mut id_to_token = vec![String::new(); vocab_size];
+        let vocab_size = vocab.len();
         let mut is_raw_special = vec![false; vocab_size];
-        for (tok, &id) in &token_to_id {
-            id_to_token[id] = tok.clone();
+        for id in 0..vocab_size {
+            let tok = vocab.get(id).unwrap_or("");
             if tok.starts_with("<|") && tok.ends_with("|>") {
                 is_raw_special[id] = true;
             }
         }
 
+        if !merges.is_empty() {
+            merge_ranks = build_merge_ranks(merges, &vocab);
+        }
         let (byte_to_char, char_to_byte) = build_gpt2_byte_unicode_tables();
-        let eos_opt = token_to_id.get("<|endoftext|>").copied();
+        let eos_opt = vocab.id("<|endoftext|>");
         let mut out = Self {
-            token_to_id,
-            id_to_token,
+            byte_char_ids: build_byte_char_ids(&byte_to_char, &vocab),
+            vocab,
             added_tokens: Vec::new(),
             is_raw_special,
             added_first_bytes: [false; 256],
             merge_ranks,
-            byte_to_char,
             char_to_byte,
             pre_tokenizer: pre_kind,
             eos_token_id: eos_opt.unwrap_or(usize::MAX),
@@ -320,7 +440,7 @@ impl BpeTokenizer {
         }
         cur.expect_byte(b'}')?;
         if let Some(eos) = eos_str {
-            if let Some(&id) = self.token_to_id.get(&eos) {
+            if let Some(id) = self.vocab.id(&eos) {
                 self.eos_token_id = id;
                 if !self.eos_token_ids.contains(&id) {
                     self.eos_token_ids.push(id);
@@ -334,13 +454,11 @@ impl BpeTokenizer {
         if content.is_empty() {
             return;
         }
-        if id >= self.id_to_token.len() {
-            self.id_to_token.resize(id + 1, String::new());
+        if id >= self.is_raw_special.len() {
             self.is_raw_special.resize(id + 1, false);
         }
-        self.id_to_token[id] = content.clone();
+        self.vocab.set(id, &content);
         self.is_raw_special[id] = true;
-        self.token_to_id.insert(content.clone(), id);
         if !self.added_tokens.iter().any(|(_, existing_id)| *existing_id == id) {
             self.added_tokens.push((content, id));
         }
@@ -357,7 +475,7 @@ impl BpeTokenizer {
             }
         }
         for special_eos in [crate::config::markup::IM_END, crate::config::markup::END_OF_TEXT] {
-            if let Some(&id) = self.token_to_id.get(special_eos) {
+            if let Some(id) = self.vocab.id(special_eos) {
                 if self.eos_token_id == usize::MAX {
                     self.eos_token_id = id;
                 }
@@ -421,7 +539,7 @@ impl BpeTokenizer {
                             self.encode_non_digit_span(&text[span_start..byte_idx], ids);
                         }
                         let digit_str = &text[byte_idx..byte_idx + 1];
-                        if let Some(&id) = self.token_to_id.get(digit_str) {
+                        if let Some(id) = self.vocab.id(digit_str) {
                             ids.push(id);
                         }
                         span_start = byte_idx + 1;
@@ -451,62 +569,43 @@ impl BpeTokenizer {
     }
 
     fn encode_bpe_piece(&self, raw_bytes: &[u8], out_ids: &mut Vec<usize>) {
-        if raw_bytes.is_empty() {
-            return;
-        }
-        let mut word: Vec<String> = raw_bytes
-            .iter()
-            .map(|&b| self.byte_to_char[b as usize].to_string())
-            .collect();
+        // Every intermediate merge result is itself a vocab token, so the word is a list of ids.
+        let mut word: Vec<u32> =
+            raw_bytes.iter().map(|&b| self.byte_char_ids[b as usize]).filter(|&id| id != u32::MAX).collect();
 
         while word.len() >= 2 {
-            let mut best_pair_idx: Option<usize> = None;
-            let mut best_rank = usize::MAX;
-
+            let mut best: Option<(usize, u32, u32)> = None; // (index, rank, merged id)
             for i in 0..word.len() - 1 {
-                if let Some(&rank) = self
-                    .merge_ranks
-                    .get(&(word[i].clone(), word[i + 1].clone()))
-                {
-                    if rank < best_rank {
-                        best_rank = rank;
-                        best_pair_idx = Some(i);
+                if let Some(&(rank, merged)) = self.merge_ranks.get(&(word[i], word[i + 1])) {
+                    if best.is_none_or(|(_, r, _)| rank < r) {
+                        best = Some((i, rank, merged));
                     }
                 }
             }
-
-            let Some(first_idx) = best_pair_idx else {
+            let Some((first_idx, _, merged)) = best else {
                 break;
             };
-            let left = word[first_idx].clone();
-            let right = word[first_idx + 1].clone();
-            let merged = format!("{left}{right}");
-
+            let (left, right) = (word[first_idx], word[first_idx + 1]);
             let mut next_word = Vec::with_capacity(word.len() - 1);
             let mut i = 0;
             while i < word.len() {
                 if i + 1 < word.len() && word[i] == left && word[i + 1] == right {
-                    next_word.push(merged.clone());
+                    next_word.push(merged);
                     i += 2;
                 } else {
-                    next_word.push(word[i].clone());
+                    next_word.push(word[i]);
                     i += 1;
                 }
             }
             word = next_word;
         }
-
-        for sym in word {
-            if let Some(&id) = self.token_to_id.get(&sym) {
-                out_ids.push(id);
-            }
-        }
+        out_ids.extend(word.iter().map(|&id| id as usize));
     }
 
     /// Appends the raw UTF-8 bytes of a single token `id` to `raw_bytes` in `O(1)` time.
     #[inline]
     pub fn append_token_bytes(&self, id: usize, raw_bytes: &mut Vec<u8>) {
-        let Some(tok) = self.id_to_token.get(id) else {
+        let Some(tok) = self.vocab.get(id) else {
             return;
         };
         if self.is_raw_special.get(id).copied().unwrap_or(false)
@@ -535,17 +634,16 @@ impl BpeTokenizer {
     }
 }
 
-fn parse_vocab_object(cur: &mut JsonCursor<'_>) -> Result<(HashMap<String, usize>, usize), String> {
+/// Streams `{"token": id, ...}` straight into `vocab`: one transient `String` at a time, so the
+/// heap never holds a second copy of the vocabulary.
+fn parse_vocab_object(cur: &mut JsonCursor<'_>, vocab: &mut Vocab) -> Result<(), String> {
     cur.expect_byte(b'{')?;
-    let mut token_to_id = HashMap::new();
-    let mut max_id = 0usize;
     if cur.peek() != Some(b'}') {
         loop {
             let tok = cur.parse_string()?;
             cur.expect_byte(b':')?;
             let id = cur.parse_u64()? as usize;
-            max_id = max_id.max(id);
-            token_to_id.insert(tok, id);
+            vocab.set(id, &tok);
             if cur.peek() == Some(b',') {
                 cur.expect_byte(b',')?;
             } else {
@@ -554,13 +652,48 @@ fn parse_vocab_object(cur: &mut JsonCursor<'_>) -> Result<(HashMap<String, usize
         }
     }
     cur.expect_byte(b'}')?;
-    Ok((token_to_id, max_id))
+    Ok(())
 }
 
-fn parse_merges_array(cur: &mut JsonCursor<'_>) -> Result<HashMap<(String, String), usize>, String> {
+/// Merge pairs in rank order; keyed by token ids, which is what the merge loop compares.
+type MergeRanks = HashMap<(u32, u32), (u32, u32)>;
+
+fn add_merge(ranks: &mut MergeRanks, vocab: &Vocab, rank: usize, a: &str, b: &str) {
+    let (Some(l), Some(r)) = (vocab.id(a), vocab.id(b)) else { return };
+    let Some(m) = vocab.id(&format!("{a}{b}")) else { return };
+    ranks.entry((l as u32, r as u32)).or_insert((rank as u32, m as u32));
+}
+
+fn build_merge_ranks(merges: Vec<(String, String)>, vocab: &Vocab) -> MergeRanks {
+    let mut ranks = HashMap::with_capacity(merges.len());
+    for (rank, (a, b)) in merges.into_iter().enumerate() {
+        add_merge(&mut ranks, vocab, rank, &a, &b);
+    }
+    ranks
+}
+
+fn build_byte_char_ids(byte_to_char: &[char; 256], vocab: &Vocab) -> [u32; 256] {
+    let mut ids = [u32::MAX; 256];
+    let mut buf = [0u8; 4];
+    for (b, &c) in byte_to_char.iter().enumerate() {
+        if let Some(id) = vocab.id(c.encode_utf8(&mut buf) as &str) {
+            ids[b] = id as u32;
+        }
+    }
+    ids
+}
+
+/// Parses the merges array; with `vocab` known they are ranked on the fly (returned as `.1`),
+/// otherwise collected as string pairs (`.0`).
+fn parse_merges_array(cur: &mut JsonCursor<'_>, vocab: Option<&Vocab>) -> Result<(Vec<(String, String)>, MergeRanks), String> {
     cur.expect_byte(b'[')?;
+    let mut merges = Vec::new();
     let mut ranks = HashMap::new();
     let mut rank = 0usize;
+    let mut push = |merges: &mut Vec<(String, String)>, rank: usize, a: &str, b: &str| match vocab {
+        Some(v) => add_merge(&mut ranks, v, rank, a, b),
+        None => merges.push((a.to_string(), b.to_string())),
+    };
     if cur.peek() != Some(b']') {
         loop {
             if cur.peek() == Some(b'[') {
@@ -569,11 +702,11 @@ fn parse_merges_array(cur: &mut JsonCursor<'_>) -> Result<HashMap<(String, Strin
                 cur.expect_byte(b',')?;
                 let b = cur.parse_string()?;
                 cur.expect_byte(b']')?;
-                ranks.insert((a, b), rank);
+                push(&mut merges, rank, &a, &b);
             } else {
                 let s = cur.parse_string()?;
                 if let Some((a, b)) = s.split_once(' ') {
-                    ranks.insert((a.to_string(), b.to_string()), rank);
+                    push(&mut merges, rank, a, b);
                 }
             }
             rank += 1;
@@ -585,7 +718,8 @@ fn parse_merges_array(cur: &mut JsonCursor<'_>) -> Result<HashMap<(String, Strin
         }
     }
     cur.expect_byte(b']')?;
-    Ok(ranks)
+    drop(push);
+    Ok((merges, ranks))
 }
 
 fn parse_added_tokens_array(cur: &mut JsonCursor<'_>) -> Result<Vec<(String, usize)>, String> {

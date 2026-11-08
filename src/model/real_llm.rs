@@ -1477,8 +1477,25 @@ pub fn set_zero_copy_weights(on: bool) {
     ZERO_COPY_WEIGHTS.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+static CPU_PROMPT_CHUNK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Caps the tokens per CPU prefill batch (`0` = tier default). Prompt scratch is ~240 KB per
+/// batched token on a 2 B model, so a memory-capped host wants a small batch.
+pub fn set_cpu_prompt_chunk(tokens: usize) {
+    CPU_PROMPT_CHUNK.store(tokens, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn cpu_prompt_chunk() -> usize {
+    match CPU_PROMPT_CHUNK.load(std::sync::atomic::Ordering::Relaxed) {
+        0 if crate::model::memory_budget::MemoryBudgetProfile::active().tier == crate::model::memory_budget::MemoryTier::Mobile5G => 16,
+        0 => 512,
+        n => n,
+    }
+}
+
+/// Also on when `KRONOS_ZERO_COPY=1`, to benchmark the mapped path on desktop.
 pub fn zero_copy_weights() -> bool {
-    ZERO_COPY_WEIGHTS.load(std::sync::atomic::Ordering::Relaxed)
+    ZERO_COPY_WEIGHTS.load(std::sync::atomic::Ordering::Relaxed) || std::env::var_os("KRONOS_ZERO_COPY").is_some_and(|v| v == "1")
 }
 
 /// Real pretrained `LlamaForCausalLM` / `Qwen2ForCausalLM` / Sparse-MoE engine.
@@ -3303,7 +3320,9 @@ impl RealLlamaEngine {
             moe_runtime: None,
             moe_hot: None,
         };
+        crate::model::memory_budget::mem_trace("engine struct built");
         eng.init_activation_scratch();
+        crate::model::memory_budget::mem_trace("activation scratch");
         Ok(eng)
     }
 
@@ -3599,6 +3618,7 @@ impl RealLlamaEngine {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "empty bipolar cache"));
         }
         let zero_copy = zero_copy_weights();
+        crate::model::memory_budget::mem_trace("load_bipolar start");
         let mmap = RawMmap::map_read_only(&file, len)?;
         let bytes = mmap.as_slice();
         let nf_stream = |s: &[u8]| {
@@ -3789,9 +3809,11 @@ impl RealLlamaEngine {
                 moe: None,
             });
         }
+        crate::model::memory_budget::mem_trace("layers read");
         let final_norm = rd.f32s()?;
         let lm_head = r_mat(&mut rd)?;
         let embed_f32_rows = rd.f32s()?;
+        crate::model::memory_budget::mem_trace("lm_head + f32 embed read");
         let auto_q_embed = crate::model::memory_budget::MemoryBudgetProfile::active()
             .quantize_untied_embeddings
             && cfg.hidden_size.is_multiple_of(64);
@@ -3829,6 +3851,7 @@ impl RealLlamaEngine {
                 _ => return Err(bad("expected NfSdot untied embedding matrix in K2TKRONOS4")),
             }
         }
+        crate::model::memory_budget::mem_trace("embeddings read");
         if zero_copy {
             std::mem::forget(mmap);
         } else {
@@ -5097,9 +5120,11 @@ impl RealLlamaEngine {
             });
         }
 
+        crate::model::memory_budget::mem_trace("layers read");
         let final_norm = rd.f32s()?;
         let lm_head = r_mat(&mut rd)?;
         let embed_f32_rows = rd.f32s()?;
+        crate::model::memory_budget::mem_trace("lm_head + f32 embed read");
         let n_u16 = rd.u64()?;
         let raw_le = rd.take(n_u16 * 2)?;
         let mut embed_bf16_rows: Vec<u16> = raw_le
@@ -7106,8 +7131,7 @@ impl RealLlamaEngine {
             }
             return self.forward_token(tokens[tokens.len() - 1]);
         }
-        const PROMPT_CHUNK: usize = 512;
-        let chunks: Vec<&[usize]> = tokens.chunks(PROMPT_CHUNK).collect();
+        let chunks: Vec<&[usize]> = tokens.chunks(cpu_prompt_chunk()).collect();
         for (idx, chunk) in chunks.iter().enumerate() {
             let last = idx + 1 == chunks.len();
             if chunk.len() == 1 && last {

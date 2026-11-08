@@ -37,7 +37,7 @@ final class KeyMetricsTests: XCTestCase {
         }
     }
 
-    private func dump(_ app: XCUIApplication, _ tag: String) {
+    func dump(_ app: XCUIApplication, _ tag: String) {
         for line in app.debugDescription.split(separator: "\n") {
             let s = line.trimmingCharacters(in: .whitespaces)
             if s.hasPrefix("Key,") || s.hasPrefix("Button,") || s.hasPrefix("Keyboard,") { print("TREE \(tag) \(s)") }
@@ -66,24 +66,49 @@ final class LocalTranslateTests: XCTestCase {
         XCTAssertTrue(field.waitForExistence(timeout: 5))
         field.tap()
         sleep(2)
+        if !app.buttons["Next keyboard"].exists, !app.keys["delete.left"].exists { enableKeyboard(app); field.tap(); sleep(2) }
         // Cycle keyboards (system, emoji, ...) until ours is up.
         for _ in 0..<4 where !app.keys["delete.left"].exists {
             let globe = app.buttons["Next keyboard"]
             if globe.waitForExistence(timeout: 3) { globe.tap() } else { app.coordinate(withNormalizedOffset: CGVector(dx: 0.08, dy: 0.97)).tap() }
+            print("TREE cycle globe=\(app.buttons["Next keyboard"].exists) kronos=\(app.keys["delete.left"].exists)")
             sleep(2)
         }
+        if !app.keys["delete.left"].exists { KeyMetricsTests().dump(app, "notup") }
         XCTAssertTrue(app.keys["delete.left"].waitForExistence(timeout: 3), "Kronos keyboard not up")
         let boardEl = app.otherElements["kronos.board"]
         let status = app.staticTexts["kronos.status"]
         let diag = { boardEl.exists ? (boardEl.value as? String ?? "") : "missing" }
         print("DIAG start \(diag())")
+        let t1 = Date()
         for k in ["h", "o", "w", "space", "a", "r", "e", "space", "y", "o", "u", "space", "t", "o", "d", "a", "y"] {
+            if !app.keys[k].waitForExistence(timeout: 1) {
+                print("DIAG typing: key '\(k)' missing after \(String(format: "%.1f", Date().timeIntervalSince(t1))) s; kb=\(app.keys["delete.left"].exists)")
+                for line in app.debugDescription.split(separator: "\n") where line.contains("Key, ") || line.contains("kronos") { print("TREE miss \(line.trimmingCharacters(in: .whitespaces).prefix(160))") }
+                for _ in 0..<4 where !app.keys["delete.left"].exists {
+                    let globe = app.buttons["Next keyboard"]
+                    if globe.waitForExistence(timeout: 3) { globe.tap() }
+                    sleep(3)
+                }
+                print("DIAG typing relaunch kb=\(app.keys["delete.left"].exists) \(diag())")
+                XCTAssertTrue(app.keys[k].waitForExistence(timeout: 2), "keyboard did not come back")
+            }
             app.keys[k].tap()
         }
         func waitTranslation(_ tag: String, _ typed: String) {
             let t0 = Date()
-            for _ in 0..<90 {
+            for _ in 0..<60 {
                 sleep(2)
+                if !app.keys["delete.left"].exists {
+                    print("DIAG \(tag) keyboard gone after \(String(format: "%.1f", Date().timeIntervalSince(t0))) s")
+                    for _ in 0..<4 where !app.keys["delete.left"].exists {
+                        let globe = app.buttons["Next keyboard"]
+                        if globe.waitForExistence(timeout: 3) { globe.tap() }
+                        sleep(3)
+                    }
+                    print("DIAG \(tag) relaunch kb=\(app.keys["delete.left"].exists) \(diag())")
+                    return
+                }
                 let s = status.exists ? status.label : "-"
                 if !s.isEmpty, s != "-", s != "…", !s.contains(typed) {
                     print("TRANSLATION \(tag) \(String(format: "%.1f", Date().timeIntervalSince(t0))) s: \(s)")
@@ -95,12 +120,32 @@ final class LocalTranslateTests: XCTestCase {
         waitTranslation("first", "how are you")
         for k in ["space", "z", "z", "d", "i", "a", "g", "space"] { app.keys[k].tap() }
         sleep(1)
-        print("DIAG first \(field.value as? String ?? "")")
-        for k in ["space", "o", "k", "space"] { app.keys[k].tap() }
+        print("DIAG first \(field.value as? String ?? "") | \(diag())")
+        for k in Array("and what are you doing this weekend with the kids") { app.keys[k == " " ? "space" : String(k)].tap() }
+        app.keys["space"].tap()
         waitTranslation("second", "zzdiag")
         for k in ["z", "z", "d", "i", "a", "g", "space"] { app.keys[k].tap() }
         sleep(1)
-        print("DIAG second \(field.value as? String ?? "")")
+        print("DIAG second \(field.value as? String ?? "") | \(diag())")
         XCTAssertTrue(status.exists, "no translation shown")
+    }
+}
+
+extension LocalTranslateTests {
+    /// Reinstalling the app drops the keyboard from the enabled list; turn it back on via Settings.
+    func enableKeyboard(_ app: XCUIApplication) {
+        app.buttons["Open Settings"].tap()
+        let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
+        XCTAssertTrue(settings.wait(for: .runningForeground, timeout: 10))
+        sleep(2)
+        let kb = settings.staticTexts["Keyboards"]
+        if kb.waitForExistence(timeout: 5) { kb.tap(); sleep(2) } else { print("TREE settings \(settings.debugDescription.prefix(3000))") }
+        let sw = settings.switches["Kronos"]
+        print("SWITCH before \(sw.exists) \(sw.value as? String ?? "?")")
+        if sw.exists, (sw.value as? String) == "0" { sw.tap(); sleep(2) }
+        if settings.alerts.firstMatch.exists { print("SWITCH alert \(settings.alerts.firstMatch.label)"); settings.alerts.buttons.firstMatch.tap() }
+        print("SWITCH after \(sw.value as? String ?? "?")")
+        app.activate()
+        sleep(2)
     }
 }

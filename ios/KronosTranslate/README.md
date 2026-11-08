@@ -7,8 +7,11 @@ before you send (Undo restores). Tap the strip to pick the typing and target lan
 
 Translation runs on the iPhone: the keyboard extension links the Kronos runtime (`libkronos_2t.a`)
 and bundles Hy-MT2-1.8B (`Keyboard/Engine/Hy-MT2-1.8B`, 881 MB NF4). Weights are mapped read-only
-from the bundle, which keeps the extension under its memory cap. Your last 5 sent messages are
-context. No network, no Full Access. Without a bundled model it falls back to `kronos_server`.
+from the bundle: clean file-backed pages do not count against the extension's memory cap, which is
+only ~77 MB on an iPhone 12 Pro Max (measured: 8 MB before load, 28 MB loaded, ~60 MB while
+translating). Never read the weight file through the page cache to "warm" it: that counts and gets
+the keyboard killed. Your last 5 sent messages are context. No network, no Full Access. Without a
+bundled model it falls back to `kronos_server`.
 
 Design: https://www.figma.com/design/USzClG0m8LjwRQwbfufETU
 
@@ -33,8 +36,11 @@ xcrun simctl install booted build/Build/Products/Debug-iphonesimulator/KronosTra
 
 Fallback without a bundled model: run `kronos_server <model> --mode nf4g128 --metal --host 0.0.0.0
 --port 18085` on the Mac, enter `http://<mac-lan-ip>:18085` in the app, tap Test, and allow Full Access.
-The strip label's accessibility value carries engine diagnostics (load, decode, memory headroom);
-`LocalTranslateTests` prints them.
+The keyboard container's accessibility value (`kronos.board`) carries engine diagnostics (launch
+count and what the previous instance was doing when it died, load/decode times, jobs, footprint and
+headroom); typing `zzdiag` + space writes them into the field. `./test-device.sh` builds, signs and
+runs `LocalTranslateTests` on the phone, re-enabling the keyboard in Settings if a reinstall dropped
+it, and prints the translation times and diagnostics.
 
 Layout: `App/` SwiftUI settings, `Keyboard/` the extension (UIKit), `Shared/` prefs (app group) and
 the HTTP client. On Face ID iPhones iOS draws the globe and dictation keys itself, so the keyboard

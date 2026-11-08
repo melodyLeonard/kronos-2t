@@ -116,7 +116,11 @@ pub unsafe fn create_session(
         let calib = calib_candidate
             .exists()
             .then_some((calib_candidate.as_path(), 512usize));
+        crate::model::memory_budget::mem_trace("session create");
         let model = ChatModel::load(Path::new(model_dir), mode, ctx, n_threads, calib)?;
+        crate::model::memory_budget::mem_trace("chat model loaded");
+        crate::model::memory_budget::release_freed_memory();
+        crate::model::memory_budget::mem_trace("freed memory released");
         Ok(KronosMobileSession {
             model,
             pending_token: None,
@@ -1051,6 +1055,18 @@ pub extern "C" fn kronos_session_process_rss_bytes() -> usize {
     current_resident_bytes()
 }
 
+/// Caps tokens per CPU prefill batch (`0` = tier default: 16 on phones). Smaller = less scratch.
+#[no_mangle]
+pub extern "C" fn kronos_set_cpu_prompt_chunk(tokens: usize) {
+    crate::model::real_llm::set_cpu_prompt_chunk(tokens);
+}
+
+/// This process's `phys_footprint`: the number iOS compares against the extension memory limit.
+#[no_mangle]
+pub extern "C" fn kronos_process_footprint_bytes() -> usize {
+    crate::model::memory_budget::current_footprint_bytes()
+}
+
 /// Makes sessions created afterwards borrow NF weights straight from the mapped `.k2tb` instead of
 /// copying them to the heap (no Metal). Clean file-backed pages do not count against an iOS app
 /// extension's memory limit, which is how a keyboard runs a model far larger than its budget.
@@ -1475,4 +1491,51 @@ mod tests {
         }
         MemoryBudgetProfile::set_global_budget_override_bytes(0);
     }
+    /// `cargo test --release ffi_translate_zero_copy -- --ignored --nocapture` with Hy-MT2 in `models/`.
+    #[test]
+    #[ignore]
+    fn ffi_translate_zero_copy_hy_mt2() {
+        // GCD worker threads on iOS have 512 KiB stacks; run the whole thing on one that small.
+        let stack = std::env::var("KRONOS_TEST_STACK_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8192) << 10;
+        std::thread::Builder::new().stack_size(stack).spawn(ffi_translate_zero_copy_hy_mt2_body).unwrap().join().unwrap();
+    }
+
+    fn ffi_translate_zero_copy_hy_mt2_body() {
+        let dir = CString::new("models/Hy-MT2-1.8B").unwrap();
+        kronos_set_zero_copy_weights(1);
+        kronos_set_cpu_prompt_chunk(std::env::var("KRONOS_TEST_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        let mut out = String::new();
+        // SAFETY: valid NUL-terminated inputs; `out` outlives the call.
+        unsafe {
+            let rss0 = kronos_process_footprint_bytes();
+            let ctx: usize = std::env::var("KRONOS_TEST_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+            let sess = kronos_session_create(dir.as_ptr(), c"nf4g128".as_ptr(), ctx, 2, 0);
+            assert!(!sess.is_null(), "load failed");
+            let rss1 = kronos_process_footprint_bytes();
+            let t0 = std::time::Instant::now();
+            let text = CString::new(std::env::var("KRONOS_TEST_TEXT").unwrap_or_else(|_| "how are you today".into())).unwrap();
+            let ctx_json = CString::new(std::env::var("KRONOS_TEST_CONTEXT").unwrap_or_else(|_| "[]".into())).unwrap();
+            let n = kronos_session_translate(
+                sess,
+                text.as_ptr(),
+                c"French".as_ptr(),
+                c"English".as_ptr(),
+                ctx_json.as_ptr(),
+                Some(collect_stream_cb),
+                (&mut out as *mut String).cast(),
+            );
+            let rss2 = kronos_process_footprint_bytes();
+            eprintln!("footprint MB start {} · loaded {} · translated {}", rss0 >> 20, rss1 >> 20, rss2 >> 20);
+            if let Ok(o) = std::process::Command::new("footprint").arg(std::process::id().to_string()).output() {
+                let txt = String::from_utf8_lossy(&o.stdout);
+                for l in txt.lines().filter(|l| l.contains("phys_footprint") || l.contains("TOTAL") || l.contains("MB ") || l.contains("Dirty")).take(16) { eprintln!("{l}"); }
+            }
+            eprintln!("tokens {n} in {:?} · {out:?} · err {:?}", t0.elapsed(), std::ffi::CStr::from_ptr(kronos_session_last_error(sess)));
+            assert!(n > 0);
+            kronos_session_destroy(sess);
+        }
+        kronos_set_zero_copy_weights(0);
+        assert!(!out.is_empty());
+    }
+
 }

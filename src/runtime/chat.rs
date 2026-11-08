@@ -70,7 +70,7 @@ pub enum PromptStyle {
 impl PromptStyle {
     /// Picks the template from the tokenizer's special tokens.
     pub fn detect(tok: &BpeTokenizer) -> Self {
-        if tok.token_to_id.contains_key(crate::config::markup::HY_USER) {
+        if tok.token_id(crate::config::markup::HY_USER).is_some() {
             Self::HunYuan
         } else {
             Self::ChatMl
@@ -643,6 +643,7 @@ impl ChatModel {
         calib: Option<(&Path, usize)>,
     ) -> Result<Self, String> {
         let mut engine = load_target(model_dir, cache_dir, mode_key, ctx, threads, calib)?;
+        crate::model::memory_budget::mem_trace("load_target done");
         // Hadamard KV cache (`Q4` for `> 1B` models under `<= 8 GB` budget profile, `Q8` otherwise).
         if !engine.is_qwen35() && matches!(engine.head_dim(), 64 | 128) {
             let kv_bits = if crate::model::memory_budget::MemoryBudgetProfile::active().prefer_q4_kv
@@ -655,7 +656,9 @@ impl ChatModel {
             engine.set_kv_bits(kv_bits);
         }
         let vocab_size = engine.vocab_size();
+        crate::model::memory_budget::mem_trace("kv bits set");
         let mut tok = BpeTokenizer::from_model_dir(model_dir).map_err(|e| format!("tokenizer: {e}"))?;
+        crate::model::memory_budget::mem_trace("tokenizer loaded");
         let mut emb_probe = vec![0.0f32; engine.hidden_size()];
         tok.retain_added_tokens(|s, id| {
             if s.starts_with("<|") && s.ends_with("|>") {
@@ -668,7 +671,7 @@ impl ChatModel {
             emb_probe.iter().any(|&v| v != 0.0)
         });
         let special =
-            |s: &str| tok.token_to_id.get(s).copied().ok_or(format!("tokenizer lacks {s}; use an Instruct model"));
+            |s: &str| tok.token_id(s).ok_or(format!("tokenizer lacks {s}; use an Instruct model"));
         let style = PromptStyle::detect(&tok);
         // HunYuan: the user-turn marker is masked like `<|im_start|>` and `<eos>` ends the reply.
         let (im_start, im_end) = match style {
@@ -700,7 +703,7 @@ impl ChatModel {
             last_gen: None,
             prev_reply: Vec::new(),
             ctx,
-            scratch: ChatScratch::new(vocab_size),
+            scratch: { crate::model::memory_budget::mem_trace("before chat scratch"); ChatScratch::new(vocab_size) },
             spec_enabled: true,
             sessions: None,
             active_session: None,
@@ -1031,14 +1034,10 @@ impl ChatModel {
         let draft_vocab = draft_eng.cfg.vocab_size;
         let target_vocab = self.engine.vocab_size();
         let shared_vocab = draft_vocab.min(target_vocab);
-        let check_len = draft_tok
-            .id_to_token
-            .len()
-            .min(self.tok.id_to_token.len())
-            .min(shared_vocab);
+        let check_len = draft_tok.vocab_len().min(self.tok.vocab_len()).min(shared_vocab);
         if check_len == 0
             || draft_tok.pre_tokenizer != self.tok.pre_tokenizer
-            || draft_tok.id_to_token[..check_len] != self.tok.id_to_token[..check_len]
+            || !draft_tok.same_vocab_prefix(&self.tok, check_len)
         {
             return Err(format!(
                 "draft tokenizer mismatch over shared {check_len} ids (draft vocab {draft_vocab}, target vocab {target_vocab})"

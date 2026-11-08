@@ -30,12 +30,13 @@ final class LocalEngine {
 
     private(set) var state: State = .idle
     private(set) var loadMillis: Double = 0
-    /// Time to stream the weight file through the page cache after load (0 until done).
-    private(set) var warmMillis: Double = 0
     private var session: OpaquePointer?
     private let queue = DispatchQueue(label: "kronos.engine", qos: .userInitiated)
     private var waiters: [(State) -> Void] = []
     private var current: Job?
+    private var started = 0, finished = 0, lastTokens = 0, lastMillis = 0.0
+    /// Jobs started/finished and the last job's tokens and wall time, for diagnostics.
+    var jobSummary: String { String(format: "jobs %d/%d · last %d tok %.1f s", started, finished, lastTokens, lastMillis) }
 
     /// Loads the session once, in the background. `completion` runs on the main thread.
     func load(completion: ((State) -> Void)? = nil) {
@@ -46,10 +47,9 @@ final class LocalEngine {
         queue.async { [self] in
             let t0 = Date()
             kronos_set_zero_copy_weights(1)
-            let threads = ProcessInfo.processInfo.activeProcessorCount
-            let sess = dir.path.withCString { kronos_session_create($0, Self.mode, 1024, 0, 0) }   // threads: P-cores; more starves the UI (spin barrier)
+            // 512-token window bounds the KV cache (~16 KB/token); threads 0 = P-cores, more starves the UI.
+            let sess = dir.path.withCString { kronos_session_create($0, Self.mode, 512, 0, 0) }
             let ms = Date().timeIntervalSince(t0) * 1000
-            if sess != nil { self.warm(dir.appendingPathComponent("kronos-" + Self.mode + ".k2tb")) }
             DispatchQueue.main.async {
                 self.loadMillis = ms
                 if let sess {
@@ -59,19 +59,6 @@ final class LocalEngine {
                     self.finish(.unavailable("Model failed to load"))
                 }
             }
-        }
-    }
-
-    /// Reads the weight file once, sequentially, so the first translation hits the page cache
-    /// instead of taking tens of thousands of random page faults. Clean pages: not counted.
-    private func warm(_ url: URL) {
-        DispatchQueue.global(qos: .userInitiated).async { [self] in
-            let t0 = Date()
-            guard let h = try? FileHandle(forReadingFrom: url) else { return }
-            while let d = try? h.read(upToCount: 8 << 20), !d.isEmpty {}
-            try? h.close()
-            let ms = Date().timeIntervalSince(t0) * 1000
-            DispatchQueue.main.async { self.warmMillis = ms }
         }
     }
 
@@ -101,6 +88,8 @@ final class LocalEngine {
             try await withCheckedThrowingContinuation { (c: CheckedContinuation<String, Error>) in
                 queue.async {
                     if job.cancelled { c.resume(throwing: CancellationError()); return }
+                    self.started += 1
+                    let t0 = Date()
                     let user = Unmanaged.passUnretained(job).toOpaque()
                     let n = text.withCString { t in to.withCString { tl in from.withCString { fl in ctx.withCString { cx in
                         kronos_session_translate(session, t, tl, fl, cx, { ptr, len, user in
@@ -113,6 +102,7 @@ final class LocalEngine {
                             return true
                         }, user)
                     } } } }
+                    self.finished += 1; self.lastTokens = Int(n); self.lastMillis = Date().timeIntervalSince(t0)
                     if job.cancelled { c.resume(throwing: CancellationError()) }
                     else if n < 0 { c.resume(throwing: Failure(message: String(cString: kronos_session_last_error(session)))) }
                     else if job.latest.isEmpty { c.resume(throwing: Failure(message: "Empty translation")) }
@@ -127,7 +117,7 @@ final class LocalEngine {
     /// Memory headroom left under the extension's cap, and the process footprint, for diagnostics.
     static var memorySummary: String {
         let avail = Double(os_proc_available_memory()) / 1_048_576
-        let rss = Double(kronos_session_process_rss_bytes()) / 1_048_576
+        let rss = Double(kronos_process_footprint_bytes()) / 1_048_576
         return String(format: "free %.0f MB · used %.0f MB", avail, rss)
     }
 }

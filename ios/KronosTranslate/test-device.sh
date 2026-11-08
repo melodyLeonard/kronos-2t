@@ -42,4 +42,4 @@ codesign --force --sign "$ID" --entitlements "$OUT/ent-test.plist" --timestamp=n
 codesign --force --sign "$ID" --entitlements "$OUT/ent-run.plist" --timestamp=none "$RUN"
 XCTR=$(ls build-device/Build/Products/*.xctestrun | head -1)
 xcodebuild test-without-building -xctestrun "$XCTR" -destination "id=$DEVICE" -only-testing:"$ONLY" 2>&1 \
-  | grep -E "TREE|PNG|TRANSLATION|DIAG|error:|crashed|Executed|passed|failed"
+  | grep -E "TREE|PNG|SWITCH|TRANSLATION|DIAG|error:|crashed|Executed|passed|failed"

@@ -125,6 +125,8 @@ int32_t kronos_session_run_agent_turn(
 size_t kronos_session_resident_bytes(const KronosMobileSession *session);
 
 size_t kronos_session_process_rss_bytes(void);
+size_t kronos_process_footprint_bytes(void);
+void kronos_set_cpu_prompt_chunk(size_t tokens);
 
 /* Sessions created afterwards map NF weights read-only instead of copying them (no Metal). */
 void kronos_set_zero_copy_weights(int32_t enabled);
