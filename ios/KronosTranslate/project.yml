@@ -40,8 +40,17 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.melodyleonard.KronosTranslate.keyboard
+        SWIFT_OBJC_BRIDGING_HEADER: Keyboard/Engine/Kronos-Bridging-Header.h
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) KRONOS_LOCAL_ENGINE
+        OTHER_LDFLAGS: -lkronos_2t
+        "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]": $(SRCROOT)/../../target/aarch64-apple-ios/release
+        "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": $(SRCROOT)/../../target/aarch64-apple-ios-sim/release
     sources:
       - path: Keyboard
+        excludes: [Engine/Hy-MT2-1.8B]
+      - path: Keyboard/Engine/Hy-MT2-1.8B
+        type: folder
+        buildPhase: resources
       - path: Shared
     info:
       path: Keyboard/Info.plist

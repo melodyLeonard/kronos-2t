@@ -1051,6 +1051,93 @@ pub extern "C" fn kronos_session_process_rss_bytes() -> usize {
     current_resident_bytes()
 }
 
+/// Makes sessions created afterwards borrow NF weights straight from the mapped `.k2tb` instead of
+/// copying them to the heap (no Metal). Clean file-backed pages do not count against an iOS app
+/// extension's memory limit, which is how a keyboard runs a model far larger than its budget.
+#[no_mangle]
+pub extern "C" fn kronos_set_zero_copy_weights(enabled: i32) {
+    crate::model::real_llm::set_zero_copy_weights(enabled != 0);
+}
+
+/// Translates `text_utf8` into language `to_utf8` (English name) from `from_utf8` (English name or
+/// `auto`), with `context_json_utf8` an optional JSON array of earlier messages, oldest first.
+/// `on_piece_cb` receives the cleaned translation so far each time it changes (the last call is the
+/// final text); returning `false` stops decoding. Greedy. Returns generated tokens, or `-1` on error.
+///
+/// # Safety
+/// `session`, `text_utf8` and `to_utf8` must be valid pointers; `from_utf8`, `context_json_utf8`,
+/// `on_piece_cb` and `user_data` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn kronos_session_translate(
+    session: *mut KronosMobileSession,
+    text_utf8: *const c_char,
+    to_utf8: *const c_char,
+    from_utf8: *const c_char,
+    context_json_utf8: *const c_char,
+    on_piece_cb: KronosStreamCallback,
+    user_data: *mut c_void,
+) -> i32 {
+    if session.is_null() {
+        return -1;
+    }
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: Validated non-null exclusive session pointer.
+        let sess = unsafe { &mut *session };
+        // SAFETY: Pointers checked per this function's contract.
+        let parsed = unsafe {
+            (|| -> Result<(&str, &str, Option<&str>, Option<&str>), String> {
+                Ok((cstr_to_str(text_utf8)?, cstr_to_str(to_utf8)?, opt_cstr_to_str(from_utf8)?, opt_cstr_to_str(context_json_utf8)?))
+            })()
+        };
+        let (text, to, from, ctx_json) = match parsed {
+            Ok(v) => v,
+            Err(e) => {
+                sess.set_error(e);
+                return -1;
+            }
+        };
+        let context = ctx_json
+            .and_then(|j| Json::parse(j).ok())
+            .and_then(|j| j.as_arr().map(|a| a.iter().filter_map(Json::as_str).map(String::from).collect::<Vec<_>>()))
+            .map(crate::runtime::translate::trim_context)
+            .unwrap_or_default();
+        let req = crate::runtime::translate::TranslateRequest {
+            text: text.trim(),
+            to,
+            from: from.unwrap_or("auto"),
+            tone: "neutral",
+            context: &context,
+            temperature: 0.0,
+        };
+        if req.text.is_empty() {
+            sess.set_error("empty text");
+            return -1;
+        }
+        sess.pending_token = None;
+        let gen = crate::runtime::translate::run(&mut sess.model, &req, |cur| {
+            let Some(cb) = on_piece_cb else {
+                return true;
+            };
+            let Ok(cs) = CString::new(cur.replace('\0', "")) else {
+                return true;
+            };
+            // SAFETY: `cs` is a live NUL-terminated buffer for the duration of the callback.
+            unsafe { cb(cs.as_ptr(), cs.as_bytes().len(), user_data) }
+        });
+        match gen {
+            Ok(comp) => {
+                sess.clear_error();
+                comp.completion_tokens as i32
+            }
+            Err(e) => {
+                sess.set_error(e);
+                -1
+            }
+        }
+    }));
+    res.unwrap_or(-1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -37,7 +37,7 @@ use kronos_2t::runtime::agent::{
 };
 use kronos_2t::runtime::attachments::{ingest_attachment, AttachmentIngestion};
 use kronos_2t::runtime::kv_sessions::KvSource;
-use kronos_2t::runtime::chat::{ChatModel, Completion, GenParams, Message, PromptStyle, ToolCall};
+use kronos_2t::runtime::chat::{ChatModel, Completion, GenParams, Message, ToolCall};
 use kronos_2t::runtime::device::{global_device_manager, use_computer_tool_definition_json};
 use kronos_2t::util::json::{quote, Json};
 use kronos_2t::runtime::vision::analyze_image_payload;
@@ -52,9 +52,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kronos_2t::config::server::{MAX_BODY_BYTES as MAX_BODY, MAX_HEADER_BYTES as MAX_HEADER, MAX_REVERT_SNAPSHOT_BYTES};
-use kronos_2t::config::limits::{
-    TRANSLATE_CONTEXT_MAX_BYTES, TRANSLATE_CONTEXT_MAX_ITEMS, TRANSLATE_TOKENS_BASE, TRANSLATE_TOKENS_MAX, TRANSLATE_TOKENS_MIN,
-};
+use kronos_2t::runtime::translate::{clean_translation, run as translate_run, trim_context, TranslateRequest};
 const CHAT_PAGE: &str = include_str!("../web/chat.html");
 const QUICK_PAGE: &str = include_str!("../web/quick.html");
 
@@ -900,9 +898,8 @@ fn format_completion_response(
 }
 
 /// `/translate`: `{"text","to","from","tone","context":[..],"stream":bool}` -> `{"text"}` (or SSE stream).
-/// Targets Hy-MT2 covers go to `--translate-model` when loaded; the rest to the main model, with thinking
-/// suppressed by an empty `<think>` prefix on Qwen3. Greedy decoding (`temperature: 0.0`) is used by default
-/// so incremental live typing stays stable and reuses the previous translation via speculative lookup.
+/// Targets Hy-MT2 covers go to `--translate-model` when loaded; the rest to the main model. Prompting,
+/// greedy decoding and output cleanup live in `runtime::translate`, shared with the mobile FFI.
 fn translate(srv: &Server, stream: &mut TcpStream, req: &Request, keep_alive: bool) -> bool {
     let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
         Ok(b) => b,
@@ -918,43 +915,24 @@ fn translate(srv: &Server, stream: &mut TcpStream, req: &Request, keep_alive: bo
     }
     let streaming = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
     let to = body.get("to").and_then(Json::as_str).map(str::trim).filter(|s| !s.is_empty()).unwrap_or("French");
-    let from = body.get("from").and_then(Json::as_str).unwrap_or("auto");
-    let tone = body.get("tone").and_then(Json::as_str).unwrap_or("neutral");
-    let temp = body.get("temperature").and_then(Json::as_f64).map_or(0.0, |v| v as f32);
-    let context = translate_context(&body);
+    let context = trim_context(
+        body.get("context")
+            .and_then(Json::as_arr)
+            .map(|a| a.iter().filter_map(Json::as_str).map(String::from).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    let treq = TranslateRequest {
+        text,
+        to,
+        from: body.get("from").and_then(Json::as_str).unwrap_or("auto"),
+        tone: body.get("tone").and_then(Json::as_str).unwrap_or("neutral"),
+        context: &context,
+        temperature: body.get("temperature").and_then(Json::as_f64).map_or(0.0, |v| v as f32),
+    };
     let routed = srv.translate_model.as_ref().filter(|_| kronos_2t::config::prompts::hy_mt2_supports(to));
     let mut model = routed.unwrap_or(&srv.model).lock().unwrap_or_else(|p| p.into_inner());
-    let max_tokens = (text.len() / 2 + TRANSLATE_TOKENS_BASE).clamp(TRANSLATE_TOKENS_MIN, TRANSLATE_TOKENS_MAX);
-    let (messages, params) = match model.prompt_style() {
-        PromptStyle::HunYuan => (
-            vec![Message::new("user", &kronos_2t::config::prompts::translate_user_hunyuan(to, from, tone, &context, text))],
-            GenParams {
-                temperature: temp,
-                top_k: 20,
-                top_p: 0.6,
-                repeat_penalty: if temp <= 0.0 { 1.0 } else { 1.05 },
-                max_tokens,
-                seed: 0,
-            },
-        ),
-        PromptStyle::ChatMl => (
-            vec![
-                Message::new("system", &kronos_2t::config::prompts::translate_system(to, from, tone, &context)),
-                Message::new("user", text),
-            ],
-            GenParams {
-                temperature: temp,
-                top_k: 40,
-                top_p: 0.9,
-                repeat_penalty: if temp <= 0.0 { 1.0 } else { 1.02 },
-                max_tokens,
-                seed: 0,
-            },
-        ),
-    };
-    let prefix = if model.name.to_ascii_lowercase().contains("qwen3") { "<think>\n\n</think>\n\n" } else { "" };
     if !streaming {
-        return match model.generate_with_tools_prefixed(&messages, &[], prefix, &params, |_| true) {
+        return match translate_run(&mut model, &treq, |_| true) {
             Ok(c) => {
                 let payload = format!(r#"{{"text":{},"usage":{}}}"#, quote(&clean_translation(&c.text)), usage(&c, None));
                 let conn_hdr = if keep_alive {
@@ -998,22 +976,11 @@ fn translate(srv: &Server, stream: &mut TcpStream, req: &Request, keep_alive: bo
             s.write_all(ev.as_bytes()).and_then(|_| s.flush()).is_ok()
         }
     };
-    let mut acc = String::new();
-    let mut last_sent = String::new();
     let mut client_alive = true;
-    match model.generate_with_tools_prefixed(&messages, &[], prefix, &params, |piece| {
-        acc.push_str(piece);
-        if !prefix.is_empty() && acc.len() <= prefix.len() {
-            return true;
-        }
-        let cur = clean_translation(&acc);
-        if !cur.is_empty() && cur != last_sent {
-            last_sent.clone_from(&cur);
-            let ev = format!("data: {{\"text\":{}}}\n\n", quote(&cur));
-            client_alive = write_sse(stream, &ev);
-            return client_alive;
-        }
-        true
+    match translate_run(&mut model, &treq, |cur| {
+        let ev = format!("data: {{\"text\":{}}}\n\n", quote(cur));
+        client_alive = write_sse(stream, &ev);
+        client_alive
     }) {
         Ok(c) if client_alive => {
             let final_text = clean_translation(&c.text);
@@ -1038,52 +1005,6 @@ fn translate(srv: &Server, stream: &mut TcpStream, req: &Request, keep_alive: bo
             false
         }
     }
-}
-
-/// Last `TRANSLATE_CONTEXT_MAX_ITEMS` non-empty `context` strings within the byte budget, oldest first.
-fn translate_context(body: &Json) -> Vec<String> {
-    let items: Vec<String> = body
-        .get("context")
-        .and_then(Json::as_arr)
-        .map(|a| a.iter().filter_map(Json::as_str).map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
-        .unwrap_or_default();
-    let mut out = Vec::new();
-    let mut bytes = 0;
-    for item in items.into_iter().rev().take(TRANSLATE_CONTEXT_MAX_ITEMS) {
-        bytes += item.len();
-        if bytes > TRANSLATE_CONTEXT_MAX_BYTES {
-            break;
-        }
-        out.push(item);
-    }
-    out.reverse();
-    out
-}
-
-/// Strips think blocks, `Translation:`-style prefixes and wrapping quotes from model output.
-fn clean_translation(raw: &str) -> String {
-    let mut s = raw;
-    if let Some(end) = s.find("</think>") {
-        s = &s[end + "</think>".len()..];
-    }
-    let mut s = s.trim();
-    loop {
-        let before = s;
-        for p in ["translation:", "translated text:", "translated:", "output:"] {
-            if s.is_char_boundary(p.len()) && s[..p.len()].eq_ignore_ascii_case(p) {
-                s = s[p.len()..].trim();
-            }
-        }
-        for (open, close) in [('"', '"'), ('“', '”'), ('«', '»'), ('\'', '\''), ('`', '`')] {
-            if s.starts_with(open) && s.ends_with(close) && s.chars().count() > 1 {
-                s = s[open.len_utf8()..s.len() - close.len_utf8()].trim();
-            }
-        }
-        if s == before {
-            break;
-        }
-    }
-    s.to_string()
 }
 
 fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
@@ -3525,16 +3446,6 @@ fn main() {
 mod tests {
     use super::*;
     use kronos_2t::runtime::chat::FinishReason;
-
-    #[test]
-    fn test_clean_translation() {
-        assert_eq!(clean_translation("\"Hasta mañana\""), "Hasta mañana");
-        assert_eq!(clean_translation("Translation: «À demain»\n"), "À demain");
-        assert_eq!(clean_translation("<think>\nhmm\n</think>\n\nSalut 👋\nça va ?"), "Salut 👋\nça va ?");
-        assert_eq!(clean_translation("“Ciao”"), "Ciao");
-        assert_eq!(clean_translation("I'm fine"), "I'm fine");
-        assert_eq!(clean_translation("\""), "\"");
-    }
 
     #[test]
     fn test_openai_tool_request_and_response_wire_format() {

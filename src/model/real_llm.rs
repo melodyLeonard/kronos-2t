@@ -1468,6 +1468,19 @@ impl LlamaWorkspace {
     }
 }
 
+static ZERO_COPY_WEIGHTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Makes later [`RealLlamaEngine::load_bipolar`] calls borrow NF weights from the mapped file
+/// (no heap copy, no gate-up interleave, Metal disabled). For memory-capped hosts such as iOS
+/// keyboard extensions.
+pub fn set_zero_copy_weights(on: bool) {
+    ZERO_COPY_WEIGHTS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn zero_copy_weights() -> bool {
+    ZERO_COPY_WEIGHTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Real pretrained `LlamaForCausalLM` / `Qwen2ForCausalLM` / Sparse-MoE engine.
 pub struct RealLlamaEngine {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -3340,7 +3353,7 @@ impl RealLlamaEngine {
     }
 
     /// Repacks projections for `SDOT`, interleaves dense `gate_up_proj` in 64-row blocks, and enables INT8
-    /// chunk activations.
+    /// chunk activations. Mapped (zero-copy) NF weights are left in place.
     pub fn repack_sdot(&mut self) {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
@@ -3368,7 +3381,8 @@ impl RealLlamaEngine {
                             LinearBackend::Nibble4(Nibble4SdotMatrix::from_bipolar_with_perm(m, true));
                         l.gate_up_interleaved = true;
                     }
-                    LinearBackend::NfSdot(m) => {
+                    // Zero-copy weights stay as mapped: interleaving would copy the largest matrices.
+                    LinearBackend::NfSdot(m) if !zero_copy_weights() => {
                         l.gate_up_proj = LinearBackend::NfSdot(m.to_gate_up_interleaved());
                         l.gate_up_interleaved = true;
                     }
@@ -3573,6 +3587,10 @@ impl RealLlamaEngine {
     }
 
     /// Loads an engine written by [`Self::save_bipolar`]; `model_dir` supplies `config.json`.
+    ///
+    /// With [`set_zero_copy_weights`] on, NF weight streams point into the mapped file instead of
+    /// being copied: clean file-backed pages, which iOS does not count against an app extension's
+    /// memory limit. The mapping then lives for the rest of the process.
     pub fn load_bipolar(model_dir: &Path, path: &Path, max_seq_len: usize) -> io::Result<Self> {
         let cfg = LlamaConfig::from_config_json(&model_dir.join("config.json"), max_seq_len)?;
         let file = fs::File::open(path)?;
@@ -3580,8 +3598,17 @@ impl RealLlamaEngine {
         if len < BIPOLAR_CACHE_MAGIC.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "empty bipolar cache"));
         }
+        let zero_copy = zero_copy_weights();
         let mmap = RawMmap::map_read_only(&file, len)?;
         let bytes = mmap.as_slice();
+        let nf_stream = |s: &[u8]| {
+            if zero_copy {
+                // SAFETY: `mmap` is forgotten below, so the mapping outlives every borrower.
+                unsafe { crate::kernels::simd_lut::PageAlignedBytes::borrowed(s.as_ptr(), s.len()) }
+            } else {
+                crate::kernels::simd_lut::PageAlignedBytes::from_slice(s)
+            }
+        };
         let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
         let (version, magic_len) = if bytes.starts_with(KRONOS6_CACHE_MAGIC) {
             (6u8, KRONOS6_CACHE_MAGIC.len())
@@ -3658,9 +3685,9 @@ impl RealLlamaEngine {
                     let cb_raw = rd.take(16)?;
                     let codebook: [i8; 16] = std::array::from_fn(|i| cb_raw[i] as i8);
                     let pair_len = rd.u64()?;
-                    let pair_stream = crate::kernels::simd_lut::PageAlignedBytes::from_slice(rd.take(pair_len)?);
+                    let pair_stream = nf_stream(rd.take(pair_len)?);
                     let tail_len = rd.u64()?;
-                    let tail_stream = crate::kernels::simd_lut::PageAlignedBytes::from_slice(rd.take(tail_len)?);
+                    let tail_stream = nf_stream(rd.take(tail_len)?);
                     let num_stripes = rows.div_ceil(SIMD_ROW_STRIPE);
                     let num_chunks = cols / 64;
                     Ok(LinearBackend::NfSdot(NfSdotMatrix {
@@ -3802,11 +3829,15 @@ impl RealLlamaEngine {
                 _ => return Err(bad("expected NfSdot untied embedding matrix in K2TKRONOS4")),
             }
         }
-        let page_aligned = len & !16_383usize;
-        if page_aligned > 0 {
-            mmap.advise_dontneed(0, page_aligned);
+        if zero_copy {
+            std::mem::forget(mmap);
+        } else {
+            let page_aligned = len & !16_383usize;
+            if page_aligned > 0 {
+                mmap.advise_dontneed(0, page_aligned);
+            }
+            drop(mmap);
         }
-        drop(mmap);
 
         let budget = crate::model::memory_budget::MemoryBudgetProfile::active();
         let mut eng = Self {
@@ -10259,6 +10290,35 @@ mod tests {
 
         q8_eng.set_num_threads(1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Needs models/Qwen3-0.6B with its compiled nf4g128 cache: mapped (zero-copy, un-interleaved)
+    // weights must decode exactly like copied ones.
+    #[test]
+    #[ignore]
+    fn zero_copy_weights_match_copied() {
+        use crate::model::bpe_tokenizer::BpeTokenizer;
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/Qwen3-0.6B");
+        let cache = dir.join("kronos-nf4g128.k2tb");
+        let (Ok(tok), true) = (BpeTokenizer::from_model_dir(&dir), cache.is_file()) else { return };
+        let prompt = tok.encode("<|im_start|>user\nSay hello in French.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
+        let gen = |eng: &mut RealLlamaEngine| {
+            let mut l = eng.forward_prompt(&prompt).to_vec();
+            (0..16).map(|_| { let t = argmax(&l); l = eng.forward_token(t).to_vec(); t }).collect::<Vec<_>>()
+        };
+        let mut copied = RealLlamaEngine::load_bipolar(&dir, &cache, 256).unwrap();
+        copied.repack_sdot();
+        let a = gen(&mut copied);
+        drop(copied);
+        eprintln!("copied engine ok");
+        set_zero_copy_weights(true);
+        let mut mapped = RealLlamaEngine::load_bipolar(&dir, &cache, 256).unwrap();
+        mapped.repack_sdot();
+        set_zero_copy_weights(false);
+        assert!(mapped.layers.iter().all(|l| !l.gate_up_interleaved));
+        let b = gen(&mut mapped);
+        println!("{:?}", tok.decode(&b));
+        assert_eq!(a, b);
     }
 
     // Needs models/Qwen3-0.6B with its compiled nf4g128 cache; prints FP32 vs compiled greedy text.

@@ -128,6 +128,7 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         actionBtn.addTarget(self, action: #selector(actionTap), for: .touchUpInside)
         status.font = .systemFont(ofSize: 15)
         status.lineBreakMode = .byTruncatingTail
+        status.accessibilityIdentifier = "kronos.status"
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         status.setContentHuggingPriority(.defaultLow, for: .horizontal)
         pill.contentHorizontalAlignment = .leading
@@ -368,6 +369,9 @@ final class KeyboardView: UIView, UIInputViewAudioFeedback {
         if let img { att.bounds = CGRect(x: 0, y: -1, width: img.size.width, height: img.size.height) }
         return NSAttributedString(attachment: att)
     }
+
+    /// Engine diagnostics, exposed as the strip label's accessibility value for the UI test.
+    var diagnostics = "" { didSet { accessibilityIdentifier = "kronos.board"; accessibilityValue = diagnostics } }
 
     func setState(_ s: State) {
         state = s

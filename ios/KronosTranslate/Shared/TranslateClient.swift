@@ -1,6 +1,8 @@
 import Foundation
 
-/// Client for Kronos `POST /translate` (persistent keep-alive + SSE token streaming).
+/// Translation entry point. The keyboard runs the bundled model on-device (`LocalEngine`); the Mac
+/// server (`POST /translate`, keep-alive + SSE) is the fallback when no model is bundled, which is
+/// also what the app's Test button exercises.
 enum TranslateClient {
     struct Failure: LocalizedError {
         let message: String
@@ -18,7 +20,7 @@ enum TranslateClient {
         return URLSession(configuration: cfg)
     }()
 
-    /// Non-streaming one-shot translation (used by `ping()` and fallback).
+    /// Non-streaming one-shot translation over the network (used by `ping()`).
     static func translate(_ text: String, from: String, to code: String, context: [String]) async throws -> String {
         let req = try makeRequest(text: text, from: from, to: code, context: context, stream: false)
         let (data, resp) = try await session.data(for: req)
@@ -32,8 +34,25 @@ enum TranslateClient {
         return out
     }
 
-    /// Streams incremental translation tokens over SSE, invoking `onPartial` on the main actor as tokens arrive.
+    /// Streams the translation as it decodes, invoking `onPartial` on the main actor.
     static func translateStream(
+        _ text: String,
+        from: String,
+        to code: String,
+        context: [String],
+        onPartial: @escaping @MainActor (String) -> Void
+    ) async throws -> String {
+        #if KRONOS_LOCAL_ENGINE
+        if LocalEngine.isBundled {
+            return try await LocalEngine.shared.translate(text, from: Languages.by(code: from).name, to: Languages.by(code: code).name, context: context) { partial in
+                Task { @MainActor in onPartial(partial) }
+            }
+        }
+        #endif
+        return try await translateStreamRemote(text, from: from, to: code, context: context, onPartial: onPartial)
+    }
+
+    static func translateStreamRemote(
         _ text: String,
         from: String,
         to code: String,
@@ -89,7 +108,7 @@ enum TranslateClient {
         return req
     }
 
-    /// Round-trip check used by the app's Test button.
+    /// Round-trip check of the Mac server, used by the app's Test button.
     static func ping() async -> Result<TimeInterval, Error> {
         let t0 = Date()
         do {

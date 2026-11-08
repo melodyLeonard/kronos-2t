@@ -29,13 +29,19 @@ struct SettingsView: View {
                 }
                 Section("Set up") {
                     step(1, "Add the keyboard", "Settings › General › Keyboard › Keyboards › Add New Keyboard › Translate")
-                    step(2, "Allow Full Access", "Needed to reach your Mac. Nothing leaves your Wi‑Fi.")
-                    step(3, "Connect to your Mac", "Run kronos_server with --host 0.0.0.0, then enter its address below")
+                    step(2, "Start typing", "Translation runs on this iPhone with the built-in model. No internet, no Full Access needed.")
                     Button {
                         if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
                     } label: { Label("Open Settings", systemImage: "gear") }
                 }
                 Section("Engine") {
+                    HStack {
+                        Image(systemName: "iphone").settingsIcon(.green)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(Self.bundledModel == nil ? "No on-device model" : "On this iPhone · Hy-MT2 1.8B")
+                            Text(Self.bundledModel.map { "\($0) · works offline" } ?? "Falls back to the Mac server below").font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
                     HStack {
                         Image(systemName: "desktopcomputer").settingsIcon(.blue)
                         TextField("http://192.168.1.70:18085", text: $server)
@@ -86,6 +92,13 @@ struct SettingsView: View {
                 Text(sub).font(.footnote).foregroundStyle(.secondary)
             }
         }
+    }
+
+    /// Size of the model inside the keyboard extension, or nil when it is not bundled.
+    private static var bundledModel: String? {
+        let ext = Bundle.main.bundleURL.appendingPathComponent("PlugIns/KronosKeyboard.appex/Hy-MT2-1.8B/kronos-nf4g128.k2tb")
+        guard let size = (try? ext.resourceValues(forKeys: [.fileSizeKey]))?.fileSize else { return nil }
+        return ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
     }
 
     private func test() {

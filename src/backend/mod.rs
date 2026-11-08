@@ -2,7 +2,7 @@
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod metal_gpu;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod metal_qwen35;
 #[cfg(all(feature = "ane", target_os = "macos"))]
 pub mod coreml;

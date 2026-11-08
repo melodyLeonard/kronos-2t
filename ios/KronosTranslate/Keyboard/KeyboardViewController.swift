@@ -35,6 +35,21 @@ final class KeyboardViewController: UIInputViewController {
         board.onSuggestion = { [weak self] in self?.accept(suggestion: $0) }
         board.onCursorMove = { [weak self] in self?.textDocumentProxy.adjustTextPosition(byCharacterOffset: $0) }
         board.onHeightChange = { [weak self] in self?.heightConstraint?.constant = $0 }
+        updateDiagnostics()
+        if LocalEngine.isBundled {
+            LocalEngine.shared.load { [weak self] state in
+                guard let self else { return }
+                if case .unavailable(let why) = state { self.board.flash(why) }
+                self.updateDiagnostics()
+                self.scheduleTranslate(self.fieldText(), now: true)
+            }
+        }
+    }
+
+    /// Load time, last decode and memory headroom, readable by the UI test through the strip label.
+    private var lastDecode = "", lastError = ""
+    private func updateDiagnostics() {
+        board.diagnostics = String(format: "load %.0f ms · warm %.0f ms · %d thr", LocalEngine.shared.loadMillis, LocalEngine.shared.warmMillis, ProcessInfo.processInfo.activeProcessorCount) + (lastDecode.isEmpty ? "" : " · \(lastDecode)") + " · " + LocalEngine.memorySummary
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -151,6 +166,14 @@ final class KeyboardViewController: UIInputViewController {
             textDocumentProxy.insertText(board.shift == .off || !cased ? s : s.uppercased())
             if board.shift == .on { board.setShift(.off) }
         case .space:
+            #if DEBUG
+            if currentWord == "zzdiag" {   // test hook: engine diagnostics into the field
+                updateDiagnostics()
+                let st: String = { switch LocalEngine.shared.state { case .idle: return "idle"; case .loading: return "loading"; case .ready: return "ready"; case .unavailable(let w): return "unavailable: \(w)" } }()
+                replaceCurrentWord(with: "[\(st) · \(board.diagnostics) · err \(lastError)]")
+                break
+            }
+            #endif
             let before = textDocumentProxy.documentContextBeforeInput ?? ""
             if Date().timeIntervalSince(lastSpace) < 0.35, before.hasSuffix(" "), before.dropLast().last?.isLetter == true {
                 // Double-tap space: ". " and capitalise, like the system keyboard.
@@ -233,10 +256,11 @@ final class KeyboardViewController: UIInputViewController {
     private func cacheKey(_ t: String) -> String { "\(Prefs.sourceCode)>\(Prefs.targetCode)|\(t)" }
 
     private func translate(_ text: String) {
-        guard hasFullAccess else { board.flash("Allow Full Access in Settings"); return }
+        guard hasFullAccess || LocalEngine.isBundled else { board.flash("Allow Full Access in Settings"); return }
         task?.cancel()
         let from = Prefs.sourceCode, code = Prefs.targetCode
         let ctx = Prefs.contextOn ? Prefs.context : []
+        let t0 = Date()
         task = Task { [weak self] in
             do {
                 let out = try await TranslateClient.translateStream(text, from: from, to: code, context: ctx) { [weak self] partial in
@@ -251,9 +275,12 @@ final class KeyboardViewController: UIInputViewController {
                 guard self.fieldText().trimmingCharacters(in: .whitespacesAndNewlines) == text else { return }
                 self.previewFor = text
                 self.board.setStreamingPreview(out, active: false)
+                self.lastDecode = String(format: "%.2f s", Date().timeIntervalSince(t0))
+                self.updateDiagnostics()
             } catch {
                 guard let self, !Task.isCancelled else { return }
                 self.task = nil
+                self.lastError = error.localizedDescription
                 self.board.flash(error.localizedDescription)
             }
         }

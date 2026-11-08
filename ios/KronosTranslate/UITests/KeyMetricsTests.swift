@@ -54,3 +54,53 @@ final class KeyMetricsTests: XCTestCase {
         }
     }
 }
+
+/// Types on the Kronos keyboard and waits for the on-device translation; prints the strip text and
+/// the engine diagnostics (load time, decode time, memory headroom under the extension's cap),
+/// which the keyboard exposes as the accessibility value of its `kronos.board` container.
+final class LocalTranslateTests: XCTestCase {
+    func testTypeAndTranslate() {
+        let app = XCUIApplication()
+        app.launch()
+        let field = app.textViews.firstMatch.exists ? app.textViews.firstMatch : app.textFields.firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        field.tap()
+        sleep(2)
+        // Cycle keyboards (system, emoji, ...) until ours is up.
+        for _ in 0..<4 where !app.keys["delete.left"].exists {
+            let globe = app.buttons["Next keyboard"]
+            if globe.waitForExistence(timeout: 3) { globe.tap() } else { app.coordinate(withNormalizedOffset: CGVector(dx: 0.08, dy: 0.97)).tap() }
+            sleep(2)
+        }
+        XCTAssertTrue(app.keys["delete.left"].waitForExistence(timeout: 3), "Kronos keyboard not up")
+        let boardEl = app.otherElements["kronos.board"]
+        let status = app.staticTexts["kronos.status"]
+        let diag = { boardEl.exists ? (boardEl.value as? String ?? "") : "missing" }
+        print("DIAG start \(diag())")
+        for k in ["h", "o", "w", "space", "a", "r", "e", "space", "y", "o", "u", "space", "t", "o", "d", "a", "y"] {
+            app.keys[k].tap()
+        }
+        func waitTranslation(_ tag: String, _ typed: String) {
+            let t0 = Date()
+            for _ in 0..<90 {
+                sleep(2)
+                let s = status.exists ? status.label : "-"
+                if !s.isEmpty, s != "-", s != "…", !s.contains(typed) {
+                    print("TRANSLATION \(tag) \(String(format: "%.1f", Date().timeIntervalSince(t0))) s: \(s)")
+                    return
+                }
+            }
+            print("TRANSLATION \(tag) timed out")
+        }
+        waitTranslation("first", "how are you")
+        for k in ["space", "z", "z", "d", "i", "a", "g", "space"] { app.keys[k].tap() }
+        sleep(1)
+        print("DIAG first \(field.value as? String ?? "")")
+        for k in ["space", "o", "k", "space"] { app.keys[k].tap() }
+        waitTranslation("second", "zzdiag")
+        for k in ["z", "z", "d", "i", "a", "g", "space"] { app.keys[k].tap() }
+        sleep(1)
+        print("DIAG second \(field.value as? String ?? "")")
+        XCTAssertTrue(status.exists, "no translation shown")
+    }
+}

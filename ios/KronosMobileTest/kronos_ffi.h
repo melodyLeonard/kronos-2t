@@ -126,6 +126,20 @@ size_t kronos_session_resident_bytes(const KronosMobileSession *session);
 
 size_t kronos_session_process_rss_bytes(void);
 
+/* Sessions created afterwards map NF weights read-only instead of copying them (no Metal). */
+void kronos_set_zero_copy_weights(int32_t enabled);
+
+/* Streams the cleaned translation-so-far; `from_utf8` and `context_json_utf8` (JSON string array) may be NULL. */
+int32_t kronos_session_translate(
+    KronosMobileSession *session,
+    const char *text_utf8,
+    const char *to_utf8,
+    const char *from_utf8,
+    const char *context_json_utf8,
+    KronosStreamCallback on_piece_cb,
+    void *user_data
+);
+
 #ifdef __cplusplus
 }
 #endif
