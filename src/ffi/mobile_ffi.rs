@@ -1614,7 +1614,9 @@ mod tests {
 
 
     /// `kronos_set_abort` during decode returns within 100 ms (needs the compiled 2-bit Hy-MT2).
+    /// Ignored: the abort flag is process-wide and truncates other tests' prefill.
     #[test]
+    #[ignore]
     fn abort_stops_decode() {
         use crate::runtime::translate::{run, TranslateRequest};
         use std::sync::atomic::{AtomicBool, Ordering};
