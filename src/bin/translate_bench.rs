@@ -3,8 +3,9 @@
 //! writes `report.tsv` plus one TSV of `idx \t source \t reference \t hypothesis` per language.
 //!
 //! Usage: `translate_bench <model_dir> --flores <flores200_dataset dir> [--mode nf4g128] [--n 1012]
-//!        [--langs FR,ES,...] [--threads N] [--cpu] [--out DIR] [--split devtest|dev]`
+//!        [--langs FR,ES,...] [--threads N] [--cpu] [--out DIR] [--split devtest|dev] [--gate BASELINE.tsv]`
 //! Languages already present as a complete TSV in `--out` are skipped, so a long run can resume.
+//! `--gate BASELINE.tsv` exits 1 if any language scores below the baseline report's chrF++ minus 1.0.
 
 use kronos_2t::runtime::chat::ChatModel;
 use kronos_2t::runtime::translate::{clean_translation, run, TranslateRequest};
@@ -75,7 +76,7 @@ const CHAR_TOKENIZED: &[&str] = &["zho_Hans", "zho_Hant", "yue_Hant", "jpn_Jpan"
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args.iter().any(|a| a == "--help") {
-        eprintln!("usage: translate_bench <model_dir> --flores DIR [--mode nf4g128] [--n 1012] [--langs FR,ES] [--threads N] [--cpu] [--out DIR]");
+        eprintln!("usage: translate_bench <model_dir> --flores DIR [--mode nf4g128] [--n 1012] [--langs FR,ES] [--threads N] [--cpu] [--out DIR] [--gate BASELINE.tsv]");
         std::process::exit(2);
     }
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned());
@@ -86,6 +87,7 @@ fn main() {
     let threads: usize = flag("--threads").map_or(0, |v| v.parse().expect("--threads"));
     let out = PathBuf::from(flag("--out").unwrap_or_else(|| "translate_bench_out".into()));
     let split = flag("--split").unwrap_or_else(|| "devtest".into());
+    let gate = flag("--gate").map(|p| read_report_chrf(Path::new(&p)));
     let langs: Vec<&(&str, &str, &str)> = match flag("--langs") {
         Some(l) => l.split(',').map(|c| LANGS.iter().find(|x| x.0.eq_ignore_ascii_case(c.trim())).unwrap_or_else(|| panic!("unknown lang {c}"))).collect(),
         None => LANGS.iter().collect(),
@@ -106,6 +108,7 @@ fn main() {
 
     let report = out.join("report.tsv");
     let mut rows: Vec<String> = Vec::new();
+    let mut scores: Vec<(&str, f64)> = Vec::new();
     for (code, name, stem) in langs {
         let refs = read_lines(&flores.join(&split).join(format!("{stem}.{split}")));
         let tsv = out.join(format!("{code}.tsv"));
@@ -145,7 +148,13 @@ fn main() {
         let row = format!("| {code} | {name} | {n} | {chrf:.1} | {bleu:.1} | {speed} |");
         eprintln!("{row}");
         rows.push(row);
+        scores.push((code, chrf));
         write_report(&report, &model.name, &mode, &rows);
+    }
+    if let Some(base) = gate {
+        if !gate_passes(&base, &scores, GATE_MARGIN) {
+            std::process::exit(1);
+        }
     }
 }
 
@@ -159,6 +168,42 @@ fn write_report(path: &Path, model: &str, mode: &str, rows: &[String]) {
     fs::write(path, s).expect("report");
 }
 
+
+/// chrF++ points a language may lose against the `--gate` baseline.
+const GATE_MARGIN: f64 = 1.0;
+
+/// `code -> chrF++` from a `report.tsv` written by [`write_report`].
+fn read_report_chrf(p: &Path) -> HashMap<String, f64> {
+    fs::read_to_string(p)
+        .unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| {
+            let c: Vec<&str> = l.split('\t').collect();
+            Some((c.first()?.to_string(), c.get(3)?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Prints one line per language; false if any falls below `baseline - margin` or has no baseline.
+fn gate_passes(base: &HashMap<String, f64>, scores: &[(&str, f64)], margin: f64) -> bool {
+    let mut ok = true;
+    for &(code, chrf) in scores {
+        match base.get(code) {
+            Some(&b) => {
+                let pass = chrf >= b - margin;
+                ok &= pass;
+                eprintln!("gate {code}: {chrf:.1} vs baseline {b:.1} ({:+.1}) {}", chrf - b, if pass { "ok" } else { "FAIL" });
+            }
+            None => {
+                ok = false;
+                eprintln!("gate {code}: no baseline FAIL");
+            }
+        }
+    }
+    eprintln!("gate {}", if ok { "passed" } else { "FAILED" });
+    ok
+}
 fn read_lines(p: &Path) -> Vec<String> {
     fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display())).lines().map(str::to_string).collect()
 }
@@ -297,5 +342,19 @@ mod tests {
         assert!(chrf_pp(&h, &r, false) < 15.0);
         assert_eq!(corpus_bleu(&h, &r, false), 0.0);
         assert_eq!(words("今天 天气", true).len(), 4);
+    }
+
+    #[test]
+    fn gate_fails_below_baseline_minus_margin() {
+        let dir = std::env::temp_dir().join(format!("tb_gate_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("report.tsv");
+        write_report(&p, "m", "nf4g128", &["| FR | French | 10 | 65.0 | 42.0 | x |".into(), "| DE | German | 10 | 59.5 | 34.0 | x |".into()]);
+        let base = read_report_chrf(&p);
+        assert_eq!(base.len(), 2);
+        assert!(gate_passes(&base, &[("FR", 64.0), ("DE", 70.0)], GATE_MARGIN));
+        assert!(!gate_passes(&base, &[("FR", 63.9)], GATE_MARGIN));
+        assert!(!gate_passes(&base, &[("JA", 50.0)], GATE_MARGIN));
+        fs::remove_dir_all(&dir).ok();
     }
 }
