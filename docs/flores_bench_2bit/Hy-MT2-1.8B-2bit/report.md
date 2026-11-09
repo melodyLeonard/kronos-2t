@@ -1,0 +1,11 @@
+# FLORES-200, English → X
+
+model: `hy-mt2-1.8b-2bit-kronos-nf4g128` · mode `nf4g128` · greedy · no context
+
+| code | language | n | chrF++ | BLEU | per sentence |
+|---|---|---|---|---|---|
+| FR | French | 300 | 65.6 | 43.6 | 1.21 s · 36.6 tok/s |
+| ES | Spanish | 300 | 54.3 | 28.4 | 1.13 s · 37.8 tok/s |
+| DE | German | 300 | 60.4 | 35.0 | 1.10 s · 40.6 tok/s |
+| JA | Japanese | 300 | 47.9 | 49.0 | 0.96 s · 46.8 tok/s |
+| AR | Arabic | 300 | 52.1 | 24.4 | 1.12 s · 47.1 tok/s |
