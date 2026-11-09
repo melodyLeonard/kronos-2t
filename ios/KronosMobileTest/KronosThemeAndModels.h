@@ -9,7 +9,7 @@
 #import <EventKit/EventKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <mach/mach_time.h>
-#include "kronos_ffi.h"
+#include "../../include/kronos_ffi.h"
 
 static inline double kronos_monotonic_ms(void) {
     static mach_timebase_info_data_t tb;

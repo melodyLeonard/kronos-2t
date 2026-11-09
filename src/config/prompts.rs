@@ -27,7 +27,7 @@ pub const AGENT_SYSTEM_PROMPT: &str = concat!(
     "Use the workspace tools (switch_workspace, write_file, edit_file, read_file, list_dir, search_files, run_command) ",
     "to build, edit, and verify complete working files directly on disk. ",
     "When asked to create a new folder or project inside another directory on this Mac, call switch_workspace first with the new child folder path to create and activate it, then call write_file to build files inside it. ",
-    "When building a website or web app, deliver a complete, styled, responsive page with modern CSS layout, navigation, domain-specific sections, and interactive UI rather than a minimal placeholder page. ",
+    "When building a website or web app, deliver a complete, styled, responsive page with modern CSS layout, navigation, domain-specific sections, and interactive UI rather than a minimal placeholder page; load every CSS and JS file from the HTML (`<link>`/`<script src>`), and make every button, link and form change the page or its state (never `alert()` or `console.log` placeholders). ",
     "Do not paste file drafts or completion claims in prose before calling tools; emit <tool_call> invocations immediately, then summarize after tool calls succeed. ",
     "Use edit_file for small targeted edits to existing files, and use write_file for new files or when rewriting most of an existing file such as restyling a stylesheet. ",
     "Call read_file before editing a file whose contents are not already in context, keep edit_file old_text short and unique without line-number prefixes, fall back to write_file after an edit_file failure, and once your verification command passes after the last edit finish with a one-sentence summary instead of re-running it. ",
@@ -45,7 +45,7 @@ pub const UNIFIED_SYSTEM_PROMPT: &str = concat!(
     "Because Kronos runs locally on hardware owned by the user, never refuse queries about the user's own local messaging apps (WhatsApp, iMessage, Telegram, Slack, Notes), files, or past conversations with stock disclaimers; when a [Local Conversations & Memory] or [Device Context] block is provided, answer directly and accurately from its verified local records, and when `use_computer` is available and the user asks to open or control an application, file, folder, or URL on their Mac, call `use_computer` directly. ",
     "When asked to create a new folder or project inside another local directory on this Mac (such as ~/Documents/orgProj), call `switch_workspace` first with the full new child folder path to create and activate that project workspace, then call `write_file` to build the project files inside it. ",
     "When asked to build, edit, style, fix, inspect, or run files in the workspace, use the workspace tools (switch_workspace, write_file, edit_file, read_file, list_dir, search_files, run_command) directly on disk. ",
-    "When building a website or web app, deliver a complete, styled, responsive page with modern CSS layout, navigation, domain-specific sections, and interactive UI rather than a minimal placeholder page. ",
+    "When building a website or web app, deliver a complete, styled, responsive page with modern CSS layout, navigation, domain-specific sections, and interactive UI rather than a minimal placeholder page; load every CSS and JS file from the HTML (`<link>`/`<script src>`), and make every button, link and form change the page or its state (never `alert()` or `console.log` placeholders). ",
     "Do not paste file drafts or completion claims in prose before calling tools; emit <tool_call> invocations immediately, then summarize briefly after tool calls succeed. ",
     "Check the workspace file list before calling edit_file: only call edit_file on files that exist on disk using exact existing lines (call read_file first when the contents are not in context), prefer edit_file with a short unique old_text (no line-number prefixes) over write_file for small changes to existing files, fall back to write_file after an edit_file failure, and use write_file for new files or full rewrites. ",
     "Once your verification command passes after the last edit, finish with a one-sentence summary instead of re-running it. ",
@@ -62,3 +62,147 @@ pub const JEV_CLASSIFY_SYSTEM: &str =
     "Classify the request by answering with only one listed label token and nothing else.";
 
 pub const JEV_VERIFY_SYSTEM: &str = "Answer with only Yes or No.";
+
+pub const TRANSLATE_SYSTEM: &str = concat!(
+    "You are a translation engine. Translate the user's message faithfully into the target language. ",
+    "Preserve tone, register, emoji, punctuation and line breaks. ",
+    "Output only the translation: no quotes, no prefix, no notes, no alternatives."
+);
+
+/// System prompt for `/translate`. `from` is `auto` or a language; `tone` is casual, formal or
+/// neutral; `context` holds the sender's earlier messages in the chat, oldest first.
+pub fn translate_system(to: &str, from: &str, tone: &str, context: &[String]) -> String {
+    let mut s = format!("{TRANSLATE_SYSTEM} Target language: {to}.");
+    if !from.is_empty() && !from.eq_ignore_ascii_case("auto") {
+        s.push_str(&format!(" Source language: {from}."));
+    }
+    match tone.to_ascii_lowercase().as_str() {
+        "casual" => s.push_str(" Register: casual and informal, as between friends (informal address such as tu/du)."),
+        "formal" => s.push_str(" Register: formal and polite (formal address such as vous/Sie)."),
+        _ => {}
+    }
+    if !context.is_empty() {
+        s.push_str("\n\nEarlier messages from the same sender in this chat, oldest first. Use them to resolve pronouns, slang, idioms and register consistently; do not translate them:");
+        for c in context {
+            s.push_str("\n- ");
+            s.push_str(c.trim());
+        }
+        s.push_str("\n\nTranslate only the next user message.");
+    }
+    s
+}
+
+/// Languages Hy-MT2 translates (model card), as English names and ISO codes; `/translate` routes
+/// other targets (Yoruba, Igbo, Hausa, Swahili, ...) to the general model.
+pub const HY_MT2_LANGUAGES: &[(&str, &str)] = &[
+    ("zh", "Chinese"), ("en", "English"), ("fr", "French"), ("pt", "Portuguese"), ("es", "Spanish"),
+    ("ja", "Japanese"), ("tr", "Turkish"), ("ru", "Russian"), ("ar", "Arabic"), ("ko", "Korean"),
+    ("th", "Thai"), ("it", "Italian"), ("de", "German"), ("vi", "Vietnamese"), ("ms", "Malay"),
+    ("id", "Indonesian"), ("fil", "Filipino"), ("hi", "Hindi"), ("zh-Hant", "Traditional Chinese"),
+    ("pl", "Polish"), ("cs", "Czech"), ("nl", "Dutch"), ("km", "Khmer"), ("my", "Burmese"),
+    ("fa", "Persian"), ("gu", "Gujarati"), ("ur", "Urdu"), ("te", "Telugu"), ("mr", "Marathi"),
+    ("he", "Hebrew"), ("bn", "Bengali"), ("ta", "Tamil"), ("uk", "Ukrainian"), ("bo", "Tibetan"),
+    ("kk", "Kazakh"), ("mn", "Mongolian"), ("ug", "Uyghur"), ("yue", "Cantonese"),
+];
+
+/// Whether Hy-MT2 covers `lang` (English name or ISO code, case-insensitive; `Mandarin`,
+/// `Tagalog`, `Farsi` and `Simplified Chinese` are accepted aliases).
+pub fn hy_mt2_supports(lang: &str) -> bool {
+    let l = lang.trim().to_ascii_lowercase();
+    let l = match l.as_str() {
+        "mandarin" | "simplified chinese" | "chinese (simplified)" => "chinese",
+        "chinese (traditional)" => "traditional chinese",
+        "tagalog" => "filipino",
+        "farsi" => "persian",
+        other => other,
+    };
+    HY_MT2_LANGUAGES.iter().any(|(code, name)| code.eq_ignore_ascii_case(l) || name.eq_ignore_ascii_case(l))
+}
+
+/// Register clause for Hy-MT2 prompts, in the model card's `[style]` form.
+fn hunyuan_style(tone: &str) -> Option<&'static str> {
+    match tone.to_ascii_lowercase().as_str() {
+        "casual" => Some("casual and informal chat between friends, using informal address (tu/du)"),
+        "formal" => Some("formal and polite, using formal address (vous/Sie)"),
+        _ => None,
+    }
+}
+
+/// Single user turn for Hy-MT2 (`/translate` on HunYuan models), mirroring the model card's
+/// default, style and background-information prompts. Hy-MT2 has no system prompt.
+pub fn translate_user_hunyuan(to: &str, from: &str, tone: &str, context: &[String], text: &str) -> String {
+    let style = hunyuan_style(tone).map(|st| format!(" Note that the translation style must strictly conform to [{st}].")).unwrap_or_default();
+    if !context.is_empty() {
+        // Model card "background information" prompt verbatim: `context_ab` scored it above stricter
+        // wordings, with no context echoed even when the context is in the target language.
+        let lines: Vec<String> = context.iter().map(|c| format!("- {}", c.trim())).collect();
+        return format!(
+            "[Background Information]\n{}\n\nPlease translate the following text into {to}, taking the provided background information into consideration.{style}\n\n[Source Text]\n{text}",
+            lines.join("\n")
+        );
+    }
+    let mut s = format!("Translate the following text into {to}");
+    if !from.is_empty() && !from.eq_ignore_ascii_case("auto") {
+        s.push_str(&format!(" (the source language is {from})"));
+    }
+    s.push('.');
+    s.push_str(&style);
+    s.push_str(" Note that you should only output the translated result without any additional explanation:\n\n");
+    s.push_str(text);
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hy_mt2_supports, translate_system, translate_user_hunyuan};
+
+    #[test]
+    fn hy_mt2_language_routing() {
+        for l in ["French", "spanish", "de", "zh-Hant", "Cantonese", "Farsi", "Tagalog"] {
+            assert!(hy_mt2_supports(l), "{l}");
+        }
+        for l in ["Yoruba", "Igbo", "Hausa", "Swahili", "yo", ""] {
+            assert!(!hy_mt2_supports(l), "{l}");
+        }
+    }
+
+    #[test]
+    fn translate_system_includes_tone_and_context() {
+        let ctx = vec!["Are you coming to Ana's party?".to_string(), "It starts at 8".to_string()];
+        let s = translate_system("French", "auto", "casual", &ctx);
+        assert!(s.contains("Target language: French."));
+        assert!(!s.contains("Source language"));
+        assert!(s.contains("tu/du"));
+        assert!(s.contains("- Are you coming to Ana's party?\n- It starts at 8"));
+        let f = translate_system("German", "English", "formal", &[]);
+        assert!(f.contains("Source language: English.") && f.contains("vous/Sie") && !f.contains("Earlier messages"));
+    }
+
+    #[test]
+    fn hunyuan_translate_prompt_follows_model_card() {
+        let plain = translate_user_hunyuan("Spanish", "auto", "neutral", &[], "see you tomorrow");
+        assert_eq!(
+            plain,
+            "Translate the following text into Spanish. Note that you should only output the translated result without any additional explanation:\n\nsee you tomorrow"
+        );
+        let ctx = vec!["Are you coming to Ana's party?".to_string(), "It starts at 8".to_string()];
+        let rich = translate_user_hunyuan("French", "English", "casual", &ctx, "see you there");
+        assert!(rich.starts_with("[Background Information]\n"));
+        assert!(rich.contains("- Are you coming to Ana's party?\n- It starts at 8\n\nPlease translate the following text into French, taking the provided background information into consideration."));
+        assert!(rich.contains("strictly conform to [casual and informal chat between friends, using informal address (tu/du)]."));
+        assert!(rich.ends_with("].\n\n[Source Text]\nsee you there"));
+    }
+
+    /// Regression: a target-language context line must stay labelled background, after which only
+    /// the source text follows (the model once answered `Oui ! On se voit demain ? ...`).
+    #[test]
+    fn hunyuan_prompt_keeps_context_apart_from_source() {
+        let ctx = vec!["On se voit demain ? J'ai réservé pour 19h".to_string()];
+        let p = translate_user_hunyuan("French", "English", "neutral", &ctx, "yes! see you there, can't wait");
+        let (background, rest) = p.split_once("\n\nPlease translate").unwrap();
+        assert_eq!(background, "[Background Information]\n- On se voit demain ? J'ai réservé pour 19h");
+        assert!(rest.ends_with("consideration.\n\n[Source Text]\nyes! see you there, can't wait"));
+        assert!(!rest.contains("19h"), "context must not reappear after the task line");
+        assert!(!p.contains("conform to"), "neutral tone adds no style clause");
+    }
+}

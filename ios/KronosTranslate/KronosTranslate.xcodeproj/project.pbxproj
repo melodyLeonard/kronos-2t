@@ -1,0 +1,614 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		20B0FF190181A6D2A4424638 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35A083B974AFF49C6CB22D6B /* SettingsView.swift */; };
+		260198FA9D1E40BFA32084FC /* TranslateClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A8F63A817BDE05449BC5171 /* TranslateClient.swift */; };
+		35013BAFBC4F4549AB6F689F /* Hy-MT2-1.8B in Resources */ = {isa = PBXBuildFile; fileRef = 56CC751B88B2694671D2D093 /* Hy-MT2-1.8B */; };
+		37296125BAAEF36D62E02F33 /* EmojiKeyboard.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB29F0AF9DA901D73075EA56 /* EmojiKeyboard.swift */; };
+		43F8475841A6FC7DAF145322 /* KeyMetricsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5EE7C8775FB47302A094444E /* KeyMetricsTests.swift */; };
+		508764A497BD3C25455B49B2 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 46C4E703FFEE468C0FB123AF /* Assets.xcassets */; };
+		6B1B378131245F938AE2E949 /* logo.svg in Resources */ = {isa = PBXBuildFile; fileRef = 6EE51523B3C8905E4FC3169E /* logo.svg */; };
+		859436B2BF8648B7740B5966 /* Layouts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1149CBA7CCE5D8855042E156 /* Layouts.swift */; };
+		A618D78F5E608019894A1ABF /* KronosKeyboard.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 7AFB77A6157C90E4FCA1FBFC /* KronosKeyboard.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		B14725E00AFFB0C7FE9F0D43 /* TranslateClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A8F63A817BDE05449BC5171 /* TranslateClient.swift */; };
+		B88462533D6A8B1B682EA36E /* KeyboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 623B6741415E1293B5182398 /* KeyboardView.swift */; };
+		BAACA6C12B4B12AD6941D049 /* EmojiCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65F8834F88E844E09E96E97F /* EmojiCatalog.swift */; };
+		D2FB08BC10A6CF55E996F41F /* KeyboardViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59B4FE23FF76A793711157C3 /* KeyboardViewController.swift */; };
+		DE3C2EE71AF501E1599798D7 /* Prefs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72E4B94E3570538348D85F68 /* Prefs.swift */; };
+		E269774341D59A3349316B3E /* KronosTranslateApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5BD19BDBBBFA444B56E3C46B /* KronosTranslateApp.swift */; };
+		EEA35B35DDF4E0A37027BC69 /* LocalEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE24F5ABD5B57CB9CA5766D8 /* LocalEngine.swift */; };
+		FEC1C74B3ECED56A5B82E1DE /* Prefs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 72E4B94E3570538348D85F68 /* Prefs.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A25185CEC19022F4B97E092E /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 06F9B380806EC4097D759EC0 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 7B1BCD9B325CEE7F694F2790;
+			remoteInfo = KronosKeyboard;
+		};
+		A62FD2C00D3B19E35D4F6156 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 06F9B380806EC4097D759EC0 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 77719BA1DA0B1E56B3A17DF6;
+			remoteInfo = KronosTranslate;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		F6DA7183832D975958A7954A /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				A618D78F5E608019894A1ABF /* KronosKeyboard.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		1149CBA7CCE5D8855042E156 /* Layouts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Layouts.swift; sourceTree = "<group>"; };
+		17DA502741A5BE001C1EF737 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		280C25CF9C8362F083363615 /* App.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = App.entitlements; sourceTree = "<group>"; };
+		35A083B974AFF49C6CB22D6B /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		3A8F63A817BDE05449BC5171 /* TranslateClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranslateClient.swift; sourceTree = "<group>"; };
+		46C4E703FFEE468C0FB123AF /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		4953C58B6612E8C8744156FE /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		56CC751B88B2694671D2D093 /* Hy-MT2-1.8B */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "Hy-MT2-1.8B"; path = "Keyboard/Engine/Hy-MT2-1.8B"; sourceTree = SOURCE_ROOT; };
+		59B4FE23FF76A793711157C3 /* KeyboardViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardViewController.swift; sourceTree = "<group>"; };
+		5BD19BDBBBFA444B56E3C46B /* KronosTranslateApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KronosTranslateApp.swift; sourceTree = "<group>"; };
+		5EE7C8775FB47302A094444E /* KeyMetricsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyMetricsTests.swift; sourceTree = "<group>"; };
+		623B6741415E1293B5182398 /* KeyboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardView.swift; sourceTree = "<group>"; };
+		65F8834F88E844E09E96E97F /* EmojiCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmojiCatalog.swift; sourceTree = "<group>"; };
+		6EE51523B3C8905E4FC3169E /* logo.svg */ = {isa = PBXFileReference; path = logo.svg; sourceTree = "<group>"; };
+		6F63A633508906D113D9BBD8 /* Kronos-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Kronos-Bridging-Header.h"; sourceTree = "<group>"; };
+		72E4B94E3570538348D85F68 /* Prefs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Prefs.swift; sourceTree = "<group>"; };
+		7AFB77A6157C90E4FCA1FBFC /* KronosKeyboard.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = KronosKeyboard.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		A28E9C4022B4A06A2ABB82CC /* KronosTranslate.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = KronosTranslate.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AE24F5ABD5B57CB9CA5766D8 /* LocalEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalEngine.swift; sourceTree = "<group>"; };
+		D80491D21E751E6378DBD908 /* Keyboard.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Keyboard.entitlements; sourceTree = "<group>"; };
+		EA3F3F60AEFC5E07CB475652 /* KronosTranslateUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = KronosTranslateUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		FB29F0AF9DA901D73075EA56 /* EmojiKeyboard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmojiKeyboard.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		03EC6285EA1670C6706EDC6E /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				72E4B94E3570538348D85F68 /* Prefs.swift */,
+				3A8F63A817BDE05449BC5171 /* TranslateClient.swift */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
+		212E05BA6CEFC9ABB83DF83E /* Engine */ = {
+			isa = PBXGroup;
+			children = (
+				6F63A633508906D113D9BBD8 /* Kronos-Bridging-Header.h */,
+				AE24F5ABD5B57CB9CA5766D8 /* LocalEngine.swift */,
+			);
+			path = Engine;
+			sourceTree = "<group>";
+		};
+		43348B3D2C40889C7EDC3582 /* Keyboard */ = {
+			isa = PBXGroup;
+			children = (
+				65F8834F88E844E09E96E97F /* EmojiCatalog.swift */,
+				FB29F0AF9DA901D73075EA56 /* EmojiKeyboard.swift */,
+				4953C58B6612E8C8744156FE /* Info.plist */,
+				D80491D21E751E6378DBD908 /* Keyboard.entitlements */,
+				623B6741415E1293B5182398 /* KeyboardView.swift */,
+				59B4FE23FF76A793711157C3 /* KeyboardViewController.swift */,
+				1149CBA7CCE5D8855042E156 /* Layouts.swift */,
+				212E05BA6CEFC9ABB83DF83E /* Engine */,
+			);
+			path = Keyboard;
+			sourceTree = "<group>";
+		};
+		976E15F3A18619664CAE312B /* UITests */ = {
+			isa = PBXGroup;
+			children = (
+				5EE7C8775FB47302A094444E /* KeyMetricsTests.swift */,
+			);
+			path = UITests;
+			sourceTree = "<group>";
+		};
+		98993E35AA67E81263A4D4FF /* App */ = {
+			isa = PBXGroup;
+			children = (
+				280C25CF9C8362F083363615 /* App.entitlements */,
+				46C4E703FFEE468C0FB123AF /* Assets.xcassets */,
+				17DA502741A5BE001C1EF737 /* Info.plist */,
+				5BD19BDBBBFA444B56E3C46B /* KronosTranslateApp.swift */,
+				6EE51523B3C8905E4FC3169E /* logo.svg */,
+				35A083B974AFF49C6CB22D6B /* SettingsView.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		E01076A42B3D2125CD07D2FB /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				7AFB77A6157C90E4FCA1FBFC /* KronosKeyboard.appex */,
+				A28E9C4022B4A06A2ABB82CC /* KronosTranslate.app */,
+				EA3F3F60AEFC5E07CB475652 /* KronosTranslateUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		FBB5D13CED74F13BA6E81F21 = {
+			isa = PBXGroup;
+			children = (
+				56CC751B88B2694671D2D093 /* Hy-MT2-1.8B */,
+				98993E35AA67E81263A4D4FF /* App */,
+				43348B3D2C40889C7EDC3582 /* Keyboard */,
+				03EC6285EA1670C6706EDC6E /* Shared */,
+				976E15F3A18619664CAE312B /* UITests */,
+				E01076A42B3D2125CD07D2FB /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		77719BA1DA0B1E56B3A17DF6 /* KronosTranslate */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4DBA8E74FD0D414F85FC9681 /* Build configuration list for PBXNativeTarget "KronosTranslate" */;
+			buildPhases = (
+				FF5792D47549C86040A3EEA8 /* Sources */,
+				95055BE5DB6BD8CFC4C82A2C /* Resources */,
+				F6DA7183832D975958A7954A /* Embed Foundation Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				93EF9EA4DC395AE0E4E6415D /* PBXTargetDependency */,
+			);
+			name = KronosTranslate;
+			packageProductDependencies = (
+			);
+			productName = KronosTranslate;
+			productReference = A28E9C4022B4A06A2ABB82CC /* KronosTranslate.app */;
+			productType = "com.apple.product-type.application";
+		};
+		7B1BCD9B325CEE7F694F2790 /* KronosKeyboard */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 650CE635258E0E98C469F3B2 /* Build configuration list for PBXNativeTarget "KronosKeyboard" */;
+			buildPhases = (
+				3494769C9B979D2BDC17CA02 /* Sources */,
+				0DAB558F97E037147C69CC49 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = KronosKeyboard;
+			packageProductDependencies = (
+			);
+			productName = KronosKeyboard;
+			productReference = 7AFB77A6157C90E4FCA1FBFC /* KronosKeyboard.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		F788A78CD5712CE85691BBF9 /* KronosTranslateUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FC657DED32B99850C55B64CB /* Build configuration list for PBXNativeTarget "KronosTranslateUITests" */;
+			buildPhases = (
+				54B4CE4DD3FCEDAF30FEE08C /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				5418525226786552803E4DA7 /* PBXTargetDependency */,
+			);
+			name = KronosTranslateUITests;
+			packageProductDependencies = (
+			);
+			productName = KronosTranslateUITests;
+			productReference = EA3F3F60AEFC5E07CB475652 /* KronosTranslateUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		06F9B380806EC4097D759EC0 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					77719BA1DA0B1E56B3A17DF6 = {
+						DevelopmentTeam = CU42G7MK57;
+						ProvisioningStyle = Automatic;
+					};
+					7B1BCD9B325CEE7F694F2790 = {
+						DevelopmentTeam = CU42G7MK57;
+						ProvisioningStyle = Automatic;
+					};
+					F788A78CD5712CE85691BBF9 = {
+						DevelopmentTeam = CU42G7MK57;
+						ProvisioningStyle = Automatic;
+						TestTargetID = 77719BA1DA0B1E56B3A17DF6;
+					};
+				};
+			};
+			buildConfigurationList = 769443CC24489121F95ACEA6 /* Build configuration list for PBXProject "KronosTranslate" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = FBB5D13CED74F13BA6E81F21;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				7B1BCD9B325CEE7F694F2790 /* KronosKeyboard */,
+				77719BA1DA0B1E56B3A17DF6 /* KronosTranslate */,
+				F788A78CD5712CE85691BBF9 /* KronosTranslateUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		0DAB558F97E037147C69CC49 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				35013BAFBC4F4549AB6F689F /* Hy-MT2-1.8B in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		95055BE5DB6BD8CFC4C82A2C /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				508764A497BD3C25455B49B2 /* Assets.xcassets in Resources */,
+				6B1B378131245F938AE2E949 /* logo.svg in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		3494769C9B979D2BDC17CA02 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BAACA6C12B4B12AD6941D049 /* EmojiCatalog.swift in Sources */,
+				37296125BAAEF36D62E02F33 /* EmojiKeyboard.swift in Sources */,
+				B88462533D6A8B1B682EA36E /* KeyboardView.swift in Sources */,
+				D2FB08BC10A6CF55E996F41F /* KeyboardViewController.swift in Sources */,
+				859436B2BF8648B7740B5966 /* Layouts.swift in Sources */,
+				EEA35B35DDF4E0A37027BC69 /* LocalEngine.swift in Sources */,
+				DE3C2EE71AF501E1599798D7 /* Prefs.swift in Sources */,
+				260198FA9D1E40BFA32084FC /* TranslateClient.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		54B4CE4DD3FCEDAF30FEE08C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				43F8475841A6FC7DAF145322 /* KeyMetricsTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FF5792D47549C86040A3EEA8 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E269774341D59A3349316B3E /* KronosTranslateApp.swift in Sources */,
+				FEC1C74B3ECED56A5B82E1DE /* Prefs.swift in Sources */,
+				20B0FF190181A6D2A4424638 /* SettingsView.swift in Sources */,
+				B14725E00AFFB0C7FE9F0D43 /* TranslateClient.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		5418525226786552803E4DA7 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 77719BA1DA0B1E56B3A17DF6 /* KronosTranslate */;
+			targetProxy = A62FD2C00D3B19E35D4F6156 /* PBXContainerItemProxy */;
+		};
+		93EF9EA4DC395AE0E4E6415D /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 7B1BCD9B325CEE7F694F2790 /* KronosKeyboard */;
+			targetProxy = A25185CEC19022F4B97E092E /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		12A35BABA6DC5C6D373C4018 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				INFOPLIST_FILE = App/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.melodyleonard.KronosTranslate;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		21F5474A3D404714D740C835 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				INFOPLIST_FILE = App/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.melodyleonard.KronosTranslate;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		42662A295613F7F89DA1F8E6 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.melodyleonard.KronosTranslateUITests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = KronosTranslate;
+			};
+			name = Release;
+		};
+		4B0AE8CDC38270B38F0CDACE /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = CU42G7MK57;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 0.1;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.10;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		7D253EFE0997D0210159D2E0 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.melodyleonard.KronosTranslateUITests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = KronosTranslate;
+			};
+			name = Debug;
+		};
+		8D69E983487C055960641408 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				INFOPLIST_FILE = Keyboard/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = "$(SRCROOT)/../../target/aarch64-apple-ios/release";
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = "$(SRCROOT)/../../target/aarch64-apple-ios-sim/release";
+				OTHER_LDFLAGS = "-lkronos_2t";
+				PRODUCT_BUNDLE_IDENTIFIER = com.melodyleonard.KronosTranslate.keyboard;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) KRONOS_LOCAL_ENGINE";
+				SWIFT_OBJC_BRIDGING_HEADER = "Keyboard/Engine/Kronos-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		B3521DCE78BE8E562E0E0A75 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = CU42G7MK57;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 0.1;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.10;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		E4136DCA597AE91F2F2725EF /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				INFOPLIST_FILE = Keyboard/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = "$(SRCROOT)/../../target/aarch64-apple-ios/release";
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = "$(SRCROOT)/../../target/aarch64-apple-ios-sim/release";
+				OTHER_LDFLAGS = "-lkronos_2t";
+				PRODUCT_BUNDLE_IDENTIFIER = com.melodyleonard.KronosTranslate.keyboard;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "$(inherited) KRONOS_LOCAL_ENGINE";
+				SWIFT_OBJC_BRIDGING_HEADER = "Keyboard/Engine/Kronos-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		4DBA8E74FD0D414F85FC9681 /* Build configuration list for PBXNativeTarget "KronosTranslate" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				12A35BABA6DC5C6D373C4018 /* Debug */,
+				21F5474A3D404714D740C835 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		650CE635258E0E98C469F3B2 /* Build configuration list for PBXNativeTarget "KronosKeyboard" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E4136DCA597AE91F2F2725EF /* Debug */,
+				8D69E983487C055960641408 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		769443CC24489121F95ACEA6 /* Build configuration list for PBXProject "KronosTranslate" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B3521DCE78BE8E562E0E0A75 /* Debug */,
+				4B0AE8CDC38270B38F0CDACE /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		FC657DED32B99850C55B64CB /* Build configuration list for PBXNativeTarget "KronosTranslateUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7D253EFE0997D0210159D2E0 /* Debug */,
+				42662A295613F7F89DA1F8E6 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 06F9B380806EC4097D759EC0 /* Project object */;
+}

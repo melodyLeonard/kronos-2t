@@ -100,6 +100,8 @@ fn build_20b_moe_config(num_layers: usize) -> LlamaConfig {
         head_dim_override: Some(64),
         rms_norm_eps: 1e-5,
         rope_theta: 150_000.0,
+        rope_ntk_alpha: 1.0,
+        qk_norm_after_rope: false,
         tie_word_embeddings: false,
         max_seq_len: 16_384,
         sliding_window: Some(2_048),

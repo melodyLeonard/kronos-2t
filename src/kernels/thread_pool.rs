@@ -10,13 +10,17 @@ use std::thread;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn pin_macos_p_core_qos() {
-    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    // iOS: USER_INITIATED so the UI thread preempts workers.
+    #[cfg(target_os = "ios")]
+    const QOS_CLASS: u32 = 0x19;
+    #[cfg(not(target_os = "ios"))]
+    const QOS_CLASS: u32 = 0x21;
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
     }
     // SAFETY: Standard Darwin libsystem call setting current thread scheduling QoS hint.
     unsafe {
-        let _ = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        let _ = pthread_set_qos_class_self_np(QOS_CLASS, 0);
     }
 }
 
@@ -256,7 +260,11 @@ fn worker_loop(st: &'static GlobalPoolState, w_id: usize, initial_epoch: usize) 
             if e != seen_epoch {
                 break e;
             }
-            if !park_now && !st.force_park.0.load(Ordering::Relaxed) && spun < 98_304 {
+            #[cfg(target_os = "ios")]
+            const MAX_IDLE_SPINS: u32 = 4_096;
+            #[cfg(not(target_os = "ios"))]
+            const MAX_IDLE_SPINS: u32 = 98_304;
+            if !park_now && !st.force_park.0.load(Ordering::Relaxed) && spun < MAX_IDLE_SPINS {
                 spin_pause4();
                 spun += 1;
             } else {

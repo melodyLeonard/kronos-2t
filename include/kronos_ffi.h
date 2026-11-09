@@ -125,6 +125,31 @@ int32_t kronos_session_run_agent_turn(
 size_t kronos_session_resident_bytes(const KronosMobileSession *session);
 
 size_t kronos_session_process_rss_bytes(void);
+size_t kronos_process_footprint_bytes(void);
+void kronos_set_cpu_prompt_chunk(size_t tokens);
+void kronos_set_abort(int32_t abort);
+
+/* Sessions created afterwards map NF weights read-only instead of copying them (no Metal). */
+void kronos_set_zero_copy_weights(int32_t enabled);
+
+/* Prefills the prompt for these languages/context with empty text; returns tokens prefilled or -1. */
+int32_t kronos_session_translate_warm(
+    KronosMobileSession *session,
+    const char *to_utf8,
+    const char *from_utf8,
+    const char *context_json_utf8
+);
+
+/* Streams the cleaned translation-so-far; `from_utf8` and `context_json_utf8` (JSON string array) may be NULL. */
+int32_t kronos_session_translate(
+    KronosMobileSession *session,
+    const char *text_utf8,
+    const char *to_utf8,
+    const char *from_utf8,
+    const char *context_json_utf8,
+    KronosStreamCallback on_piece_cb,
+    void *user_data
+);
 
 #ifdef __cplusplus
 }

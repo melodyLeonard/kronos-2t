@@ -52,6 +52,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kronos_2t::config::server::{MAX_BODY_BYTES as MAX_BODY, MAX_HEADER_BYTES as MAX_HEADER, MAX_REVERT_SNAPSHOT_BYTES};
+use kronos_2t::runtime::translate::{clean_translation, run as translate_run, trim_context, TranslateRequest};
 const CHAT_PAGE: &str = include_str!("../web/chat.html");
 const QUICK_PAGE: &str = include_str!("../web/quick.html");
 
@@ -97,6 +98,9 @@ struct LiveTurnBroadcast {
 
 struct Server {
     model: Mutex<ChatModel>,
+    /// `--translate-model`: a translation-only model (Hy-MT2) that `/translate` uses for the
+    /// languages it covers; other targets go to `model`.
+    translate_model: Option<Mutex<ChatModel>>,
     name: String,
     api_key: Option<String>,
     workdir: Mutex<PathBuf>,
@@ -214,8 +218,11 @@ fn admin_status_json(srv: &Server) -> String {
         .map(|(n, f, c, w, h)| format!(r#"{{"name":{},"threads":{},"ctx":{c},"wire_gib":{w},"hot_shard":{h}}}"#, quote(n), ((cores as f64 * f).round() as usize).max(1)))
         .collect();
     format!(
-        r#"{{"model":{},"model_dir":{},"mode":{},"ctx":{ctx},"threads":{threads},"cores":{cores},"weights_gib":{:.2},"kv_gib":{:.2},"effort":{},"hot_shard":{},"uptime_s":{:.0},"pid":{},"efforts":[{}]}}"#,
+        r#"{{"model":{},"translate_model":{},"model_dir":{},"mode":{},"ctx":{ctx},"threads":{threads},"cores":{cores},"weights_gib":{:.2},"kv_gib":{:.2},"effort":{},"hot_shard":{},"uptime_s":{:.0},"pid":{},"efforts":[{}]}}"#,
         quote(&srv.name),
+        srv.translate_model
+            .as_ref()
+            .map_or("null".to_string(), |m| quote(&m.lock().unwrap_or_else(|p| p.into_inner()).name)),
         quote(&srv.launch_args[1]),
         quote(&arg_value(&srv.launch_args, "--mode").unwrap_or_else(|| "p55454".to_string())),
         weights as f64 / (1u64 << 30) as f64,
@@ -464,7 +471,10 @@ fn encode_base64(bytes: &[u8]) -> String {
 fn read_request(stream: &mut TcpStream) -> Result<Request, (u16, String)> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| (400, e.to_string()))?;
+    let n0 = reader.read_line(&mut line).map_err(|e| (0, e.to_string()))?;
+    if n0 == 0 {
+        return Err((0, String::new()));
+    }
     let mut parts = line.split_whitespace();
     let (method, path, query) = match (parts.next(), parts.next()) {
         (Some(m), Some(target)) => {
@@ -521,7 +531,7 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, X-Kronos-Tab, Range\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
+const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Private-Network: true\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, X-Kronos-Tab, Range\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
 
 fn respond_bytes(
     stream: &mut TcpStream,
@@ -885,6 +895,116 @@ fn format_completion_response(
         c.finish.as_str(),
         usage(c, kv)
     )
+}
+
+/// `/translate`: `{"text","to","from","tone","context":[..],"stream":bool}` -> `{"text"}` (or SSE stream).
+/// Targets Hy-MT2 covers go to `--translate-model` when loaded; the rest to the main model. Prompting,
+/// greedy decoding and output cleanup live in `runtime::translate`, shared with the mobile FFI.
+fn translate(srv: &Server, stream: &mut TcpStream, req: &Request, keep_alive: bool) -> bool {
+    let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
+        Ok(b) => b,
+        Err(e) => {
+            error(stream, 400, &format!("invalid JSON: {e}"));
+            return false;
+        }
+    };
+    let text = body.get("text").and_then(Json::as_str).unwrap_or("").trim();
+    if text.is_empty() {
+        error(stream, 400, "`text` is required");
+        return false;
+    }
+    let streaming = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
+    let to = body.get("to").and_then(Json::as_str).map(str::trim).filter(|s| !s.is_empty()).unwrap_or("French");
+    let context = trim_context(
+        body.get("context")
+            .and_then(Json::as_arr)
+            .map(|a| a.iter().filter_map(Json::as_str).map(String::from).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    let treq = TranslateRequest {
+        text,
+        to,
+        from: body.get("from").and_then(Json::as_str).unwrap_or("auto"),
+        tone: body.get("tone").and_then(Json::as_str).unwrap_or("neutral"),
+        context: &context,
+        temperature: body.get("temperature").and_then(Json::as_f64).map_or(0.0, |v| v as f32),
+    };
+    let routed = srv.translate_model.as_ref().filter(|_| kronos_2t::config::prompts::hy_mt2_supports(to));
+    let mut model = routed.unwrap_or(&srv.model).lock().unwrap_or_else(|p| p.into_inner());
+    if !streaming {
+        return match translate_run(&mut model, &treq, |_| true) {
+            Ok(c) => {
+                let payload = format!(r#"{{"text":{},"usage":{}}}"#, quote(&clean_translation(&c.text)), usage(&c, None));
+                let conn_hdr = if keep_alive {
+                    "Connection: keep-alive\r\nKeep-Alive: timeout=30\r\n"
+                } else {
+                    "Connection: close\r\n"
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{CORS}{conn_hdr}\r\n",
+                    payload.len()
+                );
+                stream
+                    .write_all(head.as_bytes())
+                    .and_then(|_| stream.write_all(payload.as_bytes()))
+                    .and_then(|_| stream.flush())
+                    .is_ok()
+                    && keep_alive
+            }
+            Err(e) => {
+                error(stream, 400, &e);
+                false
+            }
+        };
+    }
+
+    let head = if keep_alive {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n{CORS}Connection: keep-alive\r\nKeep-Alive: timeout=30\r\n\r\n"
+        )
+    } else {
+        format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n{CORS}Connection: close\r\n\r\n")
+    };
+    if stream.write_all(head.as_bytes()).and_then(|_| stream.flush()).is_err() {
+        return false;
+    }
+    let write_sse = |s: &mut TcpStream, ev: &str| -> bool {
+        if keep_alive {
+            let chunk = format!("{:x}\r\n{ev}\r\n", ev.len());
+            s.write_all(chunk.as_bytes()).and_then(|_| s.flush()).is_ok()
+        } else {
+            s.write_all(ev.as_bytes()).and_then(|_| s.flush()).is_ok()
+        }
+    };
+    let mut client_alive = true;
+    match translate_run(&mut model, &treq, |cur| {
+        let ev = format!("data: {{\"text\":{}}}\n\n", quote(cur));
+        client_alive = write_sse(stream, &ev);
+        client_alive
+    }) {
+        Ok(c) if client_alive => {
+            let final_text = clean_translation(&c.text);
+            let done_ev = format!(
+                "data: {{\"text\":{},\"done\":true,\"usage\":{}}}\n\ndata: [DONE]\n\n",
+                quote(&final_text),
+                usage(&c, None)
+            );
+            let mut ok = write_sse(stream, &done_ev);
+            if ok && keep_alive {
+                ok = stream.write_all(b"0\r\n\r\n").and_then(|_| stream.flush()).is_ok();
+            }
+            ok && keep_alive
+        }
+        Ok(_) => false,
+        Err(e) => {
+            let err_ev = format!("data: {{\"error\":{}}}\n\ndata: [DONE]\n\n", quote(&e));
+            let _ = write_sse(stream, &err_ev);
+            if keep_alive {
+                let _ = stream.write_all(b"0\r\n\r\n").and_then(|_| stream.flush());
+            }
+            false
+        }
+    }
 }
 
 fn chat_completions(srv: &Server, stream: &mut TcpStream, req: &Request) {
@@ -2545,11 +2665,31 @@ fn serve_preview(srv: &Server, stream: &mut TcpStream, req: &Request) {
 }
 
 fn handle(srv: &Arc<Server>, mut stream: TcpStream) {
+    let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let req = match read_request(&mut stream) {
-        Ok(r) => r,
-        Err((status, msg)) => return error(&mut stream, status, &msg),
-    };
+    loop {
+        let req = match read_request(&mut stream) {
+            Ok(r) => r,
+            Err((0, _)) => return,
+            Err((status, msg)) => return error(&mut stream, status, &msg),
+        };
+        let want_keep_alive = !req.header("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
+        if req.method == "POST" && (req.path == "/translate" || req.path == "/v1/translate") {
+            if let Some(key) = &srv.api_key {
+                if req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")) != Some(key.as_str()) {
+                    return error(&mut stream, 401, "missing or invalid API key");
+                }
+            }
+            if translate(srv, &mut stream, &req, want_keep_alive) {
+                continue;
+            }
+            return;
+        }
+        return handle_once(srv, &mut stream, &req);
+    }
+}
+
+fn handle_once(srv: &Arc<Server>, mut stream: &mut TcpStream, req: &Request) {
     if req.method == "OPTIONS" {
         return respond(&mut stream, 204, "text/plain", "");
     }
@@ -3044,7 +3184,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args[1].starts_with("--") {
         eprintln!(
-            "usage: {} <model_dir> [--draft DIR] [--workdir DIR] [--state-dir DIR] [--cache-dir DIR] [--host 127.0.0.1] [--port 18080] [--api-key KEY] [--mode nf4g128] ...",
+            "usage: {} <model_dir> [--draft DIR] [--translate-model DIR] [--workdir DIR] [--state-dir DIR] [--cache-dir DIR] [--host 127.0.0.1] [--port 18080] [--api-key KEY] [--mode nf4g128] ...",
             args[0]
         );
         std::process::exit(2);
@@ -3142,6 +3282,36 @@ fn main() {
                 std::process::exit(1);
             });
     }
+    // Translation-only model for `/translate` (same mode/calibration flags unless `--translate-mode`).
+    let translate_model = flag("--translate-model").map(|dir| {
+        let t_mode = flag("--translate-mode").unwrap_or_else(|| mode.clone());
+        eprintln!("loading translate model {dir} ({t_mode})...");
+        let mut m = ChatModel::load_with_cache_dir(
+            Path::new(&dir),
+            cache_dir_opt,
+            &t_mode,
+            flag("--translate-ctx").map_or(4096, |v| v.parse().expect("numeric --translate-ctx")),
+            num("--threads", default_threads) as usize,
+            calib_opt,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("translate model: {e}");
+            std::process::exit(1);
+        });
+        if require_metal {
+            m.enable_metal().unwrap_or_else(|e| {
+                eprintln!("metal error: {e}");
+                std::process::exit(1);
+            });
+        } else if !force_cpu {
+            let _ = m.enable_metal();
+        }
+        let locked = m.mlock_weights();
+        if locked > 0 {
+            eprintln!("pinned {:.1} MiB of translate model weights in RAM (mlock)", locked as f64 / (1024.0 * 1024.0));
+        }
+        Mutex::new(m)
+    });
     if args.iter().any(|a| a == "--ane") {
         #[cfg(all(feature = "ane", target_os = "macos"))]
         match model.enable_ane(&model_dir.join("ane")) {
@@ -3244,6 +3414,7 @@ fn main() {
     let srv = Arc::new(Server {
         name: model.name.clone(),
         model: Mutex::new(model),
+        translate_model,
         api_key: flag("--api-key"),
         workdir: Mutex::new(workdir.clone()),
         state_dir,

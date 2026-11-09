@@ -116,7 +116,11 @@ pub unsafe fn create_session(
         let calib = calib_candidate
             .exists()
             .then_some((calib_candidate.as_path(), 512usize));
+        crate::model::memory_budget::mem_trace("session create");
         let model = ChatModel::load(Path::new(model_dir), mode, ctx, n_threads, calib)?;
+        crate::model::memory_budget::mem_trace("chat model loaded");
+        crate::model::memory_budget::release_freed_memory();
+        crate::model::memory_budget::mem_trace("freed memory released");
         Ok(KronosMobileSession {
             model,
             pending_token: None,
@@ -1051,6 +1055,177 @@ pub extern "C" fn kronos_session_process_rss_bytes() -> usize {
     current_resident_bytes()
 }
 
+fn parse_context_json(ctx_json: Option<&str>) -> Vec<String> {
+    ctx_json
+        .and_then(|j| Json::parse(j).ok())
+        .and_then(|j| j.as_arr().map(|a| a.iter().filter_map(Json::as_str).map(String::from).collect::<Vec<_>>()))
+        .map(crate::runtime::translate::trim_context)
+        .unwrap_or_default()
+}
+
+/// Prefills the translation prompt for `to`/`from`/`context` with empty text, so the first real
+/// translation only has to prefill the typed words (the text comes last in the prompt). Returns
+/// the number of tokens prefilled, or `-1` on error.
+///
+/// # Safety
+/// `session` and `to_utf8` must be valid pointers; `from_utf8` and `context_json_utf8` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn kronos_session_translate_warm(
+    session: *mut KronosMobileSession,
+    to_utf8: *const c_char,
+    from_utf8: *const c_char,
+    context_json_utf8: *const c_char,
+) -> i32 {
+    if session.is_null() {
+        return -1;
+    }
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: Validated non-null exclusive session pointer; other pointers per the contract.
+        let sess = unsafe { &mut *session };
+        let parsed = unsafe {
+            (|| -> Result<(&str, Option<&str>, Option<&str>), String> {
+                Ok((cstr_to_str(to_utf8)?, opt_cstr_to_str(from_utf8)?, opt_cstr_to_str(context_json_utf8)?))
+            })()
+        };
+        let (to, from, ctx_json) = match parsed {
+            Ok(v) => v,
+            Err(e) => {
+                sess.set_error(e);
+                return -1;
+            }
+        };
+        let context = parse_context_json(ctx_json);
+        let req = crate::runtime::translate::TranslateRequest {
+            text: "",
+            to,
+            from: from.unwrap_or("auto"),
+            tone: "neutral",
+            context: &context,
+            temperature: 0.0,
+        };
+        let (messages, _, _) = crate::runtime::translate::prompt(&sess.model, &req);
+        crate::model::real_llm::set_abort_active(false);
+        let rc = match sess.model.prefill_messages(&messages) {
+            Ok((_, n)) => {
+                sess.clear_error();
+                n as i32
+            }
+            Err(e) => {
+                sess.set_error(e);
+                -1
+            }
+        };
+        #[cfg(target_os = "ios")]
+        crate::kernels::thread_pool::SpinThreadPool::park_idle_workers();
+        rc
+    }));
+    res.unwrap_or(-1)
+}
+
+/// Stops in-flight translate/warm at the next chunk or token (`abort != 0`).
+#[no_mangle]
+pub extern "C" fn kronos_set_abort(abort: i32) {
+    crate::model::real_llm::set_abort_active(abort != 0);
+}
+
+/// Caps tokens per CPU prefill batch (`0` = tier default: 16 on phones). Smaller = less scratch.
+#[no_mangle]
+pub extern "C" fn kronos_set_cpu_prompt_chunk(tokens: usize) {
+    crate::model::real_llm::set_cpu_prompt_chunk(tokens);
+}
+
+/// This process's `phys_footprint`: the number iOS compares against the extension memory limit.
+#[no_mangle]
+pub extern "C" fn kronos_process_footprint_bytes() -> usize {
+    crate::model::memory_budget::current_footprint_bytes()
+}
+
+/// Makes sessions created afterwards borrow NF weights straight from the mapped `.k2tb` instead of
+/// copying them to the heap (no Metal). Clean file-backed pages do not count against an iOS app
+/// extension's memory limit, which is how a keyboard runs a model far larger than its budget.
+#[no_mangle]
+pub extern "C" fn kronos_set_zero_copy_weights(enabled: i32) {
+    crate::model::real_llm::set_zero_copy_weights(enabled != 0);
+}
+
+/// Translates `text_utf8` into language `to_utf8` (English name) from `from_utf8` (English name or
+/// `auto`), with `context_json_utf8` an optional JSON array of earlier messages, oldest first.
+/// `on_piece_cb` receives the cleaned translation so far each time it changes (the last call is the
+/// final text); returning `false` stops decoding. Greedy. Returns generated tokens, or `-1` on error.
+///
+/// # Safety
+/// `session`, `text_utf8` and `to_utf8` must be valid pointers; `from_utf8`, `context_json_utf8`,
+/// `on_piece_cb` and `user_data` may be null.
+#[no_mangle]
+pub unsafe extern "C" fn kronos_session_translate(
+    session: *mut KronosMobileSession,
+    text_utf8: *const c_char,
+    to_utf8: *const c_char,
+    from_utf8: *const c_char,
+    context_json_utf8: *const c_char,
+    on_piece_cb: KronosStreamCallback,
+    user_data: *mut c_void,
+) -> i32 {
+    if session.is_null() {
+        return -1;
+    }
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: Validated non-null exclusive session pointer.
+        let sess = unsafe { &mut *session };
+        // SAFETY: Pointers checked per this function's contract.
+        let parsed = unsafe {
+            (|| -> Result<(&str, &str, Option<&str>, Option<&str>), String> {
+                Ok((cstr_to_str(text_utf8)?, cstr_to_str(to_utf8)?, opt_cstr_to_str(from_utf8)?, opt_cstr_to_str(context_json_utf8)?))
+            })()
+        };
+        let (text, to, from, ctx_json) = match parsed {
+            Ok(v) => v,
+            Err(e) => {
+                sess.set_error(e);
+                return -1;
+            }
+        };
+        let context = parse_context_json(ctx_json);
+        let req = crate::runtime::translate::TranslateRequest {
+            text: text.trim(),
+            to,
+            from: from.unwrap_or("auto"),
+            tone: "neutral",
+            context: &context,
+            temperature: 0.0,
+        };
+        if req.text.is_empty() {
+            sess.set_error("empty text");
+            return -1;
+        }
+        sess.pending_token = None;
+        crate::model::real_llm::set_abort_active(false);
+        let gen = crate::runtime::translate::run(&mut sess.model, &req, |cur| {
+            let Some(cb) = on_piece_cb else {
+                return true;
+            };
+            let Ok(cs) = CString::new(cur.replace('\0', "")) else {
+                return true;
+            };
+            // SAFETY: `cs` is a live NUL-terminated buffer for the duration of the callback.
+            unsafe { cb(cs.as_ptr(), cs.as_bytes().len(), user_data) }
+        });
+        #[cfg(target_os = "ios")]
+        crate::kernels::thread_pool::SpinThreadPool::park_idle_workers();
+        match gen {
+            Ok(comp) => {
+                sess.clear_error();
+                comp.completion_tokens as i32
+            }
+            Err(e) => {
+                sess.set_error(e);
+                -1
+            }
+        }
+    }));
+    res.unwrap_or(-1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1387,5 +1562,97 @@ mod tests {
             kronos_session_destroy(sess);
         }
         MemoryBudgetProfile::set_global_budget_override_bytes(0);
+    }
+    /// `cargo test --release ffi_translate_zero_copy -- --ignored --nocapture` with Hy-MT2 in `models/`
+    /// (`KRONOS_TEST_MODEL=models/Hy-MT2-1.8B-2bit KRONOS_TEST_MODE=q2c` for the 2-bit model).
+    #[test]
+    #[ignore]
+    fn ffi_translate_zero_copy_hy_mt2() {
+        // GCD worker threads on iOS have 512 KiB stacks; run the whole thing on one that small.
+        let stack = std::env::var("KRONOS_TEST_STACK_KB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8192) << 10;
+        std::thread::Builder::new().stack_size(stack).spawn(ffi_translate_zero_copy_hy_mt2_body).unwrap().join().unwrap();
+    }
+
+    fn ffi_translate_zero_copy_hy_mt2_body() {
+        let dir = CString::new(std::env::var("KRONOS_TEST_MODEL").unwrap_or_else(|_| "models/Hy-MT2-1.8B".into())).unwrap();
+        let mode = CString::new(std::env::var("KRONOS_TEST_MODE").unwrap_or_else(|_| "nf4g128".into())).unwrap();
+        kronos_set_zero_copy_weights(1);
+        kronos_set_cpu_prompt_chunk(std::env::var("KRONOS_TEST_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        let mut out = String::new();
+        // SAFETY: valid NUL-terminated inputs; `out` outlives the call.
+        unsafe {
+            let rss0 = kronos_process_footprint_bytes();
+            let ctx: usize = std::env::var("KRONOS_TEST_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+            let sess = kronos_session_create(dir.as_ptr(), mode.as_ptr(), ctx, 2, 0);
+            assert!(!sess.is_null(), "load failed");
+            let rss1 = kronos_process_footprint_bytes();
+            let t0 = std::time::Instant::now();
+            let text = CString::new(std::env::var("KRONOS_TEST_TEXT").unwrap_or_else(|_| "how are you today".into())).unwrap();
+            let ctx_json = CString::new(std::env::var("KRONOS_TEST_CONTEXT").unwrap_or_else(|_| "[]".into())).unwrap();
+            let n = kronos_session_translate(
+                sess,
+                text.as_ptr(),
+                c"French".as_ptr(),
+                c"English".as_ptr(),
+                ctx_json.as_ptr(),
+                Some(collect_stream_cb),
+                (&mut out as *mut String).cast(),
+            );
+            let rss2 = kronos_process_footprint_bytes();
+            eprintln!("footprint MB start {} · loaded {} · translated {}", rss0 >> 20, rss1 >> 20, rss2 >> 20);
+            if let Ok(o) = std::process::Command::new("footprint").arg(std::process::id().to_string()).output() {
+                let txt = String::from_utf8_lossy(&o.stdout);
+                for l in txt.lines().filter(|l| l.contains("phys_footprint") || l.contains("TOTAL") || l.contains("MB ") || l.contains("Dirty")).take(16) { eprintln!("{l}"); }
+            }
+            eprintln!("tokens {n} in {:?} · {out:?} · err {:?}", t0.elapsed(), std::ffi::CStr::from_ptr(kronos_session_last_error(sess)));
+            assert!(n > 0);
+            kronos_session_destroy(sess);
+        }
+        kronos_set_zero_copy_weights(0);
+        assert!(!out.is_empty());
+    }
+
+
+    /// `kronos_set_abort` during decode returns within 100 ms (needs the compiled 2-bit Hy-MT2).
+    #[test]
+    fn abort_stops_decode() {
+        use crate::runtime::translate::{run, TranslateRequest};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let dir = Path::new("models/Hy-MT2-1.8B-2bit");
+        if !dir.join("kronos-q2c.k2tb").exists() {
+            return;
+        }
+        let mut model = ChatModel::load(dir, "q2c", 1024, 2, None).unwrap();
+        let text = "The committee met on Monday to review the proposal. After a long discussion about the budget, \
+            the schedule and the risks, the members agreed to postpone the decision until the next meeting, \
+            when more data from the pilot project in the northern region would be available to everyone.";
+        let req = TranslateRequest { text, to: "French", from: "English", tone: "neutral", context: &[], temperature: 0.0 };
+        let decoding = Arc::new(AtomicBool::new(false));
+        let set_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let (d2, s2) = (decoding.clone(), set_at.clone());
+        let aborter = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            while !d2.load(Ordering::Acquire) && t0.elapsed() < Duration::from_secs(60) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            *s2.lock().unwrap() = Some(Instant::now());
+            kronos_set_abort(1);
+        });
+        let c = run(&mut model, &req, |_| {
+            decoding.store(true, Ordering::Release);
+            true
+        });
+        let done = Instant::now();
+        aborter.join().unwrap();
+        kronos_set_abort(0);
+        let c = c.unwrap();
+        let set = set_at.lock().unwrap().expect("abort was never set");
+        assert!(set < done, "decode finished ({} tokens) before the abort", c.completion_tokens);
+        let lag = done - set;
+        eprintln!("stopped {lag:?} after abort, {} tokens", c.completion_tokens);
+        assert!(lag < Duration::from_millis(100), "decode kept running {lag:?} after abort");
     }
 }

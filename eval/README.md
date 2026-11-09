@@ -17,15 +17,21 @@ the checks in `hidden/` never enter the workspace.
 | 9 | `09_build_fix_loop` | 5 failing unit tests, 30-minute budget | tests + hidden extras + test file hash |
 | 10 | `10_long_context` | fix one function in a 1,510-line file | behavior + rest of file unchanged |
 
-Run (starts and stops the server itself, ports 18090-18099):
+Run (starts and stops the server itself on port 18090; the model defaults to `models/Qwen3.5-9B`):
 
 ```bash
-python3 -I eval/run_eval.py --label baseline
+cargo run --release --bin kronos_eval -- run --label baseline
+```
+
+Compare two runs:
+
+```bash
+cargo run --release --bin kronos_eval -- compare baseline after > eval/results/before_after.md
 ```
 
 Per task the runner records pass/fail, wall time, steps, prompt and completion tokens per step
 (from `step_stats`), first-token latency per turn (request send to first `text`/`tool_start`
 event), compactions, and the server's peak RSS from `ps -o rss`. Output: `results/<label>.md`
 (tracked) and `results/<label>.json` with the full transcripts (ignored by git). `--tasks 01,08`
-selects tasks; `--server-url http://127.0.0.1:18085` reuses a running server. A failed turn's `error` event carries the server-side
+selects tasks; `--model DIR`, `--mode`, `--draft DIR` and `--ctx` configure the server it starts; `--server-url http://127.0.0.1:18085` reuses a running server. A failed turn's `error` event carries the server-side
 history (`messages`), which the runner adopts so compactions survive a failed turn.

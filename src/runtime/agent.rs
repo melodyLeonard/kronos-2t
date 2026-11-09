@@ -2017,7 +2017,8 @@ pub fn execute_tool(
         "list_dir" => exec_list_dir(workdir, &args),
         "search_files" => exec_search_files(workdir, &args),
         "run_command" => {
-            let Some(cmd) = args.get("cmd").and_then(Json::as_str) else {
+            // `command` is the name most models reach for.
+            let Some(cmd) = args.get("cmd").or_else(|| args.get("command")).and_then(Json::as_str) else {
                 return ToolExecOutcome {
                     ok: false,
                     validation_ok: true,
@@ -2027,6 +2028,14 @@ pub fn execute_tool(
                     new_workdir: None,
                 };
             };
+            // The workspace preview already shows pages; `open` would only pop browser windows on the host.
+            let ct = cmd.trim();
+            if ct.starts_with("open ") && (ct.contains("://") || ct.to_ascii_lowercase().contains(".htm")) {
+                return ok_outcome("ok: not opened; the workspace preview pane already shows the page, continue with the task".to_string());
+            }
+            if ct.contains("http.server") || ct.contains("SimpleHTTPRequestHandler") || ct.contains("npx serve") || ct.contains("npx http-server") {
+                return ok_outcome("ok: no server needed; the workspace preview pane already serves the page. Do not start servers or open browsers: finish the app (every button must update the page without alert()/prompt()) and then reply with a summary".to_string());
+            }
             let out = run_shell_command_with_timeout(workdir, cmd, cmd_timeout_secs, step_tag);
             let ok = out.starts_with("exit_code=0");
             ToolExecOutcome {
@@ -2564,10 +2573,19 @@ fn exec_write_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
     let Some(rel) = args.get("path").and_then(Json::as_str) else {
         return err_outcome("error: `write_file` requires string argument `path`");
     };
-    let Some(content) = args.get("content").and_then(Json::as_str) else {
-        return err_outcome(
-            "error: `write_file` requires string arguments `path` and `content` (pass full file text in `content`)",
-        );
+    // Models sometimes pass JSON files as objects rather than text; serialize those.
+    let content_owned;
+    let content: &str = match args.get("content") {
+        Some(Json::Str(s)) => s,
+        Some(v @ (Json::Obj(_) | Json::Arr(_))) => {
+            content_owned = v.pretty();
+            &content_owned
+        }
+        _ => {
+            return err_outcome(
+                "error: `write_file` requires string arguments `path` and `content` (pass full file text in `content`)",
+            )
+        }
     };
     let lower_rel_check = rel.trim().trim_start_matches("./").to_ascii_lowercase();
     if lower_rel_check == ".kronos_media" || lower_rel_check.starts_with(".kronos_media/") {
@@ -3052,31 +3070,80 @@ fn exec_edit_file(workdir: &Path, args: &Json) -> ToolExecOutcome {
             let msg = format!("ok: `{rel}` already contains the requested text");
             return attach_validation_status(workdir, &target, rel, msg, None);
         }
+        // Fallback 4: `old_text` is code the model only believes it wrote (no line of it exists here)
+        // and `new_text` extends it, so the intent is to add the code: append it instead of failing again.
+        let old_trim = old_text.replace("\r\n", "\n");
+        let old_trim = old_trim.trim();
+        let appendable = matches!(
+            Path::new(rel).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+            Some("js" | "mjs" | "ts" | "py" | "css" | "html" | "htm")
+        );
+        let anchor_known = old_trim.lines().find(|l| l.trim().len() > 3).is_some_and(|l| {
+            let t = l.trim();
+            let k = t.char_indices().nth(12).map_or(t.len(), |(i, _)| i);
+            norm_existing.contains(&t[..k])
+        });
+        if appendable && !old_trim.is_empty() && norm_new_trim.starts_with(old_trim) && !anchor_known {
+            let is_html = rel.to_ascii_lowercase().ends_with(".html") || rel.to_ascii_lowercase().ends_with(".htm");
+            let at = if is_html { norm_existing.rfind("</body>").or_else(|| norm_existing.rfind("</html>")) } else { None };
+            let mut updated = String::with_capacity(norm_existing.len() + norm_new_trim.len() + 4);
+            let line_no = match at {
+                Some(i) => {
+                    updated.push_str(&norm_existing[..i]);
+                    if !updated.ends_with('\n') {
+                        updated.push('\n');
+                    }
+                    updated.push_str(norm_new_trim);
+                    updated.push('\n');
+                    updated.push_str(&norm_existing[i..]);
+                    norm_existing[..i].lines().count() + 1
+                }
+                None => {
+                    updated.push_str(&norm_existing);
+                    if !updated.ends_with('\n') {
+                        updated.push('\n');
+                    }
+                    updated.push('\n');
+                    updated.push_str(norm_new_trim);
+                    updated.push('\n');
+                    norm_existing.lines().count() + 2
+                }
+            };
+            return write_edited_content(workdir, &target, rel, line_no, old_text, new_text, updated);
+        }
         let first_old_line = old_text
             .lines()
             .find(|l| !l.trim().is_empty())
             .unwrap_or("")
             .trim();
         let mut hint = String::new();
+        let mut near: Option<usize> = None;
         if !first_old_line.is_empty() {
+            let k = first_old_line.char_indices().nth(12).map_or(first_old_line.len(), |(i, _)| i);
+            let probe = &first_old_line[..k];
             for (idx, line) in existing.lines().enumerate() {
-                if line.contains(first_old_line) {
+                if line.contains(first_old_line) || line.contains(probe) {
                     hint = format!(" (nearest match for `{first_old_line}` is at line {})", idx + 1);
+                    near = Some(idx);
                     break;
                 }
             }
         }
-        if existing.len() <= 6144 {
-            let mut numbered = String::new();
-            for (idx, line) in existing.lines().enumerate() {
-                numbered.push_str(&format!("{:>4} | {}\n", idx + 1, line));
-            }
-            return err_outcome(&format!(
-                "error: `old_text` not found in `{rel}`{hint}. Nothing changed. Copy the exact lines from `{rel}` below into `old_text` and call `edit_file` again; do not rewrite the file:\n{numbered}"
-            ));
+        // Always show exact lines to copy: the whole file when small, else a window around the nearest match.
+        let total = existing.lines().count();
+        let (lo, hi) = if existing.len() <= 6144 {
+            (0, total)
+        } else {
+            let c = near.unwrap_or(total.saturating_sub(1));
+            (c.saturating_sub(20), (c + 20).min(total))
+        };
+        let mut numbered = String::new();
+        for (idx, line) in existing.lines().enumerate().skip(lo).take(hi - lo) {
+            numbered.push_str(&format!("{:>4} | {}\n", idx + 1, line));
         }
+        let scope = if lo == 0 && hi == total { String::new() } else { format!(" (lines {}-{} of {total})", lo + 1, hi) };
         return err_outcome(&format!(
-            "error: `old_text` not found in `{rel}`{hint}; call `read_file` on the region, then `edit_file` again with the exact text"
+            "error: `old_text` not found in `{rel}`{hint}. Nothing changed. Copy the exact lines from `{rel}` below{scope} into `old_text` and call `edit_file` again; to add new code, use the last line shown as `old_text` and repeat it at the start of `new_text`:\n{numbered}"
         ));
     }
 
@@ -4043,6 +4110,7 @@ pub fn build_workspace_context_block(workdir: &Path) -> String {
         out.push_str(&format!("Removed since last turn: {}\n", removed.join(", ")));
     }
     out.push_str("Call read_file to view a file before editing it.\n");
+    out.push_str("Web apps: load every CSS/JS file from the HTML; every button must change the page via its script; collect input with <input>/<form> elements and show results in the page, not with alert()/prompt()/confirm().\n");
     out.push_str(WORKSPACE_STATUS_CLOSE);
     out
 }
@@ -4625,6 +4693,151 @@ fn verify_web_dom_and_css_semantics(workdir: &Path) -> Result<Option<String>, St
     }
 }
 
+/// Browser assets written this turn that no page loads, and pages whose buttons cannot do anything.
+fn verify_web_wiring(workdir: &Path, modified_files: &[String]) -> Result<Option<String>, String> {
+    let entries = list_workspace_files(workdir);
+    let is_web = |p: &str| {
+        let l = p.to_ascii_lowercase();
+        l.ends_with(".html") || l.ends_with(".htm") || l.ends_with(".js") || l.ends_with(".mjs") || l.ends_with(".css")
+    };
+    let read = |rel: &str| resolve_jailed_path(workdir, rel).ok().and_then(|f| fs::read_to_string(f).ok());
+    let pages: Vec<(String, String)> = entries
+        .iter()
+        .filter(|e| {
+            let l = e.path.to_ascii_lowercase();
+            l.ends_with(".html") || l.ends_with(".htm")
+        })
+        .filter_map(|e| read(&e.path).map(|s| (e.path.clone(), s)))
+        .collect();
+    if pages.is_empty() {
+        return Ok(None);
+    }
+    let mut issues = Vec::new();
+    for rel in modified_files {
+        let lower = rel.to_ascii_lowercase();
+        let is_js = lower.ends_with(".js") || lower.ends_with(".mjs");
+        let is_css = lower.ends_with(".css");
+        if !is_js && !is_css {
+            continue;
+        }
+        let Some(src) = read(rel) else { continue };
+        let base = Path::new(rel).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if base.is_empty() {
+            continue;
+        }
+        // Only browser code: Node scripts and library modules are loaded other ways.
+        if is_js
+            && (src.contains("require(") || src.contains("module.exports") || src.contains("process.")
+                || !(src.contains("document.") || src.contains("window.")))
+        {
+            continue;
+        }
+        let referenced = entries
+            .iter()
+            .filter(|e| e.path != *rel && is_web(&e.path))
+            .any(|e| read(&e.path).is_some_and(|t| t.contains(&base)));
+        if !referenced {
+            let tag = if is_css {
+                format!("<link rel=\"stylesheet\" href=\"{base}\">")
+            } else {
+                format!("<script src=\"{base}\"></script>")
+            };
+            issues.push(format!("`{rel}` is never loaded by any HTML page: add `{tag}` to the page so it takes effect"));
+        }
+    }
+    for (rel, src) in &pages {
+        let lower = src.to_ascii_lowercase();
+        let buttons = lower.matches("<button").count();
+        if buttons == 0 {
+            continue;
+        }
+        let has_script = lower.contains("<script");
+        let inline = lower.matches(" onclick=").count() + lower.matches(" onsubmit=").count();
+        if !has_script && !lower.contains("<form") && inline == 0 {
+            issues.push(format!(
+                "`{rel}` has {buttons} button(s) but loads no JavaScript: add a `<script src>` and wire every button to update the page"
+            ));
+        } else if !has_script && inline > 0 && lower.matches("alert(").count() >= inline {
+            issues.push(format!(
+                "`{rel}`: the only handlers call `alert()` and no script is loaded; implement the real behavior (update the DOM/state) in a loaded script"
+            ));
+        }
+    }
+    // Dialog placeholders stand in for real UI; the app should update its own page instead.
+    let mut dialog_files = Vec::new();
+    for e in &entries {
+        let l = e.path.to_ascii_lowercase();
+        if !is_web(&l) || l.ends_with(".css") {
+            continue;
+        }
+        let Some(src) = read(&e.path) else { continue };
+        if src.contains("require(") || src.contains("module.exports") {
+            continue;
+        }
+        let n = ["alert(", "prompt(", "confirm("].iter().map(|d| src.matches(d).count()).sum::<usize>();
+        if n > 0 {
+            dialog_files.push(format!("`{}` ({n})", e.path));
+        }
+    }
+    let dialog_note = if dialog_files.is_empty() {
+        String::new()
+    } else {
+        format!("; note: alert()/prompt()/confirm() dialogs in {} (in-page inputs would be better)", dialog_files.join(", "))
+    };
+    // Inline handlers must call functions some loaded script (or inline `<script>`) defines.
+    for (rel, src) in &pages {
+        let mut loaded = src.clone();
+        for e in &entries {
+            let l = e.path.to_ascii_lowercase();
+            if !(l.ends_with(".js") || l.ends_with(".mjs")) {
+                continue;
+            }
+            let base = Path::new(&e.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if !base.is_empty() && src.contains(&base) {
+                if let Some(js) = read(&e.path) {
+                    loaded.push('\n');
+                    loaded.push_str(&js);
+                }
+            }
+        }
+        let mut missing = std::collections::BTreeSet::new();
+        for attr in ["onclick=\"", "onsubmit=\"", "onchange=\"", "oninput=\"", "onclick='", "onsubmit='"] {
+            for seg in src.split(attr).skip(1) {
+                let name: String = seg
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+                    .collect();
+                if name.is_empty()
+                    || matches!(
+                        name.as_str(),
+                        "alert" | "prompt" | "confirm" | "this" | "window" | "document" | "location" | "event" | "return" | "void" | "if" | "history" | "console"
+                    )
+                {
+                    continue;
+                }
+                let defined = [format!("function {name}"), format!("{name} ="), format!("{name}="), format!("window.{name}"), format!("const {name}"), format!("let {name}"), format!("var {name}")]
+                    .iter()
+                    .any(|d| loaded.contains(d.as_str()));
+                if !defined {
+                    missing.insert(name);
+                }
+            }
+        }
+        if !missing.is_empty() {
+            issues.push(format!(
+                "`{rel}`: inline handlers call {} but no loaded script defines them; define them in the page's script",
+                missing.iter().map(|n| format!("`{n}()`")).collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    if issues.is_empty() {
+        Ok(Some(format!("web wiring ok ({} page(s)){dialog_note}", pages.len())))
+    } else {
+        Err(issues.join("\n"))
+    }
+}
+
 fn extract_relative_js_specifiers(src: &str) -> Vec<String> {
     let mut out = Vec::new();
     for raw_line in src.lines() {
@@ -4946,6 +5159,12 @@ pub fn verify_workspace_work(
     }
 
     match verify_web_dom_and_css_semantics(workdir) {
+        Ok(Some(note)) => details.push(note),
+        Ok(None) => {}
+        Err(e) => errors.push(e),
+    }
+
+    match verify_web_wiring(workdir, modified_files) {
         Ok(Some(note)) => details.push(note),
         Ok(None) => {}
         Err(e) => errors.push(e),
@@ -5443,6 +5662,17 @@ pub fn run_agent_turn_with_lock<'a>(
     )
 }
 
+/// Final reply when the step budget runs out with work on disk.
+fn budget_summary(max_steps: usize, modified_files: &[String]) -> String {
+    if modified_files.is_empty() {
+        return format!("Stopped after {max_steps} steps without changing any file.");
+    }
+    format!(
+        "Reached the {max_steps}-step budget. Files written so far: {}. Ask me to continue to finish the remaining pieces.",
+        modified_files.join(", ")
+    )
+}
+
 fn run_agent_turn_inner(
     mut with_model: impl FnMut(&mut dyn FnMut(&mut ChatModel)),
     history: &mut Vec<Message>,
@@ -5557,10 +5787,16 @@ fn run_agent_turn_inner(
     let mut last_step_sig: Option<u64> = None;
     let mut step_repeats = 0usize;
     let mut finalize_only = false;
+    // Times a repeated-call stall was turned into a verify-and-fix prompt instead of a stop.
+    let mut repeat_handoffs = 0usize;
 
     for step in 1..=cfg.max_steps {
         if dup_cmd_blocks >= 3 {
             return Err("stopped: re-ran the same failing command 3 times without editing any file".to_string());
+        }
+        // The last step of the budget is a wrap-up: tool calls are dropped and the reply stands.
+        if step == cfg.max_steps {
+            finalize_only = true;
         }
         let mut comp_rep_opt = None;
         with_model(&mut |model| {
@@ -5644,7 +5880,8 @@ fn run_agent_turn_inner(
         with_model(&mut |model| {
             comp_res = Some(model.generate_with_tools_prefixed(
                 history,
-                if finalize_only { &[] } else { render_tools },
+                // Tools stay in the prompt when finalizing so the cached prefix still matches; calls are dropped below.
+                render_tools,
                 force_tool_prefix,
                 &step_params,
                 |piece| {
@@ -5683,6 +5920,25 @@ fn run_agent_turn_inner(
             ));
         });
         let mut comp = comp_res.ok_or_else(|| "model unavailable".to_string())??;
+        // After repeated identical calls the step runs without tools; a model that still writes a
+        // call (the parser accepts `<tool_call>` text) must not get it executed again.
+        if finalize_only && !comp.tool_calls.is_empty() {
+            comp.tool_calls.clear();
+            if comp.text.trim().is_empty() {
+                comp.text = if step == cfg.max_steps {
+                    budget_summary(cfg.max_steps, &modified_files)
+                } else {
+                    let mut msg = "I stopped repeating the same tool call; the last result above is where the work stands.".to_string();
+                    if !modified_files.is_empty() {
+                        if let Err(e) = verify_workspace_work(&active_workdir, &modified_files, cfg.cmd_timeout_secs) {
+                            msg.push_str("\nRemaining issues:\n");
+                            msg.push_str(&e);
+                        }
+                    }
+                    msg
+                };
+            }
+        }
         if alive && !aborted_fence_prose {
             let _ = filter.finish(|prose| on_event(AgentEvent::TextDelta(prose)));
         }
@@ -5900,8 +6156,7 @@ fn run_agent_turn_inner(
 
             history.push(Message::new("assistant", &comp.text));
             {
-                let tools_now: &[String] = if finalize_only { &[] } else { render_tools };
-                with_model(&mut |m| m.remember_generated(history, tools_now));
+                with_model(&mut |m| m.remember_generated(history, render_tools));
             }
 
             let mut final_rolled_back = false;
@@ -5940,8 +6195,7 @@ fn run_agent_turn_inner(
         let assistant_msg_idx = history.len();
         history.push(Message::assistant_tool_calls("", comp.tool_calls.clone()));
         {
-            let tools_now: &[String] = if finalize_only { &[] } else { render_tools };
-            with_model(&mut |m| m.remember_generated(history, tools_now));
+            with_model(&mut |m| m.remember_generated(history, render_tools));
         }
 
         let mut batch_blocker: Option<String> = None;
@@ -6161,7 +6415,25 @@ fn run_agent_turn_inner(
                 ));
             }
             if step_repeats >= 2 {
-                finalize_only = true;
+                // With work on disk, hand the stall to verification first: unmet requirements give the
+                // model something concrete to do instead of ending the turn.
+                let mut handed = false;
+                if repeat_handoffs < 2 && !modified_files.is_empty() {
+                    if let Err(report) = verify_workspace_work(&active_workdir, &modified_files, cfg.cmd_timeout_secs) {
+                        repeat_handoffs += 1;
+                        step_repeats = 0;
+                        last_step_sig = None;
+                        if let Some(last_tool) = history.last_mut().filter(|m| m.role == "tool") {
+                            last_tool.content.push_str(&format!(
+                                "\n[Stop repeating that call. Verification found unmet requirements:\n{report}\nFix these next with `write_file` or `edit_file`.]"
+                            ));
+                        }
+                        handed = true;
+                    }
+                }
+                if !handed {
+                    finalize_only = true;
+                }
             }
         }
 
@@ -6660,7 +6932,7 @@ mod tests {
             &ToolCall {
                 id: "c10b4".into(),
                 name: "write_file".into(),
-                arguments: r#"{"path":"page.html","content":"<!doctype html><html><head><title>Kronos Next</title></head><body><h1 class=\"header\">Kronos Workspace</h1></body></html>"}"#.into(),
+                arguments: r#"{"path":"page.html","content":"<!doctype html><html><head><title>Kronos Next</title></head><body><h1 class=\"header\">Kronos Workspace</h1><div id=\"app\"></div><script src=\"app.js\"></script></body></html>"}"#.into(),
             },
             5,
             13,
@@ -7070,6 +7342,76 @@ mod tests {
         );
         assert!(validate_markdown_script(Path::new("script.md"), &full_md).is_ok());
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_wiring_flags_unloaded_assets_and_dead_buttons() {
+        let dir = std::env::temp_dir().join(format!("kronos_wiring_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("index.html"), "<!doctype html><html><body><button class=\"btn\" onclick=\"alert('hi')\">Go</button></body></html>").unwrap();
+        fs::write(dir.join("script.js"), "document.querySelector('.btn').addEventListener('click', () => {});\n").unwrap();
+        fs::write(dir.join("style.css"), ".btn { color: red; }\n").unwrap();
+        let mods = ["script.js".to_string(), "style.css".to_string()];
+        let err = verify_web_wiring(&dir, &mods).unwrap_err();
+        assert!(err.contains("`script.js` is never loaded"), "{err}");
+        assert!(err.contains("`style.css` is never loaded"), "{err}");
+        assert!(err.contains("only handlers call `alert()`"), "{err}");
+        // Loaded, but one handler is undefined and one action is a prompt() placeholder.
+        fs::write(
+            dir.join("index.html"),
+            "<!doctype html><html><head><link rel=\"stylesheet\" href=\"style.css\"></head><body><button onclick=\"startWorkout()\">Go</button><button onclick=\"logMeal()\">Log</button><script src=\"script.js\"></script></body></html>",
+        )
+        .unwrap();
+        fs::write(dir.join("script.js"), "function startWorkout() { const name = prompt('meal'); document.title = name; }\n").unwrap();
+        let err = verify_web_wiring(&dir, &mods).unwrap_err();
+        assert!(err.contains("call `logMeal()` but no loaded script defines"), "{err}");
+        fs::write(dir.join("script.js"), "function startWorkout() { const name = prompt('meal'); document.title = name; }\nconst logMeal = () => { document.title = 'meal'; };\n").unwrap();
+        let ok = verify_web_wiring(&dir, &mods).unwrap().unwrap();
+        assert!(ok.starts_with("web wiring ok (1 page(s)); note: alert()") && ok.contains("`script.js` (1)"), "{ok}");
+        fs::write(dir.join("script.js"), "function startWorkout() { document.title = 'go'; }\nconst logMeal = () => { document.title = 'meal'; };\n").unwrap();
+        let ok = verify_web_wiring(&dir, &mods).unwrap();
+        assert_eq!(ok.as_deref(), Some("web wiring ok (1 page(s))"));
+        // Node-side scripts are not page assets.
+        fs::write(dir.join("server.js"), "const express = require('express');\n").unwrap();
+        assert!(verify_web_wiring(&dir, &["server.js".to_string()]).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_file_appends_new_code_when_old_text_is_absent() {
+        let dir = std::env::temp_dir().join(format!("kronos_edit_append_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("app.js"), "function a() {}\n").unwrap();
+        let args = Json::parse(r#"{"path":"app.js","old_text":"// Modal\nfunction openModal() {}","new_text":"// Modal\nfunction openModal() {}\nfunction closeModal() {}"}"#).unwrap();
+        let out = exec_edit_file(&dir, &args);
+        assert!(out.ok, "{}", out.output);
+        let text = fs::read_to_string(dir.join("app.js")).unwrap();
+        assert_eq!(text, "function a() {}\n\n// Modal\nfunction openModal() {}\nfunction closeModal() {}\n");
+        // A mis-copied existing region still fails rather than duplicating code.
+        let args = Json::parse(r#"{"path":"app.js","old_text":"function a() { x }","new_text":"function a() { x }\nfunction b() {}"}"#).unwrap();
+        assert!(!exec_edit_file(&dir, &args).ok);
+        // HTML additions land before `</body>`.
+        fs::write(dir.join("index.html"), "<html><body><p>hi</p></body></html>\n").unwrap();
+        let args = Json::parse(r#"{"path":"index.html","old_text":"<!-- Modals -->\n<div id=\"m\"></div>","new_text":"<!-- Modals -->\n<div id=\"m\"></div>\n<div id=\"n\"></div>"}"#).unwrap();
+        assert!(exec_edit_file(&dir, &args).ok);
+        assert_eq!(fs::read_to_string(dir.join("index.html")).unwrap(), "<html><body><p>hi</p>\n<!-- Modals -->\n<div id=\"m\"></div>\n<div id=\"n\"></div>\n</body></html>\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_serializes_object_content() {
+        let dir = std::env::temp_dir().join(format!("kronos_wf_obj_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let args = Json::parse(r#"{"path":"app/package.json","content":{"name":"app","scripts":{"start":"node server.js"},"deps":[]}}"#).unwrap();
+        let out = exec_write_file(&dir, &args);
+        assert!(out.ok, "{}", out.output);
+        let text = fs::read_to_string(dir.join("app/package.json")).unwrap();
+        assert_eq!(text, "{\n  \"name\": \"app\",\n  \"scripts\": {\n    \"start\": \"node server.js\"\n  },\n  \"deps\": []\n}\n");
+        assert_eq!(Json::parse(&text).unwrap().stringify(), args.get("content").unwrap().stringify());
         let _ = fs::remove_dir_all(&dir);
     }
 

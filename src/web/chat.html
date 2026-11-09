@@ -830,7 +830,7 @@
   </label>
   <label>Temperature <input id="temp" type="number" step="0.05" min="0" max="2" placeholder="auto"></label>
   <label>Max tokens <input id="maxtok" type="number" min="1" max="16384" placeholder="auto"></label>
-  <label>Max steps <input id="maxsteps" type="number" min="1" max="32" value="16"></label>
+  <label>Max steps <input id="maxsteps" type="number" min="1" max="48" value="24"></label>
   <label>System <input id="system" placeholder="default"></label>
   <label>API key <input id="key" type="password" placeholder="if required"></label>
   <div class="settings-note">
@@ -1963,7 +1963,7 @@ function renderSidebar() {
     hdr.className = "proj-hdr" + (proj === wsWorkdir ? " active-proj" : "");
     hdr.title = proj;
     const liveHtml = activeAg
-      ? `<span class="proj-live-badge">live · ${activeAg.step || 1}/${activeAg.max_steps || 16}</span>`
+      ? `<span class="proj-live-badge">live · ${activeAg.step || 1}/${activeAg.max_steps || 24}</span>`
       : "";
     hdr.innerHTML = `
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
@@ -3365,7 +3365,7 @@ function renderMultiAgentBar(agents) {
     const meta = document.createElement("span");
     meta.className = "agent-pill-meta";
     if (ag.active) {
-      const st = ag.step > 0 ? `step ${ag.step}/${ag.max_steps || 16}` : "starting";
+      const st = ag.step > 0 ? `step ${ag.step}/${ag.max_steps || 24}` : "starting";
       const det = ag.status_detail ? ` · ${String(ag.status_detail).slice(0, 26)}` : "";
       meta.textContent = `${st}${det}`;
     } else if (isErr) {
@@ -3525,7 +3525,7 @@ async function runUnifiedTurn(text, attachedItems) {
     workdir: wsWorkdir || undefined,
     messages: sessionHistory,
     route: $("route-mode").value || "auto",
-    max_steps: +($("maxsteps").value || 16),
+    max_steps: +($("maxsteps").value || 24),
   };
   if (attachedItems.length > 0) {
     payload.attachments = attachedItems.map(a => ({

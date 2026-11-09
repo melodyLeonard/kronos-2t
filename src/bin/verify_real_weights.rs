@@ -84,7 +84,7 @@ fn main() {
         "Loaded SafeTensors mmap: {:.1} MB ({} BF16 tensors) | BPE Vocabulary: {} tokens\n",
         st.byte_len() as f64 / (1024.0 * 1024.0),
         st.tensors.len(),
-        tokenizer.id_to_token.len()
+        tokenizer.vocab_len()
     );
 
     // --------------------------------------------------------------------------------------------------

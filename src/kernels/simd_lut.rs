@@ -4690,6 +4690,19 @@ impl PageAlignedBytes {
         out
     }
 
+    /// Wraps memory this value does not own (a mapped weight file): never freed, never `mlock`ed,
+    /// and `page_alloc_bytes()` is 0 so Metal takes the copying path.
+    ///
+    /// # Safety
+    /// `ptr..ptr+len` must stay valid and unchanged for the rest of the process.
+    pub unsafe fn borrowed(ptr: *const u8, len: usize) -> Self {
+        Self {
+            ptr: std::ptr::NonNull::new(ptr.cast_mut()).unwrap_or(std::ptr::NonNull::dangling()),
+            len,
+            alloc_bytes: 0,
+        }
+    }
+
     #[inline]
     pub fn as_page_ptr(&self) -> *mut std::ffi::c_void {
         self.ptr.as_ptr().cast()
@@ -4698,6 +4711,24 @@ impl PageAlignedBytes {
     #[inline]
     pub fn page_alloc_bytes(&self) -> usize {
         self.alloc_bytes
+    }
+
+    /// Locks the allocation into physical RAM (`mlock`) so the OS never pages it out to swap.
+    pub fn mlock(&self) -> usize {
+        if self.alloc_bytes == 0 {
+            return 0;
+        }
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn mlock(addr: *const std::ffi::c_void, len: usize) -> i32;
+            }
+            // SAFETY: `ptr` is page-aligned and valid for `alloc_bytes`.
+            if unsafe { mlock(self.ptr.as_ptr().cast(), self.alloc_bytes) } == 0 {
+                return self.alloc_bytes;
+            }
+        }
+        0
     }
 }
 
