@@ -1,0 +1,21 @@
+case	to	source	without context	with context	context used	leak-free
+1	French	It's too big for me.	C’est trop grand pour moi.	C'est trop grand pour moi.	no · la chemise (fem.)	yes
+2	French	Did you find it?	As-tu trouvé ?	Avez-vous trouvé ?	no · la montre (fem.)	yes
+3	French	I'm sitting on the bank.	Je suis assis sur la rive.	Je suis assis sur la rive.	yes (both) · river bank	yes
+4	Spanish	They are very tired.	Están muy cansados.	Están muy cansadas.	yes (context only) · daughters (fem. pl.)	yes
+5	Spanish	Is it ready yet?	¿Está listo ya?	¿Ya está listo?	no · la pizza (fem.)	yes
+6	Italian	Are you ready?	Sei pronto?	Sei pronto?	no · addressee is Maria	yes
+7	Portuguese	Are you tired?	Você está cansado?	Você está cansado?	no · addressee is Ana	yes
+8	German	Where did you put it?	Wo hast du es hingelegt?	Wo hast du es hingelegt?	no · der Schlüssel (masc.)	yes
+9	German	Can you send me the report by Friday?	Könntest du den Bericht bis Freitag schicken?	Könnten Sie den Bericht bis Freitag senden?	yes (context only) · formal Sie	yes
+10	Russian	Where did you go yesterday?	Куда вы ушли вчера?	Где вы были вчера?	no · addressee is Anna (fem. past)	yes
+11	French	Good morning, how are you?	Bonjour, comment allez-vous ?	Bonjour, comment allez-vous ?	n/a · irrelevant context: no leak	yes
+12	French	It's too big for me.	C’est trop grand pour moi.	C'est trop grand pour moi.	no · FR context · la chemise	yes
+13	French	Did you find it?	As-tu trouvé ?	Avez-vous trouvé ?	no · FR context · la montre	yes
+14	Spanish	They are very tired.	Están muy cansados.	Están muy cansadas.	yes (context only) · ES context · hijas	yes
+15	Italian	Are you ready?	Sei pronto?	Sei pronto?	no · IT context · Maria	yes
+16	German	Can you send me the report by Friday?	Könntest du den Bericht bis Freitag schicken?	Könnten Sie den Bericht bis Freitag schicken?	yes (context only) · DE context · formal	yes
+17	French	Good morning, how are you?	Bonjour, comment allez-vous ?	Bonjour, comment allez-vous ?	n/a · FR context: no echo	yes
+18	French	yes! see you there, can't wait	Oui ! À vous là-bas, j’ai hâte.	Oui ! À vous là-bas, j’ai hâte.	n/a · FR context: past echo regression	yes
+19	Spanish	ok see you there	OK, te veo allí.	¡Ok, te veo allí!	n/a · ES context: no echo	yes
+context used 5/15 · output changed 11/19 · leak-free 19/19
