@@ -3,7 +3,7 @@
 //! writes a Markdown report plus one TSV of `idx \t source \t reference \t hypothesis` per language.
 //!
 //! Usage: `translate_bench <model_dir> --flores <flores200_dataset dir> [--mode nf4g128] [--n 1012]
-//!        [--langs FR,ES,...] [--threads N] [--cpu] [--out DIR]`
+//!        [--langs FR,ES,...] [--threads N] [--cpu] [--out DIR] [--split devtest|dev]`
 //! Languages already present as a complete TSV in `--out` are skipped, so a long run can resume.
 
 use kronos_2t::runtime::chat::ChatModel;
@@ -85,13 +85,14 @@ fn main() {
     let n: usize = flag("--n").map_or(1012, |v| v.parse().expect("--n"));
     let threads: usize = flag("--threads").map_or(0, |v| v.parse().expect("--threads"));
     let out = PathBuf::from(flag("--out").unwrap_or_else(|| "translate_bench_out".into()));
+    let split = flag("--split").unwrap_or_else(|| "devtest".into());
     let langs: Vec<&(&str, &str, &str)> = match flag("--langs") {
         Some(l) => l.split(',').map(|c| LANGS.iter().find(|x| x.0.eq_ignore_ascii_case(c.trim())).unwrap_or_else(|| panic!("unknown lang {c}"))).collect(),
         None => LANGS.iter().collect(),
     };
     fs::create_dir_all(&out).expect("out dir");
 
-    let src = read_lines(&flores.join("devtest").join("eng_Latn.devtest"));
+    let src = read_lines(&flores.join(&split).join(format!("eng_Latn.{split}")));
     let n = n.min(src.len());
 
     let threads = if threads == 0 { kronos_2t::kernels::thread_pool::default_inference_threads() } else { threads };
@@ -106,7 +107,7 @@ fn main() {
     let report = out.join("report.md");
     let mut rows: Vec<String> = Vec::new();
     for (code, name, stem) in langs {
-        let refs = read_lines(&flores.join("devtest").join(format!("{stem}.devtest")));
+        let refs = read_lines(&flores.join(&split).join(format!("{stem}.{split}")));
         let tsv = out.join(format!("{code}.tsv"));
         let char_tok = CHAR_TOKENIZED.contains(stem);
         let (hyps, secs, toks) = if let Some(h) = load_complete_tsv(&tsv, n) {
@@ -149,7 +150,7 @@ fn main() {
 }
 
 fn write_report(path: &Path, model: &str, mode: &str, rows: &[String]) {
-    let mut s = format!("# FLORES-200 devtest, English → X\n\nmodel: `{model}` · mode `{mode}` · greedy · no context\n\n");
+    let mut s = format!("# FLORES-200, English → X\n\nmodel: `{model}` · mode `{mode}` · greedy · no context\n\n");
     s.push_str("| code | language | n | chrF++ | BLEU | per sentence |\n|---|---|---|---|---|---|\n");
     for r in rows {
         s.push_str(r);
