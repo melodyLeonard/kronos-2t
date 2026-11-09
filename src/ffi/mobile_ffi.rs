@@ -1563,7 +1563,8 @@ mod tests {
         }
         MemoryBudgetProfile::set_global_budget_override_bytes(0);
     }
-    /// `cargo test --release ffi_translate_zero_copy -- --ignored --nocapture` with Hy-MT2 in `models/`.
+    /// `cargo test --release ffi_translate_zero_copy -- --ignored --nocapture` with Hy-MT2 in `models/`
+    /// (`KRONOS_TEST_MODEL=models/Hy-MT2-1.8B-2bit KRONOS_TEST_MODE=q2c` for the 2-bit model).
     #[test]
     #[ignore]
     fn ffi_translate_zero_copy_hy_mt2() {
@@ -1573,7 +1574,8 @@ mod tests {
     }
 
     fn ffi_translate_zero_copy_hy_mt2_body() {
-        let dir = CString::new("models/Hy-MT2-1.8B").unwrap();
+        let dir = CString::new(std::env::var("KRONOS_TEST_MODEL").unwrap_or_else(|_| "models/Hy-MT2-1.8B".into())).unwrap();
+        let mode = CString::new(std::env::var("KRONOS_TEST_MODE").unwrap_or_else(|_| "nf4g128".into())).unwrap();
         kronos_set_zero_copy_weights(1);
         kronos_set_cpu_prompt_chunk(std::env::var("KRONOS_TEST_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
         let mut out = String::new();
@@ -1581,7 +1583,7 @@ mod tests {
         unsafe {
             let rss0 = kronos_process_footprint_bytes();
             let ctx: usize = std::env::var("KRONOS_TEST_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
-            let sess = kronos_session_create(dir.as_ptr(), c"nf4g128".as_ptr(), ctx, 2, 0);
+            let sess = kronos_session_create(dir.as_ptr(), mode.as_ptr(), ctx, 2, 0);
             assert!(!sess.is_null(), "load failed");
             let rss1 = kronos_process_footprint_bytes();
             let t0 = std::time::Instant::now();
@@ -1610,4 +1612,47 @@ mod tests {
         assert!(!out.is_empty());
     }
 
+
+    /// `kronos_set_abort` during decode returns within 100 ms (needs the compiled 2-bit Hy-MT2).
+    #[test]
+    fn abort_stops_decode() {
+        use crate::runtime::translate::{run, TranslateRequest};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let dir = Path::new("models/Hy-MT2-1.8B-2bit");
+        if !dir.join("kronos-q2c.k2tb").exists() {
+            return;
+        }
+        let mut model = ChatModel::load(dir, "q2c", 1024, 2, None).unwrap();
+        let text = "The committee met on Monday to review the proposal. After a long discussion about the budget, \
+            the schedule and the risks, the members agreed to postpone the decision until the next meeting, \
+            when more data from the pilot project in the northern region would be available to everyone.";
+        let req = TranslateRequest { text, to: "French", from: "English", tone: "neutral", context: &[], temperature: 0.0 };
+        let decoding = Arc::new(AtomicBool::new(false));
+        let set_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let (d2, s2) = (decoding.clone(), set_at.clone());
+        let aborter = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            while !d2.load(Ordering::Acquire) && t0.elapsed() < Duration::from_secs(60) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            *s2.lock().unwrap() = Some(Instant::now());
+            kronos_set_abort(1);
+        });
+        let c = run(&mut model, &req, |_| {
+            decoding.store(true, Ordering::Release);
+            true
+        });
+        let done = Instant::now();
+        aborter.join().unwrap();
+        kronos_set_abort(0);
+        let c = c.unwrap();
+        let set = set_at.lock().unwrap().expect("abort was never set");
+        assert!(set < done, "decode finished ({} tokens) before the abort", c.completion_tokens);
+        let lag = done - set;
+        eprintln!("stopped {lag:?} after abort, {} tokens", c.completion_tokens);
+        assert!(lag < Duration::from_millis(100), "decode kept running {lag:?} after abort");
+    }
 }
