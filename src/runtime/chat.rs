@@ -1672,7 +1672,11 @@ impl ChatModel {
         let tail = &prompt[common..];
         let vocab = self.engine.vocab_size();
         self.prefill_tail(tail);
-        self.cached.extend_from_slice(tail);
+        let actual = self.engine.position().saturating_sub(self.cached.len()).min(tail.len());
+        self.cached.extend_from_slice(&tail[..actual]);
+        if actual < tail.len() || crate::model::real_llm::is_abort_active() {
+            return Err("aborted".to_string());
+        }
         if self.im_start < self.scratch.cur_logits.len() {
             self.scratch.cur_logits[self.im_start] = f32::NEG_INFINITY;
         }
@@ -1835,6 +1839,15 @@ impl ChatModel {
                     draft_synced_in_parallel = true;
                 } else {
                     self.prefill_tail(&prompt[common..]);
+                    let actual = self
+                        .engine
+                        .position()
+                        .saturating_sub(self.cached.len())
+                        .min(prompt.len() - common);
+                    if actual < prompt.len() - common || crate::model::real_llm::is_abort_active() {
+                        self.cached.extend_from_slice(&prompt[common..common + actual]);
+                        return Err("aborted".to_string());
+                    }
                 }
             }
         }
@@ -1976,6 +1989,10 @@ impl ChatModel {
         let mut t_single: Option<f64> = None;
         let mut lookup_gain = 1.5f64;
         'outer: loop {
+            if crate::model::real_llm::is_abort_active() {
+                finish = FinishReason::Stop;
+                break;
+            }
             if is_stop(next, self.im_end, &self.tok) {
                 finish = FinishReason::Stop;
                 break;

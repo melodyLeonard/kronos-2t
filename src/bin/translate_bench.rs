@@ -1,6 +1,6 @@
 //! FLORES-200 devtest accuracy of the translation prompt, English → each keyboard language.
 //! Scores chrF++ (char 1–6 + word 1–2 n-grams, β=2) and corpus BLEU-4 against the references and
-//! writes a Markdown report plus one TSV of `idx \t source \t reference \t hypothesis` per language.
+//! writes `report.tsv` plus one TSV of `idx \t source \t reference \t hypothesis` per language.
 //!
 //! Usage: `translate_bench <model_dir> --flores <flores200_dataset dir> [--mode nf4g128] [--n 1012]
 //!        [--langs FR,ES,...] [--threads N] [--cpu] [--out DIR] [--split devtest|dev]`
@@ -104,7 +104,7 @@ fn main() {
     }
     eprintln!("{} · {} · {} sentences × {} languages", model.name, mode, n, langs.len());
 
-    let report = out.join("report.md");
+    let report = out.join("report.tsv");
     let mut rows: Vec<String> = Vec::new();
     for (code, name, stem) in langs {
         let refs = read_lines(&flores.join(&split).join(format!("{stem}.{split}")));
@@ -150,10 +150,10 @@ fn main() {
 }
 
 fn write_report(path: &Path, model: &str, mode: &str, rows: &[String]) {
-    let mut s = format!("# FLORES-200, English → X\n\nmodel: `{model}` · mode `{mode}` · greedy · no context\n\n");
-    s.push_str("| code | language | n | chrF++ | BLEU | per sentence |\n|---|---|---|---|---|---|\n");
+    let mut s = format!("# {model} {mode} greedy\ncode\tlanguage\tn\tchrF++\tBLEU\tper_sentence\n");
     for r in rows {
-        s.push_str(r);
+        let cells: Vec<&str> = r.trim_matches('|').split('|').map(str::trim).collect();
+        s.push_str(&cells.join("\t"));
         s.push('\n');
     }
     fs::write(path, s).expect("report");

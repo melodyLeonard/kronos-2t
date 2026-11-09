@@ -1104,7 +1104,8 @@ pub unsafe extern "C" fn kronos_session_translate_warm(
             temperature: 0.0,
         };
         let (messages, _, _) = crate::runtime::translate::prompt(&sess.model, &req);
-        match sess.model.prefill_messages(&messages) {
+        crate::model::real_llm::set_abort_active(false);
+        let rc = match sess.model.prefill_messages(&messages) {
             Ok((_, n)) => {
                 sess.clear_error();
                 n as i32
@@ -1113,9 +1114,18 @@ pub unsafe extern "C" fn kronos_session_translate_warm(
                 sess.set_error(e);
                 -1
             }
-        }
+        };
+        #[cfg(target_os = "ios")]
+        crate::kernels::thread_pool::SpinThreadPool::park_idle_workers();
+        rc
     }));
     res.unwrap_or(-1)
+}
+
+/// Stops in-flight translate/warm at the next chunk or token (`abort != 0`).
+#[no_mangle]
+pub extern "C" fn kronos_set_abort(abort: i32) {
+    crate::model::real_llm::set_abort_active(abort != 0);
 }
 
 /// Caps tokens per CPU prefill batch (`0` = tier default: 16 on phones). Smaller = less scratch.
@@ -1189,6 +1199,7 @@ pub unsafe extern "C" fn kronos_session_translate(
             return -1;
         }
         sess.pending_token = None;
+        crate::model::real_llm::set_abort_active(false);
         let gen = crate::runtime::translate::run(&mut sess.model, &req, |cur| {
             let Some(cb) = on_piece_cb else {
                 return true;
@@ -1199,6 +1210,8 @@ pub unsafe extern "C" fn kronos_session_translate(
             // SAFETY: `cs` is a live NUL-terminated buffer for the duration of the callback.
             unsafe { cb(cs.as_ptr(), cs.as_bytes().len(), user_data) }
         });
+        #[cfg(target_os = "ios")]
+        crate::kernels::thread_pool::SpinThreadPool::park_idle_workers();
         match gen {
             Ok(comp) => {
                 sess.clear_error();

@@ -1478,6 +1478,17 @@ pub fn set_zero_copy_weights(on: bool) {
 }
 
 static CPU_PROMPT_CHUNK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ABORT_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Signals in-flight CPU prefill/decode to stop at the next chunk or token boundary.
+pub fn set_abort_active(abort: bool) {
+    ABORT_ACTIVE.store(abort, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub fn is_abort_active() -> bool {
+    ABORT_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Caps the tokens per CPU prefill batch (`0` = tier default). Prompt scratch is ~240 KB per
 /// batched token on a 2 B model, so a memory-capped host wants a small batch.
@@ -7133,6 +7144,9 @@ impl RealLlamaEngine {
         }
         let chunks: Vec<&[usize]> = tokens.chunks(cpu_prompt_chunk()).collect();
         for (idx, chunk) in chunks.iter().enumerate() {
+            if is_abort_active() {
+                break;
+            }
             let last = idx + 1 == chunks.len();
             if chunk.len() == 1 && last {
                 return self.forward_token(chunk[0]);
