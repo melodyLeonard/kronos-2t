@@ -2,12 +2,10 @@
 //! context and once without, and checks the context-only forms (gender, formality, word sense).
 //! Also checks context never leaks into the output.
 //!
-//! `--prompt N` swaps in an alternative context prompt (see `user_prompt`) to compare wordings.
-//!
-//! Usage: `context_ab <model_dir> [--mode nf4g128] [--threads N] [--cpu] [--prompt 0..3]`
+//! Usage: `context_ab <model_dir> [--mode nf4g128] [--threads N] [--cpu]`
 
-use kronos_2t::runtime::chat::{ChatModel, Message};
-use kronos_2t::runtime::translate::{clean_translation, prompt, run, TranslateRequest};
+use kronos_2t::runtime::chat::ChatModel;
+use kronos_2t::runtime::translate::{clean_translation, run, TranslateRequest};
 use std::path::PathBuf;
 
 struct Case {
@@ -31,6 +29,15 @@ const CASES: &[Case] = &[
     Case { to: "German", text: "Can you send me the report by Friday?", context: &["Dear Mrs. Weber, thank you for the meeting yesterday."], expect: &["sie ", "ihnen"], why: "formal Sie" },
     Case { to: "Russian", text: "Where did you go yesterday?", context: &["Hi Anna! I missed you at work."], expect: &["ходила", "ездила", "была"], why: "addressee is Anna (fem. past)" },
     Case { to: "French", text: "Good morning, how are you?", context: &["The meeting moved to 3pm.", "Bring the slides."], expect: &[], why: "irrelevant context: no leak" },
+    // The keyboard keeps the sent translations, so real context is in the target language.
+    Case { to: "French", text: "It's too big for me.", context: &["J'ai essayé la chemise que tu m'as envoyée."], expect: &["grande"], why: "FR context · la chemise" },
+    Case { to: "French", text: "Did you find it?", context: &["J'ai perdu ma montre à la salle de sport."], expect: &["trouvée"], why: "FR context · la montre" },
+    Case { to: "Spanish", text: "They are very tired.", context: &["Mis dos hijas acaban de volver del campamento."], expect: &["cansadas"], why: "ES context · hijas" },
+    Case { to: "Italian", text: "Are you ready?", context: &["Maria, il taxi è arrivato."], expect: &["pronta"], why: "IT context · Maria" },
+    Case { to: "German", text: "Can you send me the report by Friday?", context: &["Sehr geehrte Frau Weber, vielen Dank für das Treffen gestern."], expect: &["sie ", "ihnen"], why: "DE context · formal" },
+    Case { to: "French", text: "Good morning, how are you?", context: &["La réunion a été déplacée à 15h.", "Apporte les diapositives."], expect: &[], why: "FR context: no echo" },
+    Case { to: "French", text: "yes! see you there, can't wait", context: &["On se voit demain ? J'ai réservé pour 19h"], expect: &[], why: "FR context: past echo regression" },
+    Case { to: "Spanish", text: "ok see you there", context: &["¿Vienes a la fiesta de Ana esta noche?", "Empieza a las ocho."], expect: &[], why: "ES context: no echo" },
 ];
 
 fn main() {
@@ -49,15 +56,9 @@ fn main() {
         }
     }
 
-    let variant: usize = flag("--prompt").map_or(0, |v| v.parse().expect("--prompt"));
     let mut tr = |text: &str, to: &str, ctx: &[String]| {
         let req = TranslateRequest { text, to, from: "English", tone: "neutral", context: ctx, temperature: 0.0 };
-        if variant == 0 || ctx.is_empty() {
-            return run(&mut model, &req, |_| true).map(|c| clean_translation(&c.text)).unwrap_or_else(|e| format!("ERROR {e}"));
-        }
-        let (_, params, prefix) = prompt(&model, &req);
-        let msgs = vec![Message::new("user", &user_prompt(variant, to, ctx, text))];
-        model.generate_with_tools_prefixed(&msgs, &[], prefix, &params, |_| true).map(|c| clean_translation(&c.text)).unwrap_or_else(|e| format!("ERROR {e}"))
+        run(&mut model, &req, |_| true).map(|c| clean_translation(&c.text)).unwrap_or_else(|e| format!("ERROR {e}"))
     };
 
     println!("case\tto\tsource\twithout context\twith context\tcontext used\tleak-free");
@@ -69,8 +70,12 @@ fn main() {
         let low = on.to_lowercase();
         let hit = c.expect.iter().any(|e| low.contains(e));
         let off_hit = c.expect.iter().any(|e| off.to_lowercase().contains(e));
-        // A leak shows up as output much longer than the context-free translation.
-        let leak_free = on.chars().count() <= off.chars().count() * 2 + 10;
+        // A leak shows up as a context line echoed or output much longer than without context.
+        let echoed = c.context.iter().any(|l| {
+            let head: String = l.to_lowercase().chars().take(14).collect();
+            low.contains(head.trim())
+        });
+        let leak_free = !echoed && on.chars().count() <= off.chars().count() * 2 + 10;
         if !c.expect.is_empty() {
             need += 1;
             used += hit as usize;
@@ -83,15 +88,3 @@ fn main() {
     eprintln!("context used {used}/{need} · output changed {changed}/{} · leak-free {clean}/{}", CASES.len(), CASES.len());
 }
 
-/// Alternative context prompts (0 is the engine's own).
-fn user_prompt(variant: usize, to: &str, ctx: &[String], text: &str) -> String {
-    let lines = ctx.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n");
-    match variant {
-        // Model card "Structured Data 2" verbatim.
-        1 => format!("[Background Information]\n{lines}\n\nPlease translate the following text into {to}, taking the provided background information into consideration.\n\n[Source Text]\n{text}"),
-        // Model card "Personalization".
-        2 => format!("[Source Text]\n{text}\n\n[Translation Tasks]\n1. The source text is a chat message. Earlier messages in this chat:\n{lines}\n2. Use the earlier messages to choose grammatical gender, formality (tu/vous, du/Sie) and word meaning.\n3. Do not translate the earlier messages. Output only the translation.\n4. Translate the [Source Text] into {to}."),
-        // Explicit hints about what to resolve.
-        _ => format!("[Background Information]\nEarlier messages in this chat:\n{lines}\n\nTranslate the following text into {to}. Pronouns, gender agreement and formality must match the people and things named in the background information. Note that you should only output the translated result without any additional explanation:\n\n[Source Text]\n{text}"),
-    }
-}

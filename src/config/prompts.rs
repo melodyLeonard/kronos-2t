@@ -131,37 +131,24 @@ fn hunyuan_style(tone: &str) -> Option<&'static str> {
 /// Single user turn for Hy-MT2 (`/translate` on HunYuan models), mirroring the model card's
 /// default, style and background-information prompts. Hy-MT2 has no system prompt.
 pub fn translate_user_hunyuan(to: &str, from: &str, tone: &str, context: &[String], text: &str) -> String {
-    let mut s = String::new();
+    let style = hunyuan_style(tone).map(|st| format!(" Note that the translation style must strictly conform to [{st}].")).unwrap_or_default();
     if !context.is_empty() {
-        // Context must read as background, not as text to translate: with a looser heading the model
-        // echoed a French context line instead of translating the English source.
-        s.push_str("[Background Information]\nPrevious messages in this chat (context only, never translate or repeat them):");
-        for c in context {
-            s.push_str("\n- ");
-            s.push_str(c.trim());
-        }
-        s.push_str("\n\nPlease translate the following text into ");
-    } else {
-        s.push_str("Translate the following text into ");
+        // Model card "background information" prompt verbatim: `context_ab` scored it above stricter
+        // wordings, with no context echoed even when the context is in the target language.
+        let lines: Vec<String> = context.iter().map(|c| format!("- {}", c.trim())).collect();
+        return format!(
+            "[Background Information]\n{}\n\nPlease translate the following text into {to}, taking the provided background information into consideration.{style}\n\n[Source Text]\n{text}",
+            lines.join("\n")
+        );
     }
-    s.push_str(to);
+    let mut s = format!("Translate the following text into {to}");
     if !from.is_empty() && !from.eq_ignore_ascii_case("auto") {
         s.push_str(&format!(" (the source language is {from})"));
     }
-    if !context.is_empty() {
-        s.push_str(", taking the provided background information into consideration. Translate only the [Source Text]");
-    }
     s.push('.');
-    if let Some(style) = hunyuan_style(tone) {
-        s.push_str(&format!(" Note that the translation style must strictly conform to [{style}]."));
-    }
+    s.push_str(&style);
     s.push_str(" Note that you should only output the translated result without any additional explanation:\n\n");
-    if context.is_empty() {
-        s.push_str(text);
-    } else {
-        s.push_str("[Source Text]\n");
-        s.push_str(text);
-    }
+    s.push_str(text);
     s
 }
 
@@ -201,9 +188,9 @@ mod tests {
         let ctx = vec!["Are you coming to Ana's party?".to_string(), "It starts at 8".to_string()];
         let rich = translate_user_hunyuan("French", "English", "casual", &ctx, "see you there");
         assert!(rich.starts_with("[Background Information]\n"));
-        assert!(rich.contains("- Are you coming to Ana's party?\n- It starts at 8\n\nPlease translate the following text into French (the source language is English), taking the provided background information into consideration. Translate only the [Source Text]."));
+        assert!(rich.contains("- Are you coming to Ana's party?\n- It starts at 8\n\nPlease translate the following text into French, taking the provided background information into consideration."));
         assert!(rich.contains("strictly conform to [casual and informal chat between friends, using informal address (tu/du)]."));
-        assert!(rich.ends_with("explanation:\n\n[Source Text]\nsee you there"));
+        assert!(rich.ends_with("].\n\n[Source Text]\nsee you there"));
     }
 
     /// Regression: a target-language context line must stay labelled background, after which only
@@ -213,10 +200,8 @@ mod tests {
         let ctx = vec!["On se voit demain ? J'ai réservé pour 19h".to_string()];
         let p = translate_user_hunyuan("French", "English", "neutral", &ctx, "yes! see you there, can't wait");
         let (background, rest) = p.split_once("\n\nPlease translate").unwrap();
-        assert!(background.starts_with("[Background Information]\nPrevious messages in this chat (context only, never translate or repeat them):"));
-        assert!(rest.contains("Translate only the [Source Text]."));
-        assert!(background.ends_with("- On se voit demain ? J'ai réservé pour 19h"));
-        assert!(rest.ends_with("without any additional explanation:\n\n[Source Text]\nyes! see you there, can't wait"));
+        assert_eq!(background, "[Background Information]\n- On se voit demain ? J'ai réservé pour 19h");
+        assert!(rest.ends_with("consideration.\n\n[Source Text]\nyes! see you there, can't wait"));
         assert!(!rest.contains("19h"), "context must not reappear after the task line");
         assert!(!p.contains("conform to"), "neutral tone adds no style clause");
     }

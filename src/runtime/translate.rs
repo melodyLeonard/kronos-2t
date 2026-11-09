@@ -82,6 +82,30 @@ pub fn run(
     req: &TranslateRequest,
     mut on_text: impl FnMut(&str) -> bool,
 ) -> Result<Completion, String> {
+    let out = run_once(model, req, &mut on_text)?;
+    if !req.context.is_empty() && echoes_context(&clean_translation(&out.text), req.context) {
+        // The model sometimes answers with a context line instead of the source: retry without it.
+        let plain = TranslateRequest { context: &[], ..*req };
+        return run_once(model, &plain, &mut on_text);
+    }
+    Ok(out)
+}
+
+/// True when `out` repeats the start of any context line (the context-echo failure).
+pub fn echoes_context(out: &str, context: &[String]) -> bool {
+    let norm = |s: &str| s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect::<String>();
+    let o = norm(out);
+    context.iter().any(|c| {
+        let head: String = norm(c).chars().take(12).collect();
+        head.chars().count() >= 8 && o.contains(&head)
+    })
+}
+
+fn run_once(
+    model: &mut ChatModel,
+    req: &TranslateRequest,
+    on_text: &mut impl FnMut(&str) -> bool,
+) -> Result<Completion, String> {
     let (messages, params, prefix) = prompt(model, req);
     let mut acc = String::new();
     let mut last_sent = String::new();
@@ -127,7 +151,15 @@ pub fn clean_translation(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_translation, trim_context};
+    use super::{clean_translation, echoes_context, trim_context};
+
+    #[test]
+    fn detects_context_echo() {
+        let ctx = vec!["On se voit demain ? J'ai réservé pour 19h".to_string()];
+        assert!(echoes_context("oui ! on se voit demain, j'ai réservé pour 19h", &ctx));
+        assert!(!echoes_context("Oui ! À tout à l'heure, j'ai hâte.", &ctx));
+        assert!(!echoes_context("Oui", &["ok".to_string()]));
+    }
 
     #[test]
     fn cleans_prefixes_and_quotes() {
