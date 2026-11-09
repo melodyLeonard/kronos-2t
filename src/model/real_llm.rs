@@ -15,6 +15,7 @@ use crate::model::compiler::{
     compile_multiplane_ternary, FullRowGptqHessian,
 };
 use crate::kernels::hadamard::{fwht64_signed_inplace, ifwht64_signed_inplace};
+use crate::kernels::q2c::{q2c_batch_rows, q2c_gemv_rows, Q2cMatrix};
 use crate::model::kv_blob::{KvBlobLayout, KvSlotPtrs};
 use crate::storage::mmap_pager::sys::RawMmap;
 use crate::storage::prefetch::SubspaceProjector;
@@ -516,6 +517,9 @@ pub enum RealWeightMode {
         head: usize,
         scale_group_chunks: usize,
     },
+    /// Tencent `q2_0c` 2-bit QAT weights loaded exactly from the model dir's GGUF (unrotated),
+    /// with an `nf4g128` GPTQ LM head.
+    KronosQ2c,
 }
 
 enum LinearBackend {
@@ -535,6 +539,8 @@ enum LinearBackend {
     NfSdot(NfSdotMatrix),
     /// 2-bit vector-quantized weights.
     Vq2(Vq2LutMatrix),
+    /// Exact Tencent `q2_0c` weights; takes unrotated INT8 inputs.
+    Q2c(Q2cMatrix),
 }
 
 impl LinearBackend {
@@ -626,6 +632,10 @@ impl LinearBackend {
                 )),
                 0.0,
             ),
+            RealWeightMode::KronosQ2c => (
+                Self::NfSdot(compile_hadamard_gptq_nf(w_ref, rows, cols, 4, 2, None, 4)),
+                0.0,
+            ),
             RealWeightMode::KronosNfMixedGptq {
                 attn_head_bits,
                 scale_group_chunks,
@@ -661,6 +671,12 @@ impl LinearBackend {
         }
     }
 
+    /// Whether inputs are Hadamard-rotated before this projection.
+    #[inline]
+    fn input_rotated(&self) -> bool {
+        !matches!(self, Self::Q2c(_))
+    }
+
     fn as_fp32_slice(&self) -> &[f32] {
         match self {
             Self::Fp32 { weights, .. } => weights,
@@ -679,6 +695,7 @@ impl LinearBackend {
             Self::Nibble4(m) => m.physical_bytes(),
             Self::NfSdot(m) => m.physical_bytes(),
             Self::Vq2(m) => m.physical_bytes(),
+            Self::Q2c(m) => m.physical_bytes(),
         }
     }
 
@@ -853,6 +870,21 @@ impl LinearBackend {
                     });
                 } else {
                     vq2_lut_gemv(mat, lut, out);
+                }
+            }
+            Self::Q2c(mat) => {
+                let act = blut.and_then(|b| b.int8.as_ref()).expect("int8 activations required for Q2c");
+                let rows = mat.rows;
+                let out_addr = out.as_mut_ptr() as usize;
+                if let Some(p) = pool.filter(|p| p.num_threads() > 1 && rows >= 64) {
+                    let grain = (rows / (p.num_threads() * 4)).clamp(16, 512);
+                    p.parallel_for(rows, grain, |r0, r1| {
+                        // SAFETY: disjoint row ranges write disjoint `out` entries.
+                        unsafe { q2c_gemv_rows(mat, act, r0, r1, out_addr as *mut f32) };
+                    });
+                } else {
+                    // SAFETY: full row range on one thread.
+                    unsafe { q2c_gemv_rows(mat, act, 0, rows, out_addr as *mut f32) };
                 }
             }
         }
@@ -3337,12 +3369,139 @@ impl RealLlamaEngine {
         Ok(eng)
     }
 
+    /// Builds a [`RealWeightMode::KronosQ2c`] engine: projections copied bit-exact from the model
+    /// dir's `q2_0c` GGUF, norms from `model.safetensors`, and an `nf4g128` LM head whose GPTQ
+    /// Hessian comes from the 2-bit model's own final hidden states on `calib_sequences`.
+    pub fn compile_q2c_from_dir(
+        model_dir: &Path,
+        calib_sequences: &[Vec<usize>],
+        compile_threads: usize,
+    ) -> io::Result<Self> {
+        use crate::storage::gguf::Gguf;
+        let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
+        let max_calib_len = calib_sequences.iter().map(|s| s.len()).max().unwrap_or(1).max(1);
+        let cfg = LlamaConfig::from_config_json(&model_dir.join("config.json"), max_calib_len)?;
+        let gguf_path = fs::read_dir(model_dir)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.extension().is_some_and(|x| x == "gguf"))
+            .ok_or_else(|| bad(format!("no .gguf in {}", model_dir.display())))?;
+        let file = fs::File::open(&gguf_path)?;
+        let mmap = RawMmap::map_read_only(&file, file.metadata()?.len() as usize)?;
+        let g = Gguf::parse(mmap.as_slice()).map_err(bad)?;
+        let store = SafeTensorsStore::open_dir(model_dir)?;
+        let get_f32 = |name: &str| -> io::Result<Vec<f32>> {
+            let v = store.tensor(name).map(|t| t.to_f32_vec()).map_err(bad)?;
+            store.release_tensor_pages(name);
+            Ok(v)
+        };
+        // Row-concatenates `q2_0c` tensors that share `cols`.
+        let q2 = |names: &[String]| -> io::Result<LinearBackend> {
+            let mut blocks = Vec::new();
+            let (mut rows, mut cols) = (0, 0);
+            for n in names {
+                let (b, r, c) = g.q2_0c_blocks(n).map_err(bad)?;
+                if cols != 0 && c != cols {
+                    return Err(bad(format!("{n}: cols {c} != {cols}")));
+                }
+                cols = c;
+                rows += r;
+                blocks.extend_from_slice(b);
+            }
+            Ok(LinearBackend::Q2c(Q2cMatrix::from_q2_0c_blocks(&blocks, rows, cols)))
+        };
+        let h_dim = cfg.hidden_size;
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for l in 0..cfg.num_hidden_layers {
+            let pfx = format!("model.layers.{l}");
+            let blk = |s: &str| format!("blk.{l}.{s}.weight");
+            let (q_norm_name, k_norm_name) = qk_norm_tensor_names(&store, &pfx);
+            let opt = |n: &str| -> io::Result<Option<Vec<f32>>> {
+                if store.has_tensor(n) { get_f32(n).map(Some) } else { Ok(None) }
+            };
+            if store.has_tensor(&format!("{pfx}.self_attn.q_proj.bias")) {
+                return Err(bad("q2c: qkv bias unsupported".into()));
+            }
+            layers.push(LlamaLayer {
+                input_norm: get_f32(&format!("{pfx}.input_layernorm.weight"))?,
+                post_attn_norm: get_f32(&format!("{pfx}.post_attention_layernorm.weight"))?,
+                o_inv_scale: None,
+                down_inv_scale: None,
+                qkv_bias: None,
+                o_bias: None,
+                q_norm: opt(&q_norm_name)?,
+                k_norm: opt(&k_norm_name)?,
+                qkv_proj: q2(&[blk("attn_q"), blk("attn_k"), blk("attn_v")])?,
+                o_proj: q2(&[blk("attn_output")])?,
+                gate_up_proj: q2(&[blk("ffn_gate"), blk("ffn_up")])?,
+                gate_up_interleaved: false,
+                down_proj: q2(&[blk("ffn_down")])?,
+                moe: None,
+            });
+        }
+        drop(g);
+        drop(mmap);
+        let final_norm = get_f32("model.norm.weight")?;
+        let embed_bf16_rows = store
+            .tensor("model.embed_tokens.weight")
+            .map(|t| t.to_bf16_vec())
+            .map_err(bad)?;
+        let head_name = if cfg.tie_word_embeddings { "model.embed_tokens.weight" } else { "lm_head.weight" };
+        let head_w = get_f32(head_name)?;
+        let head_spec = ProjSpec::Nf { bits: 4, sgc: 2 };
+        let lm_head = compile_proj_spec(&head_w, cfg.vocab_size, h_dim, head_spec, None, compile_threads);
+
+        let mut eng = Self {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            metal: None,
+            kv_bits_pref: 8,
+            kv_window_pref: cfg.sliding_window,
+            kv_sinks_pref: cfg.sink_tokens,
+            rope_cos_sin: build_rope_table(&cfg),
+            ws: LlamaWorkspace::new(&cfg),
+            cfg,
+            mode: RealWeightMode::KronosQ2c,
+            mean_weight_rel_error: 0.0,
+            embed_f32_rows: Vec::new(),
+            // Exact embeddings while calibrating; dropped (tied) or kept (untied) below.
+            embed_bf16_rows,
+            embed_nf4: None,
+            layers,
+            final_norm,
+            lm_head,
+            pool: None,
+            moe_runtime: None,
+            moe_hot: None,
+        };
+        eng.init_activation_scratch();
+        eng.set_num_threads(compile_threads);
+
+        let mut hess = FullRowGptqHessian::new(h_dim);
+        let mut norm_buf = vec![0.0f32; h_dim];
+        for seq in calib_sequences {
+            eng.reset_context();
+            eng.forward_batch_sdot_impl(seq, None, false);
+            for hid in eng.ws.prompt_scratch.hidden[..seq.len() * h_dim].chunks_exact(h_dim) {
+                rms_norm(hid, &eng.final_norm, eng.cfg.rms_norm_eps, &mut norm_buf);
+                fwht64_signed_inplace(&mut norm_buf);
+                hess.observe_prerotated(&norm_buf);
+            }
+        }
+        eng.reset_context();
+        hess.finalize(BIPOLAR_GPTQ_DAMP);
+        eng.lm_head = compile_proj_spec(&head_w, eng.cfg.vocab_size, h_dim, head_spec, Some(&hess), compile_threads);
+        if eng.cfg.tie_word_embeddings {
+            eng.embed_bf16_rows = Vec::new();
+        }
+        eng.set_num_threads(1);
+        Ok(eng)
+    }
+
     fn init_activation_scratch(&mut self) {
         let is_lut = |b: &LinearBackend| matches!(b, LinearBackend::FusedBipolar(_));
         let is_int8 = |b: &LinearBackend| {
             matches!(
                 b,
-                LinearBackend::Nibble4(_) | LinearBackend::NfSdot(_) | LinearBackend::Vq2(_)
+                LinearBackend::Nibble4(_) | LinearBackend::NfSdot(_) | LinearBackend::Vq2(_) | LinearBackend::Q2c(_)
             )
         };
         let same_q = self.cfg.q_dim() == self.cfg.hidden_size;
@@ -3483,6 +3642,13 @@ impl RealLlamaEngine {
                     m.bf16_chunk_scales.iter().try_for_each(|x| w.write_all(&x.to_le_bytes()))
                 }
                 LinearBackend::NfSdot(m) => w_nf_mat(w, m),
+                LinearBackend::Q2c(m) => {
+                    w_u64(w, 3)?;
+                    w_u64(w, m.rows)?;
+                    w_u64(w, m.cols)?;
+                    w_u64(w, m.data.len())?;
+                    w.write_all(&m.data)
+                }
                 _ => Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "save_bipolar expects un-repacked FusedBipolar, NfSdot, or Vq2 projections",
@@ -3543,6 +3709,7 @@ impl RealLlamaEngine {
                     head,
                 ],
             ),
+            RealWeightMode::KronosQ2c => (true, [8, 0, 0, 0, 0, 0]),
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -3735,6 +3902,13 @@ impl RealLlamaEngine {
                         tail_stream,
                     }))
                 }
+                3 => {
+                    let rows = rd.u64()?;
+                    let cols = rd.u64()?;
+                    let n = rd.u64()?;
+                    let data = nf_stream(rd.take(n)?);
+                    Q2cMatrix::from_stream(rows, cols, data).map(LinearBackend::Q2c).map_err(|e| bad(&e))
+                }
                 _ => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "unknown matrix tag in K2TKRONOS2/3 cache",
@@ -3780,6 +3954,7 @@ impl RealLlamaEngine {
                 head: mw[5],
                 scale_group_chunks: (mw[1] >> 8).max(1),
             },
+            8 => RealWeightMode::KronosQ2c,
             _ => return Err(bad("unknown mode tag in cache")),
         };
         let num_layers = rd.u64()?;
@@ -6099,7 +6274,7 @@ impl RealLlamaEngine {
         let is_sdot = |b: &LinearBackend| {
             matches!(
                 b,
-                LinearBackend::Nibble4(_) | LinearBackend::NfSdot(_) | LinearBackend::Vq2(_)
+                LinearBackend::Nibble4(_) | LinearBackend::NfSdot(_) | LinearBackend::Vq2(_) | LinearBackend::Q2c(_)
             )
         };
         let has_dense_ffn = self.layers.iter().any(|l| l.moe.is_none());
@@ -6252,6 +6427,7 @@ impl RealLlamaEngine {
                     LinearBackend::LutMultiPlane(_) => {
                         ws.qlut_hidden.populate($buf);
                     }
+                    LinearBackend::Q2c(_) => ws.blut_hidden.populate($buf),
                     LinearBackend::GgufQ4_0(_) => {
                         GgufQ4_0Matrix::quantize_q8_0_activation(
                             $buf,
@@ -6294,6 +6470,7 @@ impl RealLlamaEngine {
                     LinearBackend::LutMultiPlane(_) => {
                         ws.qlut_q.populate($buf);
                     }
+                    LinearBackend::Q2c(_) => ws.blut_q.populate($buf),
                     LinearBackend::GgufQ4_0(_) => {
                         GgufQ4_0Matrix::quantize_q8_0_activation(
                             $buf,
@@ -6468,6 +6645,7 @@ impl RealLlamaEngine {
                     LinearBackend::LutMultiPlane(_) => {
                         ws.qlut_inter.populate(&ws.swiglu_buf);
                     }
+                    LinearBackend::Q2c(_) => ws.blut_inter.populate(&ws.swiglu_buf),
                     LinearBackend::GgufQ4_0(_) => {
                         GgufQ4_0Matrix::quantize_q8_0_activation(
                             &ws.swiglu_buf,
@@ -7290,7 +7468,7 @@ impl RealLlamaEngine {
 
         for (l_idx, layer) in layers.iter().enumerate() {
             let kv_base = l_idx * layer_kv_stride;
-            prompt_populate(pool, hidden, h, Some((&layer.input_norm, eps)), acts_h);
+            prompt_populate(pool, hidden, h, Some((&layer.input_norm, eps)), acts_h, layer.qkv_proj.input_rotated());
             prompt_gemm(pool, &layer.qkv_proj, acts_h, qkv);
 
             let qkv_ptr = qkv.as_mut_ptr() as usize;
@@ -7472,7 +7650,7 @@ impl RealLlamaEngine {
                 });
             }
 
-            prompt_populate(pool, attn, q_dim, None, acts_q);
+            prompt_populate(pool, attn, q_dim, None, acts_q, layer.o_proj.input_rotated());
             prompt_gemm(pool, &layer.o_proj, acts_q, proj);
             if let Some(ref ob) = layer.o_bias {
                 for row in proj.chunks_exact_mut(h) {
@@ -7516,7 +7694,7 @@ impl RealLlamaEngine {
                     );
                 add_inplace(hidden, proj);
             } else {
-                prompt_populate(pool, hidden, h, Some((&layer.post_attn_norm, eps)), acts_h);
+                prompt_populate(pool, hidden, h, Some((&layer.post_attn_norm, eps)), acts_h, layer.gate_up_proj.input_rotated());
                 prompt_gemm(pool, &layer.gate_up_proj, acts_h, gate_up);
                 let gu_ref = &*gate_up;
                 let sw_ptr = sw.as_mut_ptr() as usize;
@@ -7542,14 +7720,14 @@ impl RealLlamaEngine {
                         }
                     }
                 });
-                prompt_populate(pool, sw, inter, None, acts_i);
+                prompt_populate(pool, sw, inter, None, acts_i, layer.down_proj.input_rotated());
                 prompt_gemm(pool, &layer.down_proj, acts_i, proj);
                 add_inplace(hidden, proj);
             }
         }
 
         if let Some(out_all) = all_logits_out {
-            prompt_populate(pool, hidden, h, Some((&self.final_norm, eps)), acts_h);
+            prompt_populate(pool, hidden, h, Some((&self.final_norm, eps)), acts_h, self.lm_head.input_rotated());
             prompt_gemm(pool, &self.lm_head, acts_h, out_all);
             let vocab = self.cfg.vocab_size;
             self.ws.logits.copy_from_slice(&out_all[(n - 1) * vocab..n * vocab]);
@@ -7903,6 +8081,7 @@ fn prompt_populate(
     dim: usize,
     norm: Option<(&[f32], f32)>,
     acts: &mut [BipolarActivationLut],
+    rotate: bool,
 ) {
     let acts_ptr = acts.as_mut_ptr() as usize;
     par_range(pool, acts.len(), |a, b| {
@@ -7911,7 +8090,16 @@ fn prompt_populate(
             let row = &x[t * dim..(t + 1) * dim];
             // SAFETY: token `t` is owned by exactly one range.
             let act = unsafe { &mut *(acts_ptr as *mut BipolarActivationLut).add(t) };
-            if !act.lut_enabled {
+            if !rotate {
+                match norm {
+                    Some((w, eps)) => {
+                        let buf = fallback_buf.get_or_insert_with(|| vec![0.0f32; dim]);
+                        rms_norm(row, w, eps, buf);
+                        act.populate(buf);
+                    }
+                    None => act.populate(row),
+                }
+            } else if !act.lut_enabled {
                 let i8a = act.int8.as_mut().expect("int8 activations");
                 match norm {
                     Some((w, eps)) => {
@@ -7962,7 +8150,14 @@ fn prompt_gemm(pool: Option<&SpinThreadPool>, mat: &LinearBackend, acts: &[Bipol
                 unsafe { vq2_sdot_batch_stripe_range(m, acts, s0, s1, out_ptr as *mut f32, m.rows) };
             });
         }
-        _ => unreachable!("prompt_gemm requires Nibble4, NfSdot, or Vq2 SDOT projections"),
+        LinearBackend::Q2c(m) => {
+            debug_assert_eq!(out.len(), acts.len() * m.rows);
+            par_stripes(m.rows, 32, &|r0, r1| {
+                // SAFETY: disjoint row ranges write disjoint rows of every token.
+                unsafe { q2c_batch_rows(m, acts, r0, r1, out_ptr as *mut f32, m.rows) };
+            });
+        }
+        _ => unreachable!("prompt_gemm requires Nibble4, NfSdot, Vq2, or Q2c SDOT projections"),
     }
 }
 
@@ -10327,6 +10522,136 @@ mod tests {
         assert!(win_batch.can_truncate_kv_to(638));
 
         q8_eng.set_num_threads(1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Tiny HunYuan-style model with `q2_0c` projections: GGUF + F32 safetensors + config.
+    fn write_tiny_q2c_model(dir: &Path) {
+        let (h, inter, kvd, vocab, layers, hd) = (512usize, 512usize, 128usize, 256usize, 2usize, 64usize);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32
+        };
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            format!(r#"{{"vocab_size":{vocab},"hidden_size":{h},"intermediate_size":{inter},"num_hidden_layers":{layers},"num_attention_heads":8,"num_key_value_heads":2,"head_dim":{hd},"rms_norm_eps":1e-5,"rope_theta":10000.0,"tie_word_embeddings":true,"max_position_embeddings":4096}}"#),
+        )
+        .unwrap();
+
+        // GGUF v3, no metadata, q2_0c tensors only.
+        let mut tensors: Vec<(String, usize, usize)> = Vec::new();
+        for l in 0..layers {
+            for (n, rows, cols) in [("attn_q", h, h), ("attn_k", kvd, h), ("attn_v", kvd, h), ("attn_output", h, h), ("ffn_gate", inter, h), ("ffn_up", inter, h), ("ffn_down", h, inter)] {
+                tensors.push((format!("blk.{l}.{n}.weight"), rows, cols));
+            }
+        }
+        let mut hdr = b"GGUF".to_vec();
+        hdr.extend_from_slice(&3u32.to_le_bytes());
+        hdr.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        hdr.extend_from_slice(&0u64.to_le_bytes());
+        let mut data = Vec::new();
+        for (name, rows, cols) in &tensors {
+            hdr.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            hdr.extend_from_slice(name.as_bytes());
+            hdr.extend_from_slice(&2u32.to_le_bytes());
+            hdr.extend_from_slice(&(*cols as u64).to_le_bytes());
+            hdr.extend_from_slice(&(*rows as u64).to_le_bytes());
+            hdr.extend_from_slice(&crate::storage::gguf::GGML_TYPE_Q2_0C.to_le_bytes());
+            hdr.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            for _ in 0..rows * cols / 512 {
+                let mut d = [0u16];
+                crate::kernels::half::f32_to_f16(&[0.01 + 0.02 * rnd()], &mut d);
+                data.extend_from_slice(&d[0].to_le_bytes());
+                data.extend((0..128).map(|_| (rnd() * 256.0) as u8));
+            }
+        }
+        while hdr.len() % 32 != 0 {
+            hdr.push(0);
+        }
+        hdr.extend_from_slice(&data);
+        fs::write(dir.join("tiny.gguf"), hdr).unwrap();
+
+        let mut st: Vec<(String, Vec<usize>, Vec<f32>)> = vec![
+            ("model.embed_tokens.weight".into(), vec![vocab, h], (0..vocab * h).map(|_| rnd() - 0.5).collect()),
+            ("model.norm.weight".into(), vec![h], vec![1.0; h]),
+        ];
+        for l in 0..layers {
+            let p = format!("model.layers.{l}");
+            st.push((format!("{p}.input_layernorm.weight"), vec![h], (0..h).map(|_| 0.8 + 0.4 * rnd()).collect()));
+            st.push((format!("{p}.post_attention_layernorm.weight"), vec![h], (0..h).map(|_| 0.8 + 0.4 * rnd()).collect()));
+            st.push((format!("{p}.self_attn.query_layernorm.weight"), vec![hd], vec![1.0; hd]));
+            st.push((format!("{p}.self_attn.key_layernorm.weight"), vec![hd], vec![1.0; hd]));
+        }
+        let mut json = String::from("{");
+        let mut off = 0usize;
+        for (i, (n, shape, v)) in st.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(r#""{n}":{{"dtype":"F32","shape":{shape:?},"data_offsets":[{off},{}]}}"#, off + v.len() * 4));
+            off += v.len() * 4;
+        }
+        json.push('}');
+        let mut f = (json.len() as u64).to_le_bytes().to_vec();
+        f.extend_from_slice(json.as_bytes());
+        for (_, _, v) in &st {
+            v.iter().for_each(|x| f.extend_from_slice(&x.to_le_bytes()));
+        }
+        fs::write(dir.join("model.safetensors"), f).unwrap();
+    }
+
+    // Exact q2_0c weights: mapped (zero-copy) and copied loads decode the same tokens, and batched
+    // prefill matches token-by-token decode (both paths skip the Hadamard rotation).
+    #[test]
+    fn q2c_zero_copy_weights_match_copied() {
+        let dir = std::env::temp_dir().join(format!("kronos_q2c_tiny_{}", std::process::id()));
+        write_tiny_q2c_model(&dir);
+        let calib: Vec<Vec<usize>> = (0..2).map(|s| (0..96).map(|i| (i * 37 + s * 11) % 256).collect()).collect();
+        let eng = RealLlamaEngine::compile_q2c_from_dir(&dir, &calib, 2).unwrap();
+        assert!(matches!(eng.layers[0].qkv_proj, LinearBackend::Q2c(_)));
+        let cache = dir.join("kronos-q2c.k2tb");
+        eng.save_bipolar(&cache).unwrap();
+        drop(eng);
+
+        let prompt: Vec<usize> = (0..24).map(|i| (i * 13 + 5) % 256).collect();
+        let gen = |eng: &mut RealLlamaEngine| {
+            eng.reset_context();
+            let mut l = eng.forward_prompt(&prompt).to_vec();
+            (0..16).map(|_| { let t = argmax(&l); l = eng.forward_token(t).to_vec(); t }).collect::<Vec<_>>()
+        };
+        let mut copied = RealLlamaEngine::load_bipolar(&dir, &cache, 256).unwrap();
+        copied.repack_sdot();
+        assert_eq!(copied.mode, RealWeightMode::KronosQ2c);
+        assert!(copied.is_all_sdot());
+        let a = gen(&mut copied);
+
+        // Batched prefill vs one token at a time.
+        copied.reset_context();
+        let batch = copied.forward_prompt(&prompt).to_vec();
+        copied.reset_context();
+        let mut seq = Vec::new();
+        for &t in &prompt {
+            seq = copied.forward_token(t).to_vec();
+        }
+        let dot: f64 = batch.iter().zip(&seq).map(|(&x, &y)| x as f64 * y as f64).sum();
+        let nb: f64 = batch.iter().map(|&x| x as f64 * x as f64).sum::<f64>().sqrt();
+        let ns: f64 = seq.iter().map(|&x| x as f64 * x as f64).sum::<f64>().sqrt();
+        assert!(dot / (nb * ns) > 0.999, "batch vs sequential cosine {}", dot / (nb * ns));
+        drop(copied);
+
+        set_zero_copy_weights(true);
+        let mapped = RealLlamaEngine::load_bipolar(&dir, &cache, 256);
+        set_zero_copy_weights(false);
+        let mut mapped = mapped.unwrap();
+        mapped.repack_sdot();
+        let LinearBackend::Q2c(m) = &mapped.layers[0].gate_up_proj else { panic!("expected Q2c") };
+        assert_eq!(m.data.page_alloc_bytes(), 0, "q2c weights should be borrowed from the mapping");
+        let b = gen(&mut mapped);
+        assert_eq!(a, b);
         let _ = fs::remove_dir_all(&dir);
     }
 

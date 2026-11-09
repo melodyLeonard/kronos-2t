@@ -4,6 +4,7 @@ pub mod accel;
 pub mod hadamard;
 pub mod half;
 pub mod lut_gemv;
+pub mod q2c;
 pub mod simd_lut;
 pub mod synthesis;
 pub mod router;

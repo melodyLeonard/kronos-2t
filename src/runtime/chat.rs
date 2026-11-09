@@ -190,6 +190,7 @@ impl Completion {
 }
 
 /// Parses a mode key: `nf5`, `nf4`, `nf3`, `e8q2`, `nf3nf4`, `e8q2nf4` (optional `g128`),
+/// `q2c` (exact `q2_0c` GGUF weights),
 /// `nfpQOGDH` (`G=64`), `nfgQOGDH` (`G=128`), `vq2`, `vq2g128`, `v2b4`, `v2b5`, `b4`, `b5`, `b6`, or `pQOGDH`.
 pub fn parse_mode(m: &str) -> Result<RealWeightMode, String> {
     Ok(match m {
@@ -245,6 +246,7 @@ pub fn parse_mode(m: &str) -> Result<RealWeightMode, String> {
             ffn_bits: 2,
             scale_group_chunks: 2,
         },
+        "q2c" => RealWeightMode::KronosQ2c,
         "vq2" => RealWeightMode::KronosVq2Gptq { scale_group_chunks: 1 },
         "vq2g128" => RealWeightMode::KronosVq2Gptq { scale_group_chunks: 2 },
         "v2b4" => RealWeightMode::KronosVq2MixedGptq {
@@ -279,7 +281,7 @@ pub fn parse_mode(m: &str) -> Result<RealWeightMode, String> {
         }
         other => {
             return Err(format!(
-                "unknown mode {other}; use nf5, nf5g128, nf4, nf4g128, nf3nf4, nf3nf4g128, nf3, nf3g128, e8q2, e8q2g128, e8q2nf4, e8q2nf4g128, nfpQOGDH, nfgQOGDH (digits 2-5), vq2, vq2g128, v2b4, v2b5, b4, b5, b6 or pQOGDH (digits 4-6)"
+                "unknown mode {other}; use nf5, nf5g128, nf4, nf4g128, nf3nf4, nf3nf4g128, nf3, nf3g128, e8q2, e8q2g128, e8q2nf4, e8q2nf4g128, q2c, nfpQOGDH, nfgQOGDH (digits 2-5), vq2, vq2g128, v2b4, v2b5, b4, b5, b6 or pQOGDH (digits 4-6)"
             ));
         }
     })
@@ -294,6 +296,10 @@ pub fn compile(model_dir: &Path, mode: RealWeightMode, calib_text: &str, calib_t
         return Err("calibration text is too short (need at least 512 tokens)".to_string());
     }
     let seqs: Vec<Vec<usize>> = ids[..calib_tokens.min(ids.len())].chunks(SEQ).map(|c| c.to_vec()).collect();
+    if mode == RealWeightMode::KronosQ2c {
+        return RealLlamaEngine::compile_q2c_from_dir(model_dir, &seqs, crate::kernels::thread_pool::physical_p_cores())
+            .map_err(|e| format!("q2c compile: {e}"));
+    }
     RealLlamaEngine::compile_streaming_gptq_from_dir(
         model_dir,
         mode,

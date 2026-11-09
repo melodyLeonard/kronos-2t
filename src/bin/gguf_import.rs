@@ -5,167 +5,13 @@
 //! `model.safetensors` with HuggingFace tensor names, so `kronos_chat --mode …` can compile it.
 //! Tencent's `q2_0c` (GGML type 40): 512 weights per block, one f16 scale, codes `{-3,-1,1,3}`.
 //!
-//! Rust only, no dependencies: GGUF v3 header parsing per ggml's `gguf.md`.
+//! Header parsing lives in `kronos_2t::storage::gguf`.
 
+use kronos_2t::storage::gguf::{f16_to_f32, type_name, Gguf, TensorInfo};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-
-const GGUF_MAGIC: &[u8; 4] = b"GGUF";
-
-#[derive(Debug, Clone)]
-enum Val {
-    U8(u8),
-    I8(i8),
-    U16(u16),
-    I16(i16),
-    U32(u32),
-    I32(i32),
-    F32(f32),
-    Bool(bool),
-    Str(String),
-    Arr(Vec<Val>),
-    U64(u64),
-    I64(i64),
-    F64(f64),
-}
-
-impl Val {
-    fn as_u64(&self) -> Option<u64> {
-        match *self {
-            Val::U8(v) => Some(v as u64),
-            Val::U16(v) => Some(v as u64),
-            Val::U32(v) => Some(v as u64),
-            Val::U64(v) => Some(v),
-            Val::I32(v) if v >= 0 => Some(v as u64),
-            _ => None,
-        }
-    }
-    fn short(&self) -> String {
-        match self {
-            Val::Str(s) => format!("{:?}", s.chars().take(60).collect::<String>()),
-            Val::Arr(a) => format!("[{} items]", a.len()),
-            other => format!("{other:?}"),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct TensorInfo {
-    name: String,
-    dims: Vec<u64>,
-    ty: u32,
-    offset: u64,
-}
-
-struct Cursor<'a> {
-    b: &'a [u8],
-    p: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> &'a [u8] {
-        let s = &self.b[self.p..self.p + n];
-        self.p += n;
-        s
-    }
-    fn u8(&mut self) -> u8 { self.take(1)[0] }
-    fn u16(&mut self) -> u16 { u16::from_le_bytes(self.take(2).try_into().unwrap()) }
-    fn u32(&mut self) -> u32 { u32::from_le_bytes(self.take(4).try_into().unwrap()) }
-    fn u64(&mut self) -> u64 { u64::from_le_bytes(self.take(8).try_into().unwrap()) }
-    fn str(&mut self) -> String {
-        let n = self.u64() as usize;
-        String::from_utf8_lossy(self.take(n)).into_owned()
-    }
-    fn val(&mut self, ty: u32) -> Val {
-        match ty {
-            0 => Val::U8(self.u8()),
-            1 => Val::I8(self.u8() as i8),
-            2 => Val::U16(self.u16()),
-            3 => Val::I16(self.u16() as i16),
-            4 => Val::U32(self.u32()),
-            5 => Val::I32(self.u32() as i32),
-            6 => Val::F32(f32::from_bits(self.u32())),
-            7 => Val::Bool(self.u8() != 0),
-            8 => Val::Str(self.str()),
-            9 => {
-                let et = self.u32();
-                let n = self.u64() as usize;
-                Val::Arr((0..n).map(|_| self.val(et)).collect())
-            }
-            10 => Val::U64(self.u64()),
-            11 => Val::I64(self.u64() as i64),
-            12 => Val::F64(f64::from_bits(self.u64())),
-            t => panic!("unknown gguf value type {t}"),
-        }
-    }
-}
-
-struct Gguf<'a> {
-    kv: BTreeMap<String, Val>,
-    tensors: Vec<TensorInfo>,
-    data: &'a [u8],
-}
-
-fn parse(bytes: &[u8]) -> Gguf<'_> {
-    assert_eq!(&bytes[..4], GGUF_MAGIC, "not a GGUF file");
-    let mut c = Cursor { b: bytes, p: 4 };
-    let version = c.u32();
-    assert!(version >= 2, "gguf v{version} unsupported");
-    let n_tensors = c.u64() as usize;
-    let n_kv = c.u64() as usize;
-    let mut kv = BTreeMap::new();
-    for _ in 0..n_kv {
-        let k = c.str();
-        let t = c.u32();
-        kv.insert(k, c.val(t));
-    }
-    let mut tensors = Vec::with_capacity(n_tensors);
-    for _ in 0..n_tensors {
-        let name = c.str();
-        let nd = c.u32() as usize;
-        let dims = (0..nd).map(|_| c.u64()).collect();
-        let ty = c.u32();
-        let offset = c.u64();
-        tensors.push(TensorInfo { name, dims, ty, offset });
-    }
-    let align = kv.get("general.alignment").and_then(Val::as_u64).unwrap_or(32) as usize;
-    let data_start = c.p.div_ceil(align) * align;
-    Gguf { kv, tensors, data: &bytes[data_start..] }
-}
-
-/// ggml type ids (ggml.h `ggml_type`).
-fn type_name(t: u32) -> &'static str {
-    match t {
-        0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1", 6 => "Q5_0", 7 => "Q5_1", 8 => "Q8_0", 9 => "Q8_1",
-        10 => "Q2_K", 11 => "Q3_K", 12 => "Q4_K", 13 => "Q5_K", 14 => "Q6_K", 15 => "Q8_K",
-        16 => "IQ2_XXS", 17 => "IQ2_XS", 18 => "IQ3_XXS", 19 => "IQ1_S", 20 => "IQ4_NL", 21 => "IQ3_S", 22 => "IQ2_S",
-        23 => "IQ4_XS", 24 => "I8", 25 => "I16", 26 => "I32", 27 => "I64", 28 => "F64", 29 => "IQ1_M", 30 => "BF16",
-        34 => "TQ1_0", 35 => "TQ2_0", 39 => "MXFP4",
-        _ => "?",
-    }
-}
-
-fn f16_to_f32(h: u16) -> f32 {
-    let s = ((h >> 15) & 1) as u32;
-    let e = ((h >> 10) & 0x1f) as u32;
-    let m = (h & 0x3ff) as u32;
-    let bits = if e == 0 {
-        if m == 0 { s << 31 } else {
-            // subnormal
-            let mut e2 = 127 - 15 + 1;
-            let mut m2 = m;
-            while m2 & 0x400 == 0 { m2 <<= 1; e2 -= 1; }
-            (s << 31) | ((e2 as u32) << 23) | ((m2 & 0x3ff) << 13)
-        }
-    } else if e == 31 {
-        (s << 31) | 0x7f80_0000 | (m << 13)
-    } else {
-        (s << 31) | ((e + 127 - 15) << 23) | (m << 13)
-    };
-    f32::from_bits(bits)
-}
 
 fn bf16(v: f32) -> u16 {
     let b = v.to_bits();
@@ -297,7 +143,7 @@ fn main() {
     }
     let path = PathBuf::from(&args[1]);
     let bytes = fs::read(&path).expect("read gguf");
-    let g = parse(&bytes);
+    let g = Gguf::parse(&bytes).expect("parse gguf");
     let levels: [f32; 4] = args.iter().position(|a| a == "--levels").and_then(|i| args.get(i + 1)).map(|s| {
         let v: Vec<f32> = s.split(',').map(|x| x.trim().parse().expect("level")).collect();
         [v[0], v[1], v[2], v[3]]
