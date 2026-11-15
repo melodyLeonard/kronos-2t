@@ -18,6 +18,8 @@ pub struct Q2cMatrix {
     pub rows: usize,
     pub cols: usize,
     pub data: PageAlignedBytes,
+    /// Scales (`[rows, cols / 512]`) used instead of the ones in `data`, which may be a read-only mapping.
+    pub alt_scales: Option<Vec<f32>>,
 }
 
 impl Q2cMatrix {
@@ -48,7 +50,7 @@ impl Q2cMatrix {
         if data.len() != Self::total_bytes(rows, cols) {
             return Err(format!("q2c: stream is {} bytes, expected {}", data.len(), Self::total_bytes(rows, cols)));
         }
-        Ok(Self { rows, cols, data })
+        Ok(Self { rows, cols, data, alt_scales: None })
     }
 
     /// From codes `0..4` (`[rows, cols]`) and per-512 scales (`[rows, cols / 512]`).
@@ -66,7 +68,7 @@ impl Q2cMatrix {
         for (s, dst) in scales.iter().zip(data[cb..].chunks_exact_mut(4)) {
             dst.copy_from_slice(&s.to_le_bytes());
         }
-        Self { rows, cols, data }
+        Self { rows, cols, data, alt_scales: None }
     }
 
     /// From raw ggml `block_q2_0c` blocks (`f16 d`, 128 code bytes, weight `j` at bits
@@ -91,11 +93,14 @@ impl Q2cMatrix {
                 }
             }
         }
-        Self { rows, cols, data }
+        Self { rows, cols, data, alt_scales: None }
     }
 
     #[inline]
     pub fn scale(&self, r: usize, b: usize) -> f32 {
+        if let Some(a) = &self.alt_scales {
+            return a[r * self.num_blocks() + b];
+        }
         let off = Self::code_bytes(self.rows, self.cols) + (r * self.num_blocks() + b) * 4;
         f32::from_le_bytes(self.data[off..off + 4].try_into().unwrap())
     }
@@ -275,7 +280,10 @@ unsafe fn q2c_rows_neon<const NT: usize>(
     let nb = m.num_blocks();
     let row_bytes = m.cols / 4;
     let base = m.data.as_ptr();
-    let scale_base = unsafe { base.add(Q2cMatrix::code_bytes(m.rows, m.cols)) };
+    let scale_base = match &m.alt_scales {
+        Some(a) => a.as_ptr().cast::<u8>(),
+        None => unsafe { base.add(Q2cMatrix::code_bytes(m.rows, m.cols)) },
+    };
     let m3 = vdupq_n_u8(3);
     let xq: [*const i8; NT] = std::array::from_fn(|t| acts[t].q.as_ptr());
     let xs: [*const f32; NT] = std::array::from_fn(|t| acts[t].scales.as_ptr());

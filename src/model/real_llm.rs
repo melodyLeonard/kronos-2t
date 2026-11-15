@@ -1566,7 +1566,118 @@ pub struct RealLlamaEngine {
     ws: LlamaWorkspace,
 }
 
+/// One layer of a [`Q2cOverlay`].
+#[derive(Clone)]
+pub struct Q2cOverlayLayer {
+    pub input_norm: Vec<f32>,
+    pub post_attn_norm: Vec<f32>,
+    pub q_norm: Option<Vec<f32>>,
+    pub k_norm: Option<Vec<f32>>,
+    /// `qkv`, `o`, `gate_up`, `down` scales; `None` while they are live in the layer.
+    pub scales: [Option<Vec<f32>>; 4],
+}
+
+/// A second tuning of the same 2-bit codes: norms and scales of layers `first..` plus `final_norm`.
+#[derive(Clone)]
+pub struct Q2cOverlay {
+    pub first: usize,
+    pub layers: Vec<Q2cOverlayLayer>,
+    pub final_norm: Vec<f32>,
+}
+
+const Q2C_OVERLAY_MAGIC: &[u8; 8] = b"K2OVLAY1";
+
+impl Q2cOverlay {
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        use std::io::Write;
+        let mut w = io::BufWriter::new(fs::File::create(path)?);
+        let put = |w: &mut io::BufWriter<fs::File>, v: &[f32]| -> io::Result<()> {
+            w.write_all(&(v.len() as u32).to_le_bytes())?;
+            v.iter().try_for_each(|x| w.write_all(&x.to_le_bytes()))
+        };
+        w.write_all(Q2C_OVERLAY_MAGIC)?;
+        w.write_all(&(self.first as u32).to_le_bytes())?;
+        w.write_all(&(self.layers.len() as u32).to_le_bytes())?;
+        for l in &self.layers {
+            put(&mut w, &l.input_norm)?;
+            put(&mut w, &l.post_attn_norm)?;
+            put(&mut w, l.q_norm.as_deref().unwrap_or(&[]))?;
+            put(&mut w, l.k_norm.as_deref().unwrap_or(&[]))?;
+            for s in &l.scales {
+                put(&mut w, s.as_deref().expect("overlay scales are live in the engine"))?;
+            }
+        }
+        put(&mut w, &self.final_norm)?;
+        w.flush()
+    }
+
+    pub fn load(path: &Path) -> io::Result<Self> {
+        let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, format!("overlay: {m}"));
+        let buf = fs::read(path)?;
+        if buf.len() < 16 || &buf[..8] != Q2C_OVERLAY_MAGIC {
+            return Err(bad("bad magic"));
+        }
+        let mut pos = 8;
+        let u32_at = |pos: &mut usize| -> io::Result<usize> {
+            let b = buf.get(*pos..*pos + 4).ok_or_else(|| bad("truncated"))?;
+            *pos += 4;
+            Ok(u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        };
+        let first = u32_at(&mut pos)?;
+        let n = u32_at(&mut pos)?;
+        let vec_at = |pos: &mut usize| -> io::Result<Vec<f32>> {
+            let len = u32_at(pos)?;
+            let b = buf.get(*pos..*pos + len * 4).ok_or_else(|| bad("truncated"))?;
+            *pos += len * 4;
+            Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
+        };
+        let opt = |v: Vec<f32>| (!v.is_empty()).then_some(v);
+        let mut layers = Vec::with_capacity(n);
+        for _ in 0..n {
+            layers.push(Q2cOverlayLayer {
+                input_norm: vec_at(&mut pos)?,
+                post_attn_norm: vec_at(&mut pos)?,
+                q_norm: opt(vec_at(&mut pos)?),
+                k_norm: opt(vec_at(&mut pos)?),
+                scales: [Some(vec_at(&mut pos)?), Some(vec_at(&mut pos)?), Some(vec_at(&mut pos)?), Some(vec_at(&mut pos)?)],
+            });
+        }
+        Ok(Self { first, layers, final_norm: vec_at(&mut pos)? })
+    }
+}
+
 impl RealLlamaEngine {
+    /// Swaps `ov` in (`on`) or back out. Weights stay untouched, so mapped files work; the caller
+    /// must drop cached context, and Metal is turned off.
+    pub fn swap_q2c_overlay(&mut self, ov: &mut Q2cOverlay, on: bool) -> Result<(), String> {
+        if ov.first + ov.layers.len() != self.layers.len() || ov.final_norm.len() != self.final_norm.len() {
+            return Err("overlay does not fit this model".into());
+        }
+        self.disable_metal();
+        for (l, o) in self.layers[ov.first..].iter_mut().zip(&mut ov.layers) {
+            if l.input_norm.len() != o.input_norm.len() || l.q_norm.is_some() != o.q_norm.is_some() {
+                return Err("overlay does not fit this model".into());
+            }
+            std::mem::swap(&mut l.input_norm, &mut o.input_norm);
+            std::mem::swap(&mut l.post_attn_norm, &mut o.post_attn_norm);
+            std::mem::swap(&mut l.q_norm, &mut o.q_norm);
+            std::mem::swap(&mut l.k_norm, &mut o.k_norm);
+            for (b, s) in [&mut l.qkv_proj, &mut l.o_proj, &mut l.gate_up_proj, &mut l.down_proj].into_iter().zip(&mut o.scales) {
+                let LinearBackend::Q2c(m) = b else { return Err("overlay needs Q2c layers".into()) };
+                if on {
+                    if s.as_ref().is_some_and(|v| v.len() != m.rows * m.num_blocks()) {
+                        return Err("overlay does not fit this model".into());
+                    }
+                    m.alt_scales = s.take();
+                } else {
+                    *s = m.alt_scales.take();
+                }
+            }
+        }
+        std::mem::swap(&mut self.final_norm, &mut ov.final_norm);
+        Ok(())
+    }
+
     /// Configures persistent P-core thread pool (`num_threads <= 1` disables threading and parks workers).
     pub fn set_num_threads(&mut self, num_threads: usize) {
         if num_threads <= 1 {

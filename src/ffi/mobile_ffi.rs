@@ -1103,6 +1103,7 @@ pub unsafe extern "C" fn kronos_session_translate_warm(
             context: &context,
             temperature: 0.0,
         };
+        crate::runtime::translate::select_tuning(&mut sess.model, &req);
         let (messages, _, _) = crate::runtime::translate::prompt(&sess.model, &req);
         crate::model::real_llm::set_abort_active(false);
         let rc = match sess.model.prefill_messages(&messages) {

@@ -584,6 +584,9 @@ impl ConvSnapshots {
     }
 }
 
+/// Optional grammar tuning next to the model: see [`ChatModel::set_grammar_tuning`].
+pub const GRAMMAR_OVERLAY_FILE: &str = "kronos-q2c-grammar.k2ov";
+
 pub struct ChatModel {
     engine: Backend,
     /// Prompt-lookup index over the live context (doc `look_ctx`) and recent conversations; drafts
@@ -616,6 +619,8 @@ pub struct ChatModel {
     scratch: ChatScratch,
     /// Lookup and draft speculation (off = plain token-by-token decoding).
     spec_enabled: bool,
+    /// Grammar overlay from [`GRAMMAR_OVERLAY_FILE`] and whether it is swapped in.
+    grammar: Option<(crate::model::real_llm::Q2cOverlay, bool)>,
     /// Per-session KV prefixes (`--kv-sessions`), keyed by session id.
     sessions: Option<SessionKvStore>,
     active_session: Option<String>,
@@ -711,6 +716,7 @@ impl ChatModel {
             ctx,
             scratch: { crate::model::memory_budget::mem_trace("before chat scratch"); ChatScratch::new(vocab_size) },
             spec_enabled: true,
+            grammar: crate::model::real_llm::Q2cOverlay::load(&model_dir.join(GRAMMAR_OVERLAY_FILE)).ok().map(|o| (o, false)),
             sessions: None,
             active_session: None,
             name,
@@ -719,6 +725,23 @@ impl ChatModel {
             #[cfg(all(feature = "ane", target_os = "macos"))]
             ane: Vec::new(),
         })
+    }
+
+    /// Switches between the grammar overlay (`on`) and the base tuning, dropping cached context.
+    /// Returns whether the overlay is now in use; always `false` without an overlay file.
+    pub fn set_grammar_tuning(&mut self, on: bool) -> bool {
+        let Some((ov, active)) = self.grammar.as_mut() else { return false };
+        if *active == on {
+            return on;
+        }
+        let Backend::Llama(e) = &mut self.engine else { return false };
+        if e.swap_q2c_overlay(ov, on).is_err() {
+            self.grammar = None;
+            return false;
+        }
+        *active = on;
+        self.reset_cache();
+        on
     }
 
     /// Toggles the Hadamard INT8 KV cache.
