@@ -82,6 +82,7 @@ pub fn run(
     req: &TranslateRequest,
     mut on_text: impl FnMut(&str) -> bool,
 ) -> Result<Completion, String> {
+    select_tuning(model, req);
     let out = run_once(model, req, &mut on_text)?;
     if !req.context.is_empty() && echoes_context(&clean_translation(&out.text), req.context) {
         // The model sometimes answers with a context line instead of the source: retry without it.
@@ -89,6 +90,11 @@ pub fn run(
         return run_once(model, &plain, &mut on_text);
     }
     Ok(out)
+}
+
+/// Same-language requests are grammar correction and use the grammar overlay when the model has one.
+pub fn select_tuning(model: &mut ChatModel, req: &TranslateRequest) {
+    model.set_grammar_tuning(req.from.trim().eq_ignore_ascii_case(req.to.trim()));
 }
 
 /// True when `out` repeats the start of any context line (the context-echo failure).
